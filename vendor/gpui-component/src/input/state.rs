@@ -1275,13 +1275,14 @@ impl InputState {
         &mut self,
         _: &MouseUpEvent,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
         if self.selected_range.is_empty() {
             self.selection_reversed = false;
         }
         self.selecting = false;
         self.selected_word_range = None;
+        cx.notify();
     }
 
     pub(super) fn on_mouse_move(
@@ -1895,6 +1896,51 @@ impl InputState {
         ))
     }
 
+    pub fn interaction_active(&self) -> bool {
+        self.selecting || self.ime_marked_range.is_some()
+    }
+
+    pub fn replace_text_preserving_selection(
+        &mut self,
+        range: Range<usize>,
+        new_text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<bool> {
+        if self.interaction_active() || self.mode.is_single_line() {
+            return None;
+        }
+        let range_utf16 = self.range_to_utf16(&range);
+        if self.range_from_utf16(&range_utf16) != range {
+            return None;
+        }
+        let selected = self.selected_range;
+        let reversed = self.selection_reversed;
+        let offset = self.scroll_handle.offset();
+        let (start, start_changed) = refreshed_offset(selected.start, &range, new_text.len());
+        let (end, end_changed) = refreshed_offset(selected.end, &range, new_text.len());
+        let relocated = start_changed || end_changed;
+        let disabled = self.disabled;
+        let silent = self.silent_replace_text;
+        self.disabled = false;
+        self.silent_replace_text = true;
+        self.history.new_group();
+        self.replace_text_in_range(Some(range_utf16), new_text, window, cx);
+        self.history.new_group();
+        self.silent_replace_text = silent;
+        self.disabled = disabled;
+        self.selected_range = (start..end).into();
+        self.selection_reversed = reversed;
+        if !relocated {
+            self.last_selected_range = Some(self.selected_range);
+            self.last_cursor = Some(self.cursor());
+            self.deferred_scroll_offset = Some(offset);
+        }
+        self.update_preferred_column();
+        cx.notify();
+        Some(relocated)
+    }
+
     /// Replace text by [`lsp_types::Range`].
     ///
     /// See also: [`EntityInputHandler::replace_text_in_range`]
@@ -1953,7 +1999,7 @@ impl EntityInputHandler for InputState {
     ) -> Option<UTF16Selection> {
         Some(UTF16Selection {
             range: self.range_to_utf16(&self.selected_range.into()),
-            reversed: false,
+            reversed: self.selection_reversed,
         })
     }
 
@@ -1966,8 +2012,9 @@ impl EntityInputHandler for InputState {
             .map(|range| self.range_to_utf16(&range.into()))
     }
 
-    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.ime_marked_range = None;
+        cx.notify();
     }
 
     /// Replace text in range.
@@ -2204,5 +2251,28 @@ impl Render for InputState {
             .children(self.diagnostic_popover.clone())
             .children(self.context_menu.as_ref().map(|menu| menu.render()))
             .children(self.hover_popover.clone())
+    }
+}
+
+fn refreshed_offset(offset: usize, range: &Range<usize>, replacement: usize) -> (usize, bool) {
+    if offset <= range.start {
+        (offset, false)
+    } else if offset >= range.end {
+        (range.start + replacement + offset - range.end, false)
+    } else {
+        (range.start + replacement, true)
+    }
+}
+
+#[cfg(test)]
+mod refresh_tests {
+    use super::refreshed_offset;
+    #[test]
+    fn unchanged_text_positions_follow_replacement_lengths() {
+        assert_eq!(refreshed_offset(2, &(4..9), 2), (2, false));
+        assert_eq!(refreshed_offset(10, &(4..9), 2), (7, false));
+        assert_eq!(refreshed_offset(9, &(4..9), 2), (6, false));
+        assert_eq!(refreshed_offset(7, &(4..9), 2), (6, true));
+        assert_eq!(refreshed_offset(9, &(4..4), 3), (12, false));
     }
 }

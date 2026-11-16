@@ -238,6 +238,7 @@ impl Shell {
                     .into();
             return;
         }
+        doc.deferred_external = None;
         doc.saving = true;
         doc.unrecovered_save = Some(snapshot.generation);
         self.checks.invalidate(doc.id);

@@ -109,6 +109,7 @@ impl Shell {
             self.status = "The local text changed. Review the current versions before resolving the conflict.".into();
             return;
         }
+        doc.deferred_external = None;
         doc.saving = true;
         self.checks.invalidate(doc.id);
         match snapshot.resolution {

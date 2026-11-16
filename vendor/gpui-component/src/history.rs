@@ -80,6 +80,11 @@ where
         self.grouping = false;
     }
 
+    pub(crate) fn new_group(&mut self) {
+        self.grouping = false;
+        self.version += 1;
+    }
+
     /// Increment the version number if the last change was made more than `GROUP_INTERVAL` milliseconds ago.
     fn inc_version(&mut self) -> usize {
         let t = Instant::now();
@@ -207,6 +212,21 @@ mod tests {
         }
         fn set_version(&mut self, version: usize) {
             self.version = version;
+        }
+    }
+
+    #[test]
+    fn explicit_boundaries_isolate_programmatic_changes() {
+        let mut history: History<TabIndex> = History::new().group_interval(Duration::from_secs(60));
+        history.push(1.into());
+        history.new_group();
+        history.push(2.into());
+        history.new_group();
+        history.push(3.into());
+        for expected in [3, 2, 1] {
+            let changes = history.undo().unwrap();
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0].tab_index, expected);
         }
     }
 

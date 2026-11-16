@@ -2,6 +2,7 @@ mod completion;
 mod conflict;
 mod decision;
 mod destination;
+mod external;
 mod menus;
 mod modal;
 mod panes;
@@ -97,6 +98,8 @@ struct Document {
     failed_destination: Option<(PathBuf, DestinationKind)>,
     unrecovered_save: Option<u64>,
     external: Option<(DiskFile, String)>,
+    deferred_external: Option<(DiskFile, String)>,
+    passive_refresh: bool,
     tab_focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -904,7 +907,10 @@ impl Shell {
                     this.status = "Close cancelled because the document was edited".into();
                 }
                 glimpse::metrics::event("change", id, doc.generation);
-                doc.preview = false;
+                if !doc.passive_refresh || doc.dirty(cx) {
+                    doc.preview = false;
+                }
+                doc.passive_refresh = false;
                 if !this.request.pick && !doc.dirty(cx) {
                     this.io.send(Job::ClearThrough(id, doc.generation));
                 } else if !this.request.pick {
@@ -934,6 +940,9 @@ impl Shell {
         if self.request.files.contains(&disk.path) {
             self.requested.push((id, disk.path.clone()));
         }
+        let refresh_subscription = cx.observe_in(&input, window, move |this, _, window, cx| {
+            this.apply_external(id, window, cx);
+        });
         let tab_focus = cx.focus_handle();
         let tab_subscription = cx.on_focus_in(&tab_focus, window, move |this, _, cx| {
             if let Some(index) = this.documents.iter().position(|doc| doc.id == id) {
@@ -957,8 +966,10 @@ impl Shell {
             failed_destination: None,
             unrecovered_save: None,
             external: None,
+            deferred_external: None,
+            passive_refresh: false,
             tab_focus,
-            _subscriptions: vec![subscription, tab_subscription],
+            _subscriptions: vec![subscription, tab_subscription, refresh_subscription],
         });
         self.tab_scroll.scroll_to_item(self.documents.len() - 1);
         self.syntax.request(
@@ -1441,6 +1452,7 @@ impl Shell {
                             {
                                 doc.resolved_through =
                                     doc.resolved_through.max(destination.generation);
+                                doc.deferred_external = None;
                                 doc.disk = disk;
                                 doc.external = None;
                                 doc.saved = destination.text;
@@ -1555,6 +1567,7 @@ impl Shell {
                         }
                         match result {
                             Ok((disk, text)) if disk.target != doc.disk.target => {
+                                doc.deferred_external = None;
                                 self.status = format!(
                                     "Destination changed from {} to {}. Local text retained; use Save Copy or explicitly Reload disk.",
                                     paths::display(&doc.disk.target),
@@ -1563,26 +1576,13 @@ impl Shell {
                                 doc.external = Some((disk, text));
                             }
                             Ok((disk, text)) if disk.bytes != doc.disk.bytes => {
-                                if doc.dirty(cx) {
-                                    doc.external = Some((disk, text));
-                                    self.status = "Changed on disk. Local edits retained. Reload or Save Copy.".into();
-                                } else {
-                                    let length = doc.input.read(cx).value().encode_utf16().count();
-                                    doc.input.update(cx, |input, cx| {
-                                        input.replace_text_in_range(
-                                            Some(0..length),
-                                            &text,
-                                            window,
-                                            cx,
-                                        )
-                                    });
-                                    doc.saved = text;
-                                    doc.disk = disk;
-                                    self.status =
-                                        "Reloaded external change (Undo available)".into();
-                                }
+                                doc.deferred_external = Some((disk, text));
                             }
-                            Ok((disk, _)) => doc.disk = disk,
+                            Ok((disk, _)) => {
+                                doc.deferred_external = None;
+                                doc.external = None;
+                                doc.disk = disk;
+                            }
                             Err(error) => {
                                 doc.error = Some(error.clone());
                                 doc.failure_action = FailureAction::Check;
@@ -1590,6 +1590,7 @@ impl Shell {
                                 self.status = format!("File unavailable: {error}");
                             }
                         }
+                        self.apply_external(id, window, cx);
                     }
                 }
                 Reply::Reloaded(reload, result) => self.reloaded(*reload, result, window, cx),
@@ -1969,6 +1970,7 @@ impl Shell {
             }
             glimpse::metrics::event("save-queued", doc.id, doc.generation);
             self.checks.invalidate(doc.id);
+            doc.deferred_external = None;
             doc.saving = true;
             self.io.send(Job::Save {
                 id: doc.id,
@@ -2766,6 +2768,21 @@ impl Render for Shell {
         let mut root = div()
             .size_full()
             .relative()
+            .on_modifiers_changed(
+                cx.listener(|this, event: &ModifiersChangedEvent, window, cx| {
+                    if !event.modifiers.shift {
+                        let ids: Vec<_> = this
+                            .documents
+                            .iter()
+                            .filter(|doc| doc.deferred_external.is_some())
+                            .map(|doc| doc.id)
+                            .collect();
+                        for id in ids {
+                            this.apply_external(id, window, cx);
+                        }
+                    }
+                }),
+            )
             .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, window, cx| {
                 this.interaction += 1;
                 if this.preferences.is_none()
@@ -3264,23 +3281,33 @@ impl Render for Shell {
             content.into_any_element()
         };
         root.child(div().flex_1().min_h_0().child(body))
-            .when(!self.warnings.is_empty(), |root| {
-                root.child(
-                    div()
-                        .p_2()
-                        .child(self.button("Recovery Warning…", "warnings", cx)),
-                )
-            })
-            .when(
-                !self.status.is_empty() && self.warnings.is_empty(),
-                |root| {
-                    root.child(
-                        div()
-                            .p_2()
-                            .text_size(px(12. * self.settings.ui_scale))
-                            .child(self.status.clone()),
-                    )
-                },
+            .child(
+                div()
+                    .h(px(36. * self.settings.ui_scale))
+                    .flex_shrink_0()
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(12. * self.settings.ui_scale))
+                    .when(!self.warnings.is_empty(), |footer| {
+                        footer.child(self.button("Recovery Warning…", "warnings", cx))
+                    })
+                    .when(self.warnings.is_empty(), |footer| {
+                        let message = self.status.clone();
+                        footer.child(
+                            div()
+                                .id("status-message")
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .child(message.clone())
+                                .tooltip(move |window, cx| {
+                                    gpui_component::tooltip::Tooltip::new(message.clone())
+                                        .build(window, cx)
+                                }),
+                        )
+                    }),
             )
             .children(self.preferences.clone())
             .children(self.decision.clone())
