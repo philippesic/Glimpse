@@ -21,7 +21,7 @@ CARGO_BUILD_JOBS=4 cargo clippy --locked --all-targets -- -D warnings
 CARGO_BUILD_JOBS=4 cargo test --locked --workspace
 ```
 
-Set `GLIMPSE_TRACE=1` to emit monotonic edit/save event timings to stderr. Events identify documents and generations without logging their contents. These timestamps describe application and worker handling, not physical input-to-present latency.
+Set `GLIMPSE_TRACE=1` to emit monotonic edit/save event timings to stderr. Events identify documents and generations without logging their contents. These timestamps describe application and worker handling, not physical input-to-present latency. `GPUI_WORK_TRACE=1` additionally records monotonic start and duration in nanoseconds for UI updates, input dispatch, effects, frame construction and renderer submission. Updates include nested work: merge overlapping intervals rather than adding their durations. Renderer submission is not physical presentation; disable tracing for idle CPU measurements.
 
 Linux tests require util-linux `unshare` and `mount`, with user and mount namespaces available. Bind-mount fixtures run in a private namespace.
 
@@ -49,4 +49,4 @@ glimpse open --scope /folder --line 12 --column 3 --wait -- /file.txt
 glimpse pick --directory --format json /starting/folder
 ```
 
-The CLI parser, private lifecycle socket and lossless picker output are retained. Save does not finish a waiting request: use Finish Editing Requested Files. Rebinding a requested file requires finishing or aborting its request first. See the core design for differences from the previous prototype and unqualified behavior.
+The CLI parser, private lifecycle socket and lossless picker output are retained. Save does not finish a waiting request: use Finish Editing Requested Files. Save As for a waiting requested file asks for an explicit abandonment decision; accepting it returns failure to that caller. See the core design for differences from the previous prototype and unqualified behavior.
