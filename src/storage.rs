@@ -693,6 +693,36 @@ impl Recovery {
         }
         Ok(())
     }
+    pub fn rebind(
+        &self,
+        id: u64,
+        generation: u64,
+        from: &crate::document::DiskFile,
+        to: &crate::document::DiskFile,
+    ) -> Result<(), String> {
+        let _finished = self.io.lock().unwrap();
+        let path = self.directory.join(format!("{id}.json"));
+        let mut draft = match read_draft(&path) {
+            Ok(draft) => draft,
+            Err(_) if !path.try_exists().map_err(|error| error.to_string())? => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if draft.generation > generation {
+            if draft.path != from.path
+                || draft.target.as_deref().unwrap_or(std::path::Path::new("")) != from.target
+            {
+                return Err("Newer recovery text has a different binding; it was retained".into());
+            }
+            draft.path = to.path.clone();
+            draft.target = Some(to.target.clone());
+            draft.base = to.bytes.clone();
+            atomic(
+                &path,
+                &serde_json::to_vec(&draft).map_err(|error| error.to_string())?,
+            )?;
+        }
+        Ok(())
+    }
     pub fn saved(&self, id: u64, generation: u64) -> Result<(), String> {
         let mut finished = self.io.lock().unwrap();
         finished

@@ -89,7 +89,6 @@ pub enum Action {
     Cancel,
     RetryCleanup,
     CancelClosing,
-    RetainCleanup,
     Navigator,
     ToggleNavigator,
     Line,
@@ -171,12 +170,6 @@ commands![
         CancelClosing,
         "cancel-closing",
         "Cancel Closing Documents",
-        ""
-    ),
-    (
-        RetainCleanup,
-        "retain-cleanup",
-        "Close Retaining Recovery Records",
         ""
     ),
 ];

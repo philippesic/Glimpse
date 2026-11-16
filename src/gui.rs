@@ -1,6 +1,7 @@
 mod completion;
 mod conflict;
 mod decision;
+mod destination;
 mod menus;
 mod modal;
 mod panes;
@@ -126,6 +127,8 @@ enum DecisionAction {
     Conflict(Box<conflict::Snapshot>),
     Compare,
     Close,
+    AbandonDestination(Box<SaveDestination>),
+    ReplaceDestination(Box<SaveDestination>),
 }
 
 enum SettingsWrite {
@@ -189,8 +192,9 @@ struct Shell {
     close_pending: Option<CloseDecision>,
     closings: glimpse::closing::Closings,
     quit_after_cleanup: bool,
-    destination: Option<SaveDestination>,
+    abandon_destination: Option<(u64, PathBuf, u64)>,
     destination_busy: bool,
+    destination_document: Option<u64>,
     records: Vec<storage::Record>,
     recovery_usage: storage::RecoveryUsage,
     records_truncated: bool,
@@ -325,8 +329,9 @@ impl Shell {
             close_pending: None,
             closings: glimpse::closing::Closings::default(),
             quit_after_cleanup: false,
-            destination: None,
+            abandon_destination: None,
             destination_busy: false,
+            destination_document: None,
             records: vec![],
             recovery_usage: storage::RecoveryUsage::default(),
             records_truncated: false,
@@ -538,6 +543,25 @@ impl Shell {
                         }
                         Some(DecisionAction::Conflict(snapshot)) if choice.0 != 0 => {
                             this.resolve_conflict(*snapshot, window, cx)
+                        }
+                        Some(DecisionAction::AbandonDestination(destination)) => {
+                            if choice.0 == 0 {
+                                this.cancel_destination();
+                            } else {
+                                this.abandon_destination = Some((
+                                    destination.id,
+                                    destination.path.clone(),
+                                    destination.generation,
+                                ));
+                                this.authorize_destination(*destination, window, cx);
+                            }
+                        }
+                        Some(DecisionAction::ReplaceDestination(destination)) => {
+                            if choice.0 == 0 {
+                                this.cancel_destination();
+                            } else {
+                                this.io.send(Job::SaveTo(*destination));
+                            }
                         }
                         _ => {}
                     }
@@ -1097,6 +1121,7 @@ impl Shell {
                     let id = destination.id;
                     self.checks.invalidate(id);
                     self.destination_busy = false;
+                    self.destination_document = None;
                     match result {
                         Ok(disk) => {
                             if !destination.copy
@@ -1107,11 +1132,44 @@ impl Shell {
                                 doc.external = None;
                                 doc.saved = destination.text;
                                 doc.restored = false;
+                                doc.generation += 1;
+                                if doc.dirty(cx) {
+                                    self.io.send(Job::Recover(
+                                        doc.id,
+                                        storage::Draft {
+                                            path: doc.disk.path.clone(),
+                                            target: Some(doc.disk.target.clone()),
+                                            text: doc.input.read(cx).value().to_string(),
+                                            base: doc.disk.bytes.clone(),
+                                            generation: doc.generation,
+                                        },
+                                    ));
+                                }
+                                self.io
+                                    .send(Job::BindingApplied(doc.id, destination.generation));
                             }
-                            self.status = "Saved".into();
+                            if !destination.copy
+                                && self.abandon_destination.as_ref().is_some_and(
+                                    |(id, path, generation)| {
+                                        *id == destination.id
+                                            && *path == destination.path
+                                            && *generation == destination.generation
+                                    },
+                                )
+                                && self.request.wait
+                                && !self.finished
+                            {
+                                let _ = lifecycle::notify(b'1');
+                                self.finished = true;
+                                self.status =
+                                    "Saved As. The original CLI destination was abandoned.".into();
+                            } else {
+                                self.status = "Saved".into();
+                            }
                         }
                         Err(e) => self.status = e,
                     }
+                    self.abandon_destination = None;
                     if self.close_pending.as_ref().is_some_and(|d| d.saving) {
                         if succeeded {
                             self.continue_close(window, cx);
@@ -1121,18 +1179,26 @@ impl Shell {
                     }
                 }
                 Reply::Prepared(mut destination, result) => match result {
-                    Ok(None) => {
-                        destination.expected = None;
-                        self.io.send(Job::SaveTo(*destination));
+                    Ok(expected) => {
+                        let duplicate = self.documents.iter().any(|doc| {
+                            doc.id != destination.id
+                                && (doc.disk.path == destination.path
+                                    || expected
+                                        .as_ref()
+                                        .is_some_and(|disk| doc.disk.same_file(disk)))
+                        });
+                        if duplicate {
+                            self.cancel_destination();
+                            self.status =
+                                "Close the destination’s open tab before replacing it".into();
+                        } else {
+                            destination.expected = expected;
+                            self.confirm_destination(*destination, window, cx);
+                        }
                     }
-                    Ok(Some(disk)) => {
-                        destination.expected = Some(disk);
-                        self.destination = Some(*destination);
-                        self.status = "Destination exists. Replace this observed version?".into();
-                    }
-                    Err(e) => {
-                        self.destination_busy = false;
-                        self.status = e;
+                    Err(error) => {
+                        self.cancel_destination();
+                        self.status = error;
                     }
                 },
                 Reply::Checked(id, token, result) => {
@@ -1416,7 +1482,8 @@ impl Shell {
             .iter_mut()
             .find(|d| Some(d.id) == self.active)
         {
-            if doc.saving {
+            if doc.saving || (self.destination_busy && self.destination_document == Some(doc.id)) {
+                self.status = "A save for this document is already pending".into();
                 return;
             }
             if doc.disk.target.as_os_str().is_empty() {
@@ -1448,14 +1515,6 @@ impl Shell {
         let Some(doc) = self.documents.iter().find(|d| Some(d.id) == self.active) else {
             return;
         };
-        if !copy
-            && self.request.wait
-            && !self.finished
-            && self.requested.iter().any(|(id, _)| *id == doc.id)
-        {
-            self.status = "Finish or Abort the CLI request before rebinding this file".into();
-            return;
-        }
         let mut destination = SaveDestination {
             id: doc.id,
             path: PathBuf::new(),
@@ -1471,17 +1530,13 @@ impl Shell {
         cx.spawn_in(window, async move |this, cx| {
             if let Ok(Ok(Some(path))) = prompt.await {
                 let _ = this.update(cx, |this, cx| {
-                    if this.documents.iter().any(|doc| {
-                        doc.id != destination.id
-                            && (doc.disk.path == path
-                                || std::fs::canonicalize(&path).ok().as_ref()
-                                    == Some(&doc.disk.target))
-                    }) {
-                        this.status = "Close the destination's open tab before replacing it".into();
-                    } else {
+                    if this.documents.iter().any(|doc| doc.id == destination.id) {
                         destination.path = path;
                         this.destination_busy = true;
+                        this.destination_document = Some(destination.id);
                         this.io.send(Job::Prepare(destination));
+                    } else {
+                        this.status = "The document was closed; nothing was saved".into();
                     }
                     cx.notify();
                 });
@@ -1690,6 +1745,13 @@ impl Shell {
                 crate::EXIT_STATUS.store(1, std::sync::atomic::Ordering::Relaxed);
                 cx.quit();
             }
+            "cancel" => {
+                if self.close_pending.is_some() || !self.closings.is_empty() {
+                    self.command("cancel-close", window, cx);
+                } else {
+                    self.command("dismiss", window, cx);
+                }
+            }
             "named-file" => self.panel(Panel::NewFile, window, cx),
             "new-folder" => self.panel(Panel::NewFolder, window, cx),
             "rename" => self.panel(Panel::Rename, window, cx),
@@ -1754,15 +1816,7 @@ impl Shell {
                 self.quit_after_cleanup = false;
                 self.focus(window, cx);
             }
-            "replace-destination" => {
-                if let Some(destination) = self.destination.take() {
-                    self.io.send(Job::SaveTo(destination));
-                }
-            }
-            "cancel-destination" => {
-                self.destination = None;
-                self.destination_busy = false;
-            }
+            "cancel-destination" => self.cancel_destination(),
             "save-settings" => {
                 if let Err(error) = self.queue_settings(self.settings.clone(), SettingsWrite::Live)
                 {
@@ -2217,17 +2271,6 @@ impl Render for Shell {
                     .child(self.button("Keep open", "cancel-close", cx)),
             );
         }
-        if self.destination.is_some() {
-            root = root.child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .p_2()
-                    .child("Replace the observed destination?")
-                    .child(self.button("Replace", "replace-destination", cx))
-                    .child(self.button("Cancel", "cancel-destination", cx)),
-            );
-        }
 
         let query = self.filter.to_lowercase();
         let visible: Vec<_> = self
@@ -2432,7 +2475,7 @@ impl Render for Shell {
                                 .text_size(px(self.settings.font_size * self.settings.ui_scale))
                                 .line_height(relative(self.settings.line_height))
                                 .h_full()
-                                .disabled(self.request.pick || self.destination_busy),
+                                .disabled(self.request.pick),
                         ),
                 );
             }
@@ -2532,9 +2575,6 @@ impl Render for Shell {
                     if this.close_pending.is_some() || !this.closings.is_empty() {
                         this.command("cancel-close", window, cx);
                         return;
-                    }
-                    if this.destination.is_some() {
-                        this.command("cancel-destination", window, cx);
                     }
                     this.command("dismiss", window, cx);
                 }
