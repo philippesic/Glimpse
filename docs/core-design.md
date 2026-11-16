@@ -24,7 +24,11 @@ Save As rebinds after success; Save Copy retains the original binding. Existing 
 
 Linux rename uses `renameat2(RENAME_NOREPLACE)` and Trash uses the trash crate's freedesktop implementation. Linux saving copies permissions and extended attributes; failures stop replacement. macOS retains `renamex_np`, NSFileManager Trash and `fcopyfile` metadata preservation behind platform configuration. Linux Reveal opens the containing directory with xdg-open. GPUI supplies native portal file dialogs.
 
-Recovery keeps private, locked session records with exact local text and observed disk bytes. Abandoned records can be claimed from Recovery. Saved history and observed snapshots remain in the domain store. Their full management interface is not yet ported. Closing waits for acknowledgment that the exact recovery generation was resolved. Cleanup failure keeps the document open with Retry and Keep Open actions; Keep Open creates a newer recovery generation. Close decisions retain the named document IDs across tab switches, and Save and Close saves those documents before cleanup. Edits during cleanup cancel that document’s close.
+Recovery keeps private, locked session records with exact local text and observed disk bytes. Recovery lists storage usage, abandoned drafts, failed-save candidates and resolved history, with keyboard-accessible restoration and Trash controls. Claiming an abandoned draft retains its binding; history and observed snapshots open separate copies. Restoring an already-open original also creates a separate copy. New save candidates identify their owning document, so resolving one document archives only its candidates through the acknowledged generation. Legacy candidates without ownership remain available for explicit management. Closing waits for acknowledgment that the exact recovery generation was resolved. Cleanup failure keeps the document open with Retry and Keep Open actions; Keep Open creates a newer recovery generation. Close decisions retain the named document IDs across tab switches, and Save and Close saves those documents before cleanup. Edits during cleanup cancel that document’s close.
+
+Conflict decisions capture the document, local generation and specific observed disk version. Compare exposes selectable, read-only local and disk text. Reload revalidates the observed version and acknowledges recovery cleanup before replacing the buffer; the old local text remains in Undo and history. Overwrite uses the normal validated-save path against the explicitly observed version. Both operations retain local text on failure.
+
+Requested CLI files complete only after destination validation and recovery cleanup. Clean close can complete a request; closing one of several requested files leaves the others waiting. Dirty Finish offers Save, Discard and Cancel. Save alone keeps waiting; Discard or Reload that abandons requested local edits returns failure. Generation checks, exact disk bases and authoritative buffer comparisons reject obsolete completion and cleanup replies.
 
 ## Preferences and layout
 
@@ -39,11 +43,11 @@ Shell buttons and document tabs use focusable GPUI controls. Preferences contain
 The product contract and native Linux evaluation determine qualification. The following remain incomplete:
 
 - Breadcrumb/path completion, drops, horizontal navigation gestures and complete contextual command availability. macOS system-menu integration remains unverified.
-- Conflict comparison and observed-version overwrite, recovery-history controls and recovery failure alternatives.
+- Recovery failure alternatives, including the explicit one-attempt Save Without Recovery.
 - Filename-index controls. Content-result activation rejects changed disk fingerprints and dirty open buffers.
 - The earlier bounded Markdown paging, local raster images, relative-link handling and complete dialect parity. The current read view escapes HTML and omits images, including remote images.
 - Large-file/long-line performance, real IME, accessibility, the complete size/theme/settings matrix and macOS behavior. Modal behavior across asynchronous completions still requires qualification.
 
 The new view virtualizes directory rows and stores per-folder selection and scroll state. Syntax work remains bounded, but extracting full buffer text on edits can be costly. Linux native checks qualify only their executed scenarios. Whole-app performance, safety and accessibility require current-build evidence for the complete acceptance matrix.
 
-Closing a requested CLI document currently aborts its request. Use Finish Editing before closing to return success. Save As requires finishing or aborting the request first, rather than offering the earlier abandonment dialog.
+Save As for a waiting requested file still requires finishing or aborting the request first; its explicit abandonment decision remains incomplete.
