@@ -136,6 +136,7 @@ struct Shell {
     destination_busy: bool,
     records: Vec<storage::Record>,
     ready: bool,
+    startup_failed: bool,
     requested: Vec<(u64, PathBuf)>,
     finished: bool,
     finish_pending: usize,
@@ -220,6 +221,7 @@ impl Shell {
             destination_busy: false,
             records: vec![],
             ready: false,
+            startup_failed: false,
             requested: vec![],
             finished: false,
             finish_pending: 0,
@@ -514,13 +516,14 @@ impl Shell {
                 });
                 self.listing_done = batch.done;
                 if let Some(error) = batch.error {
+                    self.startup_failed |= !self.ready;
                     self.status = error;
                 }
             }
         }
         while let Ok(reply) = self.io.replies.try_recv() {
             match reply {
-                Reply::Open(_, token, result) => {
+                Reply::Open(path, token, result) => {
                     if let Some((preview, line)) = self.opening.remove(&token) {
                         match result {
                             Ok((disk, text)) => {
@@ -539,7 +542,11 @@ impl Shell {
                                 }
                                 self.add_document(disk, text, preview, line, window, cx)
                             }
-                            Err(e) => self.status = e,
+                            Err(e) => {
+                                self.startup_failed |=
+                                    !self.ready && self.request.files.contains(&path);
+                                self.status = e;
+                            }
                         }
                     }
                 }
@@ -1211,10 +1218,15 @@ impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.ready && self.listing_done && self.opening.is_empty() {
             self.ready = true;
-            window.on_next_frame(|window, _| {
-                window.on_next_frame(|_, _| {
-                    let _ = lifecycle::notify(b'0');
-                    eprintln!("GLIMPSE_READY");
+            let failed = self.startup_failed;
+            window.on_next_frame(move |window, _| {
+                window.on_next_frame(move |_, _| {
+                    let _ = lifecycle::notify(if failed { b'2' } else { b'0' });
+                    if failed {
+                        eprintln!("GLIMPSE_STARTUP_FAILED");
+                    } else {
+                        eprintln!("GLIMPSE_READY");
+                    }
                 })
             });
             window.request_animation_frame();

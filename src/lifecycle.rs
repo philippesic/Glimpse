@@ -81,7 +81,7 @@ pub fn launch(args: &[std::ffi::OsString], wait: bool, picker: bool) -> ! {
         fail(&format!("GUI did not acknowledge a usable frame: {e}"));
     }
     if message[0] != b'0' {
-        std::process::exit(2);
+        fail("GUI could not open the requested files or folder; see its error message");
     }
     if !wait {
         std::process::exit(0);
