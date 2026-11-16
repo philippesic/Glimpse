@@ -173,7 +173,7 @@ impl Shell {
         let (path, line, fingerprint) = (hit.path.clone(), hit.line, hit.fingerprint);
         self.search_ui.selection = Some(index);
         self.search_ui.picker_selection = Some(path.clone());
-        if let Some(token) = self.open(path, false, Some((line, 1)))
+        if let Some(token) = self.open(path, false, fingerprint.map(|_| (line, 1)))
             && let Some(fingerprint) = fingerprint
         {
             self.hit_versions

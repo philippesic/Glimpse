@@ -80,7 +80,11 @@ mod tests {
 
 pub fn entry(path: &Path) -> String {
     if let Some(value) = path.to_str() {
-        if value.chars().any(char::is_control) {
+        if value.chars().any(char::is_control)
+            || value.starts_with('"')
+            || value.starts_with("b\"")
+            || value.starts_with("file://")
+        {
             serde_json::to_string(value).unwrap()
         } else {
             value.to_owned()
@@ -94,10 +98,24 @@ pub fn entry(path: &Path) -> String {
             .add(b'?')
             .add(b'"')
             .add(b'\\');
-        format!(
-            "file://{}",
-            percent_encoding::percent_encode(path.as_os_str().as_bytes(), ESCAPE)
-        )
+        if path.is_absolute() {
+            format!(
+                "file://{}",
+                percent_encoding::percent_encode(path.as_os_str().as_bytes(), ESCAPE)
+            )
+        } else {
+            let mut value = String::from("b\"");
+            for &byte in path.as_os_str().as_bytes() {
+                match byte {
+                    b'\\' => value.push_str("\\\\"),
+                    b'"' => value.push_str("\\\""),
+                    b' '..=b'~' => value.push(byte as char),
+                    _ => value.push_str(&format!("\\x{byte:02x}")),
+                }
+            }
+            value.push('"');
+            value
+        }
     }
 }
 pub fn parse_entry(value: &str, current: &Path) -> Result<std::path::PathBuf, String> {
@@ -109,6 +127,45 @@ pub fn parse_entry(value: &str, current: &Path) -> Result<std::path::PathBuf, St
         std::path::PathBuf::from(std::ffi::OsString::from_vec(
             percent_encoding::percent_decode_str(encoded).collect(),
         ))
+    } else if let Some(literal) = value.strip_prefix("b\"") {
+        let literal = literal
+            .strip_suffix('"')
+            .ok_or("Byte paths must end with a quote")?
+            .as_bytes();
+        let mut bytes = Vec::new();
+        let mut index = 0;
+        while index < literal.len() {
+            let byte = literal[index];
+            index += 1;
+            if byte == b'"' {
+                return Err("Quotes inside byte paths must be escaped".into());
+            }
+            if byte != b'\\' {
+                bytes.push(byte);
+                continue;
+            }
+            let escaped = *literal.get(index).ok_or("Incomplete path escape")?;
+            index += 1;
+            match escaped {
+                b'\\' | b'"' => bytes.push(escaped),
+                b'n' => bytes.push(b'\n'),
+                b'r' => bytes.push(b'\r'),
+                b't' => bytes.push(b'\t'),
+                b'x' => {
+                    let digits = literal
+                        .get(index..index + 2)
+                        .ok_or("Incomplete byte escape")?;
+                    if !digits.iter().all(u8::is_ascii_hexdigit) {
+                        return Err("Invalid byte escape".into());
+                    }
+                    let digits = std::str::from_utf8(digits).map_err(|_| "Invalid byte escape")?;
+                    bytes.push(u8::from_str_radix(digits, 16).map_err(|_| "Invalid byte escape")?);
+                    index += 2;
+                }
+                _ => return Err("Unsupported byte path escape".into()),
+            }
+        }
+        std::path::PathBuf::from(std::ffi::OsString::from_vec(bytes))
     } else if value.starts_with('"') {
         std::path::PathBuf::from(
             serde_json::from_str::<String>(value)
@@ -117,6 +174,9 @@ pub fn parse_entry(value: &str, current: &Path) -> Result<std::path::PathBuf, St
     } else {
         std::path::PathBuf::from(value)
     };
+    if path.as_os_str().as_encoded_bytes().contains(&0) {
+        return Err("Paths cannot contain a NUL byte".into());
+    }
     Ok(if path.is_absolute() {
         path
     } else {
@@ -160,5 +220,31 @@ mod entry_tests {
             assert!(!single_name(invalid));
         }
         assert!(single_name("a\"b\\c🌱"));
+    }
+    #[test]
+    fn escaped_relative_entries_preserve_bytes_and_reserved_prefixes() {
+        let current = Path::new("/current");
+        for path in [
+            std::path::PathBuf::from("\"quoted"),
+            std::path::PathBuf::from("b\"literal"),
+            std::path::PathBuf::from("file://literal"),
+            std::path::PathBuf::from("control\nname"),
+            std::path::PathBuf::from(OsString::from_vec(b"caf\xc3\xa9\xff\\x41\"".to_vec())),
+        ] {
+            assert_eq!(
+                parse_entry(&entry(&path), current).unwrap(),
+                current.join(path)
+            );
+        }
+        for invalid in [
+            "b\"bad\\xgg\"",
+            "b\"unterminated",
+            "b\"a\\0b\"",
+            "b\"a\\x00b\"",
+            "b\"a\\x+1b\"",
+            "file:///a%00b",
+        ] {
+            assert!(parse_entry(invalid, current).is_err());
+        }
     }
 }

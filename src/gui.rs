@@ -2595,11 +2595,15 @@ impl Shell {
                 };
                 match value {
                     Ok(path) => {
-                        if let Some(value) = path.to_str() {
-                            cx.write_to_clipboard(ClipboardItem::new_string(value.to_owned()));
+                        let value = paths::entry(path);
+                        let encoded = path.to_str() != Some(value.as_str());
+                        cx.write_to_clipboard(ClipboardItem::new_string(value));
+                        self.status = if encoded {
+                            "Copied a lossless escaped path; paste it into Location to open it"
+                                .into()
                         } else {
-                            self.status = "This path cannot be copied as UTF-8 text. Use the CLI picker for a lossless path.".into();
-                        }
+                            "Copied path".into()
+                        };
                     }
                     Err(error) => self.status = error.into(),
                 }
@@ -2749,9 +2753,12 @@ impl Render for Shell {
             .child(self.path_bar(window, cx))
             .when(self.request.pick, |root| {
                 let candidate = if self.request.directory {
-                    Some(&self.current)
+                    Some(self.current.clone())
                 } else {
-                    self.search_ui.picker_selection.as_ref()
+                    self.search_ui
+                        .picker_selection
+                        .clone()
+                        .or_else(|| self.selected_path())
                 };
                 root.child(
                     div()
@@ -2760,7 +2767,7 @@ impl Render for Shell {
                         .truncate()
                         .child(candidate.map_or_else(
                             || "Select a file, then Choose".into(),
-                            |path| format!("Selection: {}", paths::display(path)),
+                            |path| format!("Selection: {}", paths::display(&path)),
                         )),
                 )
             });
