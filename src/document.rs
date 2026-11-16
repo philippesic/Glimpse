@@ -126,6 +126,70 @@ impl DiskFile {
         ))
     }
 
+    pub fn create(path: PathBuf, text: &str, bom: bool) -> Result<Self> {
+        Self::create_with(path, text, bom, || {})
+    }
+    fn create_with(
+        path: PathBuf,
+        text: &str,
+        bom: bool,
+        after_publish: impl FnOnce(),
+    ) -> Result<Self> {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let directory = fs::canonicalize(parent).map_err(|error| error.to_string())?;
+        let target = directory.join(path.file_name().ok_or("Choose a filename")?);
+        let mut bytes = Vec::with_capacity(text.len() + 3);
+        if bom {
+            bytes.extend_from_slice(&[0xef, 0xbb, 0xbf]);
+        }
+        bytes.extend_from_slice(text.as_bytes());
+        if bytes.len() as u64 > MAX_BYTES {
+            return Err("The new file exceeds the 10 MiB editing limit".into());
+        }
+        let mut staged =
+            tempfile::NamedTempFile::new_in(&directory).map_err(|error| error.to_string())?;
+        staged
+            .write_all(&bytes)
+            .and_then(|_| staged.as_file().sync_all())
+            .map_err(|error| error.to_string())?;
+        let expected_identity = identity(
+            &staged
+                .as_file()
+                .metadata()
+                .map_err(|error| error.to_string())?,
+        );
+        if fs::canonicalize(parent).map_err(|error| error.to_string())? != directory {
+            return Err(
+                "The destination folder changed before creation; nothing was published".into(),
+            );
+        }
+        staged
+            .persist_noclobber(&target)
+            .map_err(|error| error.to_string())?;
+        after_publish();
+        let message = format!(
+            "The destination changed after creating {}. The current buffer was retained; review the destination before saving again.",
+            crate::paths::display(&target)
+        );
+        if fs::canonicalize(&path).map_err(|_| message.clone())? != target {
+            return Err(message);
+        }
+        let (observed, meta) = read_regular(&target).map_err(|_| message.clone())?;
+        if identity(&meta) != expected_identity || observed != bytes {
+            return Err(message);
+        }
+        Ok(Self {
+            path,
+            target,
+            bytes,
+            bom,
+            identity: expected_identity,
+        })
+    }
+
     pub fn revalidate_paths(&self, paths: &[PathBuf]) -> Result<()> {
         for path in paths {
             if fs::canonicalize(path).map_err(|e| e.to_string())? != self.target {
@@ -267,6 +331,43 @@ mod tests {
         fs::write(&path, bytes).unwrap();
         (dir, path)
     }
+    #[test]
+    fn creating_a_file_never_adopts_a_post_publish_replacement_or_retarget() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("new.txt");
+        let kept = root.path().join("created-copy.txt");
+        let other = root.path().join("other.txt");
+        fs::write(&other, "\u{feff}local β\r\n".as_bytes()).unwrap();
+        let result = DiskFile::create_with(path.clone(), "local β\r\n", true, || {
+            fs::rename(&path, &kept).unwrap();
+            std::os::unix::fs::symlink(&other, &path).unwrap();
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read(&kept).unwrap(), "\u{feff}local β\r\n".as_bytes());
+        assert_eq!(fs::read(&other).unwrap(), "\u{feff}local β\r\n".as_bytes());
+        fs::remove_file(&path).unwrap();
+        let result = DiskFile::create_with(path.clone(), "candidate", false, || {
+            fs::rename(&path, root.path().join("second-created-copy.txt")).unwrap();
+            fs::write(&path, "external version").unwrap();
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"external version");
+        assert_eq!(
+            fs::read(root.path().join("second-created-copy.txt")).unwrap(),
+            b"candidate"
+        );
+    }
+    #[test]
+    fn creating_a_bound_file_is_exclusive_and_retains_exact_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("new.txt");
+        let disk = DiskFile::create(path.clone(), "local β\r\n", true).unwrap();
+        assert_eq!(disk.bytes, "\u{feff}local β\r\n".as_bytes());
+        disk.revalidate_paths(std::slice::from_ref(&path)).unwrap();
+        assert!(DiskFile::create(path.clone(), "replacement", false).is_err());
+        assert_eq!(fs::read(path).unwrap(), disk.bytes);
+    }
+
     #[test]
     fn untouched_bytes_and_edited_bom_are_preserved() {
         for bytes in [

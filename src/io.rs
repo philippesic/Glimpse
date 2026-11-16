@@ -825,16 +825,7 @@ fn save_destination(
     let disk = if let Some(expected) = &destination.expected {
         expected.save_with_bom(&destination.text, destination.bom)?
     } else {
-        fileops::create(
-            &destination.path,
-            false,
-            &if destination.bom {
-                format!("\u{feff}{}", destination.text)
-            } else {
-                destination.text.clone()
-            },
-        )?;
-        DiskFile::open(destination.path.clone())?.0
+        DiskFile::create(destination.path.clone(), &destination.text, destination.bom)?
     };
     if let Ok(r) = recovery {
         if !destination.copy
