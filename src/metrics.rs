@@ -11,3 +11,12 @@ pub fn event(name: &str, document: u64, generation: u64) {
         );
     }
 }
+
+#[cfg(feature = "test-support")]
+pub fn delay(operation: &str) {
+    if let Ok(value) = std::env::var(format!("GLIMPSE_TEST_{operation}_DELAY_MS"))
+        && let Ok(milliseconds) = value.parse::<u64>()
+    {
+        std::thread::sleep(std::time::Duration::from_millis(milliseconds.min(10_000)));
+    }
+}

@@ -121,6 +121,7 @@ pub struct IoWorker {
     cleared_through: Arc<Mutex<HashMap<u64, u64>>>,
     pending: Arc<AtomicUsize>,
     preview: Arc<AtomicU64>,
+    wake: wake::Context,
 }
 struct RecoveryStore {
     root: PathBuf,
@@ -230,10 +231,14 @@ impl IoWorker {
                             .ok_or_else(|| "Recovery has not been initialized".into())
                     });
                     for (id, generation) in removals {
+                        crate::metrics::event("clear-worker", id, generation);
+                        #[cfg(feature = "test-support")]
+                        crate::metrics::delay("CLEAR");
                         let result = match recovery.as_ref() {
                             Ok(r) => r.saved(id, generation),
                             Err(_) => Ok(()),
                         };
+                        crate::metrics::event("clear-worker-done", id, generation);
                         let _ = results.send(Reply::Cleared(id, generation, result));
                         ctx.request_repaint();
                     }
@@ -349,13 +354,7 @@ impl IoWorker {
                         Job::Finish(id, generation, attempt, disk, paths) => {
                             crate::metrics::event("finish-worker", id, generation);
                             #[cfg(feature = "test-support")]
-                            if let Ok(delay) = std::env::var("GLIMPSE_TEST_FINISH_DELAY_MS")
-                                && let Ok(milliseconds) = delay.parse::<u64>()
-                            {
-                                std::thread::sleep(std::time::Duration::from_millis(
-                                    milliseconds.min(10_000),
-                                ));
-                            }
+                            crate::metrics::delay("FINISH");
                             let result = disk.revalidate_paths(&paths);
                             crate::metrics::event("finish-worker-done", id, generation);
                             Reply::Finished(id, generation, attempt, disk, result)
@@ -412,6 +411,13 @@ impl IoWorker {
                             Reply::Prepared(Box::new(destination), result)
                         }
                         Job::SaveTo(destination) => {
+                            crate::metrics::event(
+                                "save-to-worker",
+                                destination.id,
+                                destination.generation,
+                            );
+                            #[cfg(feature = "test-support")]
+                            crate::metrics::delay("SAVE_TO");
                             let mut result = save_destination(
                                 &destination,
                                 recovery
@@ -452,6 +458,11 @@ impl IoWorker {
                                     }
                                 }
                             }
+                            crate::metrics::event(
+                                "save-to-worker-done",
+                                destination.id,
+                                destination.generation,
+                            );
                             Reply::SavedTo(Box::new(destination), result)
                         }
                         Job::Open(path, token, transient)
@@ -468,6 +479,9 @@ impl IoWorker {
                             }),
                         ),
                         Job::Reload(reload) => {
+                            crate::metrics::event("reload-worker", reload.id, reload.generation);
+                            #[cfg(feature = "test-support")]
+                            crate::metrics::delay("RELOAD");
                             let result = reload_document(
                                 &reload,
                                 recovery
@@ -476,6 +490,11 @@ impl IoWorker {
                                     .map(|r| &**r)
                                     .map_err(Clone::clone),
                                 &results,
+                            );
+                            crate::metrics::event(
+                                "reload-worker-done",
+                                reload.id,
+                                reload.generation,
                             );
                             Reply::Reloaded(reload, result)
                         }
@@ -487,6 +506,8 @@ impl IoWorker {
                             without_recovery,
                         } => {
                             crate::metrics::event("save-worker", id, generation);
+                            #[cfg(feature = "test-support")]
+                            crate::metrics::delay("SAVE");
                             let result = if without_recovery {
                                 disk.save(&text)
                             } else {
@@ -551,6 +572,7 @@ impl IoWorker {
             cleared_through,
             pending,
             preview,
+            wake: ctx,
         }
     }
     pub fn pending_mutations(&self) -> usize {
@@ -668,6 +690,7 @@ impl IoWorker {
                     _ => Reply::Done(Err(message)),
                 };
                 let _ = self.errors.send(reply);
+                self.wake.request_repaint();
             }
         }
     }
@@ -793,6 +816,34 @@ impl Drop for IoWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_disconnected_queue_wakes_the_shell_with_a_typed_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let (wake_tx, wake_rx) = mpsc::channel();
+        let mut io = IoWorker::new_in(
+            wake::Context::new(move || {
+                let _ = wake_tx.send(());
+            }),
+            root.path().join("recovery"),
+        );
+        let (sender, receiver) = mpsc::sync_channel(1);
+        drop(receiver);
+        io.jobs = Some(sender);
+        let target = root.path().join("not-created.txt");
+        io.send(Job::SaveTo(destination(target.clone(), None)));
+        wake_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(matches!(
+            io.replies
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+            Reply::SavedTo(_, Err(_))
+        ));
+        assert!(!target.exists());
+        assert_eq!(io.pending_mutations(), 0);
+    }
+
     #[test]
     fn save_as_moves_newer_recovery_and_late_updates_to_the_new_binding() {
         let root = tempfile::tempdir().unwrap();
