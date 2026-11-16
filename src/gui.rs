@@ -6,6 +6,7 @@ mod destination;
 mod external;
 mod menus;
 mod modal;
+mod open_failure;
 mod panes;
 mod path;
 mod platform;
@@ -241,6 +242,7 @@ struct Shell {
     reading: bool,
     reading_view: Option<reading::View>,
     status: String,
+    open_failure: Option<open_failure::Failure>,
     font_warning: Option<String>,
     window_title: String,
     warnings: Vec<String>,
@@ -410,6 +412,7 @@ impl Shell {
             reading: false,
             reading_view: None,
             status: String::new(),
+            open_failure: None,
             font_warning: None,
             window_title: String::new(),
             warnings: Vec::new(),
@@ -1286,6 +1289,13 @@ impl Shell {
                         }
                         match result {
                             Ok((disk, text)) => {
+                                if self
+                                    .open_failure
+                                    .as_ref()
+                                    .is_some_and(|failure| failure.path == path)
+                                {
+                                    self.open_failure = None;
+                                }
                                 if self.destination_busy {
                                     continue;
                                 }
@@ -1327,6 +1337,10 @@ impl Shell {
                                 {
                                     self.search_ui.status = format!("Failed to open result: {e}");
                                 }
+                                self.open_failure = Some(open_failure::Failure {
+                                    path,
+                                    message: e.clone(),
+                                });
                                 self.status = e;
                                 if !from_path && activate {
                                     self.focus(window, cx);
@@ -2670,12 +2684,8 @@ impl Shell {
                     } else {
                         path
                     };
-                    #[cfg(target_os = "linux")]
-                    let opener = "xdg-open";
-                    #[cfg(target_os = "macos")]
-                    let opener = "open";
-                    if let Err(e) = std::process::Command::new(opener).arg(path).spawn() {
-                        self.status = e.to_string();
+                    if let Err(error) = platform::open_path(&path) {
+                        self.status = error;
                     }
                 }
             }
@@ -2927,6 +2937,9 @@ impl Render for Shell {
                         )),
                 )
             });
+        if self.open_failure.is_some() {
+            root = root.child(self.open_failure_view(cx));
+        }
         if self.panel == Some(Panel::Path) {
             root = root.child(self.path_matches(cx));
         }

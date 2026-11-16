@@ -1,6 +1,20 @@
 use glimpse::commands;
 use gpui::Modifiers;
 
+pub(super) fn open_path(path: &std::path::Path) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    let opener = "xdg-open";
+    #[cfg(target_os = "macos")]
+    let opener = "open";
+    #[cfg(target_os = "windows")]
+    let opener = "explorer";
+    std::process::Command::new(opener)
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
 pub fn shortcut(expected: &commands::Modifiers, actual: &Modifiers) -> bool {
     let primary = if cfg!(target_os = "macos") {
         actual.platform
