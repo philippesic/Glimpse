@@ -45,7 +45,7 @@ impl InputState {
         direction: Option<MoveDirection>,
         cx: &mut Context<Self>,
     ) {
-        let offset = offset.clamp(0, self.text.len());
+        let offset = super::grapheme::floor(&self.text, offset);
         self.selected_range = (offset..offset).into();
         self.scroll_to(offset, direction, cx);
         self.pause_blink_cursor(cx);

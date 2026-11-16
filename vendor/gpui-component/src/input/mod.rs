@@ -3,6 +3,7 @@ mod change;
 mod clear_button;
 mod cursor;
 mod element;
+mod grapheme;
 mod indent;
 mod input;
 mod lsp;

@@ -16,7 +16,6 @@ use ropey::{Rope, RopeSlice};
 use serde::Deserialize;
 use std::ops::Range;
 use std::rc::Rc;
-use sum_tree::Bias;
 use unicode_segmentation::*;
 
 use super::{
@@ -1672,7 +1671,7 @@ impl InputState {
     pub(crate) fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         self.clear_inline_completion(cx);
 
-        let offset = offset.clamp(0, self.text.len());
+        let offset = super::grapheme::floor(&self.text, offset);
         if self.selection_reversed {
             self.selected_range.start = offset
         } else {
@@ -1727,25 +1726,11 @@ impl InputState {
     }
 
     pub(super) fn previous_boundary(&self, offset: usize) -> usize {
-        let mut offset = self.text.clip_offset(offset.saturating_sub(1), Bias::Left);
-        if let Some(ch) = self.text.char_at(offset) {
-            if ch == '\r' {
-                offset -= 1;
-            }
-        }
-
-        offset
+        super::grapheme::boundary(&self.text, offset, true)
     }
 
     pub(super) fn next_boundary(&self, offset: usize) -> usize {
-        let mut offset = self.text.clip_offset(offset + 1, Bias::Right);
-        if let Some(ch) = self.text.char_at(offset) {
-            if ch == '\r' {
-                offset += 1;
-            }
-        }
-
-        offset
+        super::grapheme::boundary(&self.text, offset, false)
     }
 
     /// Returns the true to let InputElement to render cursor, when Input is focused and current BlinkCursor is visible.
