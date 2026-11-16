@@ -1919,6 +1919,7 @@ impl Window {
     /// the contents of the new [`Scene`], use [`Self::present`].
     #[profiling::function]
     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
+        let _work = crate::work_trace::Span::new("draw");
         self.accessibility.initialize(self.handle, cx);
         self.invalidate_entities();
         cx.entities.clear_accessed();
@@ -2015,6 +2016,7 @@ impl Window {
 
     #[profiling::function]
     fn present(&self) {
+        let _work = crate::work_trace::Span::new("submit");
         self.platform_window.draw(&self.rendered_frame.scene);
         self.needs_present.set(false);
         profiling::finish_frame!();
@@ -3596,6 +3598,7 @@ impl Window {
     /// Dispatch a mouse or keyboard event on the window.
     #[profiling::function]
     pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
+        let _work = crate::work_trace::Span::new("input");
         self.last_input_timestamp.set(Instant::now());
         // Handlers may set this to false by calling `stop_propagation`.
         cx.propagate_event = true;

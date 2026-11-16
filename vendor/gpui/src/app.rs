@@ -1199,6 +1199,7 @@ impl App {
     /// such as notifying observers, emitting events, etc. Effects can themselves
     /// cause effects, so we continue looping until all effects are processed.
     fn flush_effects(&mut self) {
+        let _work = crate::work_trace::Span::new("effects");
         loop {
             self.release_dropped_entities();
             self.release_dropped_focus_handles();
