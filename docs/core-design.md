@@ -72,7 +72,7 @@ A prepared UI pass or synthetic CPU benchmark does not establish physical input-
 
 The search worker can build one filename snapshot after explicit Index This Folder activation. It retains native paths for one scope/filter set, bounded by 100,000 visited entries and 16 MiB of path bytes. Snapshots are process-local and replaced on rebuild or released on removal. Query changes cancel obsolete work. A watcher installed for the explicitly selected scope marks its snapshot stale on relevant filesystem changes; it never triggers another crawl. Rebuild remains explicit. Queries clone the shared path-array handle before ranking, keeping index status/removal responsive. Saved-content search bypasses the snapshot. Visible-folder watchers refresh directory listings independently of document observation and filename snapshots.
 
-Current acceptance uses the newer sub-100 ms opening, below-100 MB total RAM and below-0.1% active CPU aspirations documented in the product contract. Historical idle targets are not substitutes for active measurements.
+Current acceptance uses the newer sub-100 ms opening, below-100 MB total RAM and 0.1% idle CPU aspirations documented in the product contract, with active CPU proportional to the interaction. Historical idle targets are not substitutes for active measurements.
 
 Live listing refresh keeps the previous rows until the first replacement batch, retaining path-based selection and scroll offsets. Navigation and nonempty live batches start a 140 ms settling wash; input is never delayed and rows do not translate. Repaints stop when that interval ends, and Reduce motion skips it. Notifications ignore access-only/other events and drain queued changes into one refresh request.
 
