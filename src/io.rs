@@ -67,6 +67,7 @@ pub struct SaveDestination {
     pub expected: Option<DiskFile>,
     pub original: DiskFile,
     pub without_recovery: bool,
+    pub recovery_copy: bool,
 }
 pub enum Reply {
     RecentLocation(Option<PathBuf>),
@@ -84,6 +85,7 @@ pub enum Reply {
     Prepared(Box<SaveDestination>, Result<Option<DiskFile>, String>),
     Imported(u64, Result<(storage::Draft, DiskFile), String>),
     Reloaded(Box<Reload>, Result<(), String>),
+    Recovered(u64, u64, Result<(), String>),
     Done(Result<(), String>),
     Visit(PathBuf, bool),
     SavedTo(Box<SaveDestination>, Result<DiskFile, String>),
@@ -228,7 +230,9 @@ impl IoWorker {
                             Job::Save {
                                 without_recovery, ..
                             } => !*without_recovery,
-                            Job::SaveTo(destination) => !destination.without_recovery,
+                            Job::SaveTo(destination) => {
+                                !destination.without_recovery && !destination.recovery_copy
+                            }
                             _ => false,
                         };
                     let recovery = Arc::new(if needed {
@@ -256,16 +260,14 @@ impl IoWorker {
                         if let Some(binding) = binding {
                             binding.apply(&mut draft);
                         }
-                        if let Err(error) = recovery
+                        let result = recovery
                             .as_ref()
                             .as_ref()
                             .map_err(Clone::clone)
                             .and_then(|r| r.write(id, &draft))
-                        {
-                            let _ =
-                                results.send(Reply::Done(Err(format!("Recovery failed: {error}"))));
-                            ctx.request_repaint();
-                        }
+                            .map_err(|error| format!("Recovery failed: {error}"));
+                        let _ = results.send(Reply::Recovered(id, draft.generation, result));
+                        ctx.request_repaint();
                     }
                     let was_tracked = tracked(&job);
                     let observed_snapshot = matches!(&job, Job::RestoreObserved(..));
@@ -322,7 +324,10 @@ impl IoWorker {
                                 .and_then(|r| r.claim(&source, id))
                                 .map(|(draft, warning)| {
                                     if let Some(warning) = warning {
-                                        let _ = results.send(Reply::HistoryWarning(warning));
+                                        let _ = results.send(Reply::HistoryWarning(format!(
+                                            "Restored {}: {warning}",
+                                            crate::paths::display(&draft.path)
+                                        )));
                                     }
                                     let disk = DiskFile::restore(&draft);
                                     (draft, disk)
@@ -384,12 +389,15 @@ impl IoWorker {
                         Job::LoadSettings => {
                             Reply::SettingsLoaded(storage::Settings::load_in(&settings_root))
                         }
-                        Job::Recover(id, draft) => Reply::Done(
+                        Job::Recover(id, draft) => Reply::Recovered(
+                            id,
+                            draft.generation,
                             recovery
                                 .as_ref()
                                 .as_ref()
                                 .map_err(Clone::clone)
-                                .and_then(|r| r.write(id, &draft)),
+                                .and_then(|r| r.write(id, &draft))
+                                .map_err(|error| format!("Recovery failed: {error}")),
                         ),
                         Job::ClearThrough(id, generation) => Reply::Cleared(
                             id,
@@ -523,12 +531,20 @@ impl IoWorker {
                                                 },
                                             )
                                             .map_err(|e| format!("Recovery unavailable: {e}"))?;
+                                        let _ =
+                                            results.send(Reply::Recovered(id, generation, Ok(())));
                                         let saved = disk.save(&text)?;
                                         if let Err(error) = r.saved(id, generation) {
-                                            let _ = results.send(Reply::HistoryWarning(error));
+                                            let _ = results.send(Reply::HistoryWarning(format!(
+                                                "Saved {}. Recovery maintenance failed: {error}",
+                                                crate::paths::display(&disk.path)
+                                            )));
                                         }
                                         if let Err(error) = r.resolved(&candidate) {
-                                            let _ = results.send(Reply::HistoryWarning(error));
+                                            let _ = results.send(Reply::HistoryWarning(format!(
+                                                "Saved {}. Recovery maintenance failed: {error}",
+                                                crate::paths::display(&disk.path)
+                                            )));
                                         }
                                         Ok(saved)
                                     })
@@ -638,6 +654,7 @@ impl IoWorker {
                     generation,
                     Err("Recovery service stopped; record may remain".into()),
                 ));
+                self.wake.request_repaint();
             }
             return;
         }
@@ -651,9 +668,17 @@ impl IoWorker {
             {
                 return;
             }
+            let generation = draft.generation;
             self.drafts.lock().unwrap().insert(id, draft);
-            if let Some(tx) = &self.maintenance {
-                let _ = tx.try_send(Job::Wake);
+            if let Some(tx) = &self.maintenance
+                && let Err(mpsc::TrySendError::Disconnected(_)) = tx.try_send(Job::Wake)
+            {
+                let _ = self.errors.send(Reply::Recovered(
+                    id,
+                    generation,
+                    Err("Recovery service stopped; local text remains in memory".into()),
+                ));
+                self.wake.request_repaint();
             }
             return;
         } else {
@@ -756,22 +781,29 @@ fn reload_document(
         .disk
         .revalidate_paths(std::slice::from_ref(&reload.disk.path))?;
     let recovery = recovery.map_err(|error| format!("Recovery unavailable: {error}"))?;
-    let candidate = recovery.checkpoint(
-        reload.id,
-        &storage::Draft {
-            path: reload.original.path.clone(),
-            target: Some(reload.original.target.clone()),
-            text: reload.local.clone(),
-            base: reload.original.bytes.clone(),
-            generation: reload.generation,
-        },
-    )?;
+    let candidate = recovery
+        .checkpoint(
+            reload.id,
+            &storage::Draft {
+                path: reload.original.path.clone(),
+                target: Some(reload.original.target.clone()),
+                text: reload.local.clone(),
+                base: reload.original.bytes.clone(),
+                generation: reload.generation,
+            },
+        )
+        .map_err(|error| format!("Recovery unavailable: {error}"))?;
     reload
         .disk
         .revalidate_paths(std::slice::from_ref(&reload.disk.path))?;
-    recovery.saved(reload.id, reload.generation)?;
+    recovery
+        .saved(reload.id, reload.generation)
+        .map_err(|error| format!("Recovery unavailable: {error}"))?;
     if let Err(error) = recovery.resolved(&candidate) {
-        let _ = results.send(Reply::HistoryWarning(error));
+        let _ = results.send(Reply::HistoryWarning(format!(
+            "Reloaded {}. Recovery history maintenance failed: {error}",
+            crate::paths::display(&reload.disk.path)
+        )));
     }
     Ok(())
 }
@@ -781,6 +813,15 @@ fn save_destination(
     recovery: Result<&storage::Recovery, String>,
     results: &mpsc::Sender<Reply>,
 ) -> Result<DiskFile, String> {
+    if destination.recovery_copy {
+        if !destination.copy || destination.expected.is_some() || destination.without_recovery {
+            return Err(
+                "A recovery copy requires a new filename and cannot replace an existing file"
+                    .into(),
+            );
+        }
+        return DiskFile::create(destination.path.clone(), &destination.text, destination.bom);
+    }
     if destination.copy
         && destination
             .expected
@@ -822,6 +863,13 @@ fn save_destination(
             .map_err(|e| format!("Recovery unavailable: {e}"))?,
         )
     };
+    if candidate.is_some() {
+        let _ = results.send(Reply::Recovered(
+            destination.id,
+            destination.generation,
+            Ok(()),
+        ));
+    }
     let disk = if let Some(expected) = &destination.expected {
         expected.save_with_bom(&destination.text, destination.bom)?
     } else {
@@ -831,12 +879,18 @@ fn save_destination(
         if !destination.copy
             && let Err(error) = r.saved(destination.id, destination.generation)
         {
-            let _ = results.send(Reply::HistoryWarning(error));
+            let _ = results.send(Reply::HistoryWarning(format!(
+                "Saved {}. Recovery maintenance failed: {error}",
+                crate::paths::display(&destination.path)
+            )));
         }
         if let Some(candidate) = candidate
             && let Err(error) = r.resolved(&candidate)
         {
-            let _ = results.send(Reply::HistoryWarning(error));
+            let _ = results.send(Reply::HistoryWarning(format!(
+                "Saved {}. Recovery maintenance failed: {error}",
+                crate::paths::display(&destination.path)
+            )));
         }
     }
     Ok(disk)
@@ -859,6 +913,32 @@ impl Drop for IoWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recovery_copies_are_new_files_and_never_replace_or_rebind() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("copy.txt");
+        let (results, _) = mpsc::channel();
+        let mut candidate = destination(path.clone(), None);
+        candidate.text = "local β\r\n".into();
+        candidate.bom = true;
+        assert!(save_destination(&candidate, Err("storage unavailable".into()), &results).is_err());
+        assert!(!path.exists());
+        candidate.recovery_copy = true;
+        let saved =
+            save_destination(&candidate, Err("storage unavailable".into()), &results).unwrap();
+        assert_eq!(saved.bytes, "\u{feff}local β\r\n".as_bytes());
+        candidate.expected = Some(saved.clone());
+        assert!(save_destination(&candidate, Err("storage unavailable".into()), &results).is_err());
+        candidate.expected = None;
+        candidate.text = "replacement".into();
+        assert!(save_destination(&candidate, Err("storage unavailable".into()), &results).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), saved.bytes);
+        candidate.path = root.path().join("not-created.txt");
+        candidate.copy = false;
+        assert!(save_destination(&candidate, Err("storage unavailable".into()), &results).is_err());
+        assert!(!candidate.path.exists());
+    }
+
     #[test]
     fn a_disconnected_queue_wakes_the_shell_with_a_typed_failure() {
         let root = tempfile::tempdir().unwrap();
@@ -971,6 +1051,7 @@ mod tests {
             expected: None,
             original: disk.clone(),
             without_recovery: false,
+            recovery_copy: false,
         }));
         loop {
             match io
@@ -1201,6 +1282,7 @@ mod tests {
             expected,
             original: DiskFile::draft(),
             without_recovery: false,
+            recovery_copy: false,
         }
     }
     #[test]
@@ -1236,11 +1318,13 @@ mod tests {
         std::fs::write(&path, "racer").unwrap();
         assert!(save_destination(&d, Ok(&r), &tx).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "racer");
+        assert!(matches!(rx.recv().unwrap(), Reply::Recovered(_, _, Ok(()))));
         let mut d = destination(path.clone(), Some(DiskFile::open(path.clone()).unwrap().0));
         d.copy = false;
         std::fs::write(dir.path().join("recovery/history"), "not a folder").unwrap();
         save_destination(&d, Ok(&r), &tx).unwrap();
         assert_eq!(std::fs::read_to_string(path).unwrap(), "mine");
+        assert!(matches!(rx.recv().unwrap(), Reply::Recovered(_, _, Ok(()))));
         assert!(matches!(rx.recv().unwrap(), Reply::HistoryWarning(_)));
     }
     fn draft(generation: u64) -> storage::Draft {
@@ -1286,7 +1370,7 @@ mod tests {
         std::fs::write(&path, "blocked").unwrap();
         io.send(Job::Recover(7, draft(1)));
         loop {
-            if let Reply::Done(Err(error)) = io
+            if let Reply::Recovered(7, 1, Err(error)) = io
                 .replies
                 .recv_timeout(std::time::Duration::from_secs(5))
                 .unwrap()

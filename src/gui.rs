@@ -88,6 +88,12 @@ struct Document {
     preview: bool,
     saving: bool,
     restored: bool,
+    resolved_through: u64,
+    recovery_error: Option<(u64, String)>,
+    error: Option<String>,
+    failure_action: FailureAction,
+    failed_destination: Option<(PathBuf, DestinationKind)>,
+    unrecovered_save: Option<u64>,
     external: Option<(DiskFile, String)>,
     tab_focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
@@ -129,6 +135,24 @@ enum DecisionAction {
     Close,
     AbandonDestination(Box<SaveDestination>),
     ReplaceDestination(Box<SaveDestination>),
+    UnrecoveredSave(Box<recovery::UnrecoveredSave>),
+    RecoveryOptions(u64),
+    FailureDetails(u64),
+    Warnings,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum FailureAction {
+    Save,
+    Reload,
+    Check,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum DestinationKind {
+    SaveAs,
+    Copy,
+    RecoveryCopy,
 }
 
 enum SettingsWrite {
@@ -175,6 +199,8 @@ struct Shell {
     query: Entity<InputState>,
     reading: bool,
     status: String,
+    warnings: Vec<String>,
+    omitted_warnings: u64,
     volumes: Option<glimpse::locations::Volumes>,
     settings: storage::Settings,
     settings_write: Option<SettingsWrite>,
@@ -312,6 +338,8 @@ impl Shell {
             query,
             reading: false,
             status: String::new(),
+            warnings: Vec::new(),
+            omitted_warnings: 0,
             volumes: None,
             settings: storage::Settings::default(),
             settings_write: None,
@@ -563,6 +591,38 @@ impl Shell {
                                 this.io.send(Job::SaveTo(*destination));
                             }
                         }
+                        Some(DecisionAction::UnrecoveredSave(snapshot)) if choice.0 != 0 => {
+                            this.save_unrecovered(*snapshot, cx)
+                        }
+                        Some(DecisionAction::RecoveryOptions(id))
+                            if this.documents.iter().any(|doc| doc.id == id) =>
+                        {
+                            this.active = Some(id);
+                            match choice.0 {
+                                1 => this.retry_recovery(cx),
+                                2 => this.save_as(DestinationKind::RecoveryCopy, window, cx),
+                                3 => this.ask_unrecovered_save(window, cx),
+                                _ => this.focus(window, cx),
+                            }
+                        }
+                        Some(DecisionAction::FailureDetails(id))
+                            if this.documents.iter().any(|doc| doc.id == id) =>
+                        {
+                            this.active = Some(id);
+                            match choice.0 {
+                                1 => this.retry_operation(window, cx),
+                                2 => this.save_as(DestinationKind::Copy, window, cx),
+                                _ => this.focus(window, cx),
+                            }
+                        }
+                        Some(DecisionAction::Warnings) => match choice.0 {
+                            1 => this.panel(Panel::Recovery, window, cx),
+                            2 => {
+                                this.warnings.clear();
+                                this.omitted_warnings = 0;
+                            }
+                            _ => {}
+                        },
                         _ => {}
                     }
                     cx.notify();
@@ -768,6 +828,12 @@ impl Shell {
             preview,
             saving: false,
             restored: false,
+            resolved_through: 0,
+            recovery_error: None,
+            error: None,
+            failure_action: FailureAction::Save,
+            failed_destination: None,
+            unrecovered_save: None,
             external: None,
             tab_focus,
             _subscriptions: vec![subscription, tab_subscription],
@@ -1103,8 +1169,16 @@ impl Shell {
                     let succeeded = result.is_ok();
                     if let Some(doc) = self.documents.iter_mut().find(|d| d.id == id) {
                         doc.saving = false;
+                        let unrecovered = doc.unrecovered_save.take() == Some(generation);
                         match result {
                             Ok(disk) => {
+                                doc.resolved_through = doc.resolved_through.max(generation);
+                                doc.error = None;
+                                doc.failure_action = FailureAction::Save;
+                                doc.failed_destination = None;
+                                if !unrecovered {
+                                    doc.recovery_error = None;
+                                }
                                 doc.disk = disk;
                                 doc.saved = text;
                                 doc.restored = false;
@@ -1126,9 +1200,25 @@ impl Shell {
                                 }
                                 self.io
                                     .send(Job::BindingApplied(id, generation, doc.generation));
-                                self.status = "Saved".into();
+                                self.status = match (unrecovered, doc.dirty(cx)) {
+                                    (true, true) => {
+                                        "Saved without recovery. Newer edits are still unsaved."
+                                    }
+                                    (true, false) => "Saved without recovery for this attempt",
+                                    (false, true) => "Saved. Newer edits are still unsaved.",
+                                    (false, false) => "Saved",
+                                }
+                                .into();
                             }
-                            Err(e) => self.status = e,
+                            Err(error) => {
+                                if error.starts_with("Recovery unavailable:") {
+                                    doc.recovery_error = Some((generation, error.clone()));
+                                }
+                                doc.failed_destination = None;
+                                doc.failure_action = FailureAction::Save;
+                                doc.error = Some(error.clone());
+                                self.status = error;
+                            }
                         }
                     }
                     self.check_document(id);
@@ -1148,10 +1238,25 @@ impl Shell {
                     self.destination_document = None;
                     match result {
                         Ok(disk) => {
+                            if let Some(doc) = self
+                                .documents
+                                .iter_mut()
+                                .find(|doc| doc.id == destination.id)
+                            {
+                                if !destination.copy || doc.failure_action == FailureAction::Save {
+                                    doc.error = None;
+                                    doc.failed_destination = None;
+                                }
+                                if !destination.recovery_copy {
+                                    doc.recovery_error = None;
+                                }
+                            }
                             if !destination.copy
                                 && let Some(doc) =
                                     self.documents.iter_mut().find(|d| d.id == destination.id)
                             {
+                                doc.resolved_through =
+                                    doc.resolved_through.max(destination.generation);
                                 doc.disk = disk;
                                 doc.external = None;
                                 doc.saved = destination.text;
@@ -1193,10 +1298,28 @@ impl Shell {
                                 self.status =
                                     "Saved As. The original CLI destination was abandoned.".into();
                             } else {
-                                self.status = "Saved".into();
+                                self.status = if destination.recovery_copy {
+                                    format!(
+                                        "Recovery copy saved at {}. The original file is unchanged.",
+                                        paths::display(&destination.path)
+                                    )
+                                } else if destination.copy {
+                                    format!(
+                                        "Copy saved at {}. The original file is unchanged.",
+                                        paths::display(&destination.path)
+                                    )
+                                } else if self
+                                    .documents
+                                    .iter()
+                                    .any(|doc| doc.id == destination.id && doc.dirty(cx))
+                                {
+                                    "Saved. Newer edits are still unsaved.".into()
+                                } else {
+                                    "Saved".into()
+                                };
                             }
                         }
-                        Err(e) => self.status = e,
+                        Err(error) => self.destination_failed(&destination, error),
                     }
                     self.abandon_destination = None;
                     if self.close_pending.as_ref().is_some_and(|d| d.saving) {
@@ -1217,17 +1340,17 @@ impl Shell {
                                         .is_some_and(|disk| doc.disk.same_file(disk)))
                         });
                         if duplicate {
-                            self.cancel_destination();
-                            self.status =
-                                "Close the destination’s open tab before replacing it".into();
+                            self.destination_failed(
+                                &destination,
+                                "Close the destination’s open tab before replacing it".into(),
+                            );
                         } else {
                             destination.expected = expected;
                             self.confirm_destination(*destination, window, cx);
                         }
                     }
                     Err(error) => {
-                        self.cancel_destination();
-                        self.status = error;
+                        self.destination_failed(&destination, error);
                     }
                 },
                 Reply::Checked(id, token, result) => {
@@ -1241,6 +1364,11 @@ impl Shell {
                         && let Some(doc) =
                             self.documents.iter_mut().find(|d| d.id == id && !d.saving)
                     {
+                        if result.is_ok() && doc.failure_action == FailureAction::Check {
+                            doc.error = None;
+                            doc.failure_action = FailureAction::Save;
+                            self.status = "File access restored".into();
+                        }
                         match result {
                             Ok((disk, text)) if disk.target != doc.disk.target => {
                                 self.status = format!(
@@ -1271,7 +1399,12 @@ impl Shell {
                                 }
                             }
                             Ok((disk, _)) => doc.disk = disk,
-                            Err(e) => self.status = format!("External check: {e}"),
+                            Err(error) => {
+                                doc.error = Some(error.clone());
+                                doc.failure_action = FailureAction::Check;
+                                doc.failed_destination = None;
+                                self.status = format!("File unavailable: {error}");
+                            }
                         }
                     }
                 }
@@ -1432,7 +1565,45 @@ impl Shell {
                 Reply::Finished(id, generation, attempt, disk, result) => {
                     self.finished_validation((id, generation, attempt, disk), result, cx);
                 }
-                Reply::Done(Err(error)) | Reply::HistoryWarning(error) => self.status = error,
+                Reply::Recovered(id, generation, result) => {
+                    if let Some(doc) = self.documents.iter_mut().find(|doc| doc.id == id) {
+                        match result {
+                            Ok(()) => {
+                                if generation > doc.resolved_through
+                                    && doc
+                                        .recovery_error
+                                        .as_ref()
+                                        .is_some_and(|(failed, _)| generation >= *failed)
+                                {
+                                    doc.recovery_error = None;
+                                    self.status = "Recovery storage is available".into();
+                                    if doc.failed_destination.is_none()
+                                        && doc.error.as_ref().is_some_and(|error| {
+                                            error.starts_with("Recovery unavailable:")
+                                        })
+                                    {
+                                        doc.error = None;
+                                    }
+                                }
+                                if !doc.dirty(cx) {
+                                    self.io.send(Job::ClearThrough(id, generation));
+                                }
+                            }
+                            Err(error) if generation > doc.resolved_through => {
+                                doc.recovery_error = Some((generation, error))
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                }
+                Reply::Done(Err(error)) => self.status = error,
+                Reply::HistoryWarning(error) if !self.warnings.contains(&error) => {
+                    if self.warnings.len() == 32 {
+                        self.warnings.remove(0);
+                        self.omitted_warnings = self.omitted_warnings.saturating_add(1);
+                    }
+                    self.warnings.push(error);
+                }
                 Reply::Changed(result) => match result {
                     Ok(()) => {
                         self.refresh();
@@ -1517,7 +1688,7 @@ impl Shell {
                 return;
             }
             if doc.disk.target.as_os_str().is_empty() {
-                self.save_as(false, window, cx);
+                self.save_as(DestinationKind::SaveAs, window, cx);
                 return;
             }
             if doc.external.is_some() {
@@ -1538,7 +1709,7 @@ impl Shell {
             });
         }
     }
-    fn save_as(&mut self, copy: bool, window: &mut Window, cx: &mut Context<Self>) {
+    fn save_as(&mut self, kind: DestinationKind, window: &mut Window, cx: &mut Context<Self>) {
         if self.request.pick || self.destination_busy {
             return;
         }
@@ -1546,6 +1717,7 @@ impl Shell {
         let Some(doc) = self.documents.iter().find(|d| Some(d.id) == self.active) else {
             return;
         };
+        let copy = kind != DestinationKind::SaveAs;
         let mut destination = SaveDestination {
             id: doc.id,
             path: PathBuf::new(),
@@ -1556,8 +1728,18 @@ impl Shell {
             expected: None,
             original: doc.disk.clone(),
             without_recovery: false,
+            recovery_copy: kind == DestinationKind::RecoveryCopy,
         };
-        let prompt = cx.prompt_for_new_path(&self.current, Some(&paths::name(&doc.disk.path)));
+        let previous = doc
+            .failed_destination
+            .as_ref()
+            .filter(|(_, previous)| *previous == kind)
+            .map(|(path, _)| path);
+        let folder = previous
+            .and_then(|path| path.parent())
+            .unwrap_or(&self.current);
+        let suggested = paths::name(previous.unwrap_or(&doc.disk.path));
+        let prompt = cx.prompt_for_new_path(folder, Some(&suggested));
         cx.spawn_in(window, async move |this, cx| {
             if let Ok(Ok(Some(path))) = prompt.await {
                 let _ = this.update(cx, |this, cx| {
@@ -1878,6 +2060,25 @@ impl Shell {
             }
 
             "save" => self.save(window, cx),
+            "retry-operation" => self.retry_operation(window, cx),
+            "failure-details" => self.failure_details(window, cx),
+            "warnings" => {
+                let mut detail = self.warnings.join("\n\n");
+                if self.omitted_warnings > 0 {
+                    detail.push_str(&format!(
+                        "\n{} earlier warnings are outside this list.",
+                        self.omitted_warnings
+                    ));
+                }
+                self.ask_decision(
+                    DecisionAction::Warnings,
+                    "Recovery warning".into(),
+                    detail,
+                    vec!["Close", "Open Recovery", "Acknowledge"],
+                    window,
+                    cx,
+                );
+            }
             "discard-close" => self.commit_close(true, cx),
             "save-close" => {
                 if let Some(decision) = self.close_pending.as_mut() {
@@ -1890,8 +2091,12 @@ impl Shell {
                     self.io.send(Job::ClearThrough(id, generation));
                 }
             }
-            "save-as" => self.save_as(false, window, cx),
-            "save-copy" => self.save_as(true, window, cx),
+            "save-as" => self.save_as(DestinationKind::SaveAs, window, cx),
+            "save-copy" => self.save_as(DestinationKind::Copy, window, cx),
+            "recovery-copy" => self.save_as(DestinationKind::RecoveryCopy, window, cx),
+            "recovery-options" => self.recovery_options(window, cx),
+            "retry-recovery" => self.retry_recovery(cx),
+            "save-unrecovered" => self.ask_unrecovered_save(window, cx),
             "new" if !self.request.pick => {
                 self.add_document(DiskFile::draft(), String::new(), false, None, window, cx)
             }
@@ -2443,13 +2648,38 @@ impl Render for Shell {
             });
         }
         if let Some(doc) = self.documents.iter().find(|d| Some(d.id) == self.active) {
+            if doc.recovery_error.is_none() && doc.error.is_some() {
+                content = content.child(
+                    div()
+                        .w_full()
+                        .flex_shrink_0()
+                        .p_2()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_2()
+                        .child(match doc.failure_action {
+                            FailureAction::Save => "Last save failed",
+                            FailureAction::Reload => "Reload stopped",
+                            FailureAction::Check => "File unavailable",
+                        })
+                        .child(self.button("Details and Retry…", "failure-details", cx)),
+                );
+            }
+            if let Some((_, error)) = &doc.recovery_error {
+                content = content.child(self.recovery_failure_view(doc, error, cx));
+            }
             if doc.external.is_some() {
                 content = content.child(
                     div()
+                        .w_full()
+                        .flex_shrink_0()
                         .p_2()
                         .child("Changed on disk. Local text retained; ordinary Save is blocked.")
                         .child(
                             div()
+                                .w_full()
+                                .min_w_0()
                                 .flex()
                                 .flex_wrap()
                                 .gap_2()
@@ -2541,14 +2771,24 @@ impl Render for Shell {
             content.into_any_element()
         };
         root.child(div().flex_1().min_h_0().child(body))
-            .when(!self.status.is_empty(), |root| {
+            .when(!self.warnings.is_empty(), |root| {
                 root.child(
                     div()
                         .p_2()
-                        .text_size(px(12. * self.settings.ui_scale))
-                        .child(self.status.clone()),
+                        .child(self.button("Recovery Warning…", "warnings", cx)),
                 )
             })
+            .when(
+                !self.status.is_empty() && self.warnings.is_empty(),
+                |root| {
+                    root.child(
+                        div()
+                            .p_2()
+                            .text_size(px(12. * self.settings.ui_scale))
+                            .child(self.status.clone()),
+                    )
+                },
+            )
             .children(self.preferences.clone())
             .children(self.decision.clone())
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {

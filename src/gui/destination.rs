@@ -7,6 +7,13 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if destination.recovery_copy && destination.expected.is_some() {
+            self.destination_failed(
+                &destination,
+                "Recovery copies require a new filename. The existing file was not changed.".into(),
+            );
+            return;
+        }
         let requested = self
             .requested
             .iter()
@@ -63,6 +70,102 @@ impl Shell {
             );
         } else {
             self.io.send(Job::SaveTo(destination));
+        }
+    }
+    pub(super) fn destination_failed(&mut self, destination: &SaveDestination, error: String) {
+        if let Some(doc) = self
+            .documents
+            .iter_mut()
+            .find(|doc| doc.id == destination.id)
+        {
+            let kind = if destination.recovery_copy {
+                DestinationKind::RecoveryCopy
+            } else if destination.copy {
+                DestinationKind::Copy
+            } else {
+                DestinationKind::SaveAs
+            };
+            doc.failure_action = FailureAction::Save;
+            doc.failed_destination = Some((destination.path.clone(), kind));
+            doc.error = Some(format!(
+                "Could not save {}: {error}",
+                paths::display(&destination.path)
+            ));
+            if error.starts_with("Recovery unavailable:") {
+                doc.recovery_error = Some((destination.generation, error.clone()));
+            }
+        }
+        self.cancel_destination();
+        self.status = error;
+    }
+    pub(super) fn failure_details(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(doc) = self
+            .documents
+            .iter()
+            .find(|doc| Some(doc.id) == self.active)
+        else {
+            return;
+        };
+        let Some(error) = &doc.error else {
+            return;
+        };
+        let destination = doc
+            .failed_destination
+            .as_ref()
+            .map(|(path, _)| path)
+            .unwrap_or(&doc.disk.path);
+        let (title, retry) = match doc.failure_action {
+            FailureAction::Save => ("Save did not complete", "Retry Save"),
+            FailureAction::Reload => ("Reload did not complete", "Retry Reload"),
+            FailureAction::Check => ("File unavailable", "Retry File Check"),
+        };
+        self.ask_decision(DecisionAction::FailureDetails(doc.id), title.into(), format!("File: {}\n{error}\nThe current text remains open. Retry checks this file again before continuing.", paths::display(destination)), vec!["Keep Editing", retry, "Save Copy Elsewhere…"], window, cx);
+    }
+    pub(super) fn retry_operation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.destination_busy {
+            return;
+        }
+        self.cancel_cleanup_for_active(window, cx);
+        let Some(doc) = self
+            .documents
+            .iter()
+            .find(|doc| Some(doc.id) == self.active)
+        else {
+            return;
+        };
+        match doc.failure_action {
+            FailureAction::Reload => {
+                self.conflict_action("reload", window, cx);
+                return;
+            }
+            FailureAction::Check => {
+                self.check_document(doc.id);
+                return;
+            }
+            FailureAction::Save => {}
+        }
+        if let Some((path, kind)) = &doc.failed_destination {
+            if *kind == DestinationKind::RecoveryCopy {
+                self.save_as(DestinationKind::RecoveryCopy, window, cx);
+                return;
+            }
+            let destination = SaveDestination {
+                id: doc.id,
+                path: path.clone(),
+                text: doc.input.read(cx).value().to_string(),
+                copy: *kind != DestinationKind::SaveAs,
+                bom: doc.disk.bom,
+                generation: doc.generation,
+                expected: None,
+                original: doc.disk.clone(),
+                without_recovery: false,
+                recovery_copy: *kind == DestinationKind::RecoveryCopy,
+            };
+            self.destination_document = Some(doc.id);
+            self.destination_busy = true;
+            self.io.send(Job::Prepare(destination));
+        } else {
+            self.save(window, cx);
         }
     }
     pub(super) fn cancel_destination(&mut self) {

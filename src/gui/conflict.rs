@@ -141,7 +141,15 @@ impl Shell {
         };
         doc.saving = false;
         match result {
-            Err(error) => self.status = format!("Reload stopped; local text retained: {error}"),
+            Err(error) => {
+                doc.error = Some(error.clone());
+                doc.failure_action = FailureAction::Reload;
+                doc.failed_destination = None;
+                if error.starts_with("Recovery unavailable:") {
+                    doc.recovery_error = Some((reload.generation, error.clone()));
+                }
+                self.status = format!("Reload stopped; local text retained: {error}");
+            }
             Ok(())
                 if doc.generation != reload.generation
                     || doc.input.read(cx).value().as_str() != reload.local =>
@@ -152,6 +160,10 @@ impl Shell {
             Ok(()) => {
                 let abandoned = doc.dirty(cx);
                 let length = doc.input.read(cx).value().encode_utf16().count();
+                doc.resolved_through = doc.resolved_through.max(reload.generation);
+                doc.error = None;
+                doc.failed_destination = None;
+                doc.recovery_error = None;
                 doc.disk = reload.disk;
                 doc.saved = reload.text.clone();
                 doc.external = None;

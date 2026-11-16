@@ -64,3 +64,147 @@ impl Shell {
         );
     }
 }
+
+pub(super) struct UnrecoveredSave {
+    id: u64,
+    generation: u64,
+    text: String,
+    disk: DiskFile,
+}
+
+impl Shell {
+    pub(super) fn recovery_failure_view(
+        &self,
+        doc: &Document,
+        error: &str,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .p_2()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_2()
+            .child("Recovery unavailable")
+            .child(
+                self.button("Recovery Options…", "recovery-options", cx)
+                    .tooltip(error.to_owned())
+                    .disabled(
+                        doc.saving
+                            || (self.destination_busy && self.destination_document == Some(doc.id)),
+                    ),
+            )
+    }
+    pub(super) fn recovery_options(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(doc) = self
+            .documents
+            .iter()
+            .find(|doc| Some(doc.id) == self.active)
+        else {
+            return;
+        };
+        let Some((_, error)) = &doc.recovery_error else {
+            return;
+        };
+        let context = doc
+            .error
+            .as_ref()
+            .map(|error| format!("\nLast save failure: {error}"))
+            .unwrap_or_default();
+        let mut actions = vec!["Keep Editing", "Retry Recovery", "Save Copy Elsewhere…"];
+        let blocked = doc.external.is_some()
+            || doc.disk.target.as_os_str().is_empty()
+            || doc.saving
+            || self.destination_busy;
+        if !blocked {
+            actions.push("Save Without Recovery…");
+        }
+        self.ask_decision(DecisionAction::RecoveryOptions(doc.id), "Recovery unavailable".into(),
+            format!("File: {}\n{error}{context}\nThe current text remains open. Save Copy Elsewhere requires a new filename and retains this document’s file association.{}", paths::display(&doc.disk.path), if blocked { " Save Without Recovery is unavailable for a new file, a pending save or an unresolved conflict." } else { " Save Without Recovery requires a separate confirmation for one attempt." }),
+            actions, window, cx);
+    }
+    pub(super) fn retry_recovery(&mut self, cx: &mut Context<Self>) {
+        let Some(doc) = self
+            .documents
+            .iter_mut()
+            .find(|doc| Some(doc.id) == self.active)
+        else {
+            return;
+        };
+        doc.generation += 1;
+        self.io.send(Job::Recover(
+            doc.id,
+            storage::Draft {
+                path: doc.disk.path.clone(),
+                target: Some(doc.disk.target.clone()),
+                text: doc.input.read(cx).value().to_string(),
+                base: doc.disk.bytes.clone(),
+                generation: doc.generation,
+            },
+        ));
+        self.status = "Retrying recovery storage".into();
+    }
+    pub(super) fn ask_unrecovered_save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_cleanup_for_active(window, cx);
+        let Some(doc) = self
+            .documents
+            .iter()
+            .find(|doc| Some(doc.id) == self.active && !doc.saving && doc.recovery_error.is_some())
+        else {
+            return;
+        };
+        if doc.external.is_some() || doc.disk.target.as_os_str().is_empty() || self.destination_busy
+        {
+            self.status = "Save Without Recovery requires an existing file with no unresolved conflict. Save a separate recovery copy to a new filename.".into();
+            return;
+        }
+        let text = doc.input.read(cx).value().to_string();
+        let detail = format!(
+            "File: {}\nGlimpse cannot preserve its usual recovery copies of the {}-byte local text and {}-byte observed disk version. These copies may be unavailable after this attempt. The destination is still validated before replacement. Recovery remains enabled for subsequent saves.",
+            paths::display(&doc.disk.path),
+            text.len(),
+            doc.disk.bytes.len()
+        );
+        let snapshot = UnrecoveredSave {
+            id: doc.id,
+            generation: doc.generation,
+            text,
+            disk: doc.disk.clone(),
+        };
+        self.ask_decision(
+            DecisionAction::UnrecoveredSave(Box::new(snapshot)),
+            "Save once without recovery?".into(),
+            detail,
+            vec!["Cancel", "Save Without Recovery"],
+            window,
+            cx,
+        );
+    }
+    pub(super) fn save_unrecovered(&mut self, snapshot: UnrecoveredSave, cx: &mut Context<Self>) {
+        let Some(doc) = self.documents.iter_mut().find(|doc| doc.id == snapshot.id) else {
+            return;
+        };
+        if doc.generation != snapshot.generation
+            || doc.input.read(cx).value().as_str() != snapshot.text
+            || doc.saving
+            || doc.external.is_some()
+            || doc.disk.target != snapshot.disk.target
+            || doc.disk.bytes != snapshot.disk.bytes
+        {
+            self.status =
+                "The document or disk observation changed. Review the current state before saving."
+                    .into();
+            return;
+        }
+        doc.saving = true;
+        doc.unrecovered_save = Some(snapshot.generation);
+        self.checks.invalidate(doc.id);
+        self.io.send(Job::Save {
+            id: doc.id,
+            generation: snapshot.generation,
+            text: snapshot.text,
+            disk: snapshot.disk,
+            without_recovery: true,
+        });
+    }
+}
