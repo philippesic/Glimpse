@@ -398,7 +398,11 @@ impl Shell {
                                                     .strip_prefix(this.effective_scope())
                                                     .unwrap_or(&hit.path),
                                             );
-                                            let prefix = format!("{name}:{}  ", hit.line);
+                                            let prefix = if hit.fingerprint.is_some() {
+                                                format!("{name}:{}  ", hit.line)
+                                            } else {
+                                                format!("{name}  ")
+                                            };
                                             let label = format!("{prefix}{}", hit.excerpt);
                                             let ranges = if hit.fingerprint.is_some() {
                                                 hit.excerpt
@@ -411,12 +415,16 @@ impl Shell {
                                             } else {
                                                 search::highlight_ranges(&name, &hit.query)
                                             };
-                                            let tooltip = format!(
-                                                "{}:{}\n{}",
-                                                paths::display(&hit.path),
-                                                hit.line,
-                                                hit.excerpt
-                                            );
+                                            let tooltip = if hit.fingerprint.is_some() {
+                                                format!(
+                                                    "{}:{}\n{}",
+                                                    paths::display(&hit.path),
+                                                    hit.line,
+                                                    hit.excerpt
+                                                )
+                                            } else {
+                                                paths::display(&hit.path)
+                                            };
                                             let text = StyledText::new(label).with_highlights(
                                                 ranges.into_iter().map(|range| {
                                                     (
@@ -429,6 +437,10 @@ impl Shell {
                                                 }),
                                             );
                                             Button::new(("search-hit", i))
+                                                .accessibility_role(
+                                                    gpui::accesskit::Role::ListBoxOption,
+                                                )
+                                                .accessibility_focus(this.search_ui.focus.clone())
                                                 .tooltip(tooltip)
                                                 .child(
                                                     div().flex_1().min_w_0().truncate().child(text),

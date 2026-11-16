@@ -1057,7 +1057,30 @@ impl PopupMenu {
             ),
         };
 
+        let (semantic_label, semantic_role) = match item {
+            PopupMenuItem::Separator => ("".into(), gpui::accesskit::Role::Splitter),
+            PopupMenuItem::Label(label) => (label.clone(), gpui::accesskit::Role::Label),
+            PopupMenuItem::Item { label, .. } | PopupMenuItem::Submenu { label, .. } => {
+                (label.clone(), gpui::accesskit::Role::MenuItem)
+            }
+            PopupMenuItem::ElementItem { .. } => {
+                ("Menu item".into(), gpui::accesskit::Role::MenuItem)
+            }
+        };
+        let semantic_view = cx.entity().downgrade();
         let this = MenuItemElement::new(ix, &group_name)
+            .semantics(
+                semantic_label,
+                semantic_role,
+                self.focus_handle.clone(),
+                move |window, cx| {
+                    let _ = semantic_view.update(cx, |this, cx| {
+                        this.selected_index = Some(ix);
+                        this.focus_handle.focus(window);
+                        cx.notify();
+                    });
+                },
+            )
             .relative()
             .text_sm()
             .py_0()
@@ -1292,7 +1315,9 @@ impl Render for PopupMenu {
             radius: cx.theme().radius.min(px(8.)),
         };
 
-        v_flex()
+        let semantic_focus = self.focus_handle.clone();
+        let semantic_empty = self.selected_index.is_none();
+        let rendered = v_flex()
             .id("popup-menu")
             .key_context(CONTEXT)
             .track_focus(&self.focus_handle)
@@ -1350,6 +1375,14 @@ impl Render for PopupMenu {
             .when(self.scrollable, |this| {
                 // TODO: When the menu is limited by `overflow_y_scroll`, the sub-menu will cannot be displayed.
                 this.vertical_scrollbar(&self.scroll_handle)
-            })
+            });
+        gpui::accessible("menu-semantics", rendered, move |_, window, _| {
+            let mut node = gpui::accesskit::Node::new(gpui::accesskit::Role::Menu);
+            node.set_label("Menu");
+            let mut info = gpui::AccessibilityInfo::new(node);
+            info.modal = true;
+            info.focused = semantic_empty && semantic_focus.is_focused(window);
+            info
+        })
     }
 }

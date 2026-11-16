@@ -1,3 +1,4 @@
+mod accessibility;
 mod completion;
 mod conflict;
 mod decision;
@@ -3063,7 +3064,7 @@ impl Render for Shell {
                                 let path = entry.path.clone();
                                 let selected = this.selection.as_ref() == Some(&path);
                                 let tooltip = paths::display(&path);
-                                div()
+                                let row=div()
                                     .id(("entry", i))
                                     .h(px(if this.settings.compact { 28. } else { 32. }
                                         * this.settings.ui_scale))
@@ -3089,7 +3090,8 @@ impl Render for Shell {
                                             this.open(path.clone(), event.click_count() < 2, None);
                                             cx.notify();
                                         },
-                                    ))
+                                    ));
+                                this.navigation_row(entry,(i,visible.len()),selected,row,cx)
                             })
                             .collect::<Vec<_>>()
                     }),
@@ -3098,6 +3100,12 @@ impl Render for Shell {
                 .min_h_0()
                 .track_scroll(scroll),
             ));
+        let navigator = accessibility::collection(
+            "navigator-list",
+            format!("Files in {}", paths::display(&self.current)),
+            navigator,
+            self.nav_focus.clone(),
+        );
         let tabs = div()
             .id("tabs")
             .w_full()
@@ -3125,6 +3133,7 @@ impl Render for Shell {
                 );
                 div().track_focus(&doc.tab_focus).flex_shrink_0().child(
                     Button::new(("tab", id))
+                        .accessibility_role(gpui::accesskit::Role::Tab)
                         .label(title)
                         .tooltip(paths::display(&doc.disk.path))
                         .small()
@@ -3145,6 +3154,11 @@ impl Render for Shell {
                         })),
                 )
             }));
+        let tabs = accessible("open-documents", tabs, |_, _, _| {
+            let mut node = gpui::accesskit::Node::new(gpui::accesskit::Role::TabList);
+            node.set_label("Open documents");
+            AccessibilityInfo::new(node)
+        });
         let mut content = div()
             .flex_1()
             .h_full()

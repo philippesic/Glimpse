@@ -272,6 +272,7 @@ impl State {
         }
         let focus = records
             .iter()
+            .rev()
             .find(|record| record.info.focused && visible.contains(&record.id))
             .map(|record| record.id)
             .unwrap_or(modal.unwrap_or(NodeId(1)));

@@ -66,6 +66,19 @@ impl Field {
         Self::Keymaps,
     ];
 
+    fn label(self) -> &'static str {
+        match self {
+            Self::Font => "Source font family",
+            Self::Size => "Source font size",
+            Self::Height => "Line height",
+            Self::Scale => "Interface scale",
+            Self::Markdown => "Reading font size",
+            Self::Indent => "Indent width",
+            Self::FileLimit => "Search file limit",
+            Self::Exclusions => "Search exclusions",
+            Self::Keymaps => "Shortcut overrides",
+        }
+    }
     fn value(self, settings: &Settings) -> String {
         match self {
             Self::Font => settings.font_family.clone(),
@@ -110,6 +123,7 @@ impl Preferences {
                             Field::Keymaps => "{\"save\": \"Cmd+S\"}",
                             _ => "",
                         });
+                    input.set_accessibility_label(field.label(), cx);
                     input.set_cursor_blink(false, cx);
                     input
                 })

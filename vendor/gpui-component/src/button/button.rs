@@ -177,6 +177,8 @@ impl ButtonVariant {
 #[derive(IntoElement)]
 pub struct Button {
     id: ElementId,
+    semantic_role: gpui::accesskit::Role,
+    semantic_focus: Option<gpui::FocusHandle>,
     base: Stateful<Div>,
     style: StyleRefinement,
     icon: Option<Icon>,
@@ -217,6 +219,8 @@ impl Button {
 
         Self {
             id: id.clone(),
+            semantic_role: gpui::accesskit::Role::Button,
+            semantic_focus: None,
             // ID must be set after div is created;
             // `dropdown_menu` uses this id to create the popup menu.
             base: div().flex_shrink_0().id(id),
@@ -242,6 +246,16 @@ impl Button {
             tab_index: 0,
             tab_stop: true,
         }
+    }
+
+    pub fn accessibility_focus(mut self, focus: gpui::FocusHandle) -> Self {
+        self.semantic_focus = Some(focus);
+        self
+    }
+
+    pub fn accessibility_role(mut self, role: gpui::accesskit::Role) -> Self {
+        self.semantic_role = role;
+        self
     }
 
     /// Set the outline style of the Button.
@@ -448,6 +462,7 @@ impl RenderOnce for Button {
         };
 
         let semantic_id = self.id.clone();
+        let semantic_role = self.semantic_role;
         let semantic_label = self
             .label
             .clone()
@@ -457,6 +472,7 @@ impl RenderOnce for Button {
         let semantic_selected = self.selected;
         let semantic_handler = self.on_click.clone();
         let semantic_focus = focus_handle.clone();
+        let composite_focus = self.semantic_focus.clone();
         let action_focus = focus_handle.clone();
         let rendered = self
             .base
@@ -631,8 +647,8 @@ impl RenderOnce for Button {
             })
             .focus_ring(is_focused, px(0.), window, cx);
         gpui::accessible(semantic_id, rendered, move |_, window, _| {
-            use gpui::accesskit::{Action, Node, Role};
-            let mut node = Node::new(Role::Button);
+            use gpui::accesskit::{Action, Node};
+            let mut node = Node::new(semantic_role);
             node.set_label(semantic_label.to_string());
             node.set_selected(semantic_selected);
             if semantic_disabled {
@@ -642,7 +658,11 @@ impl RenderOnce for Button {
                 node.add_action(Action::Focus);
             }
             let mut info = gpui::AccessibilityInfo::new(node);
-            info.focused = semantic_focus.is_focused(window);
+            info.focused = semantic_focus.is_focused(window)
+                || (semantic_selected
+                    && composite_focus
+                        .as_ref()
+                        .is_some_and(|focus| focus.is_focused(window)));
             info
         })
         .on_action(move |request, bounds, window, cx| {
