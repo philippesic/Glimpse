@@ -72,7 +72,7 @@ The product contract and native Linux evaluation determine qualification. The fo
 
 - Complete contextual command availability. macOS system-menu integration remains unverified.
 - Complete search adaptation at narrow widths and large interface scales, including the full coverage and permission-failure matrix.
-- The earlier bounded Markdown paging, local raster images, relative-link handling and complete dialect parity. The current read view escapes HTML and omits images, including remote images.
+- Supported-size Markdown responsiveness and complete dialect, link, overflow and assistive-access qualification. The native read view now parses off-thread, virtualizes blocks, retains source position, renders bounded local rasters, omits remote images, displays raw HTML and routes relative links from the document folder.
 - Large-file/long-line performance, real IME, accessibility, the complete size/theme/settings matrix and macOS behavior. Modal behavior across asynchronous completions still requires qualification.
 
 The new view virtualizes directory rows and stores per-folder selection and scroll state. Syntax work remains bounded, but extracting full buffer text on edits can be costly. Linux native checks qualify only their executed scenarios. Whole-app performance, safety and accessibility require current-build evidence for the complete acceptance matrix.
