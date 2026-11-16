@@ -159,7 +159,7 @@ impl TextElement {
                 current_indents = last_indents.clone();
             }
 
-            offset_y += line_layout.wrapped_lines.len() * line_height;
+            offset_y += line_layout.rows() * line_height;
             last_indents = current_indents;
         }
 

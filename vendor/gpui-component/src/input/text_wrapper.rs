@@ -9,8 +9,7 @@ use crate::input::RopeExt;
 /// A line with soft wrapped lines info.
 #[derive(Debug, Clone)]
 pub(super) struct LineItem {
-    /// The original line text, without end `\n`.
-    line: Rope,
+    length: usize,
     /// The soft wrapped lines relative byte range (0..line.len) of this line (Include first line).
     ///
     /// Not contains the line end `\n`.
@@ -21,7 +20,7 @@ impl LineItem {
     /// Get the bytes length of this line.
     #[inline]
     pub(super) fn len(&self) -> usize {
-        self.line.len()
+        self.length
     }
 
     /// Get number of soft wrapped lines of this line (include the first line).
@@ -104,21 +103,25 @@ impl TextWrapper {
         self.update_all(&self.text.clone(), cx);
     }
 
-    pub(super) fn set_font(&mut self, font: Font, font_size: Pixels, cx: &mut App) {
-        if self.font.eq(&font) && self.font_size == font_size {
-            return;
-        }
-
-        self.font = font;
-        self.font_size = font_size;
-        self.update_all(&self.text.clone(), cx);
-    }
-
-    pub(super) fn prepare_if_need(&mut self, text: &Rope, cx: &mut App) {
-        if self._initialized {
+    pub(super) fn prepare(
+        &mut self,
+        text: &Rope,
+        font: Font,
+        font_size: Pixels,
+        wrap_width: Option<Pixels>,
+        cx: &mut App,
+    ) {
+        if self._initialized
+            && self.font == font
+            && self.font_size == font_size
+            && self.wrap_width == wrap_width
+        {
             return;
         }
         self._initialized = true;
+        self.font = font;
+        self.font_size = font_size;
+        self.wrap_width = wrap_width;
         self.update_all(text, cx);
     }
 
@@ -217,7 +220,7 @@ impl TextWrapper {
             }
 
             new_lines.push(LineItem {
-                line: Rope::from(line),
+                length: line.len(),
                 wrapped_lines,
             });
         }
@@ -335,12 +338,16 @@ impl DisplayPoint {
     }
 }
 
-/// The layout info of a line with soft wrapped lines.
+pub(crate) struct WrappedLine {
+    pub row: usize,
+    pub range: Range<usize>,
+    pub shaped: ShapedLine,
+}
+
 pub(crate) struct LineLayout {
-    /// Total bytes length of this line.
     len: usize,
-    /// The soft wrapped lines of this line (Include the first line).
-    pub(crate) wrapped_lines: SmallVec<[ShapedLine; 1]>,
+    rows: usize,
+    pub(crate) wrapped_lines: SmallVec<[WrappedLine; 1]>,
     pub(crate) longest_width: Pixels,
 }
 
@@ -348,110 +355,98 @@ impl LineLayout {
     pub(crate) fn new() -> Self {
         Self {
             len: 0,
-            longest_width: px(0.),
+            rows: 0,
             wrapped_lines: SmallVec::new(),
+            longest_width: px(0.),
         }
     }
 
-    pub(crate) fn lines(mut self, wrapped_lines: SmallVec<[ShapedLine; 1]>) -> Self {
-        self.set_wrapped_lines(wrapped_lines);
+    pub(crate) fn lines(mut self, lines: SmallVec<[ShapedLine; 1]>) -> Self {
+        self.set_wrapped_lines(lines);
         self
     }
 
-    pub(crate) fn set_wrapped_lines(&mut self, wrapped_lines: SmallVec<[ShapedLine; 1]>) {
-        self.len = wrapped_lines.iter().map(|l| l.len).sum();
-        let width = wrapped_lines
-            .iter()
-            .map(|l| l.width)
-            .max()
-            .unwrap_or_default();
-        self.longest_width = width;
-        self.wrapped_lines = wrapped_lines;
+    pub(crate) fn set_wrapped_lines(&mut self, lines: SmallVec<[ShapedLine; 1]>) {
+        let mut offset = 0;
+        let rows = lines.len();
+        let lines = lines
+            .into_iter()
+            .enumerate()
+            .map(|(row, shaped)| {
+                let range = offset..offset + shaped.len();
+                offset = range.end;
+                WrappedLine { row, range, shaped }
+            })
+            .collect();
+        self.set_visible_lines(offset, rows, lines);
     }
 
-    #[inline]
+    pub(crate) fn set_visible_lines(
+        &mut self,
+        len: usize,
+        rows: usize,
+        lines: SmallVec<[WrappedLine; 1]>,
+    ) {
+        self.len = len;
+        self.rows = rows;
+        self.longest_width = lines
+            .iter()
+            .map(|line| line.shaped.width)
+            .max()
+            .unwrap_or_default();
+        self.wrapped_lines = lines;
+    }
+
+    pub(crate) fn rows(&self) -> usize {
+        self.rows
+    }
     pub(super) fn len(&self) -> usize {
         self.len
     }
 
-    /// Get the position (x, y) for the given index in this line layout.
-    ///
-    /// - The `offset` is a local byte index in this line layout.
-    /// - The return value is relative to the top-left corner of this line layout, start from (0, 0)
     pub(crate) fn position_for_index(
         &self,
         offset: usize,
         line_height: Pixels,
     ) -> Option<Point<Pixels>> {
-        let mut acc_len = 0;
-        let mut offset_y = px(0.);
-
-        for (i, line) in self.wrapped_lines.iter().enumerate() {
-            let is_last = i + 1 == self.wrapped_lines.len();
-            let line_len = if is_last { line.len + 1 } else { line.len };
-
-            let range = acc_len..(acc_len + line_len);
-            if range.contains(&offset) {
-                let x = line.x_for_index(offset.saturating_sub(acc_len));
-                return Some(point(x, offset_y));
-            }
-            acc_len += line_len;
-            offset_y += line_height;
-        }
-
-        None
+        self.wrapped_lines
+            .iter()
+            .find(|line| {
+                line.range.contains(&offset)
+                    || (line.row + 1 == self.rows && offset == line.range.end)
+            })
+            .map(|line| {
+                point(
+                    line.shaped.x_for_index(offset - line.range.start),
+                    line.row * line_height,
+                )
+            })
     }
 
-    /// Get the closest index for the given x in this line layout.
     pub(super) fn closest_index_for_x(&self, x: Pixels) -> usize {
-        let mut acc_len = 0;
-        for (i, line) in self.wrapped_lines.iter().enumerate() {
-            let is_last = i + 1 == self.wrapped_lines.len();
-            if x <= line.width {
-                let mut ix = line.closest_index_for_x(x);
-                if !is_last && ix == line.text.len() {
-                    // For soft wrap line, we can't put the cursor at the end of the line.
-                    let c_len = line.text.chars().last().map(|c| c.len_utf8()).unwrap_or(0);
-                    ix = ix.saturating_sub(c_len);
-                }
-
-                return acc_len + ix;
-            }
-            acc_len += line.text.len();
-        }
-
-        acc_len
+        self.wrapped_lines
+            .iter()
+            .find(|line| x <= line.shaped.width)
+            .map_or(self.len, |line| self.closest_in_line(line, x))
     }
 
-    /// Get the index for the given position (x, y) in this line layout.
-    ///
-    /// The `pos` is relative to the top-left corner of this line layout, start from (0, 0)
-    /// The return value is a local byte index in this line layout, start from 0.
+    fn closest_in_line(&self, line: &WrappedLine, x: Pixels) -> usize {
+        let mut index = line.shaped.closest_index_for_x(x);
+        if line.row + 1 < self.rows && index == line.range.len() {
+            index = index.saturating_sub(line.shaped.text.chars().last().map_or(0, char::len_utf8));
+        }
+        line.range.start + index
+    }
+
     pub(super) fn closest_index_for_position(
         &self,
         pos: Point<Pixels>,
         line_height: Pixels,
     ) -> Option<usize> {
-        let mut offset = 0;
-        let mut line_top = px(0.);
-        for (i, line) in self.wrapped_lines.iter().enumerate() {
-            let is_last = i + 1 == self.wrapped_lines.len();
-            let line_bottom = line_top + line_height;
-            if pos.y >= line_top && pos.y < line_bottom {
-                let mut ix = line.closest_index_for_x(pos.x);
-                if !is_last && ix == line.text.len() {
-                    // For soft wrap line, we can't put the cursor at the end of the line.
-                    let c_len = line.text.chars().last().map(|c| c.len_utf8()).unwrap_or(0);
-                    ix = ix.saturating_sub(c_len);
-                }
-                return Some(offset + ix);
-            }
-
-            offset += line.text.len();
-            line_top = line_bottom;
-        }
-
-        None
+        self.wrapped_lines
+            .iter()
+            .find(|line| pos.y >= line.row * line_height && pos.y < (line.row + 1) * line_height)
+            .map(|line| self.closest_in_line(line, pos.x))
     }
 
     pub(super) fn index_for_position(
@@ -459,24 +454,15 @@ impl LineLayout {
         pos: Point<Pixels>,
         line_height: Pixels,
     ) -> Option<usize> {
-        let mut offset = 0;
-        let mut line_top = px(0.);
-        for line in self.wrapped_lines.iter() {
-            let line_bottom = line_top + line_height;
-            if pos.y >= line_top && pos.y < line_bottom {
-                let ix = line.index_for_x(pos.x)?;
-                return Some(offset + ix);
-            }
-
-            offset += line.text.len();
-            line_top = line_bottom;
-        }
-
-        None
+        let line = self
+            .wrapped_lines
+            .iter()
+            .find(|line| pos.y >= line.row * line_height && pos.y < (line.row + 1) * line_height)?;
+        Some(line.range.start + line.shaped.index_for_x(pos.x)?)
     }
 
     pub(super) fn size(&self, line_height: Pixels) -> Size<Pixels> {
-        size(self.longest_width, self.wrapped_lines.len() * line_height)
+        size(self.longest_width, self.rows * line_height)
     }
 
     pub(super) fn paint(
@@ -486,9 +472,9 @@ impl LineLayout {
         window: &mut Window,
         cx: &mut App,
     ) {
-        for (ix, line) in self.wrapped_lines.iter().enumerate() {
-            _ = line.paint(
-                pos + point(px(0.), ix * line_height),
+        for line in &self.wrapped_lines {
+            _ = line.shaped.paint(
+                pos + point(px(0.), line.row * line_height),
                 line_height,
                 window,
                 cx,
@@ -501,6 +487,48 @@ impl LineLayout {
 mod tests {
     use super::*;
     use gpui::{Boundary, FontFeatures, FontStyle, FontWeight, px};
+
+    #[test]
+    fn sparse_layout_retains_offscreen_geometry_and_byte_offsets() {
+        let mut layout = LineLayout::new();
+        let mut shaped = ShapedLine::default().with_len(6);
+        shaped.text = "a🌱b".into();
+        layout.set_visible_lines(
+            1206,
+            201,
+            smallvec::smallvec![
+                WrappedLine {
+                    row: 100,
+                    range: 600..606,
+                    shaped: shaped.clone()
+                },
+                WrappedLine {
+                    row: 200,
+                    range: 1200..1206,
+                    shaped
+                },
+            ],
+        );
+        assert_eq!(layout.len(), 1206);
+        assert_eq!(layout.size(px(20.)).height, px(4020.));
+        assert_eq!(
+            layout.position_for_index(602, px(20.)).unwrap().y,
+            px(2000.)
+        );
+        assert_eq!(
+            layout.position_for_index(1206, px(20.)).unwrap().y,
+            px(4000.)
+        );
+        assert_eq!(layout.position_for_index(606, px(20.)), None);
+        assert_eq!(
+            layout.closest_index_for_position(point(px(0.), px(100.)), px(20.)),
+            None
+        );
+        assert_eq!(
+            layout.closest_index_for_position(point(px(100.), px(2000.)), px(20.)),
+            Some(605)
+        );
+    }
 
     #[test]
     fn test_update() {
@@ -728,22 +756,22 @@ mod tests {
         wrapper.lines = vec![
             // range: 0..15
             LineItem {
-                line: Rope::from("Hello, 世界!\r"),
+                length: "Hello, 世界!\r".len(),
                 wrapped_lines: vec![0..15],
             },
             // range: 16..36
             LineItem {
-                line: Rope::from("This is second line."),
+                length: "This is second line.".len(),
                 wrapped_lines: vec![0..10, 10..20],
             },
             // range: 37..56
             LineItem {
-                line: Rope::from("This is third line."),
+                length: "This is third line.".len(),
                 wrapped_lines: vec![0..9, 9..15, 15..20],
             },
             // range: 57..79
             LineItem {
-                line: Rope::from("这里是第 4 行。"),
+                length: "这里是第 4 行。".len(),
                 wrapped_lines: vec![0..22],
             },
         ];
