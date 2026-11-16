@@ -835,7 +835,7 @@ impl Shell {
     fn add_document(
         &mut self,
         disk: DiskFile,
-        text: String,
+        text: impl Into<SharedString>,
         intent: OpenIntent,
         activate: bool,
         window: &mut Window,
@@ -932,7 +932,7 @@ impl Shell {
                         storage::Draft {
                             path: doc.disk.path.clone(),
                             target: Some(doc.disk.target.clone()),
-                            text: doc.input.read(cx).value().to_string(),
+                            text: doc.input.read(cx).value().into(),
                             base: doc.disk.bytes.clone(),
                             generation: doc.generation,
                         },
@@ -1318,7 +1318,7 @@ impl Shell {
                             storage::Draft {
                                 path: doc.disk.path.clone(),
                                 target: Some(doc.disk.target.clone()),
-                                text: doc.input.read(cx).value().to_string(),
+                                text: doc.input.read(cx).value().into(),
                                 base: doc.disk.bytes.clone(),
                                 generation: doc.generation,
                             },
@@ -1401,7 +1401,7 @@ impl Shell {
                                         storage::Draft {
                                             path: doc.disk.path.clone(),
                                             target: Some(doc.disk.target.clone()),
-                                            text: doc.input.read(cx).value().to_string(),
+                                            text: doc.input.read(cx).value().into(),
                                             base: doc.disk.bytes.clone(),
                                             generation: doc.generation,
                                         },
@@ -1486,7 +1486,7 @@ impl Shell {
                                         storage::Draft {
                                             path: doc.disk.path.clone(),
                                             target: Some(doc.disk.target.clone()),
-                                            text: doc.input.read(cx).value().to_string(),
+                                            text: doc.input.read(cx).value().into(),
                                             base: doc.disk.bytes.clone(),
                                             generation: doc.generation,
                                         },
@@ -1761,7 +1761,7 @@ impl Shell {
                                     storage::Draft {
                                         path: doc.disk.path.clone(),
                                         target: Some(doc.disk.target.clone()),
-                                        text: doc.input.read(cx).value().to_string(),
+                                        text: doc.input.read(cx).value().into(),
                                         base: doc.disk.bytes.clone(),
                                         generation: doc.generation,
                                     },
@@ -1995,7 +1995,7 @@ impl Shell {
             self.io.send(Job::Save {
                 id: doc.id,
                 disk: doc.disk.clone(),
-                text: doc.input.read(cx).value().to_string(),
+                text: doc.input.read(cx).value().into(),
                 generation: doc.generation,
                 without_recovery: false,
             });
@@ -2013,7 +2013,7 @@ impl Shell {
         let mut destination = SaveDestination {
             id: doc.id,
             path: PathBuf::new(),
-            text: doc.input.read(cx).value().to_string(),
+            text: doc.input.read(cx).value().into(),
             copy,
             bom: doc.disk.bom,
             generation: doc.generation,
@@ -2359,7 +2359,7 @@ impl Shell {
                                 storage::Draft {
                                     path: doc.disk.path.clone(),
                                     target: Some(doc.disk.target.clone()),
-                                    text: doc.input.read(cx).value().to_string(),
+                                    text: doc.input.read(cx).value().into(),
                                     base: doc.disk.bytes.clone(),
                                     generation: doc.generation,
                                 },

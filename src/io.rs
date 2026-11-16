@@ -542,7 +542,7 @@ impl IoWorker {
                                                 id,
                                                 &storage::Draft {
                                                     path: disk.path.clone(),
-                                                    text: text.clone(),
+                                                    text: text.clone().into(),
                                                     base: disk.bytes.clone(),
                                                     target: Some(disk.target.clone()),
                                                     generation,
@@ -813,7 +813,7 @@ fn reload_document(
             &storage::Draft {
                 path: reload.original.path.clone(),
                 target: Some(reload.original.target.clone()),
-                text: reload.local.clone(),
+                text: reload.local.clone().into(),
                 base: reload.original.bytes.clone(),
                 generation: reload.generation,
             },
@@ -864,7 +864,7 @@ fn save_destination(
             .map_err(|e| format!("Recovery unavailable: {e}"))?;
         let draft = storage::Draft {
             path: destination.original.path.clone(),
-            text: destination.text.clone(),
+            text: destination.text.clone().into(),
             base: destination.original.bytes.clone(),
             target: Some(destination.original.target.clone()),
             generation: destination.generation,
@@ -876,7 +876,7 @@ fn save_destination(
                 destination.id,
                 &storage::Draft {
                     path: destination.path.clone(),
-                    text: destination.text.clone(),
+                    text: destination.text.clone().into(),
                     base: destination
                         .expected
                         .as_ref()
@@ -952,13 +952,16 @@ mod tests {
         candidate.recovery_copy = true;
         let saved =
             save_destination(&candidate, Err("storage unavailable".into()), &results).unwrap();
-        assert_eq!(saved.bytes, "\u{feff}local β\r\n".as_bytes());
+        assert_eq!(saved.bytes.as_ref(), "\u{feff}local β\r\n".as_bytes());
         candidate.expected = Some(saved.clone());
         assert!(save_destination(&candidate, Err("storage unavailable".into()), &results).is_err());
         candidate.expected = None;
         candidate.text = "replacement".into();
         assert!(save_destination(&candidate, Err("storage unavailable".into()), &results).is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), saved.bytes);
+        assert_eq!(
+            std::fs::read(&path).unwrap().as_slice(),
+            saved.bytes.as_ref()
+        );
         candidate.path = root.path().join("not-created.txt");
         candidate.copy = false;
         assert!(save_destination(&candidate, Err("storage unavailable".into()), &results).is_err());
@@ -1031,8 +1034,8 @@ mod tests {
         let path = record(&recovery_root, 7);
         let read =
             || serde_json::from_slice::<storage::Draft>(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(read().base, b"saved snapshot\n");
-        assert_eq!(read().text, "newer local λ\n");
+        assert_eq!(read().base.as_ref(), b"saved snapshot\n");
+        assert_eq!(read().text.as_ref(), "newer local λ\n");
         let (started, paused) = mpsc::channel();
         let (release, hold) = mpsc::channel();
         io.send(Job::HoldMaintenance(started, hold));
@@ -1044,8 +1047,8 @@ mod tests {
         io.send(Job::Recover(7, draft(12, "edit after a later reload\n")));
         release.send(()).unwrap();
         barrier(&io);
-        assert_eq!(read().base, b"original bytes\n");
-        assert_eq!(read().text, "edit after a later reload\n");
+        assert_eq!(read().base.as_ref(), b"original bytes\n");
+        assert_eq!(read().text.as_ref(), "edit after a later reload\n");
         assert_eq!(std::fs::read(&original).unwrap(), b"saved snapshot\n");
     }
 
@@ -1096,27 +1099,27 @@ mod tests {
         let restored = read();
         assert_eq!(restored.path, target);
         assert_eq!(restored.target, Some(target.clone()));
-        assert_eq!(restored.text, "newer local λ\n");
-        assert_eq!(restored.base, b"saved snapshot\n");
+        assert_eq!(restored.text.as_ref(), "newer local λ\n");
+        assert_eq!(restored.base.as_ref(), b"saved snapshot\n");
         io.send(Job::Recover(7, draft(10, "late old-binding edit β\n")));
         io.send(Job::BindingApplied(7, 8, 11));
         barrier(&io);
         let restored = read();
         assert_eq!(restored.path, target);
-        assert_eq!(restored.text, "late old-binding edit β\n");
-        assert_eq!(restored.base, b"saved snapshot\n");
+        assert_eq!(restored.text.as_ref(), "late old-binding edit β\n");
+        assert_eq!(restored.base.as_ref(), b"saved snapshot\n");
         io.send(Job::Recover(
             7,
             storage::Draft {
                 path: target.clone(),
                 target: Some(target.clone()),
                 text: "new binding edit\n".into(),
-                base: b"fresh observed base\n".to_vec(),
+                base: b"fresh observed base\n".as_slice().into(),
                 generation: 11,
             },
         ));
         barrier(&io);
-        assert_eq!(read().base, b"fresh observed base\n");
+        assert_eq!(read().base.as_ref(), b"fresh observed base\n");
         assert_eq!(std::fs::read(&original).unwrap(), b"original bytes\n");
         assert_eq!(std::fs::read(&target).unwrap(), b"saved snapshot\n");
     }
@@ -1153,8 +1156,9 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<storage::Draft>(&std::fs::read(&record).unwrap())
                 .unwrap()
-                .text,
-            reload.local
+                .text
+                .as_ref(),
+            reload.local.as_str()
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "later version\n");
         std::fs::write(&path, &reload.disk.bytes).unwrap();
@@ -1163,8 +1167,11 @@ mod tests {
         let retained: storage::Draft =
             serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
         assert_eq!(retained.generation, 9);
-        assert_eq!(retained.text, "newer local edit\n");
-        assert_eq!(std::fs::read(&path).unwrap(), reload.disk.bytes);
+        assert_eq!(retained.text.as_ref(), "newer local edit\n");
+        assert_eq!(
+            std::fs::read(&path).unwrap().as_slice(),
+            reload.disk.bytes.as_ref()
+        );
         assert!(
             storage::inventory(&root.path().join("recovery"))
                 .unwrap()
@@ -1185,7 +1192,7 @@ mod tests {
             path: original.clone(),
             target: Some(original.clone()),
             text: "local β\r\n".into(),
-            base: std::fs::read(&original).unwrap(),
+            base: std::fs::read(&original).unwrap().into(),
             generation: 7,
         };
         source.write(41, &draft).unwrap();
@@ -1229,7 +1236,10 @@ mod tests {
             }
             _ => panic!("draft import failed"),
         }
-        assert_eq!(std::fs::read(&original).unwrap(), draft.base);
+        assert_eq!(
+            std::fs::read(&original).unwrap().as_slice(),
+            draft.base.as_ref()
+        );
     }
 
     #[test]
@@ -1357,7 +1367,7 @@ mod tests {
         storage::Draft {
             path: "unbound".into(),
             text: "local".into(),
-            base: vec![],
+            base: Default::default(),
             target: None,
             generation,
         }

@@ -179,7 +179,7 @@ impl Shell {
             storage::Draft {
                 path: doc.disk.path.clone(),
                 target: Some(doc.disk.target.clone()),
-                text: doc.input.read(cx).value().to_string(),
+                text: doc.input.read(cx).value().into(),
                 base: doc.disk.bytes.clone(),
                 generation: doc.generation,
             },

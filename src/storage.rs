@@ -332,9 +332,9 @@ impl Settings {
 pub struct Draft {
     #[serde(with = "native_path")]
     pub path: PathBuf,
-    pub text: String,
+    pub text: std::sync::Arc<str>,
     #[serde(with = "encoded_bytes")]
-    pub base: Vec<u8>,
+    pub base: std::sync::Arc<[u8]>,
     #[serde(
         default,
         serialize_with = "native_path::serialize_optional",
@@ -538,7 +538,8 @@ pub fn restore_snapshot(path: &Path, observed: bool) -> Result<Draft, String> {
             vec![0xef, 0xbb, 0xbf]
         } else {
             Vec::new()
-        };
+        }
+        .into();
         draft.target = None;
         draft.generation = 1;
     }
@@ -828,6 +829,23 @@ impl Drop for Recovery {
 mod tests {
     use super::*;
     #[test]
+    fn shared_snapshots_preserve_legacy_recovery_contents() {
+        let record = r#"{"path":"original","text":"local β\r\n","base":[239,187,191,98,97,115,101,13,10],"target":null,"generation":4}"#;
+        let draft: Draft = serde_json::from_str(record).unwrap();
+        assert_eq!(draft.text.as_ref(), "local β\r\n");
+        assert_eq!(draft.base.as_ref(), b"\xef\xbb\xbfbase\r\n");
+        let disk = crate::document::DiskFile::restore(&draft);
+        assert!(std::sync::Arc::ptr_eq(&draft.base, &disk.bytes));
+        assert!(std::sync::Arc::ptr_eq(&disk.bytes, &disk.clone().bytes));
+        let serialized = serde_json::to_value(&draft).unwrap();
+        assert_eq!(serialized["text"], "local β\r\n");
+        assert_eq!(serialized["base"], "77u/YmFzZQ0K");
+        let restored: Draft = serde_json::from_value(serialized).unwrap();
+        assert_eq!(restored.text, draft.text);
+        assert_eq!(restored.base, draft.base);
+    }
+
+    #[test]
     fn malformed_recovery_generations_are_rejected_without_removing_records() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("record.json");
@@ -835,7 +853,7 @@ mod tests {
             let draft = Draft {
                 path: "original".into(),
                 text: "local β".into(),
-                base: vec![],
+                base: Default::default(),
                 target: None,
                 generation,
             };
@@ -910,23 +928,26 @@ mod tests {
         let session = Recovery::new(root.path()).unwrap();
         let mut value = draft(7);
         value.text = "candidate\n".into();
-        value.base = b"\xef\xbb\xbfobserved\r\n".to_vec();
+        value.base = b"\xef\xbb\xbfobserved\r\n".as_slice().into();
         let path = session.checkpoint_version(1, &value).unwrap();
         session.resolved(&path).unwrap();
         let summary = inventory(root.path()).unwrap();
         let path = &summary.records.iter().find(|r| r.history).unwrap().path;
         let observed = restore_snapshot(path, true).unwrap();
-        assert_eq!(observed.text, "observed\r\n");
-        assert_eq!(observed.base, [0xef, 0xbb, 0xbf]);
+        assert_eq!(observed.text.as_ref(), "observed\r\n");
+        assert_eq!(observed.base.as_ref(), [0xef, 0xbb, 0xbf]);
         assert!(observed.target.is_none());
-        assert_eq!(restore_snapshot(path, false).unwrap().text, "candidate\n");
+        assert_eq!(
+            restore_snapshot(path, false).unwrap().text.as_ref(),
+            "candidate\n"
+        );
         assert!(path.exists());
     }
     fn draft(generation: u64) -> Draft {
         Draft {
             path: "missing".into(),
             text: "local 🦀".into(),
-            base: b"disk".to_vec(),
+            base: b"disk".as_slice().into(),
             target: None,
             generation,
         }
@@ -1120,7 +1141,7 @@ mod tests {
         let drafts = Recovery::abandoned(root.path());
         assert_eq!(drafts.len(), 1);
         assert_eq!(drafts[0].1.generation, 42);
-        assert_eq!(drafts[0].1.text, "local 🦀");
+        assert_eq!(drafts[0].1.text.as_ref(), "local 🦀");
     }
     #[test]
     fn import_transfers_once_and_preserves_live_ownership() {
@@ -1226,7 +1247,7 @@ mod encoded_bytes {
     }
     pub fn deserialize<'de, D: serde::Deserializer<'de>>(
         deserializer: D,
-    ) -> Result<Vec<u8>, D::Error> {
+    ) -> Result<std::sync::Arc<[u8]>, D::Error> {
         #[derive(Deserialize)]
         #[serde(untagged)]
         enum Value {
@@ -1234,9 +1255,10 @@ mod encoded_bytes {
             Legacy(Vec<u8>),
         }
         match Value::deserialize(deserializer)? {
-            Value::Legacy(bytes) => Ok(bytes),
+            Value::Legacy(bytes) => Ok(bytes.into()),
             Value::Encoded(value) => base64::engine::general_purpose::STANDARD
                 .decode(value)
+                .map(Into::into)
                 .map_err(serde::de::Error::custom),
         }
     }

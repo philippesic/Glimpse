@@ -14,7 +14,7 @@ type Result<T> = std::result::Result<T, String>;
 pub struct DiskFile {
     pub path: PathBuf,
     pub target: PathBuf,
-    pub bytes: Vec<u8>,
+    pub bytes: std::sync::Arc<[u8]>,
     pub bom: bool,
     identity: (u64, u64),
 }
@@ -65,7 +65,7 @@ impl DiskFile {
         Self {
             path: PathBuf::from("Untitled"),
             target: PathBuf::new(),
-            bytes: Vec::new(),
+            bytes: Default::default(),
             bom: false,
             identity: (0, 0),
         }
@@ -118,7 +118,7 @@ impl DiskFile {
             Self {
                 path,
                 target,
-                bytes,
+                bytes: bytes.into(),
                 bom,
                 identity: identity(&meta),
             },
@@ -184,7 +184,7 @@ impl DiskFile {
         Ok(Self {
             path,
             target,
-            bytes,
+            bytes: bytes.into(),
             bom,
             identity: expected_identity,
         })
@@ -200,7 +200,7 @@ impl DiskFile {
             }
         }
         let (bytes, _) = read_regular(&self.target)?;
-        if bytes != self.bytes {
+        if bytes.as_slice() != self.bytes.as_ref() {
             return Err(
                 "Requested destination bytes changed after the last observed version".into(),
             );
@@ -212,7 +212,7 @@ impl DiskFile {
             return Err("The file's destination changed. Your text is still in this tab.".into());
         }
         let (bytes, meta) = read_regular(&self.target)?;
-        if identity(&meta) != self.identity || bytes != self.bytes {
+        if identity(&meta) != self.identity || bytes.as_slice() != self.bytes.as_ref() {
             return Err(
                 "The file changed on disk. Saving was stopped; your text is still in this tab."
                     .into(),
@@ -242,7 +242,7 @@ impl DiskFile {
         if bytes.len() as u64 > MAX_BYTES {
             return Err("The edited file exceeds the 10 MiB limit.".into());
         }
-        if bytes == self.bytes {
+        if bytes.as_slice() == self.bytes.as_ref() {
             return Ok(self.clone());
         }
         if meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o7000 != 0 {
@@ -313,7 +313,7 @@ impl DiskFile {
             .map_err(|e| e.error.to_string())?;
         let saved_meta = fs::symlink_metadata(&self.target).map_err(|e| e.to_string())?;
         Ok(Self {
-            bytes,
+            bytes: bytes.into(),
             bom,
             identity: identity(&saved_meta),
             ..self.clone()
@@ -362,10 +362,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("new.txt");
         let disk = DiskFile::create(path.clone(), "local β\r\n", true).unwrap();
-        assert_eq!(disk.bytes, "\u{feff}local β\r\n".as_bytes());
+        assert_eq!(disk.bytes.as_ref(), "\u{feff}local β\r\n".as_bytes());
         disk.revalidate_paths(std::slice::from_ref(&path)).unwrap();
         assert!(DiskFile::create(path.clone(), "replacement", false).is_err());
-        assert_eq!(fs::read(path).unwrap(), disk.bytes);
+        assert_eq!(fs::read(path).unwrap().as_slice(), disk.bytes.as_ref());
     }
 
     #[test]
