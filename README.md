@@ -16,8 +16,8 @@ CARGO_BUILD_JOBS=4 cargo run --release --locked -- /path/to/folder
 A Wayland or X11 desktop and a Vulkan driver are required on Linux. GPUI file dialogs use the desktop portal; install a portal backend supporting file selection. macOS builds require Apple's Command Line Tools.
 
 ```sh
-cargo fmt --check
-CARGO_BUILD_JOBS=4 cargo clippy --locked --all-targets -- -D warnings
+cargo fmt --all --check
+CARGO_BUILD_JOBS=4 cargo clippy --locked --workspace --all-targets -- -D warnings
 CARGO_BUILD_JOBS=4 cargo test --locked --workspace
 ```
 
@@ -29,7 +29,7 @@ Linux tests require util-linux `unshare` and `mount`, with user and mount namesp
 
 The left pane lists one directory. Click folders to enter them and files to preview them. Double-click keeps a tab; editing pins a preview. Back, Forward and Parent change location.
 
-The path bar’s ancestor buttons navigate directly. Ctrl-L enters a path, Tab completes it, and Escape cancels. Dropping a file opens it; dropping a folder navigates there. Horizontal navigator gestures and Back/Forward mouse buttons traverse history. Ctrl-Shift-E focuses the navigator, and arrow keys and Enter navigate its rows. Ctrl-O opens a native dialog. Unusual names copy in a lossless escaped form that Location can reopen.
+The path bar’s ancestor buttons navigate directly. Ctrl-L selects the location for replacement, Tab completes it, and Escape cancels. Dropping a file opens it; dropping a folder navigates there. Horizontal navigator gestures and Back/Forward mouse buttons traverse history. Ctrl-Shift-E focuses the navigator, and arrow keys and Enter navigate its rows. Ctrl-O opens a native dialog. Unusual names copy in a lossless escaped form that Location can reopen.
 
 Files and Text search recursively under the displayed folder; scope can be pinned independently of location. Search This Folder provides a temporary override. Index This Folder builds a session filename snapshot with visible stale, rebuild and removal controls; text search reads saved files. Results support arrow keys and Enter, and retain coverage and exclusions beside the query.
 
