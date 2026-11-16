@@ -34,7 +34,7 @@ impl Shell {
         if let Some(relocated) = outcome {
             glimpse::metrics::event("external-applied", id, doc.generation);
             doc.passive_refresh = true;
-            doc.saved = text;
+            doc.saved = text.into();
             doc.disk = disk;
             doc.external = None;
             self.status = if relocated {

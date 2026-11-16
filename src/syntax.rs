@@ -211,7 +211,7 @@ impl Syntax {
                                     state.push_str(" · partial highlighting (span limit)");
                                     break;
                                 }
-                                let length = part.encode_utf16().count();
+                                let length = part.len();
                                 spans.push(Span {
                                     start: offset,
                                     length,
@@ -347,16 +347,23 @@ mod tests {
         }
     }
     #[test]
-    fn latest_generation_has_matching_utf16_ranges() {
+    fn latest_generation_has_matching_byte_ranges() {
         let syntax = Syntax::new(wake::Context::default());
         syntax.request(1, 1, "obsolete", std::path::Path::new("x.rs"), true);
-        syntax.request(1, 2, "let 🦀 = 3;\n", std::path::Path::new("x.rs"), true);
+        let text = "let 🦀 = \"café 中文 é\";\r\n";
+        syntax.request(1, 2, text, std::path::Path::new("x.rs"), true);
         let until = Instant::now() + Duration::from_secs(5);
         loop {
             if let Some(result) = syntax.take() {
                 assert_eq!(result.generation, 2);
-                assert_eq!(result.spans.iter().map(|s| s.length).sum::<usize>(), 12);
-                assert_eq!(result.spans.first().unwrap().start, 0);
+                let mut covered = 0;
+                for span in &result.spans {
+                    assert_eq!(span.start, covered);
+                    covered += span.length;
+                    assert!(text.is_char_boundary(span.start));
+                    assert!(text.is_char_boundary(covered));
+                }
+                assert_eq!(covered, text.len());
                 break;
             }
             assert!(Instant::now() < until);

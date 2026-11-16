@@ -166,7 +166,7 @@ impl Shell {
                 doc.failed_destination = None;
                 doc.recovery_error = None;
                 doc.disk = reload.disk;
-                doc.saved = reload.text.clone();
+                doc.saved = reload.text.clone().into();
                 doc.external = None;
                 doc.restored = false;
                 doc.input.update(cx, |input, cx| {

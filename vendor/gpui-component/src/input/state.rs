@@ -2130,8 +2130,10 @@ impl EntityInputHandler for InputState {
         }
         self.text_wrapper
             .update(&self.text, &range, &Rope::from(new_text), cx);
-        self.mode
-            .update_highlighter(&range, &self.text, &new_text, true, cx);
+        if self.external_highlights.is_none() {
+            self.mode
+                .update_highlighter(&range, &self.text, &new_text, true, cx);
+        }
         self.lsp.update(&self.text, window, cx);
         self.selected_range = (new_offset..new_offset).into();
         self.ime_marked_range.take();
@@ -2210,8 +2212,10 @@ impl EntityInputHandler for InputState {
         }
         self.text_wrapper
             .update(&self.text, &range, &Rope::from(new_text), cx);
-        self.mode
-            .update_highlighter(&range, &self.text, &new_text, true, cx);
+        if self.external_highlights.is_none() {
+            self.mode
+                .update_highlighter(&range, &self.text, &new_text, true, cx);
+        }
         self.lsp.update(&self.text, window, cx);
         self.ime_marked_range = Some((range.start..range.start + new_text.len()).into());
         let inserted = Rope::from(new_text);
@@ -2313,8 +2317,10 @@ impl Focusable for InputState {
 impl Render for InputState {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self._pending_update {
-            self.mode
-                .update_highlighter(&(0..0), &self.text, "", false, cx);
+            if self.external_highlights.is_none() {
+                self.mode
+                    .update_highlighter(&(0..0), &self.text, "", false, cx);
+            }
             self.lsp.update(&self.text, window, cx);
             self._pending_update = false;
         }

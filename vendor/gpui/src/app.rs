@@ -757,6 +757,7 @@ impl App {
     }
 
     pub(crate) fn update<R>(&mut self, update: impl FnOnce(&mut Self) -> R) -> R {
+        let _work = crate::work_trace::Span::new("update");
         self.start_update();
         let result = update(self);
         self.finish_update();

@@ -89,7 +89,7 @@ struct Document {
     id: u64,
     disk: DiskFile,
     input: Entity<InputState>,
-    saved: String,
+    saved: SharedString,
     generation: u64,
     preview: bool,
     saving: bool,
@@ -108,7 +108,7 @@ struct Document {
 }
 impl Document {
     fn dirty(&self, cx: &App) -> bool {
-        self.restored || self.input.read(cx).value().as_str() != self.saved
+        self.restored || self.input.read(cx).value().as_str() != self.saved.as_str()
     }
 }
 #[derive(Clone, Copy, PartialEq)]
@@ -289,6 +289,7 @@ impl Shell {
             .unwrap_or_else(|| std::env::home_dir().unwrap());
         let query = cx.new(|cx| {
             let mut input = InputState::new(window, cx).placeholder("Enter a path");
+            input.set_external_highlights(Vec::new(), cx);
             input.set_cursor_blink(false, cx);
             input
         });
@@ -843,6 +844,7 @@ impl Shell {
         let OpenIntent {
             preview, position, ..
         } = intent;
+        let text: SharedString = text.into();
         if activate && self.request.pick {
             self.search_ui.picker_selection = Some(disk.path.clone());
         }
@@ -883,6 +885,7 @@ impl Shell {
                 .line_number(self.settings.line_numbers)
                 .soft_wrap(self.settings.wrap)
                 .default_value(text.clone());
+            input.set_external_highlights(Vec::new(), cx);
             input.set_cursor_blink(false, cx);
             input.set_accessibility_label(format!("Source: {}", paths::display(&disk.path)), cx);
             input.set_tab_size(
@@ -1388,7 +1391,7 @@ impl Shell {
                                     doc.recovery_error = None;
                                 }
                                 doc.disk = disk;
-                                doc.saved = text;
+                                doc.saved = text.into();
                                 doc.restored = false;
                                 doc.external = None;
                                 doc.generation += 1;
@@ -1474,7 +1477,7 @@ impl Shell {
                                     )
                                 });
                                 doc.external = None;
-                                doc.saved = destination.text;
+                                doc.saved = destination.text.into();
                                 doc.restored = false;
                                 doc.generation += 1;
                                 if doc.dirty(cx) {
@@ -1929,23 +1932,21 @@ impl Shell {
                 .iter()
                 .find(|d| d.id == highlight.id && d.generation == highlight.generation)
         {
-            let text = doc.input.read(cx).value();
+            let canvas = theme::canvas(cx);
+            let mut colors = HashMap::new();
             let spans = highlight
                 .spans
                 .into_iter()
                 .map(|span| {
-                    let start = glimpse::editor::utf16_to_byte(&text, span.start);
-                    let end = glimpse::editor::utf16_to_byte(&text, span.start + span.length);
-                    let color = glimpse::syntax::readable_rgb(span.rgb, theme::canvas(cx));
+                    let color = *colors.entry(span.rgb).or_insert_with(|| {
+                        let color = glimpse::syntax::readable_rgb(span.rgb, canvas);
+                        rgb(((color[0] as u32) << 16) | ((color[1] as u32) << 8) | color[2] as u32)
+                            .into()
+                    });
                     (
-                        start..end,
+                        span.start..span.start + span.length,
                         HighlightStyle {
-                            color: Some(
-                                rgb(((color[0] as u32) << 16)
-                                    | ((color[1] as u32) << 8)
-                                    | color[2] as u32)
-                                .into(),
-                            ),
+                            color: Some(color),
                             font_style: span.italic.then_some(FontStyle::Italic),
                             ..Default::default()
                         },
