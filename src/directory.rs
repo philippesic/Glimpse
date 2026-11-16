@@ -87,6 +87,8 @@ impl Directories {
                             }
                         }
                     };
+                    #[cfg(feature = "test-support")]
+                    crate::metrics::delay("DIRECTORY");
                     let listing = match std::fs::read_dir(&request.path) {
                         Ok(value) => value,
                         Err(error) => {

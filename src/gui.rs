@@ -142,6 +142,7 @@ enum DecisionAction {
     FailureDetails(u64),
     Warnings,
     Notice,
+    FolderError,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -188,7 +189,16 @@ struct Shell {
     scrolls: HashMap<PathBuf, UniformListScrollHandle>,
     selection: Option<PathBuf>,
     selections: HashMap<PathBuf, PathBuf>,
-    entries: Vec<Entry>,
+    entries: std::sync::Arc<Vec<Entry>>,
+    entries_revision: u64,
+    visible_key: Option<(u64, String, bool)>,
+    visible_entries: std::sync::Arc<Vec<usize>>,
+    listing_buffer: Vec<Entry>,
+    listing_streaming: bool,
+    listing_error: Option<String>,
+    listing_waiter: Option<Task<()>>,
+    listing_stalled: bool,
+    listing_paused: bool,
     listing_id: u64,
     listing_done: bool,
     filter: String,
@@ -343,7 +353,16 @@ impl Shell {
             scrolls: HashMap::new(),
             selection: None,
             selections: HashMap::new(),
-            entries: vec![],
+            entries: Default::default(),
+            entries_revision: 0,
+            visible_key: None,
+            visible_entries: Default::default(),
+            listing_buffer: vec![],
+            listing_streaming: true,
+            listing_error: None,
+            listing_waiter: None,
+            listing_stalled: false,
+            listing_paused: false,
             listing_id: 0,
             listing_done: false,
             filter: String::new(),
@@ -639,6 +658,7 @@ impl Shell {
                                 _ => this.focus(window, cx),
                             }
                         }
+                        Some(DecisionAction::FolderError) if choice.0 == 1 => this.refresh(),
                         Some(DecisionAction::Warnings) => match choice.0 {
                             1 => this.panel(Panel::Recovery, window, cx),
                             2 => {
@@ -680,10 +700,52 @@ impl Shell {
             self.io.send(Job::Check(id, doc.disk.path.clone(), token));
         }
     }
+    fn visible_rows(&mut self) -> std::sync::Arc<Vec<usize>> {
+        let key = (
+            self.entries_revision,
+            self.filter.to_lowercase(),
+            self.settings.show_hidden,
+        );
+        if self.visible_key.as_ref() != Some(&key) {
+            self.visible_entries = std::sync::Arc::new(
+                self.entries
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, entry)| {
+                        let name = paths::name(&entry.path);
+                        ((self.settings.show_hidden
+                            || !entry
+                                .path
+                                .file_name()
+                                .is_some_and(|name| name.as_encoded_bytes().starts_with(b".")))
+                            && name.to_lowercase().contains(&key.1))
+                        .then_some(i)
+                    })
+                    .collect(),
+            );
+            self.visible_key = Some(key);
+        }
+        self.visible_entries.clone()
+    }
     fn refresh(&mut self) {
-        self.entries.clear();
+        self.listing_buffer.clear();
+        self.listing_streaming =
+            self.entries.is_empty() && !self.scrolls.contains_key(&self.current);
         self.listing_done = false;
-        self.listing_id = self.directories.request(self.current.clone()).unwrap_or(0);
+        self.listing_error = None;
+        self.listing_waiter = None;
+        self.listing_stalled = false;
+        self.listing_paused = false;
+        self.directories.retain(std::slice::from_ref(&self.current));
+        match self.directories.request(self.current.clone()) {
+            Ok(id) => self.listing_id = id,
+            Err(error) => {
+                self.listing_id = 0;
+                self.listing_done = true;
+                self.startup_failed |= !self.ready;
+                self.listing_error = Some(error);
+            }
+        }
         self.watch();
     }
     fn navigate(&mut self, path: PathBuf) {
@@ -701,6 +763,8 @@ impl Shell {
         self.path_completions = None;
         self.path_completion_token += 1;
         self.io.cancel_previews(self.open_token + 1);
+        self.entries = Default::default();
+        self.entries_revision += 1;
         self.current = path;
         self.selection = self.selections.get(&self.current).cloned();
         self.filter.clear();
@@ -714,7 +778,10 @@ impl Shell {
             .filter(|path| {
                 path.parent() == Some(self.current.as_path())
                     && self.entries.iter().any(|entry| entry.path == **path)
-                    && (self.settings.show_hidden || !paths::name(path).starts_with('.'))
+                    && (self.settings.show_hidden
+                        || !path
+                            .file_name()
+                            .is_some_and(|name| name.as_encoded_bytes().starts_with(b".")))
                     && paths::name(path)
                         .to_lowercase()
                         .contains(&self.filter.to_lowercase())
@@ -1080,19 +1147,34 @@ impl Shell {
         let protected_focus = (self.preferences.is_some() || self.decision.is_some())
             .then(|| window.focused(cx))
             .flatten();
+        let mut listing_changed = false;
         while let Ok(batch) = self.directories.replies.try_recv() {
             if batch.path == self.current && batch.generation == self.listing_id {
-                self.entries.extend(batch.entries);
-                self.entries.sort_by(|a, b| {
-                    b.directory
-                        .cmp(&a.directory)
-                        .then_with(|| a.path.cmp(&b.path))
-                });
+                self.listing_buffer.extend(batch.entries);
+                listing_changed = true;
                 self.listing_done = batch.done;
                 if let Some(error) = batch.error {
                     self.startup_failed |= !self.ready;
-                    self.status = error;
+                    self.listing_error = Some(error);
                 }
+            }
+        }
+        if listing_changed && (self.listing_streaming || self.listing_done) {
+            self.listing_buffer.sort_by(|a, b| {
+                b.directory
+                    .cmp(&a.directory)
+                    .then_with(|| a.path.cmp(&b.path))
+            });
+            if self.listing_error.is_none()
+                || !self.listing_buffer.is_empty()
+                || self.entries.is_empty()
+            {
+                self.entries = std::sync::Arc::new(if self.listing_done {
+                    std::mem::take(&mut self.listing_buffer)
+                } else {
+                    self.listing_buffer.clone()
+                });
+                self.entries_revision += 1;
             }
         }
         while let Ok(reply) = self.io.replies.try_recv() {
@@ -1726,7 +1808,9 @@ impl Shell {
                     for id in ids {
                         self.check_document(id);
                     }
-                    self.refresh();
+                    if !self.listing_paused {
+                        self.refresh();
+                    }
                 }
                 Err(e) => self.status = e,
             }
@@ -2062,6 +2146,7 @@ impl Shell {
     }
 
     fn command(&mut self, command: &str, window: &mut Window, cx: &mut Context<Self>) {
+        glimpse::metrics::event(command, self.active.unwrap_or(0), 0);
         if self.request.pick
             && matches!(
                 command,
@@ -2302,6 +2387,22 @@ impl Shell {
                 }
             }
             "refresh" => self.refresh(),
+            "stop-listing" => {
+                self.listing_paused = true;
+                self.directories.retain(&[]);
+                self.listing_id = 0;
+                self.listing_done = true;
+                self.listing_waiter = None;
+                self.listing_buffer.clear();
+                self.listing_error =
+                    Some("Folder reading was cancelled. Refresh to read again.".into());
+                self.startup_failed |= !self.ready;
+            }
+            "folder-error" => {
+                if let Some(error) = &self.listing_error {
+                    self.ask_decision(DecisionAction::FolderError, "Folder listing incomplete".into(), format!("Folder: {}\n{error}\nListed entries may be incomplete or from a previous refresh. Retry reads this folder again.", paths::display(&self.current)), vec!["Close", "Retry"], window, cx);
+                }
+            }
             "refresh-volumes" => {
                 self.io.send(Job::Volumes);
                 self.status = "Refreshing mounted folders; reopen Locations for the result".into();
@@ -2465,6 +2566,18 @@ impl Render for Shell {
                 })
             });
             window.request_animation_frame();
+        }
+        if !self.listing_done && self.listing_waiter.is_none() {
+            let id = self.listing_id;
+            self.listing_waiter = Some(cx.spawn(async move |this, cx| {
+                Timer::after(std::time::Duration::from_secs(1)).await;
+                let _ = this.update(cx, |this, cx| {
+                    if !this.listing_done && this.listing_id == id {
+                        this.listing_stalled = true;
+                        cx.notify();
+                    }
+                });
+            }));
         }
         let narrow = self.narrow(window);
         let mut toolbar = div()
@@ -2690,16 +2803,8 @@ impl Render for Shell {
             );
         }
 
-        let query = self.filter.to_lowercase();
-        let visible: Vec<_> = self
-            .entries
-            .iter()
-            .filter(|entry| {
-                (self.settings.show_hidden || !paths::name(&entry.path).starts_with('.'))
-                    && paths::name(&entry.path).to_lowercase().contains(&query)
-            })
-            .cloned()
-            .collect();
+        let visible = self.visible_rows();
+        let entries = self.entries.clone();
         let scroll = self
             .scrolls
             .entry(self.current.clone())
@@ -2711,6 +2816,8 @@ impl Render for Shell {
             .w_full()
             .h_full()
             .bg(cx.theme().sidebar)
+            .flex()
+            .flex_col()
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
                 if this.preferences.is_some() || this.decision.is_some() {
                     return;
@@ -2742,16 +2849,38 @@ impl Render for Shell {
                 MouseButton::Left,
                 cx.listener(|this, _, window, _| window.focus(&this.nav_focus)),
             )
-            .child(
+            .when(!self.listing_done || self.listing_error.is_some() || visible.is_empty(), |navigator| {
+                let message = if let Some(error) = &self.listing_error {
+                    format!("Folder unavailable or partial: {error}. Existing rows may be from the previous refresh.")
+                } else if self.listing_stalled {
+                    "Still reading this folder. You can stop, navigate elsewhere or keep editing.".into()
+                } else if !self.listing_done {
+                    if self.entries.is_empty() { "Loading folder…".into() } else { "Refreshing folder…".into() }
+                } else if self.entries.is_empty() {
+                    "This folder is empty".into()
+                } else {
+                    "No filenames match the filter".into()
+                };
+                navigator.child(
+                    div().p_2().text_sm()
+                        .child(div().id("listing-state").truncate().child(message.clone())
+                            .tooltip(move |window,cx| gpui_component::tooltip::Tooltip::new(message.clone()).build(window,cx)))
+                        .child(self.button("Refresh", "refresh", cx))
+                        .when(!self.listing_done, |row| row.child(self.button("Stop Reading", "stop-listing", cx)))
+                        .when(self.listing_error.is_some(), |row| row.child(self.button("Details…", "folder-error", cx)))
+                )
+            })
+            .when(!visible.is_empty(), |navigator| navigator.child(
                 uniform_list(
                     "entries",
                     visible.len(),
                     cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
                         range
                             .map(|i| {
-                                let entry = &visible[i];
+                                let entry = &entries[visible[i]];
                                 let path = entry.path.clone();
                                 let selected = this.selection.as_ref() == Some(&path);
+                                let tooltip = paths::display(&path);
                                 div()
                                     .id(("entry", i))
                                     .h(px(if this.settings.compact { 28. } else { 32. }
@@ -2763,10 +2892,12 @@ impl Render for Shell {
                                     } else {
                                         cx.theme().sidebar
                                     })
+                                    .truncate()
+                                    .tooltip(move |window,cx| gpui_component::tooltip::Tooltip::new(tooltip.clone()).build(window,cx))
                                     .cursor_pointer()
                                     .child(format!(
                                         "{} {}",
-                                        if entry.directory { "▸" } else { "·" },
+                                        if entry.symlink { "↗" } else if entry.directory { "▸" } else { "·" },
                                         paths::name(&path)
                                     ))
                                     .on_click(cx.listener(
@@ -2780,9 +2911,10 @@ impl Render for Shell {
                             .collect::<Vec<_>>()
                     }),
                 )
-                .h_full()
+                .flex_1()
+                .min_h_0()
                 .track_scroll(scroll),
-            );
+            ));
         let tabs = div()
             .id("tabs")
             .w_full()
@@ -3010,28 +3142,19 @@ impl Render for Shell {
                     && !key.modifiers.control
                     && !key.modifiers.platform
                 {
-                    let query = this.filter.to_lowercase();
-                    let rows: Vec<_> = this
-                        .entries
+                    let visible = this.visible_rows();
+                    let rows = this.entries.clone();
+                    let index = visible
                         .iter()
-                        .filter(|entry| {
-                            (this.settings.show_hidden
-                                || !paths::name(&entry.path).starts_with('.'))
-                                && paths::name(&entry.path).to_lowercase().contains(&query)
-                        })
-                        .cloned()
-                        .collect();
-                    let index = rows
-                        .iter()
-                        .position(|entry| Some(&entry.path) == this.selection.as_ref());
+                        .position(|&i| Some(&rows[i].path) == this.selection.as_ref());
                     match key.key.as_str() {
-                        "up" | "down" if !rows.is_empty() => {
+                        "up" | "down" if !visible.is_empty() => {
                             let next = if key.key == "down" {
-                                index.map_or(0, |i| (i + 1).min(rows.len() - 1))
+                                index.map_or(0, |i| (i + 1).min(visible.len() - 1))
                             } else {
                                 index.unwrap_or(0).saturating_sub(1)
                             };
-                            this.selection = Some(rows[next].path.clone());
+                            this.selection = Some(rows[visible[next]].path.clone());
                             if let Some(scroll) = this.scrolls.get(&this.current) {
                                 scroll.scroll_to_item(next, ScrollStrategy::Top);
                             }
