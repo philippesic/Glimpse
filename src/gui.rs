@@ -101,6 +101,7 @@ struct Shell {
     io: IoWorker,
     directories: directory::Directories,
     observer: observe::Observer,
+    checks: observe::Checks,
     search: search::Search,
     syntax: glimpse::syntax::Syntax,
     search_id: u64,
@@ -193,6 +194,7 @@ impl Shell {
             io,
             directories,
             observer,
+            checks: observe::Checks::default(),
             search,
             syntax,
             current,
@@ -249,6 +251,16 @@ impl Shell {
             }
         }
         self.observer.update(parents);
+    }
+    fn check_document(&mut self, id: u64) {
+        if let Some(doc) = self
+            .documents
+            .iter()
+            .find(|d| d.id == id && !d.saving && !d.disk.target.as_os_str().is_empty())
+        {
+            let token = self.checks.begin(id, doc.generation);
+            self.io.send(Job::Check(id, doc.disk.path.clone(), token));
+        }
     }
     fn refresh(&mut self) {
         self.entries.clear();
@@ -604,12 +616,15 @@ impl Shell {
                             Err(e) => self.status = e,
                         }
                     }
+                    self.check_document(id);
                     if succeeded && self.close_pending.as_ref().is_some_and(|d| d.saving) {
                         self.continue_close(window, cx);
                     }
                 }
                 Reply::SavedTo(destination, result) => {
                     let succeeded = result.is_ok();
+                    let id = destination.id;
+                    self.checks.invalidate(id);
                     self.destination_busy = false;
                     match result {
                         Ok(disk) => {
@@ -618,6 +633,7 @@ impl Shell {
                                     self.documents.iter_mut().find(|d| d.id == destination.id)
                             {
                                 doc.disk = disk;
+                                doc.external = None;
                                 doc.saved = destination.text;
                                 doc.restored = false;
                             }
@@ -644,11 +660,16 @@ impl Shell {
                         self.status = e;
                     }
                 },
-                Reply::Checked(id, generation, result) => {
-                    if let Some(doc) = self
+                Reply::Checked(id, token, result) => {
+                    let generation = self
                         .documents
-                        .iter_mut()
-                        .find(|d| d.id == id && d.generation == generation)
+                        .iter()
+                        .find(|d| d.id == id)
+                        .map(|d| d.generation);
+                    if generation
+                        .is_some_and(|generation| self.checks.accept(id, token, generation))
+                        && let Some(doc) =
+                            self.documents.iter_mut().find(|d| d.id == id && !d.saving)
                     {
                         match result {
                             Ok((disk, text)) if disk.target != doc.disk.target => {
@@ -756,7 +777,7 @@ impl Shell {
                         self.status = "CLI request finished".into();
                     }
                 }
-                Reply::Done(Err(error)) => self.status = error,
+                Reply::Done(Err(error)) | Reply::HistoryWarning(error) => self.status = error,
                 Reply::Changed(result) => match result {
                     Ok(()) => self.refresh(),
                     Err(e) => self.status = e,
@@ -773,11 +794,9 @@ impl Shell {
         if let Some(result) = self.observer.changed() {
             match result {
                 Ok(()) => {
-                    for doc in &self.documents {
-                        if !doc.disk.target.as_os_str().is_empty() {
-                            self.io
-                                .send(Job::Check(doc.id, doc.disk.path.clone(), doc.generation));
-                        }
+                    let ids: Vec<_> = self.documents.iter().map(|doc| doc.id).collect();
+                    for id in ids {
+                        self.check_document(id);
                     }
                     self.refresh();
                 }
@@ -815,7 +834,7 @@ impl Shell {
                 .collect();
             doc.input
                 .update(cx, |input, cx| input.set_external_highlights(spans, cx));
-            self.status = highlight.state;
+            let _ = highlight.state;
         }
         cx.notify();
     }
@@ -843,6 +862,7 @@ impl Shell {
                 return;
             }
             glimpse::metrics::event("save-queued", doc.id, doc.generation);
+            self.checks.invalidate(doc.id);
             doc.saving = true;
             self.io.send(Job::Save {
                 id: doc.id,
@@ -1517,10 +1537,15 @@ impl Render for Shell {
                         rgb(0x222933)
                     })
                     .child(format!(
-                        "{}{}{}",
+                        "{}{}{}{}",
                         paths::name(&doc.disk.path),
                         if doc.dirty(cx) { " •" } else { "" },
-                        if doc.preview { " (preview)" } else { "" }
+                        if doc.preview { " (preview)" } else { "" },
+                        if doc.external.is_some() {
+                            " (conflict)"
+                        } else {
+                            ""
+                        }
                     ))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.active = Some(id);
@@ -1553,6 +1578,13 @@ impl Render for Shell {
             );
         }
         if let Some(doc) = self.documents.iter().find(|d| Some(d.id) == self.active) {
+            if doc.external.is_some() {
+                content = content.child(
+                    div()
+                        .p_2()
+                        .child("Changed on disk. Local text retained; ordinary Save is blocked."),
+                );
+            }
             if self.reading {
                 content = content.child(
                     div()

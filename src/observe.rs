@@ -110,3 +110,56 @@ mod tests {
         assert!(observer.changed().is_none());
     }
 }
+
+#[derive(Default)]
+pub struct Checks {
+    next: u64,
+    pending: std::collections::HashMap<u64, (u64, u64)>,
+}
+impl Checks {
+    pub fn begin(&mut self, id: u64, generation: u64) -> u64 {
+        self.next += 1;
+        self.pending.insert(id, (self.next, generation));
+        self.next
+    }
+    pub fn invalidate(&mut self, id: u64) {
+        self.pending.remove(&id);
+    }
+    pub fn accept(&mut self, id: u64, token: u64, generation: u64) -> bool {
+        if self
+            .pending
+            .get(&id)
+            .is_some_and(|(pending, _)| *pending == token)
+        {
+            self.pending
+                .remove(&id)
+                .is_some_and(|(_, observed)| observed == generation)
+        } else {
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod check_tests {
+    use super::Checks;
+    #[test]
+    fn a_write_invalidates_reads_even_without_a_local_edit() {
+        let mut checks = Checks::default();
+        let old = checks.begin(4, 7);
+        checks.invalidate(4);
+        let after_save = checks.begin(4, 7);
+        assert!(!checks.accept(4, old, 7));
+        assert!(checks.accept(4, after_save, 7));
+        assert!(!checks.accept(4, after_save, 7));
+    }
+    #[test]
+    fn old_reads_and_edited_buffers_cannot_install_observations() {
+        let mut checks = Checks::default();
+        let old = checks.begin(2, 3);
+        let current = checks.begin(2, 3);
+        assert!(!checks.accept(2, old, 3));
+        assert!(!checks.accept(2, current, 4));
+        assert!(!checks.accept(2, current, 3));
+    }
+}
