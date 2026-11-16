@@ -245,6 +245,7 @@ struct Shell {
     recovery_usage: storage::RecoveryUsage,
     records_truncated: bool,
     importing: bool,
+    startup_recovery: Option<recovery::Startup>,
     ready: bool,
     startup_failed: bool,
     requested: Vec<(u64, PathBuf)>,
@@ -333,6 +334,7 @@ impl Shell {
             }
         })
         .detach();
+        let startup_recovery = request.desktop.then(recovery::Startup::new);
         let mut this = Self {
             scope: request.scope.clone(),
             request,
@@ -407,6 +409,7 @@ impl Shell {
             recovery_usage: storage::RecoveryUsage::default(),
             records_truncated: false,
             importing: false,
+            startup_recovery,
             ready: false,
             startup_failed: false,
             requested: vec![],
@@ -427,6 +430,9 @@ impl Shell {
             .push(cx.observe(&this.pane_state, |_, _, cx| cx.notify()));
         this.io.send(Job::LoadSettings);
         this.io.send(Job::Volumes);
+        if this.startup_recovery.is_some() {
+            this.io.send(Job::Inventory);
+        }
         let files = this.request.files.clone();
         for (index, path) in files.into_iter().enumerate() {
             let position = (index == 0).then_some((this.request.line, this.request.column));
@@ -1659,10 +1665,41 @@ impl Shell {
                         self.records_truncated = inventory.records_truncated;
                         self.records = inventory.records;
                         self.status = format!("{} recovery/history records", self.records.len());
+                        if let Some(startup) = &mut self.startup_recovery
+                            && startup.inventory_pending
+                        {
+                            startup.inventory_pending = false;
+                            startup.paths = self
+                                .records
+                                .iter()
+                                .filter(|record| !record.history && !record.candidate)
+                                .map(|record| record.path.clone())
+                                .collect();
+                            if self.records_truncated || self.recovery_usage.partial {
+                                self.warnings.push("Recovery inventory is incomplete. Open Recovery to inspect remaining records after restoration.".into());
+                            }
+                            self.restore_next_startup();
+                        }
                     }
-                    Err(e) => self.status = e,
+                    Err(error) => {
+                        if self
+                            .startup_recovery
+                            .as_ref()
+                            .is_some_and(|startup| startup.inventory_pending)
+                        {
+                            self.startup_recovery = None;
+                            self.startup_failed = true;
+                            self.warnings.push(format!("Startup recovery could not be read: {error}. Open Recovery to retry."));
+                        }
+                        self.status = error;
+                    }
                 },
                 Reply::Imported(import_id, result) => {
+                    let automatic = self
+                        .startup_recovery
+                        .as_ref()
+                        .is_some_and(|startup| startup.current == Some(import_id));
+                    let activate = !automatic || (self.interaction == 0 && self.active.is_none());
                     self.importing = false;
                     match result {
                         Ok((draft, mut disk)) => {
@@ -1685,7 +1722,7 @@ impl Shell {
                                     position: None,
                                     interaction: self.interaction,
                                 },
-                                true,
+                                activate,
                                 window,
                                 cx,
                             );
@@ -1707,7 +1744,12 @@ impl Shell {
                                     },
                                 ));
                             }
-                            self.panel = None;
+                            if !automatic {
+                                self.panel = None;
+                            }
+                            if automatic && let Some(startup) = &mut self.startup_recovery {
+                                startup.restored += 1;
+                            }
                             self.status = if duplicate {
                                 "Restored a separate copy because the original is already open. Use Save As.".into()
                             } else {
@@ -1716,7 +1758,16 @@ impl Shell {
                             };
                             self.check_document(import_id);
                         }
-                        Err(error) => self.status = error,
+                        Err(error) => {
+                            self.status = error;
+                            if automatic && let Some(startup) = &mut self.startup_recovery {
+                                startup.failed += 1;
+                                self.startup_failed = true;
+                            }
+                        }
+                    }
+                    if automatic {
+                        self.restore_next_startup();
                     }
                     self.io.send(Job::Inventory);
                 }
@@ -2638,7 +2689,11 @@ impl Shell {
 }
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if !self.ready && self.listing_done && self.opening.is_empty() {
+        if !self.ready
+            && self.listing_done
+            && self.opening.is_empty()
+            && self.startup_recovery.is_none()
+        {
             self.ready = true;
             let failed = self.startup_failed;
             window.on_next_frame(move |window, _| {

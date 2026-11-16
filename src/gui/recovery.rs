@@ -1,7 +1,49 @@
 use super::*;
 use gpui_component::Disableable;
 
+pub(super) struct Startup {
+    pub(super) inventory_pending: bool,
+    pub(super) paths: std::collections::VecDeque<PathBuf>,
+    pub(super) current: Option<u64>,
+    pub(super) restored: usize,
+    pub(super) failed: usize,
+}
+impl Startup {
+    pub(super) fn new() -> Self {
+        Self {
+            inventory_pending: true,
+            paths: Default::default(),
+            current: None,
+            restored: 0,
+            failed: 0,
+        }
+    }
+}
 impl Shell {
+    pub(super) fn restore_next_startup(&mut self) {
+        let Some(startup) = &mut self.startup_recovery else {
+            return;
+        };
+        if let Some(path) = startup.paths.pop_front() {
+            let id = self.next_id;
+            self.next_id += 1;
+            startup.current = Some(id);
+            self.importing = true;
+            self.io.send(Job::Import(id, path));
+        } else {
+            let startup = self.startup_recovery.take().unwrap();
+            if startup.failed != 0 {
+                self.warnings.push(format!("{} abandoned drafts could not be restored. Open Recovery to retry. The source records were retained.", startup.failed));
+            }
+            if startup.restored != 0 {
+                self.status = format!(
+                    "Restored {} abandoned drafts. Original files are unchanged.",
+                    startup.restored
+                );
+            }
+        }
+    }
+
     pub(super) fn recovery_view(&self, cx: &Context<Self>) -> impl IntoElement {
         let query = self.query.read(cx).value().to_lowercase();
         div().flex().flex_col().min_h_0()
