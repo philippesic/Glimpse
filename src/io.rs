@@ -15,6 +15,7 @@ pub enum Job {
     Hold(mpsc::Sender<()>, mpsc::Receiver<()>),
     #[cfg(test)]
     HoldMaintenance(mpsc::Sender<()>, mpsc::Receiver<()>),
+    CompletePath(u64, String, PathBuf),
     Visit(PathBuf),
     RecentLocation(Vec<PathBuf>),
     Volumes,
@@ -70,6 +71,7 @@ pub struct SaveDestination {
     pub recovery_copy: bool,
 }
 pub enum Reply {
+    PathCompleted(u64, String, Result<crate::path_completion::Matches, String>),
     RecentLocation(Option<PathBuf>),
     Volumes(Result<crate::locations::Volumes, String>),
     SettingsLoaded(Result<storage::Settings, String>),
@@ -302,6 +304,10 @@ impl IoWorker {
                             continue;
                         }
                         Job::Inventory => Reply::Records(storage::inventory(&root)),
+                        Job::CompletePath(token, value, folder) => {
+                            let result = crate::path_completion::complete(&value, &folder);
+                            Reply::PathCompleted(token, value, result)
+                        }
                         Job::RestoreHistory(id, path) | Job::RestoreObserved(id, path) => {
                             Reply::Imported(
                                 id,
@@ -692,6 +698,7 @@ impl IoWorker {
             #[cfg(test)]
             Job::HoldMaintenance(..) => &self.maintenance,
             Job::Volumes
+            | Job::CompletePath(..)
             | Job::Open(..)
             | Job::Choose(..)
             | Job::Finish(..)
@@ -724,6 +731,9 @@ impl IoWorker {
                 };
                 let message = "I/O queue unavailable. Operation was not queued; retry. Current buffer remains in memory.".to_owned();
                 let reply = match job {
+                    Job::CompletePath(token, value, _) => {
+                        Reply::PathCompleted(token, value, Err(message))
+                    }
                     Job::RecentLocation(_) => Reply::RecentLocation(None),
                     Job::Volumes => Reply::Volumes(Err(message)),
                     Job::Settings(_) => Reply::SettingsSaved(Err(message)),

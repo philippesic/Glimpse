@@ -17,6 +17,7 @@ pub mod metrics;
 #[cfg(test)]
 pub mod navigation;
 pub mod observe;
+pub mod path_completion;
 pub mod paths;
 pub mod picker_state;
 pub mod reservations;

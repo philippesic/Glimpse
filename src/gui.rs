@@ -5,6 +5,7 @@ mod destination;
 mod menus;
 mod modal;
 mod panes;
+mod path;
 mod platform;
 mod preferences;
 mod recovery;
@@ -197,6 +198,8 @@ struct Shell {
     open_token: u64,
     interaction: u64,
     path_request: Option<u64>,
+    path_completion_token: u64,
+    path_completions: Option<path::Completions>,
     opening: HashMap<u64, OpenIntent>,
     hit_versions: HashMap<u64, u64>,
     panel: Option<Panel>,
@@ -270,6 +273,17 @@ impl Shell {
             if matches!(event, InputEvent::PressEnter { .. }) {
                 this.submit(window, cx);
             }
+            if matches!(event, InputEvent::Change) && this.panel == Some(Panel::Path) {
+                if this
+                    .path_completions
+                    .as_ref()
+                    .is_some_and(|c| c.value != this.query.read(cx).value().as_str())
+                {
+                    this.path_completions = None;
+                    this.path_completion_token += 1;
+                }
+                cx.notify();
+            }
             if matches!(event, InputEvent::Change)
                 && matches!(this.panel, Some(Panel::Files | Panel::Text))
             {
@@ -338,6 +352,8 @@ impl Shell {
             open_token: 0,
             interaction: 0,
             path_request: None,
+            path_completion_token: 0,
+            path_completions: None,
             opening: HashMap::new(),
             hit_versions: HashMap::new(),
             panel: None,
@@ -680,6 +696,8 @@ impl Shell {
             self.selections.insert(self.current.clone(), selection);
         }
         self.interaction += 1;
+        self.path_completions = None;
+        self.path_completion_token += 1;
         self.io.cancel_previews(self.open_token + 1);
         self.current = path;
         self.selection = self.selections.get(&self.current).cloned();
@@ -943,6 +961,8 @@ impl Shell {
         }
     }
     fn panel(&mut self, panel: Panel, window: &mut Window, cx: &mut Context<Self>) {
+        self.path_completions = None;
+        self.path_completion_token += 1;
         self.panel = Some(panel);
         let value = if panel == Panel::Path {
             paths::entry(&self.current)
@@ -1075,6 +1095,9 @@ impl Shell {
         }
         while let Ok(reply) = self.io.replies.try_recv() {
             match reply {
+                Reply::PathCompleted(token, value, result) => {
+                    self.path_completed(token, value, result, window, cx)
+                }
                 Reply::Volumes(result) => match result {
                     Ok(volumes) => self.volumes = Some(volumes),
                     Err(error) => self.status = format!("Mounted folders: {error}"),
@@ -1979,6 +2002,19 @@ impl Shell {
         }
     }
     fn shortcut(&mut self, key: &Keystroke, window: &mut Window, cx: &mut Context<Self>) {
+        if self.panel == Some(Panel::Path)
+            && self.preferences.is_none()
+            && self.decision.is_none()
+            && self.query.focus_handle(cx).is_focused(window)
+            && key.key == "tab"
+            && !key.modifiers.control
+            && !key.modifiers.platform
+        {
+            self.complete_path(key.modifiers.shift, window, cx);
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
         if self.decision.is_some()
             || self.preferences.is_some()
             || (!key.modifiers.control && !key.modifiers.platform)
@@ -2481,16 +2517,11 @@ impl Render for Shell {
             .text_color(cx.theme().foreground)
             .text_size(px(14. * self.settings.ui_scale))
             .child(toolbar)
-            .child(
-                div()
-                    .id("location-summary")
-                    .px_2()
-                    .py_1()
-                    .text_size(px(12. * self.settings.ui_scale))
-                    .truncate()
-                    .child(paths::display(&self.current)),
-            );
-        if let Some(panel) = self.panel {
+            .child(self.path_bar(window, cx));
+        if self.panel == Some(Panel::Path) {
+            root = root.child(self.path_matches(cx));
+        }
+        if let Some(panel) = self.panel.filter(|panel| *panel != Panel::Path) {
             let title = match panel {
                 Panel::Path => "Location",
                 Panel::Filter => "Filter this folder",

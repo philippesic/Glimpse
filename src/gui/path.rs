@@ -1,0 +1,168 @@
+use super::*;
+use gpui_component::button::ButtonVariants;
+
+pub(super) struct Completions {
+    pub matches: glimpse::path_completion::Matches,
+    pub value: String,
+    pub next: usize,
+}
+impl Shell {
+    pub(super) fn complete_path(
+        &mut self,
+        reverse: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let value = self.query.read(cx).value().to_string();
+        if let Some(completions) = self.path_completions.as_mut().filter(|c| c.value == value) {
+            let count = completions.matches.choices.len();
+            if count == 0 {
+                return;
+            }
+            let index = if reverse {
+                (completions.next + count * 2 - 2) % count
+            } else {
+                completions.next % count
+            };
+            let entry = completions.matches.choices[index].entry();
+            completions.value = entry.clone();
+            completions.next = (index + 1) % count;
+            self.query
+                .update(cx, |input, cx| input.set_value(entry, window, cx));
+            cx.notify();
+            return;
+        }
+        self.path_completions = None;
+        self.path_completion_token += 1;
+        self.io.send(Job::CompletePath(
+            self.path_completion_token,
+            value,
+            self.current.clone(),
+        ));
+        self.status = "Completing this path…".into();
+    }
+    pub(super) fn path_completed(
+        &mut self,
+        token: u64,
+        value: String,
+        result: Result<glimpse::path_completion::Matches, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if token != self.path_completion_token
+            || self.panel != Some(Panel::Path)
+            || self.query.read(cx).value().as_str() != value
+            || !self.query.focus_handle(cx).is_focused(window)
+        {
+            return;
+        }
+        match result {
+            Ok(matches) => {
+                let count = matches.choices.len();
+                self.status = if count == 0 {
+                    "No matching paths".into()
+                } else if matches.partial {
+                    "Partial path completions — narrow the name to see more".into()
+                } else {
+                    format!("{count} path completions · Tab / Shift-Tab cycles; Enter opens")
+                };
+                self.path_completions = Some(Completions {
+                    matches,
+                    value,
+                    next: 0,
+                });
+                self.complete_path(false, window, cx);
+            }
+            Err(error) => self.status = format!("Path completion failed: {error}"),
+        }
+    }
+    pub(super) fn path_bar(&self, _window: &mut Window, cx: &Context<Self>) -> AnyElement {
+        if self.panel == Some(Panel::Path) {
+            return div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .p_2()
+                .child(Input::new(&self.query).flex_1().min_w_0())
+                .child(self.button("Go", "submit", cx))
+                .child(self.button("Cancel", "dismiss", cx))
+                .into_any_element();
+        }
+        let mut ancestors: Vec<_> = self
+            .current
+            .ancestors()
+            .map(|path| path.to_owned())
+            .collect();
+        ancestors.reverse();
+        div()
+            .id("breadcrumbs")
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .overflow_x_scroll()
+            .children(ancestors.into_iter().enumerate().map(|(i, path)| {
+                let label = paths::name(&path);
+                Button::new(("crumb", i))
+                    .label(label)
+                    .tooltip(paths::display(&path))
+                    .small()
+                    .compact()
+                    .ghost()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.navigate(path.clone());
+                        this.navigation_only = true;
+                        window.focus(&this.nav_focus);
+                        cx.notify();
+                    }))
+            }))
+            .child(
+                self.command_button("edit-location", "…", "path", cx)
+                    .tooltip("Edit path"),
+            )
+            .into_any_element()
+    }
+    pub(super) fn path_matches(&self, cx: &Context<Self>) -> AnyElement {
+        let current = self.query.read(cx).value();
+        let Some(completions) = self
+            .path_completions
+            .as_ref()
+            .filter(|c| c.value == current.as_str())
+        else {
+            return div().into_any_element();
+        };
+        div()
+            .id("path-completions")
+            .max_h(px(160.))
+            .overflow_y_scroll()
+            .px_2()
+            .children(
+                completions
+                    .matches
+                    .choices
+                    .iter()
+                    .enumerate()
+                    .map(|(i, choice)| {
+                        let entry = choice.entry();
+                        Button::new(("path-match", i))
+                            .label(format!(
+                                "{}{}",
+                                paths::name(&choice.path),
+                                if choice.directory { "/" } else { "" }
+                            ))
+                            .small()
+                            .ghost()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.path_completions = None;
+                                this.query.update(cx, |input, cx| {
+                                    input.set_value(entry.clone(), window, cx);
+                                    input.focus(window, cx);
+                                });
+                                cx.notify();
+                            }))
+                    }),
+            )
+            .into_any_element()
+    }
+}
