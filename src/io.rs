@@ -210,6 +210,10 @@ impl IoWorker {
             thread::spawn(move || {
                 let rx = Requests(requests);
                 while let Ok(job) = rx.recv() {
+                    #[cfg(feature = "test-support")]
+                    if matches!(&job, Job::Open(..)) {
+                        crate::metrics::delay("OPEN");
+                    }
                     let updates = if maintenance {
                         std::mem::take(&mut *pending_drafts.lock().unwrap())
                     } else {

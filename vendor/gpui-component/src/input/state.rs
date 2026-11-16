@@ -837,12 +837,18 @@ impl InputState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let position: Position = position.into();
-        let offset = self.text.position_to_offset(&position);
+        self.set_cursor_position_unfocused(position, cx);
+        self.focus(window, cx);
+    }
 
+    pub fn set_cursor_position_unfocused(
+        &mut self,
+        position: impl Into<Position>,
+        cx: &mut Context<Self>,
+    ) {
+        let offset = self.text.position_to_offset(&position.into());
         self.move_to(offset, None, cx);
         self.update_preferred_column();
-        self.focus(window, cx);
     }
 
     /// Focus the input field.

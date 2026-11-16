@@ -119,6 +119,7 @@ enum Panel {
 struct OpenIntent {
     preview: bool,
     position: Option<(usize, usize)>,
+    interaction: u64,
 }
 struct CloseDecision {
     quit: bool,
@@ -194,6 +195,7 @@ struct Shell {
     tab_scroll: ScrollHandle,
     next_id: u64,
     open_token: u64,
+    interaction: u64,
     path_request: Option<u64>,
     opening: HashMap<u64, OpenIntent>,
     hit_versions: HashMap<u64, u64>,
@@ -290,6 +292,7 @@ impl Shell {
         let shortcut_subscription = cx.intercept_keystrokes(move |event, window, cx| {
             if window.window_handle() == shortcut_window {
                 let _ = shortcut_view.update(cx, |this: &mut Self, cx| {
+                    this.interaction += 1;
                     this.shortcut(&event.keystroke, window, cx)
                 });
             }
@@ -333,6 +336,7 @@ impl Shell {
             tab_scroll: ScrollHandle::new(),
             next_id: 1,
             open_token: 0,
+            interaction: 0,
             path_request: None,
             opening: HashMap::new(),
             hit_versions: HashMap::new(),
@@ -675,6 +679,8 @@ impl Shell {
         if let Some(selection) = self.selection.take() {
             self.selections.insert(self.current.clone(), selection);
         }
+        self.interaction += 1;
+        self.io.cancel_previews(self.open_token + 1);
         self.current = path;
         self.selection = self.selections.get(&self.current).cloned();
         self.filter.clear();
@@ -706,20 +712,29 @@ impl Shell {
             return None;
         }
         self.open_token += 1;
-        self.opening
-            .insert(self.open_token, OpenIntent { preview, position });
-        self.io.send(Job::Open(path, self.open_token, false));
+        self.opening.insert(
+            self.open_token,
+            OpenIntent {
+                preview,
+                position,
+                interaction: self.interaction,
+            },
+        );
+        self.io.send(Job::Open(path, self.open_token, preview));
         Some(self.open_token)
     }
     fn add_document(
         &mut self,
         disk: DiskFile,
         text: String,
-        preview: bool,
-        position: Option<(usize, usize)>,
+        intent: OpenIntent,
+        activate: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let OpenIntent {
+            preview, position, ..
+        } = intent;
         if !disk.target.as_os_str().is_empty()
             && let Some(parent) = disk.path.parent()
         {
@@ -735,12 +750,14 @@ impl Shell {
                 self.requested.push((doc.id, disk.path.clone()));
             }
             let id = doc.id;
-            self.active = Some(id);
-            self.navigation_only = false;
-            if let Some(position) = position {
-                self.position_document(id, position, window, cx);
-            } else {
-                self.focus(window, cx);
+            if activate {
+                self.active = Some(id);
+                self.navigation_only = false;
+                if let Some(position) = position {
+                    self.position_document(id, position, true, window, cx);
+                } else {
+                    self.focus(window, cx);
+                }
             }
             return;
         }
@@ -852,16 +869,22 @@ impl Shell {
             &disk_path(&self.documents, id),
             cx.theme().is_dark(),
         );
-        self.active = Some(id);
-        self.reading = false;
-        self.navigation_only = false;
         self.watch();
-        self.position_document(id, position.unwrap_or((1, 1)), window, cx);
+        if activate {
+            self.active = Some(id);
+            self.reading = false;
+            self.navigation_only = false;
+        }
+        if activate || position.is_some() {
+            self.position_document(id, position.unwrap_or((1, 1)), activate, window, cx);
+        }
     }
+
     fn position_document(
         &mut self,
         id: u64,
         (line, column): (usize, usize),
+        focus: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -888,7 +911,10 @@ impl Shell {
             .encode_utf16()
             .count() as u32;
         input.update(cx, |input, cx| {
-            input.set_cursor_position(Position::new(row, column), window, cx)
+            input.set_cursor_position_unfocused(Position::new(row, column), cx);
+            if focus {
+                input.focus(window, cx);
+            }
         });
         if clamped {
             self.status = "Requested position clamped to a text boundary".into();
@@ -1053,19 +1079,39 @@ impl Shell {
                     Ok(volumes) => self.volumes = Some(volumes),
                     Err(error) => self.status = format!("Mounted folders: {error}"),
                 },
-                Reply::OpenDirectory(path, token)
-                    if self.opening.remove(&token).is_some() && token == self.open_token =>
-                {
-                    if self.path_request == Some(token) {
-                        self.path_request = None;
-                        self.panel = None;
+                Reply::OpenDirectory(path, token) => {
+                    if let Some(intent) = self.opening.remove(&token) {
+                        if !self.ready && self.request.files.contains(&path) {
+                            self.startup_failed = true;
+                            self.status = format!(
+                                "Requested file became a directory: {}",
+                                paths::display(&path)
+                            );
+                        } else if intent.interaction == self.interaction && token == self.open_token
+                        {
+                            if self.path_request == Some(token) {
+                                self.path_request = None;
+                                self.panel = None;
+                            }
+                            self.navigate(path);
+                            self.navigation_only = true;
+                            window.focus(&self.nav_focus);
+                        }
                     }
-                    self.navigate(path);
-                    self.navigation_only = true;
-                    window.focus(&self.nav_focus);
                 }
                 Reply::Open(path, token, result) => {
-                    if let Some(OpenIntent { preview, position }) = self.opening.remove(&token) {
+                    if let Some(OpenIntent {
+                        preview,
+                        position,
+                        interaction,
+                    }) = self.opening.remove(&token)
+                    {
+                        let activate = interaction == self.interaction
+                            && self.preferences.is_none()
+                            && self.decision.is_none();
+                        if preview && (!activate || token != self.open_token) {
+                            continue;
+                        }
                         let from_path = self.path_request == Some(token);
                         if from_path {
                             self.path_request = None;
@@ -1085,16 +1131,27 @@ impl Shell {
                                     self.status = "Search result changed or has unsaved edits. Search again before jumping.".into();
                                     continue;
                                 }
-                                if from_path {
+                                if from_path && activate {
                                     self.panel = None;
                                 }
-                                self.add_document(disk, text, preview, position, window, cx)
+                                self.add_document(
+                                    disk,
+                                    text,
+                                    OpenIntent {
+                                        preview,
+                                        position,
+                                        interaction,
+                                    },
+                                    activate,
+                                    window,
+                                    cx,
+                                )
                             }
                             Err(e) => {
                                 self.startup_failed |=
                                     !self.ready && self.request.files.contains(&path);
                                 self.status = e;
-                                if !from_path {
+                                if !from_path && activate {
                                     self.focus(window, cx);
                                 }
                             }
@@ -1505,7 +1562,18 @@ impl Shell {
                             }
                             let next_id = self.next_id;
                             self.next_id = import_id;
-                            self.add_document(disk, draft.text, false, None, window, cx);
+                            self.add_document(
+                                disk,
+                                draft.text,
+                                OpenIntent {
+                                    preview: false,
+                                    position: None,
+                                    interaction: self.interaction,
+                                },
+                                true,
+                                window,
+                                cx,
+                            );
                             self.next_id = self.next_id.max(next_id);
                             self.requested.retain(|(id, _)| *id != import_id);
                             if let Some(doc) =
@@ -2120,9 +2188,18 @@ impl Shell {
             "recovery-options" => self.recovery_options(window, cx),
             "retry-recovery" => self.retry_recovery(cx),
             "save-unrecovered" => self.ask_unrecovered_save(window, cx),
-            "new" if !self.request.pick => {
-                self.add_document(DiskFile::draft(), String::new(), false, None, window, cx)
-            }
+            "new" if !self.request.pick => self.add_document(
+                DiskFile::draft(),
+                String::new(),
+                OpenIntent {
+                    preview: false,
+                    position: None,
+                    interaction: self.interaction,
+                },
+                true,
+                window,
+                cx,
+            ),
             "open" | "folder" => {
                 let prompt = cx.prompt_for_paths(PathPromptOptions {
                     files: command == "open",
@@ -2397,6 +2474,7 @@ impl Render for Shell {
         let mut root = div()
             .size_full()
             .relative()
+            .capture_any_mouse_down(cx.listener(|this, _, _, _| this.interaction += 1))
             .flex()
             .flex_col()
             .bg(cx.theme().background)
