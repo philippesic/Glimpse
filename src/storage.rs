@@ -630,11 +630,11 @@ impl Recovery {
     }
     pub fn checkpoint(&self, id: u64, draft: &Draft) -> Result<PathBuf, String> {
         self.write(id, draft)?;
-        self.checkpoint_version(draft)
+        self.checkpoint_version(id, draft)
     }
-    pub fn checkpoint_version(&self, draft: &Draft) -> Result<PathBuf, String> {
+    pub fn checkpoint_version(&self, id: u64, draft: &Draft) -> Result<PathBuf, String> {
         let path = self.directory.join(format!(
-            "candidate-{}-{}.json",
+            "candidate-{id}-{}-{}.json",
             draft.generation,
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -655,7 +655,13 @@ impl Recovery {
             self.directory.file_name().unwrap().to_string_lossy(),
             candidate.file_name().unwrap().to_string_lossy()
         ));
-        fs::rename(candidate, destination).map_err(|e| e.to_string())?;
+        match fs::rename(candidate, &destination) {
+            Ok(()) => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && fs::symlink_metadata(&destination).is_ok_and(|meta| meta.is_file()) => {}
+            Err(error) => return Err(error.to_string()),
+        }
         self.prune_history()
     }
     pub fn prune_history(&self) -> Result<(), String> {
@@ -703,6 +709,33 @@ impl Recovery {
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.to_string()),
+        }
+        for (index, entry) in fs::read_dir(&self.directory)
+            .map_err(|error| error.to_string())?
+            .enumerate()
+        {
+            if index >= 100_000 {
+                return Err("Recovery cleanup exceeded its scan limit; records retained".into());
+            }
+            let entry = entry.map_err(|error| error.to_string())?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(candidate) = name
+                .strip_prefix("candidate-")
+                .and_then(|name| name.strip_suffix(".json"))
+            else {
+                continue;
+            };
+            let parts: Vec<_> = candidate.split('-').collect();
+            if parts.len() != 3 || parts[0].parse::<u64>().ok() != Some(id) {
+                continue;
+            }
+            let draft = read_draft(&entry.path())?;
+            if draft.generation <= generation {
+                self.resolved(&entry.path())?;
+            }
         }
         Ok(())
     }
@@ -808,7 +841,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let session = Recovery::new(root.path()).unwrap();
         session.write(1, &draft(2)).unwrap();
-        let candidate = session.checkpoint_version(&draft(3)).unwrap();
+        let candidate = session.checkpoint_version(1, &draft(3)).unwrap();
         let summary = inventory(root.path()).unwrap();
         assert!(summary.records.is_empty());
         assert_eq!(summary.usage.files, 3);
@@ -848,7 +881,7 @@ mod tests {
         let mut value = draft(7);
         value.text = "candidate\n".into();
         value.base = b"\xef\xbb\xbfobserved\r\n".to_vec();
-        let path = session.checkpoint_version(&value).unwrap();
+        let path = session.checkpoint_version(1, &value).unwrap();
         session.resolved(&path).unwrap();
         let summary = inventory(root.path()).unwrap();
         let path = &summary.records.iter().find(|r| r.history).unwrap().path;
@@ -868,6 +901,31 @@ mod tests {
             generation,
         }
     }
+    #[test]
+    fn resolving_a_document_archives_only_its_owned_candidates_through_the_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let recovery = Recovery::new(root.path()).unwrap();
+        let old = recovery.checkpoint(7, &draft(3)).unwrap();
+        let newer = recovery.checkpoint_version(7, &draft(4)).unwrap();
+        let other = recovery.checkpoint_version(8, &draft(2)).unwrap();
+        let legacy = recovery.directory.join("candidate-7-123456789.json");
+        fs::write(&legacy, serde_json::to_vec(&draft(1)).unwrap()).unwrap();
+        recovery.saved(7, 3).unwrap();
+        assert!(!old.exists());
+        assert!(newer.exists());
+        assert!(other.exists());
+        assert!(legacy.exists());
+        recovery.resolved(&old).unwrap();
+        let history = inventory(root.path())
+            .unwrap()
+            .records
+            .into_iter()
+            .find(|record| record.history)
+            .unwrap();
+        assert_eq!(read_draft(&history.path).unwrap().text, draft(3).text);
+        assert_eq!(read_draft(&history.path).unwrap().base, draft(3).base);
+    }
+
     #[test]
     fn saved_generation_cannot_recur_or_remove_a_newer_edit() {
         let root = tempfile::tempdir().unwrap();

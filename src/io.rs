@@ -663,17 +663,20 @@ fn save_destination(
         r.write(destination.id, &draft)
             .map_err(|e| format!("Recovery unavailable: {e}"))?;
         Some(
-            r.checkpoint_version(&storage::Draft {
-                path: destination.path.clone(),
-                text: destination.text.clone(),
-                base: destination
-                    .expected
-                    .as_ref()
-                    .map(|d| d.bytes.clone())
-                    .unwrap_or_default(),
-                target: destination.expected.as_ref().map(|d| d.target.clone()),
-                generation: destination.generation,
-            })
+            r.checkpoint_version(
+                destination.id,
+                &storage::Draft {
+                    path: destination.path.clone(),
+                    text: destination.text.clone(),
+                    base: destination
+                        .expected
+                        .as_ref()
+                        .map(|d| d.bytes.clone())
+                        .unwrap_or_default(),
+                    target: destination.expected.as_ref().map(|d| d.target.clone()),
+                    generation: destination.generation,
+                },
+            )
             .map_err(|e| format!("Recovery unavailable: {e}"))?,
         )
     };
@@ -792,7 +795,7 @@ mod tests {
         };
         source.write(41, &draft).unwrap();
         let record = source.directory.join("41.json");
-        let snapshot = source.checkpoint_version(&draft).unwrap();
+        let snapshot = source.checkpoint_version(41, &draft).unwrap();
         source.resolved(&snapshot).unwrap();
         drop(source);
         let history = storage::inventory(&recovery_root)
