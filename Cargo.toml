@@ -7,6 +7,7 @@ rust-version = "1.95"
 [dependencies]
 gpui = "=0.2.2"
 gpui-component = "=0.5.1"
+gpui-component-assets = "=0.5.1"
 trash = "5.2"
 xattr = "1.6"
 async-channel = "2"

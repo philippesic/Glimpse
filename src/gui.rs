@@ -14,31 +14,52 @@ use gpui_component::{
 use std::{collections::HashMap, path::PathBuf};
 
 pub fn run(request: cli::Request) {
-    Application::new().run(move |cx| {
-        gpui_component::init(cx);
-        gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
-        let bounds = Bounds::centered(None, size(px(1280.), px(844.)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                ..Default::default()
-            },
-            move |window, cx| {
-                let view = cx.new(|cx| Shell::new(request, window, cx));
-                let weak = view.downgrade();
-                window.on_window_should_close(cx, move |window, cx| {
-                    weak.update(cx, |shell, cx| {
-                        shell.close(true, window, cx);
-                        false
-                    })
-                    .unwrap_or(true)
-                });
-                cx.new(|cx| Root::new(view, window, cx))
-            },
-        )
-        .expect("Cannot open GPUI window");
-        cx.activate(true);
-    });
+    Application::new()
+        .with_assets(gpui_component_assets::Assets)
+        .run(move |cx| {
+            gpui_component::init(cx);
+            #[cfg(target_os = "linux")]
+            cx.bind_keys([
+                KeyBinding::new(
+                    "ctrl-home",
+                    gpui_component::input::MoveToStart,
+                    Some("Input"),
+                ),
+                KeyBinding::new("ctrl-end", gpui_component::input::MoveToEnd, Some("Input")),
+                KeyBinding::new(
+                    "ctrl-shift-home",
+                    gpui_component::input::SelectToStart,
+                    Some("Input"),
+                ),
+                KeyBinding::new(
+                    "ctrl-shift-end",
+                    gpui_component::input::SelectToEnd,
+                    Some("Input"),
+                ),
+            ]);
+            gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+            let bounds = Bounds::centered(None, size(px(1280.), px(844.)), cx);
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    ..Default::default()
+                },
+                move |window, cx| {
+                    let view = cx.new(|cx| Shell::new(request, window, cx));
+                    let weak = view.downgrade();
+                    window.on_window_should_close(cx, move |window, cx| {
+                        weak.update(cx, |shell, cx| {
+                            shell.close(true, window, cx);
+                            false
+                        })
+                        .unwrap_or(true)
+                    });
+                    cx.new(|cx| Root::new(view, window, cx))
+                },
+            )
+            .expect("Cannot open GPUI window");
+            cx.activate(true);
+        });
 }
 struct Document {
     id: u64,
