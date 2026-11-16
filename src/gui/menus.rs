@@ -172,6 +172,12 @@ impl Shell {
                         &[
                             "find-files",
                             "find-text",
+                            "search-here",
+                            "index-folder",
+                            "remove-index",
+                            "search-details",
+                            "stop-search",
+                            "focus-results",
                             "read",
                             "wrap",
                             "recovery",

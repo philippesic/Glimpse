@@ -25,6 +25,7 @@ pub struct ResultSet {
     pub generation: u64,
     pub hits: Vec<Hit>,
     pub state: String,
+    pub completed: bool,
 }
 #[derive(Clone, PartialEq, Eq)]
 pub struct Filters {
@@ -63,6 +64,53 @@ pub fn fingerprint(bytes: &[u8]) -> u64 {
     let mut hash = DefaultHasher::new();
     bytes.hash(&mut hash);
     hash.finish()
+}
+pub fn highlight_ranges(value: &str, query: &str) -> Vec<std::ops::Range<usize>> {
+    let chars: Vec<_> = value
+        .char_indices()
+        .flat_map(|(start, c)| {
+            c.to_lowercase()
+                .map(move |lower| (start, start + c.len_utf8(), lower))
+        })
+        .collect();
+    let mut position = 0;
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    for expected in query.chars().flat_map(char::to_lowercase) {
+        let Some(offset) = chars[position..]
+            .iter()
+            .position(|(_, _, c)| *c == expected)
+        else {
+            return Vec::new();
+        };
+        position += offset;
+        let (start, end, _) = chars[position];
+        if let Some(last) = ranges.last_mut().filter(|range| range.end >= start) {
+            last.end = end;
+        } else {
+            ranges.push(start..end);
+        }
+        position += 1;
+    }
+    ranges
+}
+fn excerpt(value: &str, query: &str) -> String {
+    let found = value.find(query).unwrap_or(0);
+    let start = value[..found]
+        .char_indices()
+        .rev()
+        .nth(47)
+        .map_or(0, |(offset, _)| offset);
+    let text: String = value[start..].chars().take(160).collect();
+    format!(
+        "{}{}{}",
+        if start > 0 { "…" } else { "" },
+        text,
+        if start + text.len() < value.len() {
+            "…"
+        } else {
+            ""
+        }
+    )
 }
 fn rank(path: &Path, scope: &Path, query: &str) -> Option<i64> {
     let value = path
@@ -129,12 +177,15 @@ impl Search {
                 else {
                     continue;
                 };
+                #[cfg(feature = "test-support")]
+                crate::metrics::delay("SEARCH");
                 let cancelled = || cancel.load(Ordering::Relaxed) != id;
-                let send = |hits: &[Hit], state: &str| {
+                let send = |hits: &[Hit], state: &str, completed: bool| {
                     let mut result = ResultSet {
                         generation: id,
                         hits: ordered(hits),
                         state: state.into(),
+                        completed,
                     };
                     loop {
                         if cancelled() {
@@ -190,6 +241,7 @@ impl Search {
                             } else {
                                 "Indexed snapshot · rebuild for changes"
                             },
+                            true,
                         );
                         continue;
                     }
@@ -231,7 +283,7 @@ impl Search {
                 let mut count = 0;
                 let mut last = Instant::now();
                 if !scope.is_dir() {
-                    send(&[], "Failed — scope unavailable");
+                    send(&[], "Failed — scope unavailable", true);
                     continue;
                 }
                 let mut exclusions = ignore::overrides::OverrideBuilder::new(&scope);
@@ -241,16 +293,36 @@ impl Search {
                     .filter(|s| !s.trim().is_empty())
                     .find_map(|line| exclusions.add(&format!("!{line}")).err());
                 if let Some(error) = invalid {
-                    send(&[], &format!("Failed — invalid exclusion: {error}"));
+                    send(&[], &format!("Failed — invalid exclusion: {error}"), true);
                     continue;
                 }
                 let exclusions = match exclusions.build() {
                     Ok(value) => value,
                     Err(error) => {
-                        send(&[], &format!("Failed — {error}"));
+                        send(&[], &format!("Failed — {error}"), true);
                         continue;
                     }
                 };
+                let (resolved_scope, mount_points) = match std::fs::canonicalize(&scope)
+                    .map_err(|error| error.to_string())
+                    .and_then(|scope| {
+                        crate::locations::mount_points().map(|points| (scope, points))
+                    }) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        send(
+                            &[],
+                            &format!("Failed — cannot validate mount boundaries: {error}"),
+                            true,
+                        );
+                        continue;
+                    }
+                };
+                let boundaries: std::collections::HashSet<_> = mount_points
+                    .into_iter()
+                    .filter(|path| path != &resolved_scope && path.starts_with(&resolved_scope))
+                    .collect();
+                let walked_scope = scope.clone();
                 let metadata = filters.metadata;
                 let file_bytes = filters.file_bytes.clamp(1, 10 * 1024 * 1024);
                 let walker = ignore::WalkBuilder::new(&scope)
@@ -263,10 +335,18 @@ impl Search {
                     .same_file_system(true)
                     .overrides(exclusions)
                     .filter_entry(move |entry| {
-                        metadata
+                        let allowed_metadata = metadata
                             || ![".git", ".hg", ".svn"]
                                 .iter()
-                                .any(|name| entry.file_name() == *name)
+                                .any(|name| entry.file_name() == *name);
+                        let boundary =
+                            entry
+                                .path()
+                                .strip_prefix(&walked_scope)
+                                .is_ok_and(|relative| {
+                                    boundaries.contains(&resolved_scope.join(relative))
+                                });
+                        allowed_metadata && !boundary
                     })
                     .build();
                 for entry in walker {
@@ -356,7 +436,7 @@ impl Search {
                                 hits.push(Hit {
                                     path: entry.path().to_owned(),
                                     line: line + 1,
-                                    excerpt: value.chars().take(160).collect(),
+                                    excerpt: excerpt(value, &query),
                                     query: query.clone(),
                                     fingerprint: Some(version),
                                     score: 0,
@@ -378,7 +458,7 @@ impl Search {
                         });
                     }
                     if last.elapsed() >= Duration::from_millis(40) {
-                        if !send(&hits, "Searching") {
+                        if !send(&hits, "Searching", false) {
                             break;
                         }
                         last = Instant::now();
@@ -408,6 +488,7 @@ impl Search {
                         } else {
                             "Complete"
                         },
+                        true,
                     );
                 }
             }
@@ -483,8 +564,12 @@ impl Search {
     ) -> Result<u64, String> {
         let id = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
         *self.latest.lock().unwrap() = Some((id, scope, query, content, filters));
-        let _ = self.jobs.try_send(());
-        Ok(id)
+        match self.jobs.try_send(()) {
+            Ok(()) | Err(mpsc::TrySendError::Full(())) => Ok(id),
+            Err(mpsc::TrySendError::Disconnected(())) => {
+                Err("Search worker unavailable; retry after reopening Glimpse".into())
+            }
+        }
     }
 }
 impl Drop for Search {
@@ -795,5 +880,106 @@ mod tests {
                 )
         );
         assert!(rank(Path::new("/scope/readme"), Path::new("/scope"), "rdm").is_some());
+    }
+}
+
+#[cfg(test)]
+mod presentation_tests {
+    use super::*;
+    #[test]
+    fn unicode_highlights_and_long_line_context_retain_match_boundaries() {
+        let value = "İmage/文档/native.txt";
+        let ranges = highlight_ranges(value, "İ文nat");
+        assert!(!ranges.is_empty());
+        for range in ranges {
+            assert!(value.is_char_boundary(range.start));
+            assert!(value.is_char_boundary(range.end));
+        }
+        let line = format!("{}needle α{}", "文".repeat(300), "tail".repeat(100));
+        let shown = excerpt(&line, "needle α");
+        assert!(shown.contains("needle α"));
+        assert!(shown.chars().count() <= 162);
+        assert!(shown.starts_with('…') && shown.ends_with('…'));
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod mount_tests {
+    use super::*;
+    #[test]
+    fn same_device_bind_mounts_and_directory_aliases_remain_outside_search() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+        if let Some(root) = std::env::var_os("GLIMPSE_MOUNT_FIXTURE") {
+            let root = PathBuf::from(root);
+            let parent_namespace = std::env::var_os("GLIMPSE_PARENT_MOUNT_NAMESPACE").unwrap();
+            assert_ne!(
+                std::fs::read_link("/proc/self/ns/mnt").unwrap().as_os_str(),
+                parent_namespace
+            );
+            assert!(
+                std::process::Command::new("mount")
+                    .arg("--bind")
+                    .arg(root.join("outside"))
+                    .arg(root.join("scope/mounted"))
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            assert_eq!(
+                std::fs::metadata(root.join("scope")).unwrap().dev(),
+                std::fs::metadata(root.join("scope/mounted")).unwrap().dev()
+            );
+            assert!(root.join("scope/mounted/needle-outside.txt").is_file());
+            let search = Search::new(crate::wake::Context::default());
+            let scope = root.join("scope");
+            for indexed in [false, true] {
+                if indexed {
+                    search
+                        .start_filtered(scope.clone(), String::new(), false, Filters::default())
+                        .unwrap();
+                    loop {
+                        if search
+                            .replies
+                            .recv_timeout(Duration::from_secs(5))
+                            .unwrap()
+                            .completed
+                        {
+                            break;
+                        }
+                    }
+                }
+                search
+                    .start_filtered(scope.clone(), "needle".into(), false, Filters::default())
+                    .unwrap();
+                loop {
+                    let result = search.replies.recv_timeout(Duration::from_secs(5)).unwrap();
+                    if result.completed {
+                        assert_eq!(result.hits.len(), 1, "{}", result.state);
+                        assert_eq!(result.hits[0].path, scope.join("needle-visible.txt"));
+                        break;
+                    }
+                }
+            }
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("scope/mounted")).unwrap();
+        std::fs::create_dir(root.path().join("outside")).unwrap();
+        std::fs::write(root.path().join("scope/needle-visible.txt"), b"inside").unwrap();
+        std::fs::write(root.path().join("outside/needle-outside.txt"), b"outside").unwrap();
+        symlink(root.path().join("outside"), root.path().join("scope/alias")).unwrap();
+        let result = std::process::Command::new("unshare")
+            .args(["--user","--map-root-user","--mount","--propagation","private","--"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact","search::mount_tests::same_device_bind_mounts_and_directory_aliases_remain_outside_search","--nocapture"])
+            .env("GLIMPSE_MOUNT_FIXTURE",root.path())
+            .env("GLIMPSE_PARENT_MOUNT_NAMESPACE",std::fs::read_link("/proc/self/ns/mnt").unwrap())
+            .output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
     }
 }

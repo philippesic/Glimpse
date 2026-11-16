@@ -515,7 +515,7 @@ impl RenderOnce for Button {
                         let hover_style = style.hovered(self.outline, cx);
                         this.bg(hover_style.bg)
                             .border_color(hover_style.border)
-                            .text_color(crate::red_400())
+                            .text_color(hover_style.fg)
                     })
                     .active(|this| {
                         let active_style = style.active(self.outline, cx);
@@ -563,6 +563,9 @@ impl RenderOnce for Button {
             .child({
                 h_flex()
                     .id("label")
+                    .min_w_0()
+                    .max_w_full()
+                    .overflow_hidden()
                     .items_center()
                     .justify_center()
                     .button_text_size(self.size)
@@ -584,7 +587,13 @@ impl RenderOnce for Button {
                         )
                     })
                     .when_some(self.label, |this, label| {
-                        this.child(div().flex_none().line_height(relative(1.)).child(label))
+                        this.child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .line_height(relative(1.))
+                                .child(label),
+                        )
                     })
                     .children(self.children)
                     .when(self.dropdown_caret, |this| {

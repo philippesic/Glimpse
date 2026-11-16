@@ -9,6 +9,7 @@ mod path;
 mod platform;
 mod preferences;
 mod recovery;
+mod searching;
 mod theme;
 
 use glimpse::directory::Entry;
@@ -176,7 +177,8 @@ struct Shell {
     search: search::Search,
     syntax: glimpse::syntax::Syntax,
     search_id: u64,
-    hits: Vec<search::Hit>,
+    hits: std::sync::Arc<Vec<search::Hit>>,
+    search_ui: searching::State,
     scope: Option<PathBuf>,
     current: PathBuf,
     history: Vec<PathBuf>,
@@ -212,7 +214,7 @@ struct Shell {
     path_completion_token: u64,
     path_completions: Option<path::Completions>,
     opening: HashMap<u64, OpenIntent>,
-    hit_versions: HashMap<u64, u64>,
+    hit_versions: HashMap<u64, (u64, u64)>,
     panel: Option<Panel>,
     query: Entity<InputState>,
     reading: bool,
@@ -298,9 +300,7 @@ impl Shell {
             if matches!(event, InputEvent::Change)
                 && matches!(this.panel, Some(Panel::Files | Panel::Text))
             {
-                this.search_id = this.search.cancel();
-                this.hits.clear();
-                cx.notify();
+                this.search_changed(cx);
             }
             if matches!(event, InputEvent::Change)
                 && matches!(this.panel, Some(Panel::Palette | Panel::Recovery))
@@ -418,7 +418,8 @@ impl Shell {
             keep_after_cleanup: HashSet::new(),
             finishing: glimpse::validation::Validations::default(),
             search_id: 0,
-            hits: vec![],
+            hits: Default::default(),
+            search_ui: searching::State::new(cx),
         };
         window.focus(&this.nav_focus);
         this.refresh();
@@ -552,8 +553,7 @@ impl Shell {
             self.status = warning.clone();
         }
         theme::apply(&self.settings, window, cx);
-        self.search_id = self.search.cancel();
-        self.hits.clear();
+        self.reset_search("Search settings changed; press Enter to search");
         for doc in &self.documents {
             doc.input.update(cx, |input, cx| {
                 input.set_soft_wrap(self.settings.wrap, window, cx);
@@ -756,6 +756,7 @@ impl Shell {
         }
     }
     fn change_location(&mut self, path: PathBuf) {
+        let old_scope = self.effective_scope().clone();
         if let Some(selection) = self.selection.take() {
             self.selections.insert(self.current.clone(), selection);
         }
@@ -765,11 +766,13 @@ impl Shell {
         self.io.cancel_previews(self.open_token + 1);
         self.entries = Default::default();
         self.entries_revision += 1;
+        self.search_ui.picker_selection = None;
         self.current = path;
         self.selection = self.selections.get(&self.current).cloned();
         self.filter.clear();
-        self.hits.clear();
-        self.search_id = self.search.cancel();
+        if self.effective_scope() != &old_scope {
+            self.reset_search("Search folder changed; press Enter to search");
+        }
         self.refresh();
     }
     fn selected_path(&self) -> Option<PathBuf> {
@@ -822,6 +825,9 @@ impl Shell {
         let OpenIntent {
             preview, position, ..
         } = intent;
+        if activate && self.request.pick {
+            self.search_ui.picker_selection = Some(disk.path.clone());
+        }
         if !disk.target.as_os_str().is_empty()
             && let Some(parent) = disk.path.parent()
         {
@@ -1032,6 +1038,18 @@ impl Shell {
     fn panel(&mut self, panel: Panel, window: &mut Window, cx: &mut Context<Self>) {
         self.path_completions = None;
         self.path_completion_token += 1;
+        if panel == Panel::Palette && matches!(self.panel, Some(Panel::Files | Panel::Text)) {
+            self.search_ui.suspended = self
+                .panel
+                .map(|panel| (panel, self.query.read(cx).value().to_string()));
+        } else {
+            self.search_ui.suspended = None;
+            if !matches!(panel, Panel::Files | Panel::Text) {
+                self.search_ui.temporary = None;
+            }
+            self.reset_search("Enter a query, then press Enter to search");
+            self.search_ui.query.clear();
+        }
         self.panel = Some(panel);
         let value = if panel == Panel::Path {
             paths::entry(&self.current)
@@ -1069,9 +1087,7 @@ impl Shell {
                 if let Some(command) = glimpse::commands::COMMANDS.iter().find(|command| {
                     command.label.to_lowercase().contains(&query) || command.id.contains(&query)
                 }) {
-                    self.panel = None;
-                    self.focus(window, cx);
-                    self.command(command.id, window, cx);
+                    self.palette_command(command.id, window, cx);
                 }
             }
             Some(Panel::Path) => match paths::parse_entry(&value, &self.current) {
@@ -1083,25 +1099,7 @@ impl Shell {
                 }
                 Err(error) => self.status = error,
             },
-            Some(Panel::Files | Panel::Text) => {
-                let scope = self.scope.clone().unwrap_or_else(|| self.current.clone());
-                self.search_id = self
-                    .search
-                    .start_filtered(
-                        scope,
-                        value,
-                        self.panel == Some(Panel::Text),
-                        search::Filters {
-                            ignored: self.settings.search_ignored,
-                            metadata: self.settings.search_metadata,
-                            exclude: self.settings.search_exclude.clone(),
-                            file_bytes: self.settings.search_file_mib * 1024 * 1024,
-                        },
-                    )
-                    .unwrap();
-                self.hits.clear();
-                self.status = "Searching…".into();
-            }
+            Some(Panel::Files | Panel::Text) => self.start_search(cx),
             Some(Panel::NewFile | Panel::NewFolder | Panel::Rename) => {
                 let path = self.current.join(&value);
                 if !paths::single_name(&value) {
@@ -1207,6 +1205,7 @@ impl Shell {
                     }
                 }
                 Reply::Open(path, token, result) => {
+                    let expected = self.hit_versions.remove(&token);
                     if let Some(OpenIntent {
                         preview,
                         position,
@@ -1228,14 +1227,18 @@ impl Shell {
                                 if self.destination_busy {
                                     continue;
                                 }
-                                if let Some(expected) = self.hit_versions.remove(&token)
+                                if let Some((expected, search_generation)) = expected
                                     && (expected != search::fingerprint(&disk.bytes)
                                         || self
                                             .documents
                                             .iter()
                                             .any(|doc| doc.disk.same_file(&disk) && doc.dirty(cx)))
                                 {
-                                    self.status = "Search result changed or has unsaved edits. Search again before jumping.".into();
+                                    let message = "Failed to open result — disk changed or the document has unsaved edits. Search again before jumping.";
+                                    self.status = message.into();
+                                    if search_generation == self.search_id {
+                                        self.search_ui.status = message.into();
+                                    }
                                     continue;
                                 }
                                 if from_path && activate {
@@ -1257,6 +1260,11 @@ impl Shell {
                             Err(e) => {
                                 self.startup_failed |=
                                     !self.ready && self.request.files.contains(&path);
+                                if expected
+                                    .is_some_and(|(_, generation)| generation == self.search_id)
+                                {
+                                    self.search_ui.status = format!("Failed to open result: {e}");
+                                }
                                 self.status = e;
                                 if !from_path && activate {
                                     self.focus(window, cx);
@@ -1797,8 +1805,36 @@ impl Shell {
         }
         while let Ok(result) = self.search.replies.try_recv() {
             if result.generation == self.search_id {
-                self.hits = result.hits;
-                self.status = result.state;
+                let selected = self
+                    .search_ui
+                    .selection
+                    .and_then(|i| self.hits.get(i))
+                    .map(|hit| (hit.path.clone(), hit.line));
+                self.hits = std::sync::Arc::new(result.hits);
+                self.search_ui.selection = selected.and_then(|(path, line)| {
+                    self.hits
+                        .iter()
+                        .position(|hit| hit.path == path && hit.line == line)
+                });
+                self.search_ui.status = result.state;
+                self.search_ui.running = !result.completed;
+                if result.completed && self.search_ui.building {
+                    self.search_ui.building = false;
+                    if self
+                        .search
+                        .index_compatible(self.effective_scope(), &self.search_filters())
+                    {
+                        if let Some((panel, query)) = self.search_ui.suspended.clone() {
+                            if !query.is_empty() {
+                                self.start_search_value(query, panel == Panel::Text);
+                            }
+                        } else if matches!(self.panel, Some(Panel::Files | Panel::Text))
+                            && !self.query.read(cx).value().is_empty()
+                        {
+                            self.start_search(cx);
+                        }
+                    }
+                }
             }
         }
         if let Some(result) = self.observer.changed() {
@@ -2088,6 +2124,20 @@ impl Shell {
         }
     }
     fn shortcut(&mut self, key: &Keystroke, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.panel, Some(Panel::Files | Panel::Text))
+            && self.preferences.is_none()
+            && self.decision.is_none()
+            && self.query.focus_handle(cx).is_focused(window)
+            && key.key == "down"
+            && !key.modifiers.control
+            && !key.modifiers.platform
+            && !self.hits.is_empty()
+        {
+            self.focus_results(window, cx);
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
         if self.panel == Some(Panel::Path)
             && self.preferences.is_none()
             && self.decision.is_none()
@@ -2205,6 +2255,10 @@ impl Shell {
             }
             "submit" => self.submit(window, cx),
             "dismiss" => {
+                if self.panel == Some(Panel::Palette) && self.resume_search(window, cx) {
+                    cx.notify();
+                    return;
+                }
                 if let Some(token) = self.path_request.take() {
                     self.opening.remove(&token);
                 }
@@ -2212,8 +2266,8 @@ impl Shell {
                     self.filter.clear();
                 }
                 self.panel = None;
-                self.hits.clear();
-                self.search_id = self.search.cancel();
+                self.search_ui.temporary = None;
+                self.reset_search("Search closed");
                 self.focus(window, cx);
             }
             "cancel-close" | "cancel-closing" => {
@@ -2426,14 +2480,34 @@ impl Shell {
                     doc.preview = false;
                 }
             }
+            "search-here" => {
+                if !matches!(self.panel, Some(Panel::Files | Panel::Text)) {
+                    self.panel(Panel::Files, window, cx);
+                }
+                self.search_ui.temporary = Some(self.current.clone());
+                self.reset_search("Temporary search folder selected; press Enter to search");
+            }
+            "index-folder" => {
+                if !matches!(self.panel, Some(Panel::Files | Panel::Text)) {
+                    self.panel(Panel::Files, window, cx);
+                }
+                self.build_index();
+            }
+            "remove-index" => {
+                self.search.clear_index();
+                self.reset_search("Filename index removed; press Enter for an on-demand search");
+            }
+            "stop-search" => self.reset_search("Cancelled — displayed results were cleared"),
+            "focus-results" => self.focus_results(window, cx),
+            "search-details" => self.search_details(window, cx),
             "scope" => {
                 self.scope = if self.scope.is_some() {
                     None
                 } else {
                     Some(self.current.clone())
                 };
-                self.search_id = self.search.cancel();
-                self.hits.clear();
+                self.search_ui.temporary = None;
+                self.reset_search("Search scope changed; press Enter to search");
             }
             "close" => self.close(false, window, cx),
             "quit" => self.close(true, window, cx),
@@ -2448,9 +2522,15 @@ impl Shell {
             "choose" if self.request.pick => {
                 let path = if self.request.directory {
                     self.current.clone()
-                } else if let Some(path) = self.selected_path() {
+                } else if let Some(path) = self
+                    .search_ui
+                    .picker_selection
+                    .clone()
+                    .or_else(|| self.selected_path())
+                {
                     path
                 } else {
+                    self.status = "Select an existing file before choosing".into();
                     return;
                 };
                 self.io.send(Job::Choose(path, self.request.directory));
@@ -2483,9 +2563,10 @@ impl Shell {
                 }
             }
             "go-scope" => {
-                if let Some(scope) = self.scope.clone() {
-                    self.navigate(scope);
-                }
+                let scope = self.effective_scope().clone();
+                self.navigate(scope);
+                self.navigation_only = true;
+                window.focus(&self.nav_focus);
             }
             "reveal" => {
                 if let Some(path) = self
@@ -2505,7 +2586,7 @@ impl Shell {
             }
             "copy-path" | "copy-relative" => {
                 let path = self.selected_path().unwrap_or_else(|| self.current.clone());
-                let scope = self.scope.as_ref().unwrap_or(&self.current);
+                let scope = self.effective_scope();
                 let value = if command == "copy-relative" {
                     path.strip_prefix(scope)
                         .map_err(|_| "Selected path is outside the search folder")
@@ -2665,7 +2746,24 @@ impl Render for Shell {
             .text_color(cx.theme().foreground)
             .text_size(px(14. * self.settings.ui_scale))
             .child(toolbar)
-            .child(self.path_bar(window, cx));
+            .child(self.path_bar(window, cx))
+            .when(self.request.pick, |root| {
+                let candidate = if self.request.directory {
+                    Some(&self.current)
+                } else {
+                    self.search_ui.picker_selection.as_ref()
+                };
+                root.child(
+                    div()
+                        .px_2()
+                        .text_sm()
+                        .truncate()
+                        .child(candidate.map_or_else(
+                            || "Select a file, then Choose".into(),
+                            |path| format!("Selection: {}", paths::display(path)),
+                        )),
+                )
+            });
         if self.panel == Some(Panel::Path) {
             root = root.child(self.path_matches(cx));
         }
@@ -2690,54 +2788,20 @@ impl Render for Shell {
                     .child(title)
                     .child(Input::new(&self.query).flex_1().min_w_0())
                     .when(!matches!(panel, Panel::Recovery | Panel::Filter), |row| {
-                        row.child(self.button("Apply", "submit", cx))
+                        row.child(self.button(
+                            if matches!(panel, Panel::Files | Panel::Text) {
+                                "Search"
+                            } else {
+                                "Apply"
+                            },
+                            "submit",
+                            cx,
+                        ))
                     })
                     .child(self.button("Close", "dismiss", cx)),
             );
             if matches!(panel, Panel::Files | Panel::Text) {
-                root = root.child(
-                    div()
-                        .px_2()
-                        .child(format!(
-                            "Search folder: {}{}",
-                            paths::display(self.scope.as_ref().unwrap_or(&self.current)),
-                            if self.scope.is_some() {
-                                " (pinned)"
-                            } else {
-                                ""
-                            }
-                        ))
-                        .child(self.button("Pin / unpin scope", "scope", cx)),
-                );
-                root = root.child(
-                    div()
-                        .id("results")
-                        .max_h(px(200.))
-                        .overflow_y_scroll()
-                        .children(self.hits.iter().take(1000).enumerate().map(|(i, hit)| {
-                            let path = hit.path.clone();
-                            let line = hit.line;
-                            let expected = hit.fingerprint;
-                            div()
-                                .id(("hit", i))
-                                .px_2()
-                                .py_1()
-                                .cursor_pointer()
-                                .child(format!(
-                                    "{}:{}  {}",
-                                    paths::display(&path),
-                                    line,
-                                    hit.excerpt
-                                ))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.open(path.clone(), false, Some((line, 1)));
-                                    if let Some(fingerprint) = expected {
-                                        this.hit_versions.insert(this.open_token, fingerprint);
-                                    }
-                                    cx.notify();
-                                }))
-                        })),
-                );
+                root = root.child(self.search_view(window, cx));
             }
             if panel == Panel::Palette {
                 let query = self.query.read(cx).value().to_lowercase();
@@ -2774,6 +2838,11 @@ impl Render for Shell {
                                         command.id,
                                         cx,
                                     )
+                                    .on_click(cx.listener(
+                                        move |this, _, window, cx| {
+                                            this.palette_command(command.id, window, cx)
+                                        },
+                                    ))
                                 }),
                         ),
                 );
@@ -2903,6 +2972,7 @@ impl Render for Shell {
                                     .on_click(cx.listener(
                                         move |this, event: &ClickEvent, _, cx| {
                                             this.selection = Some(path.clone());
+                                            this.search_ui.picker_selection = Some(path.clone());
                                             this.open(path.clone(), event.click_count() < 2, None);
                                             cx.notify();
                                         },
@@ -2989,6 +3059,24 @@ impl Render for Shell {
             });
         }
         if let Some(doc) = self.documents.iter().find(|d| Some(d.id) == self.active) {
+            if !doc.disk.target.as_os_str().is_empty()
+                && !doc.disk.path.starts_with(self.effective_scope())
+            {
+                content = content.child(
+                    div().px_2().py_1().text_sm().child(
+                        self.command_button(
+                            "document-search-scope",
+                            format!(
+                                "Outside search folder: {}",
+                                paths::name(self.effective_scope())
+                            ),
+                            "search-details",
+                            cx,
+                        )
+                        .tooltip(paths::display(self.effective_scope())),
+                    ),
+                );
+            }
             if doc.recovery_error.is_none() && doc.error.is_some() {
                 content = content.child(
                     div()
@@ -3138,6 +3226,9 @@ impl Render for Shell {
                     return;
                 }
                 let key = &event.keystroke;
+                if this.search_ui.focus.is_focused(window) && this.search_key(key, window, cx) {
+                    return;
+                }
                 if this.nav_focus.is_focused(window)
                     && !key.modifiers.control
                     && !key.modifiers.platform
@@ -3155,6 +3246,7 @@ impl Render for Shell {
                                 index.unwrap_or(0).saturating_sub(1)
                             };
                             this.selection = Some(rows[visible[next]].path.clone());
+                            this.search_ui.picker_selection = this.selection.clone();
                             if let Some(scroll) = this.scrolls.get(&this.current) {
                                 scroll.scroll_to_item(next, ScrollStrategy::Top);
                             }

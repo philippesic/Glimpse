@@ -9,6 +9,9 @@ pub struct Volumes {
 pub fn mounted() -> Result<Volumes, String> {
     platform::mounted()
 }
+pub fn mount_points() -> Result<Vec<PathBuf>, String> {
+    platform::mount_points()
+}
 
 #[cfg(target_os = "linux")]
 mod platform {
@@ -96,6 +99,34 @@ mod platform {
         paths
     }
 
+    pub fn mount_points() -> Result<Vec<PathBuf>, String> {
+        let mut bytes = Vec::new();
+        std::fs::File::open("/proc/self/mountinfo")
+            .and_then(|file| file.take(1024 * 1024 + 1).read_to_end(&mut bytes))
+            .map_err(|error| error.to_string())?;
+        if bytes.len() > 1024 * 1024 {
+            return Err("Mount table exceeds the search safety budget".into());
+        }
+        let mut result = Vec::new();
+        for line in bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+        {
+            let path = line
+                .split(|byte| byte.is_ascii_whitespace())
+                .filter(|field| !field.is_empty())
+                .nth(4)
+                .and_then(unescape)
+                .ok_or("Invalid mount table; search was not started")?;
+            let path = PathBuf::from(std::ffi::OsString::from_vec(path));
+            if !path.is_absolute() {
+                return Err("Invalid relative mount boundary".into());
+            }
+            result.push(path);
+        }
+        Ok(result)
+    }
+
     pub fn mounted() -> Result<Volumes, String> {
         let mut bytes = Vec::new();
         std::fs::File::open("/proc/self/mountinfo")
@@ -146,6 +177,51 @@ mod platform {
 #[cfg(target_os = "macos")]
 mod platform {
     use super::*;
+    pub fn mount_points() -> Result<Vec<PathBuf>, String> {
+        use std::os::unix::ffi::OsStringExt;
+        let count = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
+        if count <= 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let capacity = count as usize + 16;
+        let bytes = capacity
+            .checked_mul(std::mem::size_of::<libc::statfs>())
+            .filter(|size| *size <= 16 * 1024 * 1024)
+            .ok_or("Mount table exceeds the search safety budget")?;
+        let mut entries: Vec<std::mem::MaybeUninit<libc::statfs>> =
+            std::iter::repeat_with(std::mem::MaybeUninit::uninit)
+                .take(capacity)
+                .collect();
+        let written = unsafe {
+            libc::getfsstat(
+                entries.as_mut_ptr().cast(),
+                bytes as libc::c_int,
+                libc::MNT_NOWAIT,
+            )
+        };
+        if written < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        if written as usize >= capacity {
+            return Err("Mount table changed during discovery; retry search".into());
+        }
+        Ok(entries
+            .iter()
+            .take(written as usize)
+            .map(|entry| {
+                let entry = unsafe { entry.assume_init_ref() };
+                PathBuf::from(std::ffi::OsString::from_vec(
+                    entry
+                        .f_mntonname
+                        .iter()
+                        .take_while(|&&byte| byte != 0)
+                        .map(|&byte| byte as u8)
+                        .collect(),
+                ))
+            })
+            .collect())
+    }
+
     pub fn mounted() -> Result<Volumes, String> {
         let mut paths = vec![PathBuf::from("/")];
         let mut note = None;
