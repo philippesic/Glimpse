@@ -1,5 +1,5 @@
 //! Highlighting runs outside the event loop; obsolete documents never recolor a newer edit.
-use eframe::egui;
+use crate::wake;
 use std::{
     sync::{
         Arc, Mutex,
@@ -171,7 +171,7 @@ pub struct Syntax {
     token: Arc<AtomicU64>,
 }
 impl Syntax {
-    pub fn new(ctx: egui::Context) -> Self {
+    pub fn new(ctx: wake::Context) -> Self {
         let pending = Arc::new(Mutex::new(None::<Request>));
         let ready = Arc::new(Mutex::new(None));
         let token = Arc::new(AtomicU64::new(0));
@@ -300,7 +300,7 @@ mod tests {
     use super::*;
     #[test]
     fn plain_text_is_immediate_and_invalidates_pending_grammar_work() {
-        let syntax = Syntax::new(egui::Context::default());
+        let syntax = Syntax::new(wake::Context::default());
         syntax.request(1, 1, "fn old() {}", std::path::Path::new("x.rs"), true);
         syntax.request(1, 2, "plain 🦀", std::path::Path::new("x.txt"), false);
         let result = syntax.take().unwrap();
@@ -348,7 +348,7 @@ mod tests {
     }
     #[test]
     fn latest_generation_has_matching_utf16_ranges() {
-        let syntax = Syntax::new(egui::Context::default());
+        let syntax = Syntax::new(wake::Context::default());
         syntax.request(1, 1, "obsolete", std::path::Path::new("x.rs"), true);
         syntax.request(1, 2, "let 🦀 = 3;\n", std::path::Path::new("x.rs"), true);
         let until = Instant::now() + Duration::from_secs(5);

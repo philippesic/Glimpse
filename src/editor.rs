@@ -1,4 +1,5 @@
-use eframe::egui::{
+#[cfg(test)]
+use egui::{
     self,
     text::{CCursor, CCursorRange},
 };
@@ -38,6 +39,7 @@ pub fn position(text: &str, line: usize, column: usize) -> (usize, bool) {
     clamped |= boundary != requested;
     (text[..offset + boundary].chars().count(), clamped)
 }
+#[cfg(test)]
 pub fn replace(ctx: &egui::Context, id: egui::Id, old: &str, new: &str) {
     if let Some(mut state) = egui::TextEdit::load_state(ctx, id) {
         let cursor = state

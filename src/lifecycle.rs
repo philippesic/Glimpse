@@ -42,7 +42,10 @@ pub fn launch(args: &[std::ffi::OsString], wait: bool, picker: bool) -> ! {
         .env("GLIMPSE_GUI", "1")
         .stdin(std::process::Stdio::null());
     if !picker {
-        command.env("GLIMPSE_CHANNEL", &socket);
+        command
+            .env("GLIMPSE_CHANNEL", &socket)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
     }
     let mut child = command
         .spawn()

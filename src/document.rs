@@ -1,10 +1,9 @@
+#[cfg(target_os = "macos")]
+use std::os::fd::AsRawFd;
 use std::{
     fs::{self, Metadata, OpenOptions},
     io::{Read, Write},
-    os::{
-        fd::AsRawFd,
-        unix::fs::{MetadataExt, OpenOptionsExt},
-    },
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
 };
 
@@ -200,20 +199,47 @@ impl DiskFile {
         if identity(&source.metadata().map_err(|e| e.to_string())?) != self.identity {
             return Err("The file changed before saving.".into());
         }
-        // Replacement must retain the original metadata rather than the temp file's defaults.
-        let copied = unsafe {
-            libc::fcopyfile(
-                source.as_raw_fd(),
-                staged.as_file().as_raw_fd(),
-                std::ptr::null_mut(),
-                libc::COPYFILE_METADATA,
-            )
-        };
-        if copied != 0 {
-            return Err(format!(
-                "Cannot preserve file metadata: {}",
-                std::io::Error::last_os_error()
-            ));
+        #[cfg(target_os = "macos")]
+        {
+            let copied = unsafe {
+                libc::fcopyfile(
+                    source.as_raw_fd(),
+                    staged.as_file().as_raw_fd(),
+                    std::ptr::null_mut(),
+                    libc::COPYFILE_METADATA,
+                )
+            };
+            if copied != 0 {
+                return Err(format!(
+                    "Cannot preserve file metadata: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            use xattr::FileExt;
+            if unsafe { libc::fchown(staged.as_file().as_raw_fd(), meta.uid(), meta.gid()) } != 0 {
+                return Err(format!(
+                    "Cannot preserve ownership: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            staged
+                .as_file()
+                .set_permissions(meta.permissions())
+                .map_err(|e| e.to_string())?;
+            for key in source.list_xattr().map_err(|e| e.to_string())? {
+                let value = source
+                    .get_xattr(&key)
+                    .map_err(|e| e.to_string())?
+                    .ok_or("File metadata changed")?;
+                staged
+                    .as_file()
+                    .set_xattr(&key, &value)
+                    .map_err(|e| e.to_string())?;
+            }
         }
         staged.write_all(&bytes).map_err(|e| e.to_string())?;
         staged.as_file().sync_all().map_err(|e| e.to_string())?;
@@ -302,6 +328,28 @@ mod tests {
         fs::remove_file(path).unwrap();
         assert!(disk.save("mine").is_err());
     }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn save_preserves_linux_metadata() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metadata.txt");
+        fs::write(&path, "before").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        xattr::set(&path, "user.glimpse", b"preserved").unwrap();
+        let meta = fs::metadata(&path).unwrap();
+        let (disk, _) = DiskFile::open(path.clone()).unwrap();
+        disk.save("after").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"after");
+        let saved = fs::metadata(&path).unwrap();
+        assert_eq!(saved.mode() & 0o777, 0o640);
+        assert_eq!((saved.uid(), saved.gid()), (meta.uid(), meta.gid()));
+        assert_eq!(
+            xattr::get(&path, "user.glimpse").unwrap().unwrap(),
+            b"preserved"
+        );
+    }
+    #[cfg(target_os = "macos")]
     #[test]
     fn save_preserves_mode_and_macos_extended_attributes() {
         use std::{

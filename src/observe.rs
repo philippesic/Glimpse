@@ -12,7 +12,7 @@ pub struct Observer {
     changes: mpsc::Receiver<Result<(), String>>,
 }
 impl Observer {
-    pub fn new(ctx: eframe::egui::Context) -> Self {
+    pub fn new(ctx: crate::wake::Context) -> Self {
         let (jobs, requests) = mpsc::sync_channel(1);
         let (tx, changes) = mpsc::sync_channel(8);
         let latest = Arc::new(Mutex::new(HashSet::<PathBuf>::new()));

@@ -1,5 +1,5 @@
+use crate::wake;
 use crate::{document::DiskFile, fileops, storage};
-use eframe::egui;
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -132,10 +132,10 @@ fn tracked(job: &Job) -> bool {
     )
 }
 impl IoWorker {
-    pub fn new(ctx: egui::Context) -> Self {
+    pub fn new(ctx: wake::Context) -> Self {
         Self::new_in(ctx, storage::data_dir().join("recovery"))
     }
-    fn new_in(ctx: egui::Context, root: PathBuf) -> Self {
+    fn new_in(ctx: wake::Context, root: PathBuf) -> Self {
         let (jobs, writes) = mpsc::sync_channel(16);
         let (reads, read_jobs) = mpsc::sync_channel(32);
         let (maintenance, maintenance_jobs) = mpsc::sync_channel(16);
@@ -651,7 +651,7 @@ mod tests {
         std::fs::create_dir(&folder).unwrap();
         let file = root.path().join("file");
         std::fs::write(&file, "").unwrap();
-        let io = IoWorker::new_in(egui::Context::default(), root.path().join("recovery"));
+        let io = IoWorker::new_in(wake::Context::default(), root.path().join("recovery"));
         io.send(Job::RecentLocation(vec![
             root.path().join("missing"),
             file,
@@ -758,7 +758,7 @@ mod tests {
     fn recovery_initialization_is_lazy_and_retryable() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("recovery");
-        let io = IoWorker::new_in(egui::Context::default(), path.clone());
+        let io = IoWorker::new_in(wake::Context::default(), path.clone());
         assert!(!path.exists());
         std::fs::write(&path, "blocked").unwrap();
         io.send(Job::Recover(7, draft(1)));
@@ -783,7 +783,7 @@ mod tests {
     fn full_maintenance_queue_does_not_lose_clear_or_resurrect_an_old_generation() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("recovery");
-        let io = IoWorker::new_in(egui::Context::default(), path.clone());
+        let io = IoWorker::new_in(wake::Context::default(), path.clone());
         let (started, seen) = mpsc::channel();
         let (release, hold) = mpsc::channel();
         io.send(Job::HoldMaintenance(started, hold));
@@ -816,7 +816,7 @@ mod tests {
     fn cleanup_failure_is_acknowledged_and_can_be_retried() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("recovery");
-        let io = IoWorker::new_in(egui::Context::default(), path.clone());
+        let io = IoWorker::new_in(wake::Context::default(), path.clone());
         io.send(Job::Recover(3, draft(1)));
         barrier(&io);
         let path = record(&path, 3);
@@ -854,7 +854,7 @@ mod tests {
     #[test]
     fn frontend_drop_does_not_join_stalled_work() {
         let root = tempfile::tempdir().unwrap();
-        let io = IoWorker::new_in(egui::Context::default(), root.path().join("recovery"));
+        let io = IoWorker::new_in(wake::Context::default(), root.path().join("recovery"));
         let (started, seen) = mpsc::channel();
         let (release, hold) = mpsc::channel();
         io.send(Job::Hold(started, hold));
@@ -872,7 +872,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("read.txt");
         std::fs::write(&path, "available").unwrap();
-        let io = IoWorker::new_in(egui::Context::default(), root.path().join("recovery"));
+        let io = IoWorker::new_in(wake::Context::default(), root.path().join("recovery"));
         let (started, seen) = mpsc::channel();
         let (release, hold) = mpsc::channel();
         io.send(Job::Hold(started, hold));

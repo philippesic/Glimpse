@@ -1,4 +1,43 @@
-use eframe::egui::{self, Key, Modifiers};
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Modifiers {
+    pub command: bool,
+    pub shift: bool,
+    pub alt: bool,
+    pub ctrl: bool,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct Key(String);
+impl Key {
+    fn from_name(name: &str) -> Option<Self> {
+        ((name.len() == 1 && name.chars().all(|c| c.is_ascii_alphanumeric()))
+            || matches!(
+                name,
+                "ArrowLeft"
+                    | "ArrowRight"
+                    | "ArrowUp"
+                    | "ArrowDown"
+                    | "Enter"
+                    | "Comma"
+                    | "Escape"
+                    | "Tab"
+                    | "Space"
+                    | "Backspace"
+                    | "Delete"
+                    | "Home"
+                    | "End"
+                    | "PageUp"
+                    | "PageDown"
+            )
+            || name
+                .strip_prefix('F')
+                .and_then(|n| n.parse::<u8>().ok())
+                .is_some_and(|n| (1..=24).contains(&n)))
+        .then(|| Self(name.to_owned()))
+    }
+    pub fn name(&self) -> &str {
+        &self.0
+    }
+}
 use std::collections::{BTreeMap, HashSet};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Action {
@@ -120,7 +159,7 @@ pub struct Binding {
     pub modifiers: Modifiers,
 }
 pub fn parse(value: &str) -> Result<(Modifiers, Key), String> {
-    let mut modifiers = Modifiers::NONE;
+    let mut modifiers = Modifiers::default();
     let mut key = None;
     for part in value.split('+') {
         match part {
@@ -148,7 +187,10 @@ pub fn parse(value: &str) -> Result<(Modifiers, Key), String> {
     }
     if !modifiers.alt
         && !modifiers.ctrl
-        && matches!(key, Key::A | Key::C | Key::V | Key::X | Key::Z)
+        && matches!(
+            key.name().to_ascii_uppercase().as_str(),
+            "A" | "C" | "V" | "X" | "Z"
+        )
     {
         return Err(
             "Select All, clipboard and Undo/Redo shortcuts are reserved for text editing.".into(),
@@ -184,15 +226,6 @@ pub fn bindings(overrides: &BTreeMap<String, String>) -> Result<Vec<Binding>, St
         });
     }
     Ok(result)
-}
-pub fn consume(ctx: &egui::Context, bindings: &[Binding]) -> Vec<Action> {
-    ctx.input_mut(|i| {
-        bindings
-            .iter()
-            .filter(|b| i.consume_key(b.modifiers, b.key))
-            .map(|b| b.action)
-            .collect()
-    })
 }
 #[cfg(test)]
 mod tests {

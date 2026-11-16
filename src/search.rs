@@ -114,7 +114,7 @@ fn ordered(hits: &[Hit]) -> Vec<Hit> {
     hits
 }
 impl Search {
-    pub fn new(ctx: eframe::egui::Context) -> Self {
+    pub fn new(ctx: crate::wake::Context) -> Self {
         let index = Arc::new(Mutex::new(None::<FilenameIndex>));
         let worker_index = index.clone();
         let generation = Arc::new(AtomicU64::new(0));
@@ -651,7 +651,7 @@ mod tests {
         std::fs::create_dir(&outside).unwrap();
         std::fs::write(outside.join("escape.txt"), "needle").unwrap();
         std::os::unix::fs::symlink(&outside, scope.join("linked")).unwrap();
-        let search = Search::new(eframe::egui::Context::default());
+        let search = Search::new(crate::wake::Context::default());
         let id = search
             .start_filtered(
                 scope.clone(),
@@ -706,7 +706,7 @@ mod tests {
         .unwrap();
         std::fs::write(root.path().join("binary"), b"needle\x01").unwrap();
         std::fs::write(root.path().join("invalid"), b"needle\xff").unwrap();
-        let search = Search::new(eframe::egui::Context::default());
+        let search = Search::new(crate::wake::Context::default());
         let id = search
             .start_filtered(
                 root.path().into(),
@@ -743,7 +743,7 @@ mod tests {
         for id in 0..1200 {
             std::fs::write(root.path().join(format!("match-{id}")), "").unwrap();
         }
-        let search = Search::new(eframe::egui::Context::default());
+        let search = Search::new(crate::wake::Context::default());
         let old = search
             .start(root.path().into(), "match".into(), false, false)
             .unwrap();
@@ -766,7 +766,7 @@ mod tests {
         std::fs::write(scope.join("inside.txt"), "needle\n").unwrap();
         std::fs::write(scope.join(".ignore"), "ignored.txt\n").unwrap();
         std::fs::write(scope.join("ignored.txt"), "needle").unwrap();
-        let search = Search::new(eframe::egui::Context::default());
+        let search = Search::new(crate::wake::Context::default());
         let old = search
             .start(scope.clone(), "old".into(), true, false)
             .unwrap();

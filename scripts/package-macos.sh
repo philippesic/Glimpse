@@ -2,7 +2,7 @@
 set -eu
 cd "$(dirname "$0")/.."
 if [ "$(uname -s)" != Darwin ]; then
-    echo "Glimpse currently builds on macOS only." >&2
+    echo "The macOS bundle must be packaged on macOS." >&2
     exit 1
 fi
 cargo build --release --locked

@@ -1,4 +1,9 @@
-use crate::navigation::Entry;
+#[derive(Clone)]
+pub struct Entry {
+    pub path: std::path::PathBuf,
+    pub directory: bool,
+    pub symlink: bool,
+}
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -30,7 +35,7 @@ pub struct Directories {
     stop: Arc<AtomicBool>,
 }
 impl Directories {
-    pub fn new(ctx: eframe::egui::Context) -> Self {
+    pub fn new(ctx: crate::wake::Context) -> Self {
         let (jobs, requests) = mpsc::sync_channel::<Request>(64);
         let requests = Arc::new(Mutex::new(requests));
         let (results, replies) = mpsc::sync_channel(16);
@@ -188,7 +193,7 @@ mod tests {
         for i in 0..600 {
             std::fs::write(root.path().join(format!("entry-{i}")), "").unwrap();
         }
-        let service = Directories::new(eframe::egui::Context::default());
+        let service = Directories::new(crate::wake::Context::default());
         let path = root.path().to_owned();
         let old = service.request(path.clone()).unwrap();
         let current = service.request(path).unwrap();

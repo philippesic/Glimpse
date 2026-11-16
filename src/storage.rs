@@ -7,13 +7,22 @@ use std::{
 };
 
 pub fn data_dir() -> PathBuf {
-    std::env::var_os("GLIMPSE_DATA_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::home_dir()
-                .unwrap()
-                .join("Library/Application Support/Glimpse")
-        })
+    if let Some(path) = std::env::var_os("GLIMPSE_DATA_DIR") {
+        return path.into();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::home_dir().unwrap().join(".local/share"))
+            .join("glimpse")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::env::home_dir()
+            .unwrap()
+            .join("Library/Application Support/Glimpse")
+    }
 }
 pub fn private_dir(path: &Path) -> Result<(), String> {
     fs::DirBuilder::new()

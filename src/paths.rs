@@ -12,10 +12,10 @@ fn escaped(value: &std::ffi::OsStr) -> String {
         .map(str::to_owned)
         .unwrap_or_else(|| format!("{value:?}"))
 }
-pub(crate) fn display(path: &Path) -> String {
+pub fn display(path: &Path) -> String {
     escaped(path.as_os_str())
 }
-pub(crate) fn name(path: &Path) -> String {
+pub fn name(path: &Path) -> String {
     let name = path.file_name().unwrap_or(path.as_os_str());
     display(Path::new(name))
 }
