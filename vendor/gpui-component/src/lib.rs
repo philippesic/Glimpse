@@ -9,6 +9,7 @@ mod index_path;
 #[cfg(any(feature = "inspector", debug_assertions))]
 mod inspector;
 mod root;
+mod semantic_text;
 mod styled;
 mod time;
 mod title_bar;

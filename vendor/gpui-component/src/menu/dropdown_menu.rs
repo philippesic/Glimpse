@@ -2,8 +2,8 @@ use std::rc::Rc;
 
 use gpui::{
     Context, Corner, DismissEvent, ElementId, Entity, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyUpEvent, MouseButton, RenderOnce, SharedString, StyleRefinement, Styled,
-    Window,
+    IntoElement, KeyDownEvent, KeyUpEvent, MouseButton, RenderOnce, SharedString, StyleRefinement,
+    Styled, Window,
 };
 
 use crate::{button::Button, menu::PopupMenu, popover::Popover, Selectable};
@@ -79,6 +79,7 @@ struct DropdownMenuState {
     menu: Option<Entity<PopupMenu>>,
     open: bool,
     return_focus: Option<FocusHandle>,
+    keyboard_armed: bool,
 }
 
 impl<T> RenderOnce for DropdownMenuPopover<T>
@@ -99,6 +100,16 @@ where
                     state.update(cx, |state, cx| state.return_focus = window.focused(cx));
                 }
             })
+            .on_key_down({
+                let state = menu_state.clone();
+                move |event: &KeyDownEvent, _, cx| {
+                    if !event.keystroke.modifiers.modified()
+                        && matches!(event.keystroke.key.as_str(), "enter" | "space" | "down")
+                    {
+                        state.update(cx, |state, _| state.keyboard_armed = true);
+                    }
+                }
+            })
             .on_key_up({
                 let state = menu_state.clone();
                 move |event: &KeyUpEvent, window, cx| {
@@ -106,8 +117,10 @@ where
                         && matches!(event.keystroke.key.as_str(), "enter" | "space" | "down")
                     {
                         state.update(cx, |state, cx| {
-                            state.return_focus = window.focused(cx);
-                            state.open = true;
+                            if std::mem::take(&mut state.keyboard_armed) {
+                                state.return_focus = window.focused(cx);
+                                state.open = true;
+                            }
                         });
                         window.refresh();
                         cx.stop_propagation();

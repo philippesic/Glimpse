@@ -52,12 +52,59 @@ impl RenderOnce for TextViewElement {
                     Some(Ok(content)) => {
                         let mut node_cx = content.node_cx.clone();
                         node_cx.resources = state.resources.clone();
-                        this.child(content.root_node.render_root(
+                        let body = content.root_node.render_root(
                             self.list_state.clone(),
                             &node_cx,
                             window,
                             cx,
-                        ))
+                        );
+                        let mut container = this;
+                        if !content.links.is_empty() {
+                            if let Some(handler) = node_cx.resources.on_link.clone() {
+                                use crate::{
+                                    menu::{DropdownMenu, PopupMenuItem},
+                                    button::Button,
+                                    Sizable,
+                                };
+                                let links = content.links.clone();
+                                container = container.child(
+                                    crate::h_flex().flex_shrink_0().mb_2().child(
+                                        Button::new("reading-links")
+                                            .label("Links")
+                                            .small()
+                                            .dropdown_caret(true)
+                                            .dropdown_menu(move |mut menu, window, _| {
+                                                menu = menu
+                                                    .scrollable(true)
+                                                    .max_h(
+                                                        (window.viewport_size().height - px(96.))
+                                                            .max(px(100.)),
+                                                    )
+                                                    .max_w(
+                                                        (window.viewport_size().width - px(32.))
+                                                            .min(px(700.)),
+                                                    );
+                                                for (label, url) in links.iter() {
+                                                    let handler = handler.clone();
+                                                    let url = url.clone();
+                                                    menu = menu.item(
+                                                        PopupMenuItem::new(if label.is_empty() {
+                                                            url.to_string()
+                                                        } else {
+                                                            format!("{label} — {url}")
+                                                        })
+                                                        .on_click(move |_, window, cx| {
+                                                            handler(&url, window, cx)
+                                                        }),
+                                                    );
+                                                }
+                                                menu
+                                            }),
+                                    ),
+                                );
+                            }
+                        }
+                        container.child(div().flex_1().min_h_0().child(body))
                     }
                     Some(Err(err)) => this.child(
                         v_flex()
@@ -107,6 +154,7 @@ pub struct TextView {
 pub(crate) struct ParsedContent {
     pub(crate) root_node: node::Node,
     pub(crate) node_cx: node::NodeContext,
+    links: Arc<Vec<(SharedString, SharedString)>>,
 }
 
 /// The type of the text view.
@@ -667,7 +715,7 @@ impl Element for TextView {
             .on_key_down({
                 let state = self.state.clone();
                 let scrollable = self.scrollable;
-                move |event, _, cx| {
+                move |event, window, cx| {
                     if !scrollable {
                         return;
                     }
@@ -687,6 +735,7 @@ impl Element for TextView {
                         cx.stop_propagation();
                         cx.notify();
                     });
+                    window.refresh();
                 }
             })
             .child(TextViewElement {
@@ -700,6 +749,46 @@ impl Element for TextView {
             .refine_style(&self.style)
             .vertical_scrollbar(list_state)
             .into_any_element();
+        let semantic_state = self.state.clone();
+        let action_state = self.state.clone();
+        el = gpui::accessible("reading-document", el, move |_, window, cx| {
+            use gpui::accesskit::{Node, Role, Action};
+            let state = semantic_state.read(cx);
+            let mut node = Node::new(Role::Document);
+            node.set_label("Reading view");
+            node.set_read_only();
+            node.add_action(Action::Focus);
+            node.add_action(Action::ScrollDown);
+            node.add_action(Action::ScrollUp);
+            let mut info = gpui::AccessibilityInfo::new(node);
+            info.focused = state
+                .focus_handle
+                .as_ref()
+                .is_some_and(|focus| focus.is_focused(window));
+            info
+        })
+        .on_action(move |request, _, window, cx| {
+            action_state.update(cx, |state, cx| {
+                use gpui::accesskit::Action;
+                match request.action {
+                    Action::Focus => {
+                        if let Some(focus) = &state.focus_handle {
+                            focus.focus(window)
+                        }
+                    }
+                    Action::ScrollDown => state
+                        .list_state
+                        .scroll_by(state.bounds.size.height.max(px(100.))),
+                    Action::ScrollUp => state
+                        .list_state
+                        .scroll_by(-state.bounds.size.height.max(px(100.))),
+                    _ => return,
+                }
+                cx.notify();
+            });
+            window.refresh();
+        })
+        .into_any_element();
         let layout_id = el.request_layout(window, cx);
         (layout_id, el)
     }
@@ -830,7 +919,17 @@ fn parse_content(
         }
         TextViewType::Html => super::format::html::parse(text, &mut node_cx),
     };
-    res.map(move |root_node| ParsedContent { root_node, node_cx })
+    res.map(move |root_node| {
+        let mut links = vec![];
+        root_node.links(&node_cx, &mut links);
+        let mut seen = std::collections::HashSet::new();
+        links.retain(|link| seen.insert(link.clone()));
+        ParsedContent {
+            root_node,
+            node_cx,
+            links: Arc::new(links),
+        }
+    })
 }
 
 fn selection_bounds(

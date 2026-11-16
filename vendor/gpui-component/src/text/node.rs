@@ -385,13 +385,16 @@ impl CodeBlock {
                     .text_size(cx.theme().mono_font_size)
                     .relative()
                     .refine_style(&style.code_block)
-                    .child(Inline::new(
-                        "code",
-                        self.state.clone(),
-                        vec![],
-                        self.styles.clone(),
-                        None,
-                    ))
+                    .child(
+                        Inline::new(
+                            "code",
+                            self.state.clone(),
+                            vec![],
+                            self.styles.clone(),
+                            None,
+                        )
+                        .accessible(),
+                    )
                     .when_some(node_cx.code_block_actions.clone(), |this, actions| {
                         this.child(
                             div()
@@ -582,7 +585,7 @@ impl Paragraph {
         let mut links: Vec<(Range<usize>, LinkMark)> = vec![];
         let mut offset = 0;
 
-        let mut ix = 0;
+        let mut ix = 0usize;
         for inline_node in children {
             let text_len = inline_node.text.len();
             text.push_str(&inline_node.text);
@@ -602,16 +605,22 @@ impl Paragraph {
                             highlights.clone(),
                             node_cx.resources.on_link.clone(),
                         )
+                        .accessible()
                         .into_any_element(),
                     );
                 }
                 if node_cx.resources.restrict_images
                     && !node_cx.resources.images.contains_key(&image.url)
                 {
+                    let label: SharedString =
+                        format!("[Image unavailable: {}]", image.title()).into();
                     child_nodes.push(
-                        div()
-                            .child(format!("[Image unavailable: {}]", image.title()))
-                            .into_any_element(),
+                        crate::semantic_text::text(
+                            ("image-omitted", ix),
+                            label.clone(),
+                            div().child(label),
+                        )
+                        .into_any_element(),
                     );
                 } else {
                     let image_source = node_cx
@@ -622,28 +631,34 @@ impl Paragraph {
                         .map(gpui::ImageSource::from)
                         .unwrap_or_else(|| image.url.clone().into());
                     let on_link = node_cx.resources.on_link.clone();
+                    let alt = image.title();
+                    let rendered = img(image_source)
+                        .id(ix)
+                        .object_fit(ObjectFit::Contain)
+                        .max_w(relative(1.))
+                        .when_some(image.width, |this, width| this.w(width))
+                        .when_some(image.link.clone(), |this, link| {
+                            let title = image.title();
+                            this.cursor_pointer()
+                                .tooltip(move |window, cx| {
+                                    Tooltip::new(title.clone()).build(window, cx)
+                                })
+                                .on_click(move |_, window, cx| {
+                                    cx.stop_propagation();
+                                    if let Some(on_link) = &on_link {
+                                        on_link(&link.url, window, cx);
+                                    } else {
+                                        cx.open_url(&link.url);
+                                    }
+                                })
+                        });
                     child_nodes.push(
-                        img(image_source)
-                            .id(ix)
-                            .object_fit(ObjectFit::Contain)
-                            .max_w(relative(1.))
-                            .when_some(image.width, |this, width| this.w(width))
-                            .when_some(image.link.clone(), |this, link| {
-                                let title = image.title();
-                                this.cursor_pointer()
-                                    .tooltip(move |window, cx| {
-                                        Tooltip::new(title.clone()).build(window, cx)
-                                    })
-                                    .on_click(move |_, window, cx| {
-                                        cx.stop_propagation();
-                                        if let Some(on_link) = &on_link {
-                                            on_link(&link.url, window, cx);
-                                        } else {
-                                            cx.open_url(&link.url);
-                                        }
-                                    })
-                            })
-                            .into_any_element(),
+                        gpui::accessible(("image", ix), rendered, move |_, _, _| {
+                            let mut node = gpui::accesskit::Node::new(gpui::accesskit::Role::Image);
+                            node.set_label(alt.clone());
+                            gpui::AccessibilityInfo::new(node)
+                        })
+                        .into_any_element(),
                     );
                 }
                 text.clear();
@@ -709,6 +724,7 @@ impl Paragraph {
                     highlights,
                     node_cx.resources.on_link.clone(),
                 )
+                .accessible()
                 .into_any_element(),
             );
         }
@@ -778,6 +794,60 @@ impl Paragraph {
 }
 
 impl Node {
+    pub(crate) fn links(
+        &self,
+        context: &NodeContext,
+        links: &mut Vec<(SharedString, SharedString)>,
+    ) {
+        let mut paragraph = |paragraph: &Paragraph| {
+            for child in &paragraph.children {
+                for (range, mark) in &child.marks {
+                    if let Some(link) = &mark.link {
+                        let link = link
+                            .identifier
+                            .as_ref()
+                            .and_then(|id| context.link_refs.get(id))
+                            .unwrap_or(link);
+                        if !link.url.is_empty() {
+                            links.push((
+                                child.text[range.clone()].to_owned().into(),
+                                link.url.clone(),
+                            ));
+                        }
+                    }
+                }
+                if let Some(image) = &child.image {
+                    if let Some(link) = &image.link {
+                        links.push((image.title().into(), link.url.clone()));
+                    }
+                }
+            }
+        };
+        match self {
+            Node::Root { children } => {
+                for child in children.iter() {
+                    child.links(context, links)
+                }
+            }
+            Node::List { children, .. }
+            | Node::ListItem { children, .. }
+            | Node::Blockquote { children } => {
+                for child in children {
+                    child.links(context, links)
+                }
+            }
+            Node::Paragraph(text) | Node::Heading { children: text, .. } => paragraph(text),
+            Node::Table(table) => {
+                for row in &table.children {
+                    for cell in &row.children {
+                        paragraph(&cell.children)
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Converts the node to markdown format.
     ///
     /// This is used to generate markdown for test.
@@ -930,7 +1000,7 @@ impl Node {
                 spread,
                 checked,
             } => v_flex()
-                .id("li")
+                .id(("li", ix))
                 .when(*spread, |this| this.child(div()))
                 .children({
                     let mut items: Vec<Div> = Vec::with_capacity(children.len());
@@ -979,26 +1049,41 @@ impl Node {
                                         })
                                         .when_some(*checked, |this, checked| {
                                             // Todo list checkbox
-                                            this.child(
-                                                div()
-                                                    .flex()
-                                                    .mt(rems(0.4))
-                                                    .mr_1p5()
-                                                    .size(rems(0.875))
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .rounded(cx.theme().radius.half())
-                                                    .border_1()
-                                                    .border_color(cx.theme().primary)
-                                                    .text_color(cx.theme().primary_foreground)
-                                                    .when(checked, |this| {
-                                                        this.bg(cx.theme().primary).child(
-                                                            Icon::new(IconName::Check)
-                                                                .size_2()
-                                                                .text_xs(),
-                                                        )
-                                                    }),
-                                            )
+                                            let marker = div()
+                                                .flex()
+                                                .mt(rems(0.4))
+                                                .mr_1p5()
+                                                .size(rems(0.875))
+                                                .items_center()
+                                                .justify_center()
+                                                .rounded(cx.theme().radius.half())
+                                                .border_1()
+                                                .border_color(cx.theme().primary)
+                                                .text_color(cx.theme().primary_foreground)
+                                                .when(checked, |this| {
+                                                    this.bg(cx.theme().primary).child(
+                                                        Icon::new(IconName::Check)
+                                                            .size_2()
+                                                            .text_xs(),
+                                                    )
+                                                });
+                                            this.child(gpui::accessible(
+                                                ("task", child_ix),
+                                                marker,
+                                                move |_, _, _| {
+                                                    let mut node = gpui::accesskit::Node::new(
+                                                        gpui::accesskit::Role::CheckBox,
+                                                    );
+                                                    node.set_label("Task");
+                                                    node.set_read_only();
+                                                    node.set_toggled(if checked {
+                                                        gpui::accesskit::Toggled::True
+                                                    } else {
+                                                        gpui::accesskit::Toggled::False
+                                                    });
+                                                    gpui::AccessibilityInfo::new(node)
+                                                },
+                                            ))
                                         })
                                         .child(div().overflow_hidden().child(text)),
                                 );
@@ -1071,7 +1156,7 @@ impl Node {
                             for (row_ix, row) in table.children.iter().enumerate() {
                                 rows.push(
                                     div()
-                                        .id("row")
+                                        .id(("row", row_ix))
                                         .min_w_full()
                                         .w(rems(
                                             col_lens
@@ -1101,7 +1186,7 @@ impl Node {
 
                                                 cells.push(
                                                     div()
-                                                        .id("cell")
+                                                        .id(("cell", ix))
                                                         .flex()
                                                         .when(
                                                             align == ColumnumnAlign::Center,
@@ -1122,14 +1207,49 @@ impl Node {
                                                         .child(
                                                             cell.children
                                                                 .render(node_cx, window, cx),
-                                                        ),
+                                                        )
+                                                        .map(|rendered| {
+                                                            gpui::accessible(
+                                                                ("cell-role", ix),
+                                                                rendered,
+                                                                move |_, _, _| {
+                                                                    let role = if row_ix == 0 {
+                                                                        gpui::accesskit::Role::ColumnHeader
+                                                                    } else {
+                                                                        gpui::accesskit::Role::Cell
+                                                                    };
+                                                                    let mut node = gpui::accesskit::Node::new(role);
+                                                                    node.set_row_index(row_ix);
+                                                                    node.set_column_index(ix);
+                                                                    gpui::AccessibilityInfo::new(node)
+                                                                },
+                                                            )
+                                                            .into_any_element()
+                                                        }),
                                                 )
                                             }
                                             cells
+                                        })
+                                        .map(|rendered| {
+                                            gpui::accessible(("row-role", row_ix), rendered, move |_, _, _| {
+                                                let mut node = gpui::accesskit::Node::new(gpui::accesskit::Role::Row);
+                                                node.set_row_index(row_ix);
+                                                gpui::AccessibilityInfo::new(node)
+                                            })
                                         }),
                                 )
                             }
                             rows
+                        })
+                        .map(|rendered| {
+                            let row_count = table.children.len();
+                            let column_count = col_lens.len();
+                            gpui::accessible("table-role", rendered, move |_, _, _| {
+                                let mut node = gpui::accesskit::Node::new(gpui::accesskit::Role::Table);
+                                node.set_row_count(row_count);
+                                node.set_column_count(column_count);
+                                gpui::AccessibilityInfo::new(node)
+                            })
                         }),
                 )
                 .into_any_element(),
@@ -1193,11 +1313,11 @@ impl Node {
         match self {
             Node::Root { children } => div()
                 .id("div")
-                .children(
-                    children
-                        .iter()
-                        .map(move |node| node.render_block(options, node_cx, window, cx)),
-                )
+                .children(children.iter().enumerate().map(move |(index, node)| {
+                    div()
+                        .id(("block", index))
+                        .child(node.render_block(options, node_cx, window, cx))
+                }))
                 .into_any_element(),
             Node::Paragraph(paragraph) => div()
                 .id("p")
@@ -1220,14 +1340,26 @@ impl Node {
                     text_size = (f)(*level, node_cx.style.heading_base_font_size);
                 }
 
-                h_flex()
-                    .id(("h", *level as usize))
+                let level = *level;
+                let label: String = children
+                    .children
+                    .iter()
+                    .map(|node| node.text.as_str())
+                    .collect();
+                let heading = h_flex()
+                    .id(("h", level as usize))
                     .pb(rems(0.3))
                     .whitespace_normal()
                     .text_size(text_size)
                     .font_weight(font_weight)
-                    .child(children.render(node_cx, window, cx))
-                    .into_any_element()
+                    .child(children.render(node_cx, window, cx));
+                gpui::accessible("heading", heading, move |_, _, _| {
+                    let mut node = gpui::accesskit::Node::new(gpui::accesskit::Role::Heading);
+                    node.set_level(level as usize);
+                    node.set_label(label.clone());
+                    gpui::AccessibilityInfo::new(node)
+                })
+                .into_any_element()
             }
             Node::Blockquote { children } => div()
                 .w_full()

@@ -63,6 +63,10 @@ impl Inline {
         }
     }
 
+    pub(super) fn accessible(self) -> gpui::Accessible {
+        crate::semantic_text::text(self.id.clone(), self.text.clone(), self)
+    }
+
     /// Get link at given mouse position.
     fn link_for_position(
         layout: &TextLayout,
