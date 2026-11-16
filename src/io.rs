@@ -381,6 +381,7 @@ impl IoWorker {
                             generation,
                             without_recovery,
                         } => {
+                            crate::metrics::event("save-worker", id, generation);
                             let result = if without_recovery {
                                 disk.save(&text)
                             } else {
@@ -411,6 +412,7 @@ impl IoWorker {
                                         Ok(saved)
                                     })
                             };
+                            crate::metrics::event("save-worker-done", id, generation);
                             Reply::Save(id, text, result)
                         }
                     };

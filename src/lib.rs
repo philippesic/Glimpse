@@ -12,6 +12,7 @@ pub mod io;
 pub mod lifecycle;
 #[cfg(test)]
 pub mod markdown;
+pub mod metrics;
 #[cfg(test)]
 pub mod navigation;
 pub mod observe;

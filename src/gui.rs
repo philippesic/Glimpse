@@ -328,6 +328,7 @@ impl Shell {
                 }
                 if let Some(doc) = this.documents.iter_mut().find(|d| d.id == id) {
                     doc.generation += 1;
+                    glimpse::metrics::event("change", id, doc.generation);
                     doc.preview = false;
                     if !this.request.pick {
                         this.io.send(Job::Recover(
@@ -589,6 +590,7 @@ impl Shell {
                     }
                 }
                 Reply::Save(id, text, result) => {
+                    glimpse::metrics::event("save-reply", id, 0);
                     let succeeded = result.is_ok();
                     if let Some(doc) = self.documents.iter_mut().find(|d| d.id == id) {
                         doc.saving = false;
@@ -818,6 +820,7 @@ impl Shell {
         cx.notify();
     }
     fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        glimpse::metrics::event("save-command", self.active.unwrap_or(0), 0);
         if self.request.pick {
             return;
         }
@@ -839,6 +842,7 @@ impl Shell {
                         .into();
                 return;
             }
+            glimpse::metrics::event("save-queued", doc.id, doc.generation);
             doc.saving = true;
             self.io.send(Job::Save {
                 id: doc.id,
