@@ -1,3 +1,8 @@
+[workspace]
+members = ["vendor/gpui-component"]
+default-members = ["."]
+resolver = "3"
+
 [package]
 name = "glimpse"
 version = "0.1.0"

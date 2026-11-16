@@ -1,6 +1,4 @@
-use gpui::{
-    AnyElement, App, IntoElement, ParentElement, RenderOnce, StyleRefinement, Styled, Window,
-};
+use gpui::{AnyElement, App, IntoElement, ParentElement, RenderOnce, StyleRefinement, Styled, Window};
 
 use crate::{v_flex, StyledExt};
 

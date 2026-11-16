@@ -795,7 +795,11 @@ impl Node {
                 children, checked, ..
             } => {
                 let checkbox = if let Some(checked) = checked {
-                    if *checked { "[x] " } else { "[ ] " }
+                    if *checked {
+                        "[x] "
+                    } else {
+                        "[ ] "
+                    }
                 } else {
                     ""
                 };
@@ -923,9 +927,10 @@ impl Node {
                                 // merge content into last item.
                                 if last_not_list {
                                     if let Some(item_item) = items.last_mut() {
-                                        item_item.extend(vec![
-                                            div().overflow_hidden().child(text).into_any_element(),
-                                        ]);
+                                        item_item.extend(vec![div()
+                                            .overflow_hidden()
+                                            .child(text)
+                                            .into_any_element()]);
                                         continue;
                                     }
                                 }

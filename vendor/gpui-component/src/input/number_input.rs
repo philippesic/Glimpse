@@ -4,9 +4,7 @@ use gpui::{
     StyleRefinement, Styled, Window, actions, prelude::FluentBuilder as _,
 };
 
-use crate::{
-    ActiveTheme, Disableable, IconName, Sizable, Size, StyledExt as _, button::Button, h_flex,
-};
+use crate::{ActiveTheme, Disableable, IconName, Sizable, Size, StyledExt as _, button::Button, h_flex};
 
 use super::{Input, InputState};
 
