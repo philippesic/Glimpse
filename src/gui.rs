@@ -1059,12 +1059,7 @@ impl Shell {
             .map_or(text.len(), |(byte, _)| byte);
         let prefix = &text[..byte];
         let row = prefix.bytes().filter(|&byte| byte == b'\n').count() as u32;
-        let column = prefix
-            .rsplit('\n')
-            .next()
-            .unwrap_or("")
-            .encode_utf16()
-            .count() as u32;
+        let column = prefix.rsplit('\n').next().unwrap_or("").chars().count() as u32;
         input.update(cx, |input, cx| {
             input.set_cursor_position_unfocused(Position::new(row, column), cx);
             if focus {
