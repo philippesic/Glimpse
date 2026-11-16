@@ -25,7 +25,7 @@ use glimpse::{
 use gpui::{prelude::*, *};
 use gpui_component::{
     ActiveTheme, Root, Selectable, Sizable,
-    button::Button,
+    button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState, Position},
     text::TextView,
 };
@@ -90,6 +90,8 @@ struct Document {
     disk: DiskFile,
     input: Entity<InputState>,
     saved: SharedString,
+    endings: std::cell::Cell<Option<(u64, &'static str)>>,
+    status_cursor: usize,
     generation: u64,
     preview: bool,
     saving: bool,
@@ -107,6 +109,25 @@ struct Document {
     _subscriptions: Vec<Subscription>,
 }
 impl Document {
+    fn information(&self, cx: &App, reading: bool) -> String {
+        let input = self.input.read(cx);
+        let position = input.cursor_position();
+        let endings = match self.endings.get() {
+            Some((generation, endings)) if generation == self.generation => endings,
+            _ => {
+                let endings = glimpse::editor::line_endings(&input.value());
+                self.endings.set(Some((self.generation, endings)));
+                endings
+            }
+        };
+        format!(
+            "{}Ln {}, Col {} · UTF-8{} · {endings}",
+            if reading { "Read · " } else { "" },
+            position.line + 1,
+            position.character + 1,
+            if self.disk.bom { " BOM" } else { "" }
+        )
+    }
     fn dirty(&self, cx: &App) -> bool {
         self.restored || self.input.read(cx).value().as_str() != self.saved.as_str()
     }
@@ -228,6 +249,7 @@ struct Shell {
     reading_view: Option<reading::View>,
     status: String,
     font_warning: Option<String>,
+    window_title: String,
     warnings: Vec<String>,
     omitted_warnings: u64,
     volumes: Option<glimpse::locations::Volumes>,
@@ -396,6 +418,7 @@ impl Shell {
             reading_view: None,
             status: String::new(),
             font_warning: None,
+            window_title: String::new(),
             warnings: Vec::new(),
             omitted_warnings: 0,
             volumes: None,
@@ -954,6 +977,15 @@ impl Shell {
             self.requested.push((id, disk.path.clone()));
         }
         let refresh_subscription = cx.observe_in(&input, window, move |this, _, window, cx| {
+            if this.active == Some(id)
+                && let Some(doc) = this.documents.iter_mut().find(|doc| doc.id == id)
+            {
+                let cursor = doc.input.read(cx).cursor();
+                if doc.status_cursor != cursor {
+                    doc.status_cursor = cursor;
+                    cx.notify();
+                }
+            }
             this.apply_external(id, window, cx);
         });
         let tab_focus = cx.focus_handle();
@@ -968,6 +1000,8 @@ impl Shell {
             disk,
             input: input.clone(),
             saved: text,
+            endings: std::cell::Cell::new(None),
+            status_cursor: 0,
             generation: 0,
             preview,
             saving: false,
@@ -1103,6 +1137,9 @@ impl Shell {
             );
             input.set_value(value, window, cx);
             input.focus(window, cx);
+            if panel == Panel::Path {
+                input.select_all(&gpui_component::input::SelectAll, window, cx);
+            }
         });
         if panel == Panel::Recovery {
             self.io.send(Job::Inventory);
@@ -2726,6 +2763,25 @@ impl Shell {
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.prepare_reading(cx);
+        let title = self
+            .documents
+            .iter()
+            .find(|doc| Some(doc.id) == self.active)
+            .map(|doc| {
+                format!(
+                    "{}{} — Glimpse",
+                    paths::tab_label(
+                        &doc.disk.path,
+                        self.documents.iter().map(|doc| doc.disk.path.as_path())
+                    ),
+                    if doc.dirty(cx) { " •" } else { "" }
+                )
+            })
+            .unwrap_or_else(|| "Glimpse".into());
+        if self.window_title != title {
+            window.set_window_title(&title);
+            self.window_title = title;
+        }
         if !self.ready
             && self.listing_done
             && self.opening.is_empty()
@@ -3140,6 +3196,7 @@ impl Render for Shell {
                         .small()
                         .compact()
                         .selected(Some(id) == self.active)
+                        .when(Some(id) == self.active, |tab| tab.primary())
                         .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                             this.active = Some(id);
                             if event.click_count() > 1
@@ -3324,13 +3381,16 @@ impl Render for Shell {
         root.child(div().flex_1().min_h_0().child(body))
             .child(
                 div()
-                    .h(px(36. * self.settings.ui_scale))
+                    .h(px(if narrow { 48. } else { 36. } * self.settings.ui_scale))
                     .flex_shrink_0()
                     .px_2()
                     .flex()
                     .items_center()
                     .gap_2()
                     .text_size(px(12. * self.settings.ui_scale))
+                    .when(narrow, |footer| {
+                        footer.flex_col().items_start().justify_center().gap_0()
+                    })
                     .when(!self.warnings.is_empty(), |footer| {
                         footer.child(self.button("Recovery Warning…", "warnings", cx))
                     })
@@ -3352,7 +3412,25 @@ impl Render for Shell {
                                         .build(window, cx)
                                 }),
                         )
-                    }),
+                    })
+                    .when_some(
+                        self.documents
+                            .iter()
+                            .find(|doc| Some(doc.id) == self.active),
+                        |footer, doc| {
+                            let information = doc.information(cx, self.reading);
+                            footer.child(accessible(
+                                "document-information",
+                                div().flex_shrink_0().child(information.clone()),
+                                move |_, _, _| {
+                                    let mut node =
+                                        gpui::accesskit::Node::new(gpui::accesskit::Role::Status);
+                                    node.set_label(information.clone());
+                                    AccessibilityInfo::new(node)
+                                },
+                            ))
+                        },
+                    ),
             )
             .children(self.preferences.clone())
             .children(self.decision.clone())

@@ -119,6 +119,38 @@ pub fn match_ranges(
     (ranges, matches.next().is_some())
 }
 
+pub fn line_endings(text: &str) -> &'static str {
+    let bytes = text.as_bytes();
+    let lf = bytes.iter().filter(|&&byte| byte == b'\n').count();
+    let cr = bytes.iter().filter(|&&byte| byte == b'\r').count();
+    let crlf = bytes.windows(2).filter(|pair| *pair == b"\r\n").count();
+    match (lf, cr, crlf) {
+        (0, 0, _) => "No line breaks",
+        (_, 0, _) => "LF",
+        (0, _, _) => "CR",
+        (lf, cr, pairs) if lf == pairs && cr == pairs => "CRLF",
+        _ => "Mixed",
+    }
+}
+
+#[cfg(test)]
+mod line_endings_tests {
+    #[test]
+    fn endings_distinguish_empty_uniform_and_mixed_text() {
+        for (text, expected) in [
+            ("", "No line breaks"),
+            ("café 🦀", "No line breaks"),
+            ("a\nb\n", "LF"),
+            ("a\rb\r", "CR"),
+            ("a\r\nb\r\n", "CRLF"),
+            ("a\r\nb\n", "Mixed"),
+            ("a\rb\n", "Mixed"),
+        ] {
+            assert_eq!(super::line_endings(text), expected);
+        }
+    }
+}
+
 pub struct Metadata {
     pub generation: u64,
     pub starts: Vec<usize>,

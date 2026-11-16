@@ -134,6 +134,7 @@ version = "=2.0.0-beta.1"
 features = [
     "metric_lines_lf",
     "metric_utf16",
+    "metric_chars",
 ]
 
 [dependencies.rust-i18n]
