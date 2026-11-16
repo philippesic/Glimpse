@@ -1,5 +1,7 @@
 # Glimpse UI design
 
+Implementation descriptions and measurements below refer to the retired macOS prototype. The GPUI port has separate coverage and limitations in [core design](core-design.md); these records do not establish GPUI parity or qualification.
+
 Glimpse combines sophisticated appearance with simple functionality and interaction. Its everyday workflow is find a file, inspect it, make a small edit, save, and return to work. Visual refinement should make that workflow feel effortless: well-proportioned controls, readable typography, familiar focus and keyboard behavior, and clear document state. Clean means organized and intentional, with enough context to act confidently.
 
 [glimpse.md](../glimpse.md) governs product scope, navigation and file safety. This document defines how that contract appears on screen; requirements here do not claim that a feature is implemented or qualified. [src/appearance.rs](../src/appearance.rs) holds the built-in appearance tokens.

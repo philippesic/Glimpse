@@ -1,6 +1,6 @@
 # Glimpse
 
-**Product and design source of truth · Core development baseline · Updated 30 October 2026**
+**Product and design source of truth · Core development baseline · Updated 16 November 2026**
 
 Glimpse is a small desktop file navigator and text editor for people whose main work happens in terminals and agent harnesses. Its primary workflow is **find a file, inspect it, make a small edit, and return to the task that brought you there**.
 
@@ -10,7 +10,7 @@ This document governs product scope, interaction, visual language, and implement
 
 ### Current implementation stage
 
-The macOS development build implements single-list directory navigation, previews, native AppKit source editing, syntax and line numbers, validated Save/As/Copy, no-clobber creation/rename, OS Trash, recovery/history, external-change handling, scoped streaming search, native Markdown reading, functional preferences/keymaps and CLI open/pick/wait. [README.md](README.md) describes actual behavior; [qualification results](docs/qualification.md) separate implemented functionality from release evidence. The 10 MiB long-line case and memory aspiration fail their performance gates. Physical 120 Hz delivery, full VoiceOver and real IME composition remain unverified; no other desktop platform is qualified. These limits do not relax the product targets.
+The development build uses GPUI, with Linux as the current verification target. [README.md](README.md) describes the current interface and [core design](docs/core-design.md) records gaps. Historical [qualification results](docs/qualification.md) apply to the retired prototype. macOS compilation and interaction are unverified for the GPUI port. These limits do not relax the product targets.
 
 ## 1. Purpose and position
 
@@ -280,11 +280,11 @@ The initial implementation should use one Cargo package with ordinary Rust modul
 
 The domain modules must compile and be testable without opening a window. Prefer concrete types and explicit ownership; use traits when an actual alternative implementation or necessary test boundary requires one. Keep public interfaces small. Extract another crate when a demonstrated dependency, reuse, or build-time need justifies it. A possible future TUI or plugin system alone is not that need. Rust modules already provide encapsulation within a crate. [Rust module privacy](https://doc.rust-lang.org/book/ch07-02-defining-modules-to-control-scope-and-privacy.html).
 
-### Toolkit selection remains an engineering gate
+### GPUI implementation
 
-Prototype **egui/eframe and one editor-capable alternative** against the same workload. Floem is a relevant alternative because it exposes a text editor used by Lapce; GPUI and Iced remain candidates if their current APIs and component availability fit. Choose the second candidate after a short component and license assessment, rather than implementing four parallel prototypes. [egui](https://github.com/emilk/egui), [Floem editor](https://lapce.dev/floem/floem/views/text_editor/index.html), [GPUI](https://gpui.rs/), [Iced](https://github.com/iced-rs/iced).
+The GUI uses GPUI with a native Rust text component. Linux is the first port target; macOS remains a target requiring separate compilation and desktop verification. The egui/eframe and embedded AppKit application layer is retired. No WebView application frontend or Markdown renderer is permitted.
 
-A framework's renderer or text-input demo is insufficient evidence. The spike must demonstrate long-document layout, selection, undo, IME/dead keys, emoji/graphemes, font fallback, native clipboard, screen-reader editing, virtualized tree rows, startup, and idle behavior. Evaluate upstream maintenance and licensing of any editor code separately from the toolkit. Choose a toolkit only after this evidence; if no candidate meets the essentials, revise the implementation strategy before constructing the full application around it.
+The editor choice and its patches are recorded in [core design](docs/core-design.md). Availability of a component is not qualification: long-document layout, long lines, selection, undo, IME/dead keys, emoji/graphemes, font fallback, native clipboard, accessibility, virtualized rows, startup and idle behavior require direct evidence. Remaining gaps must stay visible rather than weakening the editing or safety contracts.
 
 Extensions begin with stable internal commands and declarative preferences, not a public plugin ABI. Add a runtime only after concrete optional features demonstrate a repeated need. Any later extension system must make activation, capabilities, resource cost, isolation, compatibility, and disablement explicit. Core navigation, editing, and recovery stay available with all extensions disabled.
 

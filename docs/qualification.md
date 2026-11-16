@@ -1,5 +1,7 @@
 # macOS qualification
 
+Implementation descriptions and measurements below refer to the retired macOS prototype. The GPUI port has separate coverage and limitations in [core design](core-design.md); these records do not establish GPUI parity or qualification.
+
 Results from the 28 October 2026 development build. These are measured development results, not release certification. Tests ran on a Mac15,10 / M3 Max, 36 GiB RAM, macOS 27.0, with a reported 120 Hz display and Retina backing. Other user applications were not controlled. Windows and Linux were not tested.
 
 ## Functional evidence

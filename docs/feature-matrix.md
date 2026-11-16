@@ -1,5 +1,7 @@
 # macOS feature acceptance
 
+Implementation descriptions and measurements below refer to the retired macOS prototype. The GPUI port has separate coverage and limitations in [core design](core-design.md); these records do not establish GPUI parity or qualification.
+
 Development status for the current native Rust implementation. Automated and native checks support the implemented workflows below; they do not establish release certification or full visual parity. Performance targets and failed/unverified gates are recorded in [qualification](qualification.md).
 
 | Area | Implemented and exercised | Remaining qualification |
