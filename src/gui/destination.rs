@@ -118,6 +118,14 @@ impl Shell {
             FailureAction::Save => ("Save did not complete", "Retry Save"),
             FailureAction::Reload => ("Reload did not complete", "Retry Reload"),
             FailureAction::Check => ("File unavailable", "Retry File Check"),
+            FailureAction::Choose(DestinationKind::SaveAs) => (
+                "Destination chooser unavailable",
+                "Choose Destination Again",
+            ),
+            FailureAction::Choose(_) => (
+                "Copy destination chooser unavailable",
+                "Choose Copy Destination Again",
+            ),
         };
         self.ask_decision(DecisionAction::FailureDetails(doc.id), title.into(), format!("File: {}\n{error}\nThe current text remains open. Retry checks this file again before continuing.", paths::display(destination)), vec!["Keep Editing", retry, "Save Copy Elsewhere…"], window, cx);
     }
@@ -140,6 +148,10 @@ impl Shell {
             }
             FailureAction::Check => {
                 self.check_document(doc.id);
+                return;
+            }
+            FailureAction::Choose(kind) => {
+                self.save_as(kind, window, cx);
                 return;
             }
             FailureAction::Save => {}

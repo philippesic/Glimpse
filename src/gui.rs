@@ -139,6 +139,7 @@ enum DecisionAction {
     RecoveryOptions(u64),
     FailureDetails(u64),
     Warnings,
+    Notice,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -146,6 +147,7 @@ enum FailureAction {
     Save,
     Reload,
     Check,
+    Choose(DestinationKind),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1745,25 +1747,42 @@ impl Shell {
         let suggested = paths::name(previous.unwrap_or(&doc.disk.path));
         let prompt = cx.prompt_for_new_path(folder, Some(&suggested));
         cx.spawn_in(window, async move |this, cx| {
-            if let Ok(Ok(Some(path))) = prompt.await {
-                let _ = this.update(cx, |this, cx| {
-                    if this.documents.iter().any(|doc| doc.id == destination.id) {
-                        destination.path = path;
-                        this.destination_busy = true;
-                        this.destination_document = Some(destination.id);
-                        this.io.send(Job::Prepare(destination));
-                    } else {
-                        this.status = "The document was closed; nothing was saved".into();
+            let result = prompt
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result.map_err(|error| error.to_string()));
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(Some(path)) => {
+                        if this.documents.iter().any(|doc| doc.id == destination.id) {
+                            destination.path = path;
+                            this.destination_busy = true;
+                            this.destination_document = Some(destination.id);
+                            this.io.send(Job::Prepare(destination));
+                        } else {
+                            this.status = "The document was closed; nothing was saved".into();
+                        }
                     }
-                    cx.notify();
-                });
-            } else {
-                let _ = this.update(cx, |this, cx| {
-                    this.close_pending = None;
-                    this.status = "Save cancelled. The document remains open.".into();
-                    cx.notify();
-                });
-            }
+                    Ok(None) => {
+                        this.close_pending = None;
+                        this.status = "Save cancelled. The document remains open.".into();
+                    }
+                    Err(error) => {
+                        this.close_pending = None;
+                        let message = format!("Destination chooser failed: {error}");
+                        if let Some(doc) = this
+                            .documents
+                            .iter_mut()
+                            .find(|doc| doc.id == destination.id)
+                        {
+                            doc.error = Some(message.clone());
+                            doc.failure_action = FailureAction::Choose(kind);
+                        }
+                        this.status = message;
+                    }
+                }
+                cx.notify();
+            });
         })
         .detach();
     }
@@ -2112,14 +2131,29 @@ impl Shell {
                     prompt: None,
                 });
                 cx.spawn_in(window, async move |this, cx| {
-                    if let Ok(Ok(Some(paths))) = prompt.await {
-                        let _ = this.update(cx, |this, cx| {
-                            for path in paths {
-                                this.open(path, false, None);
+                    let result = prompt
+                        .await
+                        .map_err(|error| error.to_string())
+                        .and_then(|result| result.map_err(|error| error.to_string()));
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        match result {
+                            Ok(Some(paths)) => {
+                                for path in paths {
+                                    this.open(path, false, None);
+                                }
                             }
-                            cx.notify();
-                        });
-                    }
+                            Ok(None) => this.status = "Open cancelled".into(),
+                            Err(error) => this.ask_decision(
+                                DecisionAction::Notice,
+                                "File chooser unavailable".into(),
+                                format!("{error}\nTry Open again after the desktop file chooser is available."),
+                                vec!["Close"],
+                                window,
+                                cx,
+                            ),
+                        }
+                        cx.notify();
+                    });
                 })
                 .detach();
             }
@@ -2666,6 +2700,7 @@ impl Render for Shell {
                             FailureAction::Save => "Last save failed",
                             FailureAction::Reload => "Reload stopped",
                             FailureAction::Check => "File unavailable",
+                            FailureAction::Choose(_) => "Destination unavailable",
                         })
                         .child(self.button("Details and Retry…", "failure-details", cx)),
                 );
