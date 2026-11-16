@@ -274,6 +274,7 @@ pub struct InputState {
     pub(super) mode: InputMode,
     pub(super) text: Rope,
     value_cache: std::cell::RefCell<Option<SharedString>>,
+    line_endings: super::text_metadata::LineEndings,
     accessibility_label: Option<SharedString>,
     pub(super) text_wrapper: TextWrapper,
     pub(super) history: History<Change>,
@@ -406,6 +407,7 @@ impl InputState {
             focus_handle: focus_handle.clone(),
             text: "".into(),
             value_cache: std::cell::RefCell::new(None),
+            line_endings: Default::default(),
             text_wrapper: TextWrapper::new(text_style.font(), window.rem_size(), None),
             blink_cursor,
             history,
@@ -814,6 +816,7 @@ impl InputState {
     pub fn default_value(mut self, value: impl Into<SharedString>) -> Self {
         let text: SharedString = value.into();
         self.text = Rope::from(text.as_str());
+        self.line_endings = super::text_metadata::LineEndings::new(&text);
         *self.value_cache.get_mut() = Some(text);
         if let Some(diagnostics) = self.mode.diagnostics_mut() {
             diagnostics.reset(&self.text)
@@ -829,6 +832,10 @@ impl InputState {
             .borrow_mut()
             .get_or_insert_with(|| SharedString::new(self.text.to_string()))
             .clone()
+    }
+
+    pub fn line_endings(&self) -> &'static str {
+        self.line_endings.label()
     }
 
     /// Return the value without mask.
@@ -2110,6 +2117,11 @@ impl EntityInputHandler for InputState {
         }
 
         self.value_cache.get_mut().take();
+        if self.mode.is_single_line() {
+            self.line_endings = super::text_metadata::LineEndings::new(&self.text.to_string());
+        } else {
+            self.line_endings.replace(&old_text, &self.text, &range);
+        }
         if let Some(original) = self.composition.take() {
             if !self.history.ignore {
                 self.history.new_group();
@@ -2199,6 +2211,11 @@ impl EntityInputHandler for InputState {
         }
 
         self.value_cache.get_mut().take();
+        if self.mode.is_single_line() {
+            self.line_endings = super::text_metadata::LineEndings::new(&self.text.to_string());
+        } else {
+            self.line_endings.replace(&old_text, &self.text, &range);
+        }
         if self.composition.is_none() {
             self.composition = Some(Composition {
                 range: range.clone(),

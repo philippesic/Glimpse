@@ -91,7 +91,6 @@ struct Document {
     disk: DiskFile,
     input: Entity<InputState>,
     saved: SharedString,
-    endings: std::cell::Cell<Option<(u64, &'static str)>>,
     status_cursor: usize,
     generation: u64,
     preview: bool,
@@ -113,14 +112,7 @@ impl Document {
     fn information(&self, cx: &App, reading: bool) -> String {
         let input = self.input.read(cx);
         let position = input.cursor_position();
-        let endings = match self.endings.get() {
-            Some((generation, endings)) if generation == self.generation => endings,
-            _ => {
-                let endings = glimpse::editor::line_endings(&input.value());
-                self.endings.set(Some((self.generation, endings)));
-                endings
-            }
-        };
+        let endings = input.line_endings();
         format!(
             "{}Ln {}, Col {} · UTF-8{} · {endings}",
             if reading { "Read · " } else { "" },
@@ -1001,7 +993,6 @@ impl Shell {
             disk,
             input: input.clone(),
             saved: text,
-            endings: std::cell::Cell::new(None),
             status_cursor: 0,
             generation: 0,
             preview,
