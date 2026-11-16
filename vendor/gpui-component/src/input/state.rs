@@ -273,6 +273,7 @@ pub struct InputState {
     pub(super) focus_handle: FocusHandle,
     pub(super) mode: InputMode,
     pub(super) text: Rope,
+    value_cache: std::cell::RefCell<Option<SharedString>>,
     accessibility_label: Option<SharedString>,
     pub(super) text_wrapper: TextWrapper,
     pub(super) history: History<Change>,
@@ -404,6 +405,7 @@ impl InputState {
             external_highlights: None,
             focus_handle: focus_handle.clone(),
             text: "".into(),
+            value_cache: std::cell::RefCell::new(None),
             text_wrapper: TextWrapper::new(text_style.font(), window.rem_size(), None),
             blink_cursor,
             history,
@@ -812,6 +814,7 @@ impl InputState {
     pub fn default_value(mut self, value: impl Into<SharedString>) -> Self {
         let text: SharedString = value.into();
         self.text = Rope::from(text.as_str());
+        *self.value_cache.get_mut() = Some(text);
         if let Some(diagnostics) = self.mode.diagnostics_mut() {
             diagnostics.reset(&self.text)
         }
@@ -822,7 +825,10 @@ impl InputState {
 
     /// Return the value of the input field.
     pub fn value(&self) -> SharedString {
-        SharedString::new(self.text.to_string())
+        self.value_cache
+            .borrow_mut()
+            .get_or_insert_with(|| SharedString::new(self.text.to_string()))
+            .clone()
     }
 
     /// Return the value without mask.
@@ -2102,6 +2108,7 @@ impl EntityInputHandler for InputState {
             }
         }
 
+        self.value_cache.get_mut().take();
         if let Some(original) = self.composition.take() {
             if !self.history.ignore {
                 self.history.new_group();
@@ -2188,6 +2195,7 @@ impl EntityInputHandler for InputState {
             }
         }
 
+        self.value_cache.get_mut().take();
         if self.composition.is_none() {
             self.composition = Some(Composition {
                 range: range.clone(),

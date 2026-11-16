@@ -191,15 +191,11 @@ impl TextElement {
                     scroll_offset.x
                 };
 
-                // If we change the scroll_offset.y, GPUI will render and trigger the next run loop.
-                // So, here we just adjust offset by `line_height` for move smooth.
                 scroll_offset.y =
                     if scroll_offset.y + cursor_pos.y > bounds.size.height - top_bottom_margin {
-                        // cursor is out of bottom
-                        scroll_offset.y - line_height
+                        bounds.size.height - top_bottom_margin - line_height - cursor_pos.y
                     } else if scroll_offset.y + cursor_pos.y < top_bottom_margin {
-                        // cursor is out of top
-                        (scroll_offset.y + line_height).min(px(0.))
+                        (top_bottom_margin - cursor_pos.y).min(px(0.))
                     } else {
                         scroll_offset.y
                     };
