@@ -12,7 +12,7 @@ Document reads use two bounded workers, mutations one, and maintenance one. Dire
 
 The editor uses gpui-component 0.5.1 InputState in code-editor mode, retaining one entity per document. Its rope buffer, visible-line rendering, selection, clipboard, undo and GPUI input-method handling provide a smaller implementation surface than writing those primitives again. This is a provisional choice: a rope does not establish large-file performance, long-line responsiveness, IME correctness or accessibility.
 
-The component is vendored under its Apache-2.0 license for externally supplied highlight spans, a steady caret, and bounded visible-row shaping. Line metadata retains lengths instead of individual rope copies. Wrapping is prepared before first layout; off-screen wrapped rows retain byte ranges and geometry without shaped glyphs. These changes reduce layout allocations but do not eliminate full-line wrapping or whole-buffer extraction. The existing bounded syntect/two-face worker remains responsible for syntax. Generation checks reject obsolete results; UTF-16 grammar offsets become UTF-8 byte ranges at the presentation boundary. The other vendored patch corrects xattr 0.2.3's Linux errno name for aarch64 in GPUI's transitive archive dependency. Neither patch changes file-save validation.
+The component is vendored under its Apache-2.0 license for externally supplied highlight spans, a steady caret, live indentation preferences, and bounded visible-row shaping. Line metadata retains lengths instead of individual rope copies. Wrapping is prepared before first layout; off-screen wrapped rows retain byte ranges and geometry without shaped glyphs. These changes reduce layout allocations but do not eliminate full-line wrapping or whole-buffer extraction. The existing bounded syntect/two-face worker remains responsible for syntax. Generation checks reject obsolete results; UTF-16 grammar offsets become UTF-8 byte ranges at the presentation boundary. The other vendored patch corrects xattr 0.2.3's Linux errno name for aarch64 in GPUI's transitive archive dependency. Neither patch changes file-save validation.
 
 The component's default text operations preserve the authoritative buffer. Performance qualification must cover 10 MiB documents, long lines, graphemes, real IME composition and clipboard. None of those requirements is relaxed by choosing this component.
 
@@ -26,16 +26,22 @@ Linux rename uses `renameat2(RENAME_NOREPLACE)` and Trash uses the trash crate's
 
 Recovery keeps private, locked session records with exact local text and observed disk bytes. Abandoned records can be claimed from Recovery. Saved history and observed snapshots remain in the domain store. Their full management interface is not yet ported. Closing waits for acknowledgment that the exact recovery generation was resolved. Cleanup failure keeps the document open with Retry and Keep Open actions; Keep Open creates a newer recovery generation. Close decisions retain the named document IDs across tab switches, and Save and Close saves those documents before cleanup. Edits during cleanup cancel that document’s close.
 
+## Preferences and layout
+
+Preferences edits a draft until Apply validates and persists it. The worker acknowledges settings writes before the shell adopts the saved values. Cancel retains the running configuration; Reload reads the observed file again. External settings changes block replacement, and the settings writer enforces the same 64 KiB limit as the reader. Theme, typography, wrapping, indentation, line numbers, current-line highlighting, syntax, density, hidden files, search filters and shortcut overrides share the stored configuration.
+
+Shell buttons and document tabs use focusable GPUI controls. Preferences contains Tab navigation, scrolls focused fields into view and restores focus on dismissal. The navigator divider accepts pointer dragging and keyboard resizing. Narrow layouts show either navigator or document, use fewer visible toolbar actions and retain the command palette. The width threshold accounts for interface scale. These changes do not establish screen-reader support.
+
 ## Presentation gaps and qualification
 
 The GPUI interface is an initial port, not feature or performance parity with the macOS prototype. The following remain incomplete:
 
-- Full preferences and editable shortcut controls, native menus, pins/recents/volumes, breadcrumb completion, drops, resizable panes and horizontal navigation gestures.
+- Native menus, pins/recents/volumes, breadcrumb completion, drops and horizontal navigation gestures. Remembered-location configuration is stored but its shell integration remains incomplete.
 - Conflict comparison and observed-version overwrite, recovery-history controls and recovery failure alternatives.
 - Filename-index controls. Content-result activation rejects changed disk fingerprints and dirty open buffers.
 - The earlier bounded Markdown paging, local raster images, relative-link handling and complete dialect parity. The current read view escapes HTML and omits images, including remote images.
-- Large-file/long-line performance, real IME, accessibility and macOS behavior. Narrow-window layouts remain incomplete.
+- Large-file/long-line performance, real IME, accessibility, the complete size/theme/settings matrix and macOS behavior. Modal behavior across asynchronous completions still requires qualification.
 
-The new view virtualizes directory rows and retains per-folder selection and scrolling. Syntax work remains bounded, but extracting full buffer text on edits can be costly. The present Linux evidence is local smoke evidence, not the Mac reference gates or a UI hill-climb campaign.
+The new view virtualizes directory rows and stores per-folder selection and scroll state. Syntax work remains bounded, but extracting full buffer text on edits can be costly. Linux native checks qualify only their executed scenarios. Whole-app performance, safety and accessibility require current-build evidence for the complete acceptance matrix.
 
 Closing a requested CLI document currently aborts its request. Use Finish Editing before closing to return success. Save As requires finishing or aborting the request first, rather than offering the earlier abandonment dialog.
