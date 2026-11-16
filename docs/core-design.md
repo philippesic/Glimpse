@@ -34,7 +34,7 @@ A completed save updates newer automatic recovery to the saved disk base before 
 
 GPUI is vendored at 0.2.2 for a Linux Wayland startup fix: modifier masks received before a keymap are deferred until it arrives, and untranslatable key events are ignored safely. The other upstream platform implementations remain unchanged by this patch. macOS compilation and interaction remain unqualified.
 
-Save, Reload and file-access failures persist with the affected document and retain the appropriate retry action. Failed destination saves retain their path and operation. Recovery maintenance warnings remain separately visible until acknowledged; later success or background updates cannot hide them. Warning details retain 32 distinct messages and disclose omitted earlier notices.
+Save, Reload and file-access failures persist with the affected document and retain the appropriate retry action. Failed destination saves retain their path and operation. Native chooser errors are distinct from cancellation, and their retry retains Save As or Save Copy. Recovery maintenance warnings remain separately visible until acknowledged; later success or background updates cannot hide them. Warning details retain 32 distinct messages and disclose omitted earlier notices.
 
 New-file saves retain the staged file’s identity, resolved destination and exact candidate bytes. Before adopting the file, the worker verifies that the chosen path still names that created version. A post-creation replacement or symlink retarget stops adoption.
 
@@ -46,11 +46,15 @@ Locations contains explicit pins, frequent/recent folders and mounted folders. S
 
 Shell buttons and document tabs use focusable GPUI controls. Preferences contains Tab navigation, scrolls focused fields into view and restores focus on dismissal. The navigator divider accepts pointer dragging and keyboard resizing. Narrow layouts show either navigator or document, use fewer visible toolbar actions and retain the command palette. The width threshold accounts for interface scale. Menus support keyboard opening, focus return and scrolling; labels use bounded ellipses and wrapped tooltips. Duplicate document names use the shortest distinguishing parent suffix, with full paths available on hover. Document subscriptions end when their tabs close. App shortcut matching precedes editor bindings while preserving reserved editing keys. These changes do not establish screen-reader support.
 
+The path bar exposes ancestor buttons and inline entry. Tab and Shift-Tab cycle worker-produced completions; escaped entries retain native filename bytes. Completion lists disclose truncation. File and folder drops use the same asynchronous open path without changing pinned scope. Predominantly horizontal navigator scrolling emits at most one history step per touch sequence or wheel burst; vertical and strongly diagonal scrolling stays in the list. Back/Forward mouse buttons use the same history commands.
+
+Open requests retain the user interaction generation that issued them. A late explicit file open becomes a background tab after the user moves on; a stale preview is discarded. Cursor positioning for a background document does not focus it. A requested CLI file that becomes a directory during startup fails the request rather than reporting successful readiness.
+
 ## Presentation gaps and qualification
 
 The product contract and native Linux evaluation determine qualification. The following remain incomplete:
 
-- Breadcrumb/path completion, drops, horizontal navigation gestures and complete contextual command availability. macOS system-menu integration remains unverified.
+- Complete contextual command availability, persistent directory-read states and refresh continuity. macOS system-menu integration remains unverified.
 - Filename-index controls. Content-result activation rejects changed disk fingerprints and dirty open buffers.
 - The earlier bounded Markdown paging, local raster images, relative-link handling and complete dialect parity. The current read view escapes HTML and omits images, including remote images.
 - Large-file/long-line performance, real IME, accessibility, the complete size/theme/settings matrix and macOS behavior. Modal behavior across asynchronous completions still requires qualification.
