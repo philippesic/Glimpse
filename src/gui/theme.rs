@@ -19,13 +19,24 @@ pub fn apply(settings: &Settings, window: &mut Window, cx: &mut App) {
     let theme = Theme::global_mut(cx);
     theme.font_size = px(16. * settings.ui_scale);
     theme.mono_font_size = px(settings.font_size * settings.ui_scale);
-    if !settings.font_family.is_empty() {
-        theme.mono_font_family = settings.font_family.clone().into();
-    }
+    theme.mono_font_family = if settings.font_family.is_empty() {
+        if cfg!(target_os = "macos") {
+            "Menlo"
+        } else if cfg!(target_os = "windows") {
+            "Consolas"
+        } else {
+            "DejaVu Sans Mono"
+        }
+        .into()
+    } else {
+        settings.font_family.clone().into()
+    };
     theme.colors.muted_foreground =
         gpui::rgb(if theme.is_dark() { 0xaab5c5 } else { 0x4d596a }).into();
     theme.colors.border = gpui::rgb(if theme.is_dark() { 0x65758b } else { 0x7b8797 }).into();
     theme.colors.input = theme.colors.border;
+    theme.colors.danger = gpui::rgb(if theme.is_dark() { 0xffb4ab } else { 0x9b1c1c }).into();
+    theme.colors.danger_foreground = theme.colors.background;
     theme.colors.sidebar = theme.colors.muted;
     theme.colors.sidebar_foreground = theme.colors.foreground;
     let mut highlight = (*theme.highlight_theme).clone();

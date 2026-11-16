@@ -60,6 +60,7 @@ pub struct SaveDestination {
 pub enum Reply {
     RecentLocation(Option<PathBuf>),
     SettingsLoaded(Result<storage::Settings, String>),
+    SettingsSaved(Result<storage::Settings, String>),
     Changed(Result<(), String>),
     Records(Result<storage::Inventory, String>),
     Finished(u64, u64, u64, Result<(), String>),
@@ -313,10 +314,15 @@ impl IoWorker {
                         Job::Check(id, path, generation) => {
                             Reply::Checked(id, generation, DiskFile::open(path))
                         }
-                        Job::Settings(settings) => {
+                        Job::Settings(mut settings) => {
                             let base =
                                 settings_base.get_or_insert_with(|| settings.disk_base.clone());
-                            Reply::Done(settings.save_checked(&storage::data_dir(), base))
+                            Reply::SettingsSaved(
+                                settings.save_checked(&storage::data_dir(), base).map(|()| {
+                                    settings.disk_base = base.clone();
+                                    settings
+                                }),
+                            )
                         }
                         Job::LoadSettings => {
                             let result = storage::Settings::load();
@@ -554,6 +560,7 @@ impl IoWorker {
                 let message = "I/O queue unavailable. Operation was not queued; retry. Current buffer remains in memory.".to_owned();
                 let reply = match job {
                     Job::RecentLocation(_) => Reply::RecentLocation(None),
+                    Job::Settings(_) => Reply::SettingsSaved(Err(message)),
                     Job::Save { id, text, .. } => Reply::Save(id, text, Err(message)),
                     Job::SaveTo(d) | Job::Prepare(d) => Reply::SavedTo(Box::new(d), Err(message)),
                     Job::Choose(path, _) => Reply::Chosen(path, Err(message)),

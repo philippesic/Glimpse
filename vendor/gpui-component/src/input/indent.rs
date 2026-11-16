@@ -203,6 +203,14 @@ impl InputState {
         cx.notify();
     }
 
+    pub fn set_tab_size(&mut self, tab: TabSize, cx: &mut Context<Self>) {
+        match &mut self.mode {
+            InputMode::PlainText { tab: t, .. } | InputMode::CodeEditor { tab: t, .. } => *t = tab,
+            _ => {}
+        }
+        cx.notify();
+    }
+
     /// Set the tab size for the input.
     ///
     /// Only for [`InputMode::PlainText`] and [`InputMode::CodeEditor`] mode with multi_line.

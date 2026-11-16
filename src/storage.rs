@@ -203,6 +203,16 @@ impl Settings {
                 "Unsupported or invalid settings; the last valid values are retained.".into(),
             );
         }
+        if self.font_family.len() > 512 || self.search_exclude.len() > 32768 {
+            return Err("Font family or search exclusions exceed the settings size limit.".into());
+        }
+        if serde_json::to_vec_pretty(self)
+            .map_err(|error| error.to_string())?
+            .len()
+            > 65536
+        {
+            return Err("Settings exceed 64 KiB; the saved settings are retained.".into());
+        }
         crate::commands::bindings(&self.keymaps)?;
         let mut globs = ignore::overrides::OverrideBuilder::new("/");
         for line in self.search_exclude.lines().filter(|s| !s.trim().is_empty()) {
@@ -893,6 +903,42 @@ mod tests {
         assert_eq!(restored.path, value.path);
         assert_eq!(restored.target, value.target);
     }
+    #[test]
+    fn oversized_settings_never_replace_a_readable_file() {
+        let root = tempfile::tempdir().unwrap();
+        let mut expected = None;
+        let valid = Settings::default();
+        valid.save_checked(root.path(), &mut expected).unwrap();
+        let original = fs::read(root.path().join("settings.json")).unwrap();
+        let mut large = valid.clone();
+        large.search_exclude = "x".repeat(65536);
+        assert!(large.save_checked(root.path(), &mut expected).is_err());
+        assert_eq!(
+            fs::read(root.path().join("settings.json")).unwrap(),
+            original
+        );
+        assert!(Settings::load_in(root.path()).is_ok());
+        large = valid;
+        large.pins = (0..128)
+            .map(|i| PathBuf::from(format!("/{i}/{}", "x".repeat(1024))))
+            .collect();
+        assert!(large.save_checked(root.path(), &mut expected).is_err());
+        assert_eq!(
+            fs::read(root.path().join("settings.json")).unwrap(),
+            original
+        );
+        large.pins = vec![PathBuf::from("x".repeat(1024))];
+        while serde_json::to_vec_pretty(&large).unwrap().len() <= 65536 {
+            large.pins[0].as_mut_os_string().push("xxxxxxxxxxxxxxxx");
+        }
+        assert!(serde_json::to_vec(&large).unwrap().len() <= 65536);
+        assert!(large.save_checked(root.path(), &mut expected).is_err());
+        assert_eq!(
+            fs::read(root.path().join("settings.json")).unwrap(),
+            original
+        );
+    }
+
     #[test]
     fn settings_persist_atomically_with_private_permissions() {
         let dir = tempfile::tempdir().unwrap();

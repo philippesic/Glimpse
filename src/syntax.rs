@@ -114,7 +114,7 @@ struct Request {
     dark: bool,
     token: u64,
 }
-fn grammar_extension(path: &std::path::Path, text: &str) -> Option<&'static str> {
+pub fn grammar_extension(path: &std::path::Path, text: &str) -> Option<&'static str> {
     let extension = path.extension().and_then(|s| s.to_str()).unwrap_or("");
     let extension = match extension.to_ascii_lowercase().as_str() {
         "md" | "markdown" | "mdown" => "md",

@@ -293,6 +293,7 @@ pub struct InputState {
     pub(super) masked: bool,
     pub(super) clean_on_escape: bool,
     pub(super) soft_wrap: bool,
+    auto_indent: bool,
     pub(super) pattern: Option<regex::Regex>,
     pub(super) validate: Option<Box<dyn Fn(&str, &mut Context<Self>) -> bool + 'static>>,
     pub(crate) scroll_handle: ScrollHandle,
@@ -339,6 +340,11 @@ pub struct InputState {
 impl EventEmitter<InputEvent> for InputState {}
 
 impl InputState {
+    pub fn set_auto_indent(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.auto_indent = enabled;
+        cx.notify();
+    }
+
     pub fn set_cursor_blink(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.blink_cursor
             .update(cx, |cursor, cx| cursor.set_enabled(enabled, cx));
@@ -401,6 +407,7 @@ impl InputState {
             masked: false,
             clean_on_escape: false,
             soft_wrap: true,
+            auto_indent: true,
             loading: false,
             pattern: None,
             validate: None,
@@ -1167,7 +1174,7 @@ impl InputState {
 
         if self.mode.is_multi_line() {
             // Get current line indent
-            let indent = if self.mode.is_code_editor() {
+            let indent = if self.mode.is_code_editor() && self.auto_indent {
                 self.indent_of_next_line()
             } else {
                 "".to_string()

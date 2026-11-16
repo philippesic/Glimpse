@@ -1,4 +1,7 @@
+mod modal;
 mod panes;
+mod platform;
+mod preferences;
 mod theme;
 
 use glimpse::directory::Entry;
@@ -90,7 +93,6 @@ enum Panel {
     Files,
     Text,
     Palette,
-    Settings,
     Recovery,
     Line,
     NewFile,
@@ -143,6 +145,9 @@ struct Shell {
     reading: bool,
     status: String,
     settings: storage::Settings,
+    preferences: Option<Entity<preferences::Preferences>>,
+    preferences_subscription: Option<Subscription>,
+    preferences_return: Option<FocusHandle>,
     subscriptions: Vec<Subscription>,
     close_pending: Option<CloseDecision>,
     closings: glimpse::closing::Closings,
@@ -244,6 +249,9 @@ impl Shell {
             reading: false,
             status: String::new(),
             settings: storage::Settings::default(),
+            preferences: None,
+            preferences_subscription: None,
+            preferences_return: None,
             subscriptions: vec![subscription],
             close_pending: None,
             closings: glimpse::closing::Closings::default(),
@@ -271,6 +279,78 @@ impl Shell {
         }
         this
     }
+    fn open_preferences(
+        &mut self,
+        settings: storage::Settings,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.preferences.is_none() {
+            self.preferences_return = window.focused(cx);
+        }
+        let view = cx.new(|cx| preferences::Preferences::new(settings, window, cx));
+        self.preferences_subscription =
+            Some(
+                cx.subscribe_in(&view, window, |this, _, event, window, cx| match event {
+                    preferences::Event::Apply(settings) => {
+                        this.io.send(Job::Settings(settings.as_ref().clone()))
+                    }
+                    preferences::Event::Cancel => this.close_preferences(window, cx),
+                    preferences::Event::Reload => this.io.send(Job::LoadSettings),
+                }),
+            );
+        self.preferences = Some(view);
+        cx.notify();
+    }
+
+    fn close_preferences(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.preferences.take().is_some() {
+            self.preferences_subscription = None;
+            if let Some(focus) = self.preferences_return.take() {
+                window.focus(&focus);
+            } else {
+                self.focus(window, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn apply_settings(
+        &mut self,
+        settings: storage::Settings,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings = settings;
+        theme::apply(&self.settings, window, cx);
+        self.search_id = self.search.cancel();
+        self.hits.clear();
+        for doc in &self.documents {
+            doc.input.update(cx, |input, cx| {
+                input.set_soft_wrap(self.settings.wrap, window, cx);
+                input.set_line_number(self.settings.line_numbers, window, cx);
+                input.set_tab_size(
+                    gpui_component::input::TabSize {
+                        tab_size: self.settings.indent,
+                        hard_tabs: self.settings.tabs,
+                    },
+                    cx,
+                );
+                input.set_auto_indent(self.settings.auto_indent, cx);
+                if !self.settings.syntax {
+                    input.set_external_highlights(vec![], cx);
+                }
+            });
+        }
+        self.refresh();
+        self.focus(window, cx);
+        cx.notify();
+    }
+
+    fn narrow(&self, window: &Window) -> bool {
+        window.viewport_size().width < px(760. * self.settings.ui_scale)
+    }
+
     fn watch(&mut self) {
         let mut parents = std::collections::HashSet::from([self.current.clone()]);
         for doc in &self.documents {
@@ -379,6 +459,14 @@ impl Shell {
                 .soft_wrap(self.settings.wrap)
                 .default_value(text.clone());
             input.set_cursor_blink(false, cx);
+            input.set_tab_size(
+                gpui_component::input::TabSize {
+                    tab_size: self.settings.indent,
+                    hard_tabs: self.settings.tabs,
+                },
+                cx,
+            );
+            input.set_auto_indent(self.settings.auto_indent, cx);
             input
         });
         self.subscriptions.push(
@@ -797,16 +885,31 @@ impl Shell {
                 }
                 Reply::SettingsLoaded(result) => match result {
                     Ok(settings) => {
-                        self.settings = settings;
-                        theme::apply(&self.settings, window, cx);
-                        for doc in &self.documents {
-                            doc.input.update(cx, |input, cx| {
-                                input.set_soft_wrap(self.settings.wrap, window, cx);
-                                input.set_line_number(self.settings.line_numbers, window, cx);
-                            });
+                        self.apply_settings(settings, window, cx);
+                        if self.preferences.is_some() {
+                            self.open_preferences(self.settings.clone(), window, cx);
+                            self.status = "Preferences reloaded".into();
                         }
                     }
-                    Err(e) => self.status = e,
+                    Err(e) => {
+                        if let Some(preferences) = &self.preferences {
+                            preferences.update(cx, |view, cx| view.failed(e.clone(), cx));
+                        }
+                        self.status = e;
+                    }
+                },
+                Reply::SettingsSaved(result) => match result {
+                    Ok(settings) => {
+                        self.apply_settings(settings, window, cx);
+                        self.close_preferences(window, cx);
+                        self.status = "Preferences saved".into();
+                    }
+                    Err(error) => {
+                        if let Some(preferences) = &self.preferences {
+                            preferences.update(cx, |view, cx| view.failed(error.clone(), cx));
+                        }
+                        self.status = error;
+                    }
                 },
                 Reply::Records(result) => match result {
                     Ok(inventory) => {
@@ -910,6 +1013,7 @@ impl Shell {
             }
         }
         if let Some(highlight) = self.syntax.take()
+            && self.settings.syntax
             && let Some(doc) = self
                 .documents
                 .iter()
@@ -1027,6 +1131,14 @@ impl Shell {
         .detach();
     }
     fn close(&mut self, quit: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(preferences) = &self.preferences {
+            if preferences.read(cx).busy() {
+                self.status = "Wait for the settings operation to finish".into();
+            } else {
+                self.close_preferences(window, cx);
+            }
+            return;
+        }
         if self.io.pending_mutations() > 0 || self.destination_busy || !self.closings.is_empty() {
             self.status = "Wait for pending writes or recovery cleanup".into();
             cx.notify();
@@ -1124,7 +1236,7 @@ impl Shell {
                 window.focus(&self.nav_focus);
             }
             "toggle-navigator" => {
-                if window.viewport_size().width < px(760.) {
+                if self.narrow(window) {
                     self.navigation_only = !self.navigation_only;
                     if self.navigation_only {
                         window.focus(&self.nav_focus);
@@ -1240,7 +1352,7 @@ impl Shell {
             "find-files" => self.panel(Panel::Files, window, cx),
             "find-text" => self.panel(Panel::Text, window, cx),
             "commands" => self.panel(Panel::Palette, window, cx),
-            "settings" => self.panel(Panel::Settings, window, cx),
+            "settings" => self.open_preferences(self.settings.clone(), window, cx),
             "recovery" => self.panel(Panel::Recovery, window, cx),
             "line" => self.panel(Panel::Line, window, cx),
             "parent" => {
@@ -1418,6 +1530,7 @@ impl Shell {
         Button::new(command)
             .label(label)
             .small()
+            .compact()
             .outline()
             .on_click(cx.listener(move |this, _, window, cx| this.command(command, window, cx)))
     }
@@ -1439,25 +1552,37 @@ impl Render for Shell {
             });
             window.request_animation_frame();
         }
-        let mut toolbar = div()
-            .flex()
-            .flex_wrap()
-            .gap_2()
-            .p_2()
-            .bg(cx.theme().muted)
-            .child(self.button("‹", "back", cx))
-            .child(self.button("›", "forward", cx))
-            .child(self.button("↑", "parent", cx))
-            .child(
-                self.button("Location", "path", cx)
-                    .tooltip(paths::display(&self.current)),
-            )
-            .child(self.button("Navigator", "toggle-navigator", cx))
-            .child(self.button("Open", "open", cx))
-            .child(self.button("Filter", "filter", cx))
-            .child(self.button("Files", "find-files", cx))
-            .child(self.button("Text", "find-text", cx))
-            .child(self.button("Commands", "commands", cx));
+        let narrow = self.narrow(window);
+        let mut toolbar = div().flex().flex_wrap().gap_2().p_2().bg(cx.theme().muted);
+        if narrow {
+            toolbar = toolbar
+                .child(self.button(
+                    if self.navigation_only && self.active.is_some() {
+                        "Edit"
+                    } else {
+                        "Browse"
+                    },
+                    "toggle-navigator",
+                    cx,
+                ))
+                .child(self.button("Location", "path", cx))
+                .child(self.button("Commands", "commands", cx));
+        } else {
+            toolbar = toolbar
+                .child(self.button("‹", "back", cx))
+                .child(self.button("›", "forward", cx))
+                .child(self.button("↑", "parent", cx))
+                .child(
+                    self.button("Location", "path", cx)
+                        .tooltip(paths::display(&self.current)),
+                )
+                .child(self.button("Navigator", "toggle-navigator", cx))
+                .child(self.button("Open", "open", cx))
+                .child(self.button("Filter", "filter", cx))
+                .child(self.button("Files", "find-files", cx))
+                .child(self.button("Text", "find-text", cx))
+                .child(self.button("Commands", "commands", cx));
+        }
         if self.request.pick {
             toolbar = toolbar
                 .child(self.button("Choose", "choose", cx))
@@ -1465,6 +1590,7 @@ impl Render for Shell {
         }
         let mut root = div()
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .bg(cx.theme().background)
@@ -1487,7 +1613,6 @@ impl Render for Shell {
                 Panel::Files => "Find files",
                 Panel::Text => "Find saved text",
                 Panel::Palette => "Commands",
-                Panel::Settings => "Preferences",
                 Panel::Recovery => "Recovery",
                 Panel::Line => "Go to line",
                 Panel::NewFile => "New file name",
@@ -1562,17 +1687,6 @@ impl Render for Shell {
                                 .filter(|c| c.label.to_lowercase().contains(&query))
                                 .map(|command| self.button(command.label, command.id, cx)),
                         ),
-                );
-            }
-            if panel == Panel::Settings {
-                root = root.child(
-                    div()
-                        .flex()
-                        .gap_2()
-                        .p_2()
-                        .child(self.button("Toggle wrap", "wrap", cx))
-                        .child(self.button("Toggle line numbers", "numbers", cx))
-                        .child(self.button("Save preferences", "save-settings", cx)),
                 );
             }
             if panel == Panel::Recovery {
@@ -1652,7 +1766,10 @@ impl Render for Shell {
         let visible: Vec<_> = self
             .entries
             .iter()
-            .filter(|entry| paths::name(&entry.path).to_lowercase().contains(&query))
+            .filter(|entry| {
+                (self.settings.show_hidden || !paths::name(&entry.path).starts_with('.'))
+                    && paths::name(&entry.path).to_lowercase().contains(&query)
+            })
             .cloned()
             .collect();
         let scroll = self
@@ -1770,12 +1887,14 @@ impl Render for Shell {
             .flex_col()
             .child(tabs);
         if !self.request.pick {
-            content = content.child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_2()
-                    .p_1()
+            let actions = div().flex().flex_wrap().gap_2().p_1();
+            content = content.child(if narrow {
+                actions
+                    .child(self.button("Save", "save", cx))
+                    .child(self.button("Read / Edit", "read", cx))
+                    .child(self.button("Close", "close", cx))
+            } else {
+                actions
                     .child(self.button("New", "new", cx))
                     .child(self.button("Save", "save", cx))
                     .child(self.button("Save As", "save-as", cx))
@@ -1783,8 +1902,8 @@ impl Render for Shell {
                     .child(self.button("Read / Edit", "read", cx))
                     .child(self.button("Line", "line", cx))
                     .child(self.button("Close tab", "close", cx))
-                    .child(self.button("Reload disk", "reload", cx)),
-            );
+                    .child(self.button("Reload disk", "reload", cx))
+            });
         }
         if let Some(doc) = self.documents.iter().find(|d| Some(d.id) == self.active) {
             if doc.external.is_some() {
@@ -1801,6 +1920,7 @@ impl Render for Shell {
                         .flex_1()
                         .overflow_y_scroll()
                         .p_4()
+                        .text_size(px(self.settings.markdown_font_size * self.settings.ui_scale))
                         .child(TextView::markdown(
                             "markdown",
                             reading_source(&doc.input.read(cx).value()),
@@ -1813,7 +1933,16 @@ impl Render for Shell {
                     div()
                         .flex_1()
                         .min_h_0()
-                        .font_family(cx.theme().mono_font_family.clone())
+                        .font_family(
+                            if self.settings.proportional
+                                && glimpse::syntax::grammar_extension(&doc.disk.path, &doc.saved)
+                                    .is_none()
+                            {
+                                cx.theme().font_family.clone()
+                            } else {
+                                cx.theme().mono_font_family.clone()
+                            },
+                        )
                         .child(
                             Input::new(&doc.input)
                                 .text_size(px(self.settings.font_size * self.settings.ui_scale))
@@ -1830,7 +1959,6 @@ impl Render for Shell {
                     .child("Select a file to preview, or open a file."),
             );
         }
-        let narrow = window.viewport_size().width < px(760.);
         let body = if narrow {
             if self.navigation_only || self.active.is_none() {
                 navigator.into_any_element()
@@ -1855,13 +1983,19 @@ impl Render for Shell {
             content.into_any_element()
         };
         root.child(div().flex_1().min_h_0().child(body))
-            .child(
-                div()
-                    .p_2()
-                    .text_size(px(12. * self.settings.ui_scale))
-                    .child(self.status.clone()),
-            )
+            .when(!self.status.is_empty(), |root| {
+                root.child(
+                    div()
+                        .p_2()
+                        .text_size(px(12. * self.settings.ui_scale))
+                        .child(self.status.clone()),
+                )
+            })
+            .children(self.preferences.clone())
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if this.preferences.is_some() {
+                    return;
+                }
                 let key = &event.keystroke;
                 if this.nav_focus.is_focused(window)
                     && !key.modifiers.control
@@ -1871,7 +2005,11 @@ impl Render for Shell {
                     let rows: Vec<_> = this
                         .entries
                         .iter()
-                        .filter(|entry| paths::name(&entry.path).to_lowercase().contains(&query))
+                        .filter(|entry| {
+                            (this.settings.show_hidden
+                                || !paths::name(&entry.path).starts_with('.'))
+                                && paths::name(&entry.path).to_lowercase().contains(&query)
+                        })
                         .cloned()
                         .collect();
                     let index = rows
@@ -1931,8 +2069,7 @@ impl Render for Shell {
                                 other => other,
                             };
                             name.eq_ignore_ascii_case(&key.key)
-                                && binding.modifiers.shift == key.modifiers.shift
-                                && binding.modifiers.alt == key.modifiers.alt
+                                && platform::shortcut(&binding.modifiers, &key.modifiers)
                         })
                         .and_then(|binding| {
                             glimpse::commands::COMMANDS
