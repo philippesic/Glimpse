@@ -1,11 +1,16 @@
 use gpui::{prelude::*, *};
-use gpui_component::{ActiveTheme, Sizable, button::Button};
+use gpui_component::{
+    ActiveTheme, Sizable,
+    button::Button,
+    input::{Input, InputState},
+};
 
 pub struct Decision {
     title: String,
     detail: String,
     actions: Vec<&'static str>,
     focus: FocusHandle,
+    comparison: Option<[Entity<InputState>; 2]>,
     _subscription: Subscription,
 }
 pub struct Choice(pub usize);
@@ -42,8 +47,27 @@ impl Decision {
             detail,
             actions,
             focus,
+            comparison: None,
             _subscription: subscription,
         }
+    }
+    pub fn compare(
+        &mut self,
+        local: &str,
+        observed: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.comparison = Some([local, observed].map(|text| {
+            cx.new(|cx| {
+                let mut input = InputState::new(window, cx)
+                    .code_editor("text")
+                    .default_value(text.to_owned());
+                input.set_cursor_blink(false, cx);
+                input
+            })
+        }));
+        cx.notify();
     }
 }
 impl Render for Decision {
@@ -81,6 +105,25 @@ impl Render for Decision {
                             .overflow_y_scroll()
                             .child(self.detail.clone()),
                     )
+                    .when_some(self.comparison.as_ref(), |panel, inputs| {
+                        panel.children(inputs.iter().enumerate().map(|(i, input)| {
+                            div()
+                                .min_h_0()
+                                .flex()
+                                .flex_col()
+                                .child(if i == 0 {
+                                    "Local text (read only)"
+                                } else {
+                                    "Observed disk text (read only)"
+                                })
+                                .child(
+                                    div()
+                                        .h(px(160.).min(window.viewport_size().height * 0.22))
+                                        .min_h_0()
+                                        .child(Input::new(input).h_full().disabled(true)),
+                                )
+                        }))
+                    })
                     .child(div().flex().flex_wrap().gap_2().children(
                         self.actions.iter().enumerate().map(|(i, label)| {
                             Button::new(i)

@@ -25,6 +25,7 @@ pub enum Job {
     TrashRecord(PathBuf),
     Prepare(SaveDestination),
     SaveTo(SaveDestination),
+    Reload(Box<Reload>),
     Recover(u64, storage::Draft),
     Wake,
     Inventory,
@@ -45,6 +46,14 @@ pub enum Job {
         generation: u64,
         without_recovery: bool,
     },
+}
+pub struct Reload {
+    pub id: u64,
+    pub generation: u64,
+    pub original: DiskFile,
+    pub local: String,
+    pub disk: DiskFile,
+    pub text: String,
 }
 #[derive(Clone)]
 pub struct SaveDestination {
@@ -73,6 +82,7 @@ pub enum Reply {
     RecordTrashed(Result<(), String>),
     Prepared(Box<SaveDestination>, Result<Option<DiskFile>, String>),
     Imported(u64, Result<(storage::Draft, DiskFile), String>),
+    Reloaded(Box<Reload>, Result<(), String>),
     Done(Result<(), String>),
     Visit(PathBuf, bool),
     SavedTo(Box<SaveDestination>, Result<DiskFile, String>),
@@ -131,6 +141,7 @@ fn tracked(job: &Job) -> bool {
             | Job::TrashRecord(..)
             | Job::Save { .. }
             | Job::SaveTo(..)
+            | Job::Reload(..)
             | Job::Settings(..)
     )
 }
@@ -183,7 +194,8 @@ impl IoWorker {
                             Job::Import(..)
                             | Job::RestoreHistory(..)
                             | Job::RestoreObserved(..)
-                            | Job::Recover(..) => true,
+                            | Job::Recover(..)
+                            | Job::Reload(..) => true,
                             Job::Save {
                                 without_recovery, ..
                             } => !*without_recovery,
@@ -390,6 +402,18 @@ impl IoWorker {
                                 transient && preview.load(Ordering::Relaxed) != token
                             }),
                         ),
+                        Job::Reload(reload) => {
+                            let result = reload_document(
+                                &reload,
+                                recovery
+                                    .as_ref()
+                                    .as_ref()
+                                    .map(|r| &**r)
+                                    .map_err(Clone::clone),
+                                &results,
+                            );
+                            Reply::Reloaded(reload, result)
+                        }
                         Job::Save {
                             id,
                             disk,
@@ -573,6 +597,7 @@ impl IoWorker {
                     | Job::RestoreHistory(id, _)
                     | Job::RestoreObserved(id, _) => Reply::Imported(id, Err(message)),
                     Job::TrashRecord(_) => Reply::RecordTrashed(Err(message)),
+                    Job::Reload(reload) => Reply::Reloaded(reload, Err(message)),
                     _ => Reply::Done(Err(message)),
                 };
                 let _ = self.errors.send(reply);
@@ -580,6 +605,35 @@ impl IoWorker {
         }
     }
 }
+fn reload_document(
+    reload: &Reload,
+    recovery: Result<&storage::Recovery, String>,
+    results: &mpsc::Sender<Reply>,
+) -> Result<(), String> {
+    reload
+        .disk
+        .revalidate_paths(std::slice::from_ref(&reload.disk.path))?;
+    let recovery = recovery.map_err(|error| format!("Recovery unavailable: {error}"))?;
+    let candidate = recovery.checkpoint(
+        reload.id,
+        &storage::Draft {
+            path: reload.original.path.clone(),
+            target: Some(reload.original.target.clone()),
+            text: reload.local.clone(),
+            base: reload.original.bytes.clone(),
+            generation: reload.generation,
+        },
+    )?;
+    reload
+        .disk
+        .revalidate_paths(std::slice::from_ref(&reload.disk.path))?;
+    recovery.saved(reload.id, reload.generation)?;
+    if let Err(error) = recovery.resolved(&candidate) {
+        let _ = results.send(Reply::HistoryWarning(error));
+    }
+    Ok(())
+}
+
 fn save_destination(
     destination: &SaveDestination,
     recovery: Result<&storage::Recovery, String>,
@@ -669,6 +723,59 @@ impl Drop for IoWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reload_validates_the_observed_version_and_retires_only_its_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("original.txt");
+        std::fs::write(&path, "base\n").unwrap();
+        let original = DiskFile::open(path.clone()).unwrap().0;
+        let recovery = storage::Recovery::new(&root.path().join("recovery")).unwrap();
+        std::fs::write(&path, "observed β\n").unwrap();
+        let (disk, text) = DiskFile::open(path.clone()).unwrap();
+        let reload = Reload {
+            id: 4,
+            generation: 8,
+            original,
+            local: "local λ\n".into(),
+            disk,
+            text,
+        };
+        let draft = |generation, text: &str| storage::Draft {
+            path: path.clone(),
+            text: text.into(),
+            base: reload.original.bytes.clone(),
+            target: Some(path.clone()),
+            generation,
+        };
+        recovery.write(4, &draft(8, &reload.local)).unwrap();
+        let record = recovery.directory.join("4.json");
+        let (results, _) = mpsc::channel();
+        std::fs::write(&path, "later version\n").unwrap();
+        assert!(reload_document(&reload, Ok(&recovery), &results).is_err());
+        assert_eq!(
+            serde_json::from_slice::<storage::Draft>(&std::fs::read(&record).unwrap())
+                .unwrap()
+                .text,
+            reload.local
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "later version\n");
+        std::fs::write(&path, &reload.disk.bytes).unwrap();
+        recovery.write(4, &draft(9, "newer local edit\n")).unwrap();
+        reload_document(&reload, Ok(&recovery), &results).unwrap();
+        let retained: storage::Draft =
+            serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+        assert_eq!(retained.generation, 9);
+        assert_eq!(retained.text, "newer local edit\n");
+        assert_eq!(std::fs::read(&path).unwrap(), reload.disk.bytes);
+        assert!(
+            storage::inventory(&root.path().join("recovery"))
+                .unwrap()
+                .records
+                .iter()
+                .any(|record| record.history)
+        );
+    }
+
     #[test]
     fn restored_history_is_an_unbound_copy_and_import_keeps_its_binding() {
         let root = tempfile::tempdir().unwrap();

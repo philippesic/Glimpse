@@ -1,3 +1,4 @@
+mod conflict;
 mod decision;
 mod menus;
 mod modal;
@@ -115,6 +116,8 @@ struct CloseDecision {
 }
 enum DecisionAction {
     TrashRecord(PathBuf),
+    Conflict(Box<conflict::Snapshot>),
+    Compare,
 }
 
 enum SettingsWrite {
@@ -507,7 +510,10 @@ impl Shell {
                             Some(DecisionAction::TrashRecord(path)) => {
                                 this.io.send(Job::TrashRecord(path))
                             }
-                            None => {}
+                            Some(DecisionAction::Conflict(snapshot)) => {
+                                this.resolve_conflict(*snapshot, window, cx)
+                            }
+                            Some(DecisionAction::Compare) | None => {}
                         }
                     }
                     cx.notify();
@@ -654,7 +660,9 @@ impl Shell {
                 doc.generation += 1;
                 glimpse::metrics::event("change", id, doc.generation);
                 doc.preview = false;
-                if !this.request.pick {
+                if !this.request.pick && !doc.dirty(cx) {
+                    this.io.send(Job::ClearThrough(id, doc.generation));
+                } else if !this.request.pick {
                     this.io.send(Job::Recover(
                         id,
                         storage::Draft {
@@ -886,6 +894,9 @@ impl Shell {
         cx.notify();
     }
     fn receive(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let protected_focus = (self.preferences.is_some() || self.decision.is_some())
+            .then(|| window.focused(cx))
+            .flatten();
         while let Ok(batch) = self.directories.replies.try_recv() {
             if batch.path == self.current && batch.generation == self.listing_id {
                 self.entries.extend(batch.entries);
@@ -997,6 +1008,7 @@ impl Shell {
                                 doc.disk = disk;
                                 doc.saved = text;
                                 doc.restored = false;
+                                doc.external = None;
                                 self.status = "Saved".into();
                             }
                             Err(e) => self.status = e,
@@ -1091,6 +1103,7 @@ impl Shell {
                         }
                     }
                 }
+                Reply::Reloaded(reload, result) => self.reloaded(*reload, result, window, cx),
                 Reply::SettingsLoaded(result) => {
                     self.settings_reloading = false;
                     self.settings_loaded = true;
@@ -1329,6 +1342,11 @@ impl Shell {
                 .collect();
             doc.input
                 .update(cx, |input, cx| input.set_external_highlights(spans, cx));
+        }
+        if (self.preferences.is_some() || self.decision.is_some())
+            && let Some(focus) = protected_focus
+        {
+            window.focus(&focus);
         }
         cx.notify();
     }
@@ -1820,21 +1838,8 @@ impl Shell {
                     }
                 }
             }
-            "reload" => {
-                if let Some(doc) = self
-                    .documents
-                    .iter_mut()
-                    .find(|d| Some(d.id) == self.active)
-                    && let Some((disk, text)) = doc.external.take()
-                {
-                    let length = doc.input.read(cx).value().encode_utf16().count();
-                    doc.input.update(cx, |input, cx| {
-                        input.replace_text_in_range(Some(0..length), &text, window, cx)
-                    });
-                    doc.disk = disk;
-                    doc.saved = text;
-                }
-            }
+            "reload" | "overwrite" | "compare" => self.conflict_action(command, window, cx),
+            "keep-editing" => self.focus(window, cx),
             "external" | "finder" => {
                 if let Some(path) = self.selected_path() {
                     let path = if command == "finder" {
@@ -2297,7 +2302,28 @@ impl Render for Shell {
                 content = content.child(
                     div()
                         .p_2()
-                        .child("Changed on disk. Local text retained; ordinary Save is blocked."),
+                        .child("Changed on disk. Local text retained; ordinary Save is blocked.")
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap_2()
+                                .child(self.button("Compare", "compare", cx))
+                                .child(self.button("Keep Editing", "keep-editing", cx))
+                                .child(self.command_button(
+                                    "conflict-reload",
+                                    "Reload Disk Version",
+                                    "reload",
+                                    cx,
+                                ))
+                                .child(self.command_button(
+                                    "conflict-save-copy",
+                                    "Save Copy",
+                                    "save-copy",
+                                    cx,
+                                ))
+                                .child(self.button("Overwrite Disk Version…", "overwrite", cx)),
+                        ),
                 );
             }
             if self.reading {
