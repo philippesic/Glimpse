@@ -162,7 +162,11 @@ impl Shell {
                     .and_then(|p| p.parent().map(|p| p.to_owned()))
             })
             .unwrap_or_else(|| std::env::home_dir().unwrap());
-        let query = cx.new(|cx| InputState::new(window, cx).placeholder("Enter a path"));
+        let query = cx.new(|cx| {
+            let mut input = InputState::new(window, cx).placeholder("Enter a path");
+            input.set_cursor_blink(false, cx);
+            input
+        });
         let subscription = cx.subscribe_in(&query, window, |this, _, event, window, cx| {
             if matches!(event, InputEvent::PressEnter { .. }) {
                 this.submit(window, cx);
@@ -309,11 +313,13 @@ impl Shell {
         let id = self.next_id;
         self.next_id += 1;
         let input = cx.new(|cx| {
-            InputState::new(window, cx)
+            let mut input = InputState::new(window, cx)
                 .code_editor("text")
                 .line_number(self.settings.line_numbers)
                 .soft_wrap(self.settings.wrap)
-                .default_value(text.clone())
+                .default_value(text.clone());
+            input.set_cursor_blink(false, cx);
+            input
         });
         self.subscriptions.push(
             cx.subscribe_in(&input, window, move |this, _, event, _, cx| {

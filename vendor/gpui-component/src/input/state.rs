@@ -339,7 +339,16 @@ pub struct InputState {
 impl EventEmitter<InputEvent> for InputState {}
 
 impl InputState {
-    pub fn set_external_highlights(&mut self, highlights: Vec<(std::ops::Range<usize>, gpui::HighlightStyle)>, cx: &mut Context<Self>) {
+    pub fn set_cursor_blink(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.blink_cursor
+            .update(cx, |cursor, cx| cursor.set_enabled(enabled, cx));
+    }
+
+    pub fn set_external_highlights(
+        &mut self,
+        highlights: Vec<(std::ops::Range<usize>, gpui::HighlightStyle)>,
+        cx: &mut Context<Self>,
+    ) {
         self.external_highlights = Some(highlights);
         cx.notify();
     }

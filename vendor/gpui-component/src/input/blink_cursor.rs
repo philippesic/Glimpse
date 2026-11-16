@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use gpui::{px, Context, Pixels, Task, Timer};
+use gpui::{Context, Pixels, Task, Timer, px};
 
 static INTERVAL: Duration = Duration::from_millis(500);
 static PAUSE_DELAY: Duration = Duration::from_millis(300);
@@ -14,6 +14,7 @@ pub(super) const CURSOR_WIDTH: Pixels = px(1.5);
 /// The input painter will check if this in visible state, then it will draw the cursor.
 pub(crate) struct BlinkCursor {
     visible: bool,
+    enabled: bool,
     paused: bool,
     epoch: usize,
 
@@ -24,9 +25,23 @@ impl BlinkCursor {
     pub fn new() -> Self {
         Self {
             visible: false,
+            enabled: true,
             paused: false,
             epoch: 0,
             _task: Task::ready(()),
+        }
+    }
+
+    pub fn set_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.enabled = enabled;
+        self.next_epoch();
+        self._task = Task::ready(());
+        self.visible = true;
+        self.paused = false;
+        if enabled {
+            self.start(cx);
+        } else {
+            cx.notify();
         }
     }
 
@@ -46,6 +61,9 @@ impl BlinkCursor {
     }
 
     fn blink(&mut self, epoch: usize, cx: &mut Context<Self>) {
+        if !self.enabled {
+            return;
+        }
         if self.paused || epoch != self.epoch {
             self.visible = true;
             return;
@@ -71,6 +89,9 @@ impl BlinkCursor {
 
     /// Pause the blinking, and delay 500ms to resume the blinking.
     pub fn pause(&mut self, cx: &mut Context<Self>) {
+        if !self.enabled {
+            return;
+        }
         self.paused = true;
         self.visible = true;
         cx.notify();
