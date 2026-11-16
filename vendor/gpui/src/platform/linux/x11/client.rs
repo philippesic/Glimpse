@@ -1604,7 +1604,12 @@ impl LinuxClient for X11Client {
             return;
         };
 
-        event_loop.run(None, &mut self.clone(), |_| {}).log_err();
+        event_loop
+            .run(None, &mut self.clone(), |client| {
+                let connection = client.0.borrow().xcb_connection.clone();
+                client.process_x11_events(&connection).log_err();
+            })
+            .log_err();
     }
 
     fn active_window(&self) -> Option<AnyWindowHandle> {
