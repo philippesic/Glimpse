@@ -32,7 +32,7 @@ Requested CLI files complete only after destination validation and recovery clea
 
 A completed save updates newer automatic recovery to the saved disk base before acknowledgment. Save As also transfers the newer draft’s destination. Late updates made against the preceding binding are translated only through the UI’s adoption generation; later observations retain their own bases. Recovery writes and rebinding serialize on a worker-only lock, while the UI’s acknowledgment touches only brief metadata locks.
 
-GPUI is vendored at 0.2.2 for a Linux Wayland startup fix: modifier masks received before a keymap are deferred until it arrives, and untranslatable key events are ignored safely. The other upstream platform implementations remain unchanged by this patch. macOS compilation and interaction remain unqualified.
+GPUI is vendored at 0.2.2. Its Linux Wayland startup fix handles keyboard initialization: modifier masks received before a keymap are deferred until it arrives, and untranslatable key events are ignored safely. The other upstream platform implementations remain unchanged by this patch. Shared text layout also keys cached measurements by truncation width and preserves the original style runs across measurement passes, so constrained labels can produce an ellipsis. macOS compilation and interaction remain unqualified.
 
 Save, Reload and file-access failures persist with the affected document and retain the appropriate retry action. Failed destination saves retain their path and operation. Native chooser errors are distinct from cancellation, and their retry retains Save As or Save Copy. Recovery maintenance warnings remain separately visible until acknowledged; later success or background updates cannot hide them. Warning details retain 32 distinct messages and disclose omitted earlier notices.
 
@@ -54,12 +54,18 @@ Directory refresh retains the current rows until the replacement listing complet
 
 Loading, slow reads, empty folders, filtering and unavailable or partial listings remain visible in the navigator. Error details expose the full path, failure and Retry. Stop Reading rejects late results and stays paused through filesystem notifications until explicit refresh or navigation; document-change checks continue. Obsolete directory requests are cancelled when Location changes. A full directory queue is an explicit failure rather than indefinite startup waiting.
 
+Recursive search has its own persistent state, result selection and coverage surface. Effective scope is the temporary Search This Folder override, then the pin, then Location. Navigation changes only an unpinned, non-temporary scope; a changed effective target cancels old work. Closing search retires the temporary override and leaves the pin intact. The command palette preserves the search query and target while it is open.
+
+Filename indexing is explicit and session-only. Index, Rebuild and Remove controls show snapshot size, staleness and filter incompatibility. Compatible indexed queries update while typed; empty ordinary queries do not build an index. Result rows are virtualized, expose full paths in tooltips, emphasize matches and support arrow, page, Home/End and Enter navigation. Text excerpts retain bounded context around a match. Saved-text result activation rechecks the observed bytes and refuses to jump into a dirty open document. Such failures remain with the results rather than only in the global status line. Picker result selection is independent of a previous navigator selection and is returned only by Choose.
+
+Search excludes symlink entries, metadata unless enabled, configured ignore patterns and nested mounts. Linux reads the mount table and checks bind mounts as well as device changes. macOS has a bounded, non-blocking mount-table implementation in its platform module; its compilation and behavior are unqualified. Linux tests create bind mounts only in private user/mount namespaces, and native checks cover both excluded traversal and explicit navigation into a mounted search root.
+
 ## Presentation gaps and qualification
 
 The product contract and native Linux evaluation determine qualification. The following remain incomplete:
 
 - Complete contextual command availability. macOS system-menu integration remains unverified.
-- Filename-index controls. Content-result activation rejects changed disk fingerprints and dirty open buffers.
+- Complete search adaptation at narrow widths and large interface scales, including the full coverage and permission-failure matrix.
 - The earlier bounded Markdown paging, local raster images, relative-link handling and complete dialect parity. The current read view escapes HTML and omits images, including remote images.
 - Large-file/long-line performance, real IME, accessibility, the complete size/theme/settings matrix and macOS behavior. Modal behavior across asynchronous completions still requires qualification.
 
