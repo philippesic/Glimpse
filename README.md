@@ -35,7 +35,7 @@ Files and Text search recursively under the displayed folder; scope can be pinne
 
 Filter affects only the current directory. The navigator reports slow or failed reads; Stop Reading keeps existing rows available, and Refresh resumes listing.
 
-Ctrl-N creates a draft. Ctrl-S saves; Ctrl-Shift-S opens Save As; Ctrl-Alt-S opens Save Copy. Ctrl-F opens the editor's Find/Replace panel. Ctrl-G goes to a line. Ctrl-Shift-P opens commands, Ctrl-comma opens preferences, Ctrl-W closes a tab and Ctrl-Q quits. The corresponding Command modifier applies on macOS. Read / Edit switches the current buffer to a read-only Markdown presentation. Images are omitted in this port.
+Ctrl-N creates a draft. Ctrl-S saves; Ctrl-Shift-S opens Save As; Ctrl-Alt-S opens Save Copy. Ctrl-F searches the current buffer with case and whole-word options. Replacement is disclosed on request; Replace and Replace All have separate Undo steps. Escape returns to the selected match. Ctrl-G goes to a line. Ctrl-Shift-P opens commands, Ctrl-comma opens preferences, Ctrl-W closes a tab and Ctrl-Q quits. The corresponding Command modifier applies on macOS. Read / Edit switches the current buffer to a read-only Markdown presentation. Images are omitted in this port.
 
 Save validation, no-clobber creation/rename and recovery use the existing domain workers. Ordinary saves refuse detected external changes. Clean external changes reload with an undo step; dirty buffers retain local text and offer Reload or Save Copy. Dirty close exposes Save, Discard and Cancel. Linux removal uses freedesktop Trash, never permanent deletion. Close an open file before rename or Trash.
 
