@@ -20,7 +20,7 @@ The component's default text operations preserve the authoritative buffer. Perfo
 
 DiskFile retains observed identity, symlink binding and bytes. Save stages beside the target, preserves supported metadata, syncs, validates and atomically replaces. Hard links, unsupported ownership/metadata and changed destinations stop saving. Atomic replacement is not compare-and-swap against unrelated writers. External observation retains the existing binding when a symlink target changes, even when both targets have identical bytes; ordinary Save stays blocked until an explicit resolution.
 
-Save As rebinds after success; Save Copy retains the original binding. Existing destinations require a modal confirmation of an observed version. Destination identity checks run on the I/O path. Destinations already open in another tab must be closed first. A waiting CLI request requires explicit abandonment before Save As to another path; cancellation or failed saving keeps it waiting, while successful rebinding returns exit 1. Recovery remains mandatory for normal saves. Failure retains local text and reports the error; the earlier one-attempt recovery bypass is not exposed.
+Save As rebinds after success; Save Copy retains the original binding. Existing destinations require a modal confirmation of an observed version. Destination identity checks run on the I/O path. Destinations already open in another tab must be closed first. A waiting CLI request requires explicit abandonment before Save As to another path; cancellation or failed saving keeps it waiting, while successful rebinding returns exit 1. Recovery remains mandatory for normal saves. A document’s recovery failure offers Retry, a new recovery copy elsewhere, and a separately confirmed one-attempt Save Without Recovery for an existing file without an unresolved conflict. The recovery-copy operation creates a new file exclusively, keeps the original association, and cannot replace an existing destination. Its output is itself the requested recovery copy. The one-attempt override bypasses neither disk validation nor metadata and replacement requirements.
 
 Linux rename uses `renameat2(RENAME_NOREPLACE)` and Trash uses the trash crate's freedesktop implementation. Linux saving copies permissions and extended attributes; failures stop replacement. macOS retains `renamex_np`, NSFileManager Trash and `fcopyfile` metadata preservation behind platform configuration. Linux Reveal opens the containing directory with xdg-open. GPUI supplies native portal file dialogs.
 
@@ -33,6 +33,10 @@ Requested CLI files complete only after destination validation and recovery clea
 A completed save updates newer automatic recovery to the saved disk base before acknowledgment. Save As also transfers the newer draft’s destination. Late updates made against the preceding binding are translated only through the UI’s adoption generation; later observations retain their own bases. Recovery writes and rebinding serialize on a worker-only lock, while the UI’s acknowledgment touches only brief metadata locks.
 
 GPUI is vendored at 0.2.2 for a Linux Wayland startup fix: modifier masks received before a keymap are deferred until it arrives, and untranslatable key events are ignored safely. The other upstream platform implementations remain unchanged by this patch. macOS compilation and interaction remain unqualified.
+
+Save, Reload and file-access failures persist with the affected document and retain the appropriate retry action. Failed destination saves retain their path and operation. Recovery maintenance warnings remain separately visible until acknowledged; later success or background updates cannot hide them. Warning details retain 32 distinct messages and disclose omitted earlier notices.
+
+New-file saves retain the staged file’s identity, resolved destination and exact candidate bytes. Before adopting the file, the worker verifies that the chosen path still names that created version. A post-creation replacement or symlink retarget stops adoption.
 
 ## Preferences and layout
 
@@ -47,7 +51,6 @@ Shell buttons and document tabs use focusable GPUI controls. Preferences contain
 The product contract and native Linux evaluation determine qualification. The following remain incomplete:
 
 - Breadcrumb/path completion, drops, horizontal navigation gestures and complete contextual command availability. macOS system-menu integration remains unverified.
-- Recovery failure alternatives, including the explicit one-attempt Save Without Recovery.
 - Filename-index controls. Content-result activation rejects changed disk fingerprints and dirty open buffers.
 - The earlier bounded Markdown paging, local raster images, relative-link handling and complete dialect parity. The current read view escapes HTML and omits images, including remote images.
 - Large-file/long-line performance, real IME, accessibility, the complete size/theme/settings matrix and macOS behavior. Modal behavior across asynchronous completions still requires qualification.
