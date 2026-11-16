@@ -322,6 +322,9 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         self.settings = settings;
+        if let Some(warning) = &self.settings.warning {
+            self.status = warning.clone();
+        }
         theme::apply(&self.settings, window, cx);
         self.search_id = self.search.cancel();
         self.hits.clear();

@@ -248,11 +248,22 @@ impl Settings {
         let mut value = match parse(&bytes) {
             Ok(value) => value,
             Err(error) => {
-                let previous =
-                    fs::read(root.join("settings.previous.json")).map_err(|_| error.clone())?;
-                let mut value = parse(&previous)?;
+                let previous = fs::File::open(root.join("settings.previous.json"))
+                    .ok()
+                    .and_then(|file| {
+                        let mut bytes = Vec::new();
+                        file.take(65537).read_to_end(&mut bytes).ok()?;
+                        (bytes.len() <= 65536).then_some(bytes)
+                    })
+                    .and_then(|bytes| parse(&bytes).ok());
+                let source = if previous.is_some() {
+                    "previous valid settings"
+                } else {
+                    "defaults"
+                };
+                let mut value = previous.unwrap_or_default();
                 value.warning = Some(format!(
-                    "Settings are invalid ({error}); previous valid settings loaded. Apply Settings explicitly to replace the invalid file."
+                    "Settings are invalid ({error}); {source} loaded. Apply Preferences explicitly to replace the invalid file."
                 ));
                 value
             }
@@ -892,6 +903,35 @@ mod tests {
             b"invalid"
         );
     }
+    #[test]
+    fn invalid_first_settings_require_explicit_replacement_and_keep_original_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let original = b"{invalid settings";
+        fs::write(root.path().join("settings.json"), original).unwrap();
+        fs::write(root.path().join("settings.previous.json"), b"also invalid").unwrap();
+        let mut settings = Settings::load_in(root.path()).unwrap();
+        assert!(
+            settings
+                .warning
+                .as_ref()
+                .unwrap()
+                .contains("defaults loaded")
+        );
+        let mut base = settings.disk_base.clone();
+        assert!(settings.save_checked(root.path(), &mut base).is_err());
+        assert_eq!(
+            fs::read(root.path().join("settings.json")).unwrap(),
+            original
+        );
+        settings.warning = None;
+        settings.save_checked(root.path(), &mut base).unwrap();
+        assert_eq!(
+            fs::read(root.path().join("settings.rejected.json")).unwrap(),
+            original
+        );
+        assert!(Settings::load_in(root.path()).unwrap().warning.is_none());
+    }
+
     #[test]
     fn recovery_preserves_native_non_unicode_paths() {
         use std::os::unix::ffi::OsStringExt;
