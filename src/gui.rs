@@ -686,6 +686,10 @@ impl Shell {
             .filter(|path| {
                 path.parent() == Some(self.current.as_path())
                     && self.entries.iter().any(|entry| entry.path == **path)
+                    && (self.settings.show_hidden || !paths::name(path).starts_with('.'))
+                    && paths::name(path)
+                        .to_lowercase()
+                        .contains(&self.filter.to_lowercase())
             })
             .cloned()
     }
@@ -2833,7 +2837,7 @@ impl Render for Shell {
                             return;
                         }
                         "right" | "enter" => {
-                            if let Some(path) = this.selection.clone() {
+                            if let Some(path) = this.selected_path() {
                                 this.open(path, false, None);
                             }
                             cx.notify();
