@@ -1,4 +1,4 @@
-use aho_corasick::AhoCorasick;
+use regex::{Regex, RegexBuilder};
 use rust_i18n::t;
 use std::{ops::Range, rc::Rc};
 
@@ -37,7 +37,8 @@ pub(super) fn init(cx: &mut App) {
 #[derive(Debug, Clone)]
 pub struct SearchMatcher {
     text: Rope,
-    pub query: Option<AhoCorasick>,
+    pub query: Option<Regex>,
+    query_error: bool,
 
     pub(super) matched_ranges: Rc<Vec<Range<usize>>>,
     pub(super) current_match_ix: usize,
@@ -50,6 +51,7 @@ impl SearchMatcher {
         Self {
             text: "".into(),
             query: None,
+            query_error: false,
             matched_ranges: Rc::new(Vec::new()),
             current_match_ix: 0,
             replacing: false,
@@ -70,33 +72,39 @@ impl SearchMatcher {
         let mut new_ranges = Vec::new();
         if let Some(query) = &self.query {
             let text = self.text.to_string();
-            // FIXME: Use stream find
-            let matches = query.stream_find_iter(text.as_bytes());
-
-            for query_match in matches.into_iter() {
-                let query_match = query_match.expect("query match for select all action");
-                new_ranges.push(query_match.range());
-            }
+            new_ranges.extend(query.find_iter(&text).map(|found| found.range()));
         }
         self.matched_ranges = Rc::new(new_ranges);
         if !self.replacing {
             self.current_match_ix = 0;
-            self.replacing = false;
         }
+        self.current_match_ix = self.current_match_ix.min(self.len().saturating_sub(1));
+        self.replacing = false;
     }
 
     /// Update the search query and reset the current match index.
-    pub fn update_query(&mut self, query: &str, case_insensitive: bool) {
-        if query.len() > 0 {
-            self.query = Some(
-                AhoCorasick::builder()
-                    .ascii_case_insensitive(case_insensitive)
-                    .build(&[query.to_string()])
-                    .expect("failed to build AhoCorasick query in SearchMatcher"),
-            );
+    pub fn update_query(&mut self, query: &str, case_insensitive: bool, whole_word: bool) {
+        let escaped = regex::escape(query);
+        let pattern = if whole_word {
+            format!(r"\b(?:{escaped})\b")
         } else {
-            self.query = None;
-        }
+            escaped
+        };
+        self.query_error = false;
+        self.query = if query.is_empty() {
+            None
+        } else {
+            match RegexBuilder::new(&pattern)
+                .case_insensitive(case_insensitive)
+                .build()
+            {
+                Ok(query) => Some(query),
+                Err(_) => {
+                    self.query_error = true;
+                    None
+                }
+            }
+        };
         self.update_matches();
     }
 
@@ -112,6 +120,9 @@ impl SearchMatcher {
     }
 
     fn label(&self) -> String {
+        if self.query_error {
+            return "Query is too large".into();
+        }
         if self.len() == 0 {
             return "0/0".to_string();
         }
@@ -169,6 +180,7 @@ pub(super) struct SearchPanel {
     search_input: Entity<InputState>,
     replace_input: Entity<InputState>,
     case_insensitive: bool,
+    whole_word: bool,
     replace_mode: bool,
     matcher: SearchMatcher,
     input_width: Pixels,
@@ -186,7 +198,9 @@ impl InputState {
 
         let text = self.text.clone();
         search_panel.update(cx, |this, _| {
-            this.matcher.update(&text);
+            if this.open {
+                this.matcher.update(&text);
+            }
         });
     }
 
@@ -220,8 +234,8 @@ impl InputState {
 
 impl SearchPanel {
     pub fn new(editor: Entity<InputState>, window: &mut Window, cx: &mut App) -> Entity<Self> {
-        let search_input = cx.new(|cx| InputState::new(window, cx));
-        let replace_input = cx.new(|cx| InputState::new(window, cx));
+        let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Find in document"));
+        let replace_input = cx.new(|cx| InputState::new(window, cx).placeholder("Replace with"));
 
         cx.new(|cx| {
             let _subscriptions =
@@ -242,6 +256,7 @@ impl SearchPanel {
                 search_input,
                 replace_input,
                 case_insensitive: true,
+                whole_word: false,
                 replace_mode: false,
                 matcher: SearchMatcher::new(),
                 open: true,
@@ -279,7 +294,7 @@ impl SearchPanel {
             .map(|l| l.visible_range_offset.clone());
 
         self.matcher
-            .update_query(query.as_str(), self.case_insensitive);
+            .update_query(query.as_str(), self.case_insensitive, self.whole_word);
 
         if let Some(visible_range_offset) = visible_range_offset {
             self.matcher
@@ -290,6 +305,18 @@ impl SearchPanel {
 
     pub(super) fn hide(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open = false;
+        if let Some(range) = self
+            .matcher
+            .matched_ranges
+            .get(self.matcher.current_match_ix)
+        {
+            self.editor.update(cx, |state, cx| {
+                state.selected_range = range.clone().into();
+                state.selection_reversed = false;
+                state.scroll_to(range.end, Some(MoveDirection::Down), cx);
+                cx.notify();
+            });
+        }
         self.editor.read(cx).focus_handle.focus(window);
         cx.notify();
     }
@@ -306,14 +333,17 @@ impl SearchPanel {
         self.hide(window, cx);
     }
 
-    fn on_action_tab(&mut self, _: &IndentInline, window: &mut Window, cx: &mut Context<Self>) {
-        self.editor.focus_handle(cx).focus(window);
+    fn on_action_tab(&mut self, _: &IndentInline, window: &mut Window, _: &mut Context<Self>) {
+        window.focus_next();
     }
 
     fn prev(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(range) = self.matcher.next_back() {
             self.editor.update(cx, |state, cx| {
+                state.selected_range = range.clone().into();
+                state.selection_reversed = false;
                 state.scroll_to(range.start, Some(MoveDirection::Up), cx);
+                cx.notify();
             });
         }
     }
@@ -321,7 +351,10 @@ impl SearchPanel {
     fn next(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(range) = self.matcher.next() {
             self.editor.update(cx, |state, cx| {
+                state.selected_range = range.clone().into();
+                state.selection_reversed = false;
                 state.scroll_to(range.end, Some(MoveDirection::Down), cx);
+                cx.notify();
             });
         }
     }
@@ -344,19 +377,25 @@ impl SearchPanel {
             .cloned()
         {
             let text_state = self.editor.clone();
+            let original = text_state.read(cx).text.clone();
 
             let next_range = self.matcher.peek().unwrap_or(range.clone());
             cx.spawn_in(window, async move |_, cx| {
                 cx.update(|window, cx| {
                     text_state.update(cx, |state, cx| {
+                        if state.text != original {
+                            return;
+                        }
                         let range_utf16 = state.range_to_utf16(&range);
                         state.scroll_to(next_range.end, Some(MoveDirection::Down), cx);
+                        state.history.new_group();
                         state.replace_text_in_range_silent(
                             Some(range_utf16),
                             new_text.as_str(),
                             window,
                             cx,
                         );
+                        state.history.new_group();
                     });
                 })
             })
@@ -373,20 +412,27 @@ impl SearchPanel {
         }
 
         let editor = self.editor.clone();
+        let original = editor.read(cx).text.clone();
         cx.spawn_in(window, async move |_, cx| {
             cx.update(|window, cx| {
                 editor.update(cx, |state, cx| {
+                    if state.text != original {
+                        return;
+                    }
                     // Replace from the end to avoid messing up the ranges.
                     let mut rope = state.text.clone();
                     for range in ranges.iter().rev() {
                         rope.replace(range.clone(), new_text.as_str());
                     }
+                    let full_range = state.range_to_utf16(&(0..state.text.len()));
+                    state.history.new_group();
                     state.replace_text_in_range_silent(
-                        Some(0..state.text.len()),
+                        Some(full_range),
                         &rope.to_string(),
                         window,
                         cx,
                     );
+                    state.history.new_group();
                     state.scroll_to(0, Some(MoveDirection::Down), cx);
                 });
             })
@@ -446,6 +492,7 @@ impl Render for SearchPanel {
                                             .compact()
                                             .ghost()
                                             .icon(IconName::CaseSensitive)
+                                            .tooltip("Match case")
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.case_insensitive = !this.case_insensitive;
                                                 this.update_search_query(cx);
@@ -473,10 +520,23 @@ impl Render for SearchPanel {
                             ),
                     )
                     .child(
+                        Button::new("whole-word")
+                            .xsmall()
+                            .ghost()
+                            .label("Word")
+                            .tooltip("Match whole words")
+                            .selected(self.whole_word)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.whole_word = !this.whole_word;
+                                this.update_search_query(cx);
+                            })),
+                    )
+                    .child(
                         Button::new("replace-mode")
                             .xsmall()
                             .ghost()
                             .icon(IconName::Replace)
+                            .tooltip("Show replacement")
                             .selected(self.replace_mode)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.replace_mode = !this.replace_mode;
@@ -493,6 +553,7 @@ impl Render for SearchPanel {
                             .xsmall()
                             .ghost()
                             .icon(IconName::ChevronLeft)
+                            .tooltip("Previous match")
                             .disabled(!has_matches)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.prev(window, cx);
@@ -503,6 +564,7 @@ impl Render for SearchPanel {
                             .xsmall()
                             .ghost()
                             .icon(IconName::ChevronRight)
+                            .tooltip("Next match")
                             .disabled(!has_matches)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.next(window, cx);
@@ -522,6 +584,7 @@ impl Render for SearchPanel {
                             .xsmall()
                             .ghost()
                             .icon(IconName::Close)
+                            .tooltip("Close Find")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.on_action_escape(&Escape, window, cx);
                             })),
@@ -571,7 +634,7 @@ mod tests {
     fn test_search() {
         let mut matcher = SearchMatcher::new();
         matcher.update(&Rope::from("Hello 世界 this is a Is test string."));
-        matcher.update_query("Is", true);
+        matcher.update_query("Is", true, false);
 
         assert_eq!(matcher.len(), 3);
         let mut matches = matcher.clone();
@@ -589,17 +652,39 @@ mod tests {
         assert_eq!(matches.current_match_ix, 0);
         assert_eq!(matches.next_back(), Some(23..25));
 
-        matcher.update_query("IS", false);
+        matcher.update_query("IS", false, false);
         assert_eq!(matcher.len(), 0);
         assert_eq!(matcher.next(), None);
         assert_eq!(matcher.next_back(), None);
     }
 
     #[test]
+    fn unicode_case_and_whole_word_ranges() {
+        let text = "🙂 CAFÉ café décafé café_ café\r\n";
+        let mut matcher = SearchMatcher::new();
+        matcher.update(&Rope::from(text));
+        matcher.update_query("café", true, true);
+        let matches: Vec<_> = matcher
+            .matched_ranges
+            .iter()
+            .map(|r| &text[r.clone()])
+            .collect();
+        assert_eq!(matches, ["CAFÉ", "café", "café"]);
+        matcher.update_query("café", false, false);
+        assert_eq!(matcher.len(), 4);
+        matcher.current_match_ix = 3;
+        matcher.replacing = true;
+        matcher.update(&Rope::from("café"));
+        assert_eq!(matcher.label(), "1/1");
+        matcher.update_query("[", true, false);
+        assert_eq!(matcher.len(), 0);
+    }
+
+    #[test]
     fn test_search_label() {
         let mut matcher = SearchMatcher::new();
         matcher.update(&Rope::from("Hello 世界 this is a Is test string."));
-        matcher.update_query("Is", true);
+        matcher.update_query("Is", true, false);
         assert_eq!(matcher.label(), "1/3");
         matcher.next();
         assert_eq!(matcher.label(), "2/3");
@@ -608,7 +693,7 @@ mod tests {
         matcher.next();
         assert_eq!(matcher.label(), "1/3");
 
-        matcher.update_query("IS", false);
+        matcher.update_query("IS", false, false);
         assert_eq!(matcher.label(), "0/0");
     }
 
