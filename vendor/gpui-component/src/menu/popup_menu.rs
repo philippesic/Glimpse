@@ -320,7 +320,19 @@ impl PopupMenu {
         cx: &mut App,
         f: impl FnOnce(Self, &mut Window, &mut Context<PopupMenu>) -> Self,
     ) -> Entity<Self> {
-        cx.new(|cx| f(Self::new(cx), window, cx))
+        cx.new(|cx| {
+            let mut menu = f(Self::new(cx), window, cx);
+            let focus = menu.focus_handle.clone();
+            menu._subscriptions
+                .push(cx.on_focus_out(&focus, window, |menu, _, window, cx| {
+                    if !menu.focus_handle.contains_focused(window, cx)
+                        && menu.active_submenu().is_none()
+                    {
+                        menu.dismiss(&Cancel, window, cx);
+                    }
+                }));
+            menu
+        })
     }
 
     /// Set the focus handle of Entity to handle actions.
@@ -1035,8 +1047,14 @@ impl PopupMenu {
         let group_name = format!("popup-menu-item-{}", ix);
 
         let (item_height, radius) = match self.size {
-            Size::Small => (px(20.), options.radius.half()),
-            _ => (px(26.), options.radius),
+            Size::Small => (
+                (px(24.) * (cx.theme().font_size / px(16.))).max(px(24.)),
+                options.radius.half(),
+            ),
+            _ => (
+                (px(28.) * (cx.theme().font_size / px(16.))).max(px(24.)),
+                options.radius,
+            ),
         };
 
         let this = MenuItemElement::new(ix, &group_name)
@@ -1073,7 +1091,7 @@ impl PopupMenu {
                     .items_center()
                     .gap_x_1()
                     .children(Self::render_icon(has_left_icon, false, None, window, cx))
-                    .child(div().flex_1().child(label.clone())),
+                    .child(div().flex_1().min_w_0().child(label.clone())),
             ),
             PopupMenuItem::ElementItem {
                 render,
@@ -1114,6 +1132,24 @@ impl PopupMenu {
                 let show_link_icon = *is_link && self.external_link_icon;
                 let action = action.as_ref().map(|action| action.boxed_clone());
                 let key = self.render_key_binding(action, window, cx);
+                let full_label = label.clone();
+                let label_element = || {
+                    div()
+                        .id(("menu-label", ix))
+                        .flex_1()
+                        .min_w_0()
+                        .line_clamp(1)
+                        .text_ellipsis()
+                        .child(label.clone())
+                        .tooltip({
+                            let label = full_label.clone();
+                            move |window, cx| {
+                                crate::tooltip::Tooltip::new(label.clone())
+                                    .max_w((window.viewport_size().width - px(48.)).min(px(600.)))
+                                    .build(window, cx)
+                            }
+                        })
+                };
 
                 this.when(!disabled, |this| {
                     this.on_click(
@@ -1132,11 +1168,12 @@ impl PopupMenu {
                 ))
                 .child(
                     h_flex()
-                        .w_full()
+                        .flex_1()
+                        .min_w_0()
                         .gap_3()
                         .items_center()
                         .justify_between()
-                        .when(!show_link_icon, |this| this.child(label.clone()))
+                        .when(!show_link_icon, |this| this.child(label_element()))
                         .children(right_check_icon)
                         .when(show_link_icon, |this| {
                             this.child(
@@ -1144,7 +1181,8 @@ impl PopupMenu {
                                     .w_full()
                                     .justify_between()
                                     .gap_1p5()
-                                    .child(label.clone())
+                                    .min_w_0()
+                                    .child(label_element())
                                     .child(
                                         Icon::new(IconName::ExternalLink)
                                             .xsmall()
@@ -1232,17 +1270,22 @@ impl Render for PopupMenu {
         let view = cx.entity().clone();
         let items_count = self.menu_items.len();
 
-        let max_height = self.max_height.unwrap_or_else(|| {
-            let window_half_height = window.window_bounds().get_bounds().size.height * 0.5;
-            window_half_height.min(px(450.))
-        });
+        let max_height = self
+            .max_height
+            .unwrap_or_else(|| {
+                let window_half_height = window.window_bounds().get_bounds().size.height * 0.5;
+                window_half_height.min(px(450.))
+            })
+            .min((window.viewport_size().height - px(24.)).max(px(72.)));
 
         let has_left_icon = self
             .menu_items
             .iter()
             .any(|item| item.has_left_icon(self.check_side));
 
-        let max_width = self.max_width();
+        let max_width = self
+            .max_width()
+            .min((window.viewport_size().width - px(24.)).max(px(96.)));
         let options = RenderOptions {
             has_left_icon,
             check_side: self.check_side,

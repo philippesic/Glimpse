@@ -19,6 +19,32 @@ pub fn name(path: &Path) -> String {
     let name = path.file_name().unwrap_or(path.as_os_str());
     display(Path::new(name))
 }
+
+pub fn tab_label<'a>(path: &Path, others: impl IntoIterator<Item = &'a Path>) -> String {
+    let duplicates: Vec<_> = others
+        .into_iter()
+        .filter(|other| *other != path && other.file_name() == path.file_name())
+        .collect();
+    if duplicates.is_empty() {
+        return name(path);
+    }
+    let suffix = |path: &Path, depth: usize| {
+        let components: Vec<_> = path.parent().unwrap_or(path).components().collect();
+        components[components.len().saturating_sub(depth)..]
+            .iter()
+            .collect::<std::path::PathBuf>()
+    };
+    for depth in 1..=path.components().count() {
+        let parent = suffix(path, depth);
+        if duplicates
+            .iter()
+            .all(|other| suffix(other, depth) != parent)
+        {
+            return format!("{} — {}", name(path), display(&parent));
+        }
+    }
+    display(path)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -32,6 +58,23 @@ mod tests {
         let invalid =
             std::path::PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/a\xff".to_vec()));
         assert_ne!(display(&invalid), display(Path::new("/tmp/a�")));
+    }
+
+    #[test]
+    fn tabs_use_the_shortest_distinguishing_parent_suffix() {
+        let paths = [
+            Path::new("/work/alpha/src/main.rs"),
+            Path::new("/work/beta/src/main.rs"),
+            Path::new("/work/beta/other.txt"),
+        ];
+        assert_eq!(tab_label(paths[0], paths), "main.rs — alpha/src");
+        assert_eq!(tab_label(paths[1], paths), "main.rs — beta/src");
+        assert_eq!(tab_label(paths[2], paths), "other.txt");
+        let parents = [
+            Path::new("/work/alpha/main.rs"),
+            Path::new("/work/beta/main.rs"),
+        ];
+        assert_eq!(tab_label(parents[0], parents), "main.rs — alpha");
     }
 }
 

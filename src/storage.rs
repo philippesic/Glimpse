@@ -223,7 +223,7 @@ impl Settings {
     pub fn load() -> Result<Self, String> {
         Self::load_in(&data_dir())
     }
-    fn load_in(root: &Path) -> Result<Self, String> {
+    pub(crate) fn load_in(root: &Path) -> Result<Self, String> {
         use std::io::Read;
         let path = root.join("settings.json");
         let bytes = match fs::File::open(&path) {

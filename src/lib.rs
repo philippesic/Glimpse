@@ -10,6 +10,7 @@ pub mod editor;
 pub mod fileops;
 pub mod io;
 pub mod lifecycle;
+pub mod locations;
 #[cfg(test)]
 pub mod markdown;
 pub mod metrics;

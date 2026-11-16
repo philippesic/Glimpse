@@ -1,8 +1,9 @@
 use std::rc::Rc;
 
 use gpui::{
-    Context, Corner, DismissEvent, ElementId, Entity, Focusable, InteractiveElement, IntoElement,
-    RenderOnce, SharedString, StyleRefinement, Styled, Window,
+    Context, Corner, DismissEvent, ElementId, Entity, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, KeyUpEvent, MouseButton, RenderOnce, SharedString, StyleRefinement, Styled,
+    Window,
 };
 
 use crate::{button::Button, menu::PopupMenu, popover::Popover, Selectable};
@@ -33,7 +34,7 @@ pub trait DropdownMenu: Styled + Selectable + InteractiveElement + IntoElement +
 impl DropdownMenu for Button {}
 
 #[derive(IntoElement)]
-pub struct DropdownMenuPopover<T: Selectable + IntoElement + 'static> {
+pub struct DropdownMenuPopover<T: Selectable + InteractiveElement + IntoElement + 'static> {
     id: ElementId,
     style: StyleRefinement,
     anchor: Corner,
@@ -43,7 +44,7 @@ pub struct DropdownMenuPopover<T: Selectable + IntoElement + 'static> {
 
 impl<T> DropdownMenuPopover<T>
 where
-    T: Selectable + IntoElement + 'static,
+    T: Selectable + InteractiveElement + IntoElement + 'static,
 {
     fn new(
         id: ElementId,
@@ -76,21 +77,66 @@ where
 #[derive(Default)]
 struct DropdownMenuState {
     menu: Option<Entity<PopupMenu>>,
+    open: bool,
+    return_focus: Option<FocusHandle>,
 }
 
 impl<T> RenderOnce for DropdownMenuPopover<T>
 where
-    T: Selectable + IntoElement + 'static,
+    T: Selectable + InteractiveElement + IntoElement + 'static,
 {
     fn render(self, window: &mut Window, cx: &mut gpui::App) -> impl IntoElement {
         let builder = self.builder.clone();
         let menu_state =
             window.use_keyed_state(self.id.clone(), cx, |_, _| DropdownMenuState::default());
 
+        let open = menu_state.read(cx).open;
+        let trigger = self
+            .trigger
+            .on_mouse_down(MouseButton::Left, {
+                let state = menu_state.clone();
+                move |_, window, cx| {
+                    state.update(cx, |state, cx| state.return_focus = window.focused(cx));
+                }
+            })
+            .on_key_up({
+                let state = menu_state.clone();
+                move |event: &KeyUpEvent, window, cx| {
+                    if !event.keystroke.modifiers.modified()
+                        && matches!(event.keystroke.key.as_str(), "enter" | "space" | "down")
+                    {
+                        state.update(cx, |state, cx| {
+                            state.return_focus = window.focused(cx);
+                            state.open = true;
+                        });
+                        window.refresh();
+                        cx.stop_propagation();
+                    }
+                }
+            });
         Popover::new(SharedString::from(format!("popover:{}", self.id)))
+            .open(open)
+            .on_open_change({
+                let state = menu_state.clone();
+                move |open, window, cx| {
+                    state.update(cx, |state, cx| {
+                        state.open = *open;
+                        if !open {
+                            let contains_focus = state.menu.as_ref().is_some_and(|menu| {
+                                menu.focus_handle(cx).contains_focused(window, cx)
+                            });
+                            if contains_focus && let Some(focus) = state.return_focus.take() {
+                                window.focus(&focus);
+                            }
+                            state.menu = None;
+                        }
+                    });
+                    window.refresh();
+                }
+            })
             .appearance(false)
             .overlay_closable(false)
-            .trigger(self.trigger)
+            .trigger(trigger)
             .trigger_style(self.style)
             .anchor(self.anchor)
             .content(move |_, window, cx| {

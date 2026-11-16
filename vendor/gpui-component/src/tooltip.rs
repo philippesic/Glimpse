@@ -1,6 +1,7 @@
 use gpui::{
     div, prelude::FluentBuilder, px, Action, AnyElement, AnyView, App, AppContext, Context,
-    IntoElement, ParentElement, Render, SharedString, StyleRefinement, Styled, Window,
+    IntoElement, InteractiveElement, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, StyleRefinement, Styled, Window,
 };
 
 use crate::{h_flex, kbd::Kbd, text::Text, ActiveTheme, StyledExt};
@@ -89,6 +90,8 @@ impl Render for Tooltip {
         div().child(
             // Wrap in a child, to ensure the left margin is applied to the tooltip
             h_flex()
+                .id("tooltip-content")
+                .min_w_0()
                 .font_family(cx.theme().font_family.clone())
                 .m_3()
                 .bg(cx.theme().popover)
@@ -104,10 +107,20 @@ impl Render for Tooltip {
                 .text_sm()
                 .gap_3()
                 .refine_style(&self.style)
+                .max_w(
+                    (window.viewport_size().width - px(48.))
+                        .min(px(640.))
+                        .max(px(96.)),
+                )
+                .max_h((window.viewport_size().height - px(48.)).max(px(72.)))
+                .overflow_y_scroll()
+                .whitespace_normal()
                 .map(|this| {
-                    this.child(div().map(|this| match self.content {
-                        TooltipContext::Text(ref text) => this.child(text.clone()),
-                        TooltipContext::Element(ref builder) => this.child(builder(window, cx)),
+                    this.child(div().flex_1().min_w_0().whitespace_normal().map(|this| {
+                        match self.content {
+                            TooltipContext::Text(ref text) => this.child(text.clone()),
+                            TooltipContext::Element(ref builder) => this.child(builder(window, cx)),
+                        }
                     }))
                 })
                 .when_some(key_binding, |this, kbd| {

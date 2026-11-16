@@ -17,6 +17,7 @@ pub enum Job {
     HoldMaintenance(mpsc::Sender<()>, mpsc::Receiver<()>),
     Visit(PathBuf),
     RecentLocation(Vec<PathBuf>),
+    Volumes,
     External(PathBuf, bool),
     Create(PathBuf, bool, String),
     Rename(PathBuf, PathBuf),
@@ -59,6 +60,7 @@ pub struct SaveDestination {
 }
 pub enum Reply {
     RecentLocation(Option<PathBuf>),
+    Volumes(Result<crate::locations::Volumes, String>),
     SettingsLoaded(Result<storage::Settings, String>),
     SettingsSaved(Result<storage::Settings, String>),
     Changed(Result<(), String>),
@@ -162,9 +164,9 @@ impl IoWorker {
             let count = pending.clone();
             let root = root.clone();
             let preview = preview.clone();
+            let settings_root = root.parent().unwrap_or(&root).to_owned();
             thread::spawn(move || {
                 let rx = Requests(requests);
-                let mut settings_base: Option<Option<Vec<u8>>> = None;
                 while let Ok(job) = rx.recv() {
                     let updates = if maintenance {
                         std::mem::take(&mut *pending_drafts.lock().unwrap())
@@ -314,22 +316,18 @@ impl IoWorker {
                         Job::Check(id, path, generation) => {
                             Reply::Checked(id, generation, DiskFile::open(path))
                         }
+                        Job::Volumes => Reply::Volumes(crate::locations::mounted()),
                         Job::Settings(mut settings) => {
-                            let base =
-                                settings_base.get_or_insert_with(|| settings.disk_base.clone());
+                            let mut base = settings.disk_base.clone();
                             Reply::SettingsSaved(
-                                settings.save_checked(&storage::data_dir(), base).map(|()| {
+                                settings.save_checked(&settings_root, &mut base).map(|()| {
                                     settings.disk_base = base.clone();
                                     settings
                                 }),
                             )
                         }
                         Job::LoadSettings => {
-                            let result = storage::Settings::load();
-                            if let Ok(value) = &result {
-                                settings_base = Some(value.disk_base.clone());
-                            }
-                            Reply::SettingsLoaded(result)
+                            Reply::SettingsLoaded(storage::Settings::load_in(&settings_root))
                         }
                         Job::Recover(id, draft) => Reply::Done(
                             recovery
@@ -528,7 +526,8 @@ impl IoWorker {
         let channel = match &job {
             #[cfg(test)]
             Job::HoldMaintenance(..) => &self.maintenance,
-            Job::Open(..)
+            Job::Volumes
+            | Job::Open(..)
             | Job::Choose(..)
             | Job::Finish(..)
             | Job::Check(..)
@@ -560,6 +559,7 @@ impl IoWorker {
                 let message = "I/O queue unavailable. Operation was not queued; retry. Current buffer remains in memory.".to_owned();
                 let reply = match job {
                     Job::RecentLocation(_) => Reply::RecentLocation(None),
+                    Job::Volumes => Reply::Volumes(Err(message)),
                     Job::Settings(_) => Reply::SettingsSaved(Err(message)),
                     Job::Save { id, text, .. } => Reply::Save(id, text, Err(message)),
                     Job::SaveTo(d) | Job::Prepare(d) => Reply::SavedTo(Box::new(d), Err(message)),
@@ -664,6 +664,48 @@ impl Drop for IoWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reloading_settings_cannot_authorize_a_stale_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let io = IoWorker::new_in(wake::Context::default(), root.path().join("recovery"));
+        io.send(Job::Settings(storage::Settings::default()));
+        let mut saved = match io
+            .replies
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+        {
+            Reply::SettingsSaved(Ok(settings)) => settings,
+            _ => panic!("initial settings write failed"),
+        };
+        let mut outside = saved.clone();
+        outside.font_size = 22.;
+        let external = serde_json::to_vec_pretty(&outside).unwrap();
+        std::fs::write(root.path().join("settings.json"), &external).unwrap();
+        io.send(Job::LoadSettings);
+        match io
+            .replies
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+        {
+            Reply::SettingsLoaded(Ok(settings)) => assert_eq!(settings.font_size, 22.),
+            _ => panic!("settings reload failed"),
+        }
+        saved.font_size = 18.;
+        io.send(Job::Settings(saved));
+        match io
+            .replies
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+        {
+            Reply::SettingsSaved(Err(error)) => assert!(error.contains("changed outside")),
+            _ => panic!("stale settings snapshot replaced an external edit"),
+        }
+        assert_eq!(
+            std::fs::read(root.path().join("settings.json")).unwrap(),
+            external
+        );
+    }
+
     #[test]
     fn desktop_recent_location_skips_missing_files_and_uses_native_paths() {
         let root = tempfile::tempdir().unwrap();

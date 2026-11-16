@@ -1,3 +1,4 @@
+mod menus;
 mod modal;
 mod panes;
 mod platform;
@@ -80,6 +81,8 @@ struct Document {
     saving: bool,
     restored: bool,
     external: Option<(DiskFile, String)>,
+    tab_focus: FocusHandle,
+    _subscriptions: Vec<Subscription>,
 }
 impl Document {
     fn dirty(&self, cx: &App) -> bool {
@@ -108,6 +111,13 @@ struct CloseDecision {
     documents: Vec<u64>,
     saving: bool,
 }
+enum SettingsWrite {
+    Preferences,
+    Live,
+    Pin,
+    Visits(Vec<PathBuf>),
+}
+
 struct Shell {
     request: cli::Request,
     io: IoWorker,
@@ -135,6 +145,7 @@ struct Shell {
     filter: String,
     documents: Vec<Document>,
     active: Option<u64>,
+    tab_scroll: ScrollHandle,
     next_id: u64,
     open_token: u64,
     path_request: Option<u64>,
@@ -144,7 +155,12 @@ struct Shell {
     query: Entity<InputState>,
     reading: bool,
     status: String,
+    volumes: Option<glimpse::locations::Volumes>,
     settings: storage::Settings,
+    settings_write: Option<SettingsWrite>,
+    settings_loaded: bool,
+    settings_reloading: bool,
+    location_visits_pending: Vec<PathBuf>,
     preferences: Option<Entity<preferences::Preferences>>,
     preferences_subscription: Option<Subscription>,
     preferences_return: Option<FocusHandle>,
@@ -198,9 +214,23 @@ impl Shell {
                 this.hits.clear();
                 cx.notify();
             }
+            if matches!(event, InputEvent::Change)
+                && matches!(this.panel, Some(Panel::Palette | Panel::Recovery))
+            {
+                cx.notify();
+            }
             if matches!(event, InputEvent::Change) && this.panel == Some(Panel::Filter) {
                 this.filter = this.query.read(cx).value().to_string();
                 cx.notify();
+            }
+        });
+        let shortcut_view = cx.weak_entity();
+        let shortcut_window = window.window_handle();
+        let shortcut_subscription = cx.intercept_keystrokes(move |event, window, cx| {
+            if window.window_handle() == shortcut_window {
+                let _ = shortcut_view.update(cx, |this: &mut Self, cx| {
+                    this.shortcut(&event.keystroke, window, cx)
+                });
             }
         });
         cx.spawn_in(window, async move |this, cx| {
@@ -239,6 +269,7 @@ impl Shell {
             filter: String::new(),
             documents: vec![],
             active: None,
+            tab_scroll: ScrollHandle::new(),
             next_id: 1,
             open_token: 0,
             path_request: None,
@@ -248,11 +279,16 @@ impl Shell {
             query,
             reading: false,
             status: String::new(),
+            volumes: None,
             settings: storage::Settings::default(),
+            settings_write: None,
+            settings_loaded: false,
+            settings_reloading: true,
+            location_visits_pending: Vec::new(),
             preferences: None,
             preferences_subscription: None,
             preferences_return: None,
-            subscriptions: vec![subscription],
+            subscriptions: vec![subscription, shortcut_subscription],
             close_pending: None,
             closings: glimpse::closing::Closings::default(),
             quit_after_cleanup: false,
@@ -272,6 +308,7 @@ impl Shell {
         this.subscriptions
             .push(cx.observe(&this.pane_state, |_, _, cx| cx.notify()));
         this.io.send(Job::LoadSettings);
+        this.io.send(Job::Volumes);
         let files = this.request.files.clone();
         for (index, path) in files.into_iter().enumerate() {
             let position = (index == 0).then_some((this.request.line, this.request.column));
@@ -285,20 +322,38 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.settings_write.is_some() || self.settings_reloading {
+            self.status = "Wait for the current settings operation, then open Preferences".into();
+            cx.notify();
+            return;
+        }
         if self.preferences.is_none() {
             self.preferences_return = window.focused(cx);
         }
         let view = cx.new(|cx| preferences::Preferences::new(settings, window, cx));
-        self.preferences_subscription =
-            Some(
-                cx.subscribe_in(&view, window, |this, _, event, window, cx| match event {
-                    preferences::Event::Apply(settings) => {
-                        this.io.send(Job::Settings(settings.as_ref().clone()))
+        self.preferences_subscription = Some(cx.subscribe_in(
+            &view,
+            window,
+            |this, _, event, window, cx| match event {
+                preferences::Event::Apply(settings) => {
+                    let mut settings = settings.as_ref().clone();
+                    settings.disk_base = this.settings.disk_base.clone();
+                    settings.pins = this.settings.pins.clone();
+                    settings.recents = this.settings.recents.clone();
+                    settings.location_visits = this.settings.location_visits.clone();
+                    if let Err(error) = this.queue_settings(settings, SettingsWrite::Preferences)
+                        && let Some(view) = &this.preferences
+                    {
+                        view.update(cx, |view, cx| view.failed(error, cx));
                     }
-                    preferences::Event::Cancel => this.close_preferences(window, cx),
-                    preferences::Event::Reload => this.io.send(Job::LoadSettings),
-                }),
-            );
+                }
+                preferences::Event::Cancel => this.close_preferences(window, cx),
+                preferences::Event::Reload => {
+                    this.settings_reloading = true;
+                    this.io.send(Job::LoadSettings);
+                }
+            },
+        ));
         self.preferences = Some(view);
         cx.notify();
     }
@@ -312,7 +367,61 @@ impl Shell {
                 self.focus(window, cx);
             }
         }
+        self.flush_locations();
         cx.notify();
+    }
+
+    fn queue_settings(
+        &mut self,
+        settings: storage::Settings,
+        purpose: SettingsWrite,
+    ) -> Result<(), String> {
+        if self.settings_write.is_some() || self.settings_reloading {
+            return Err("A settings operation is in progress. Retry after it finishes.".into());
+        }
+        self.settings_write = Some(purpose);
+        self.io.send(Job::Settings(settings));
+        Ok(())
+    }
+
+    fn record_location(&mut self, path: PathBuf) {
+        if self.request.pick || (self.settings_loaded && !self.settings.remember_locations) {
+            return;
+        }
+        self.location_visits_pending.retain(|other| *other != path);
+        self.location_visits_pending.push(path);
+        if self.location_visits_pending.len() > 32 {
+            self.location_visits_pending.remove(0);
+        }
+        self.flush_locations();
+    }
+
+    fn flush_locations(&mut self) {
+        if !self.settings_loaded
+            || self.settings_reloading
+            || self.settings_write.is_some()
+            || self.preferences.is_some()
+            || self.settings.warning.is_some()
+        {
+            return;
+        }
+        if !self.settings.remember_locations {
+            self.location_visits_pending.clear();
+            return;
+        }
+        let visits = std::mem::take(&mut self.location_visits_pending);
+        let mut settings = self.settings.clone();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut changed = false;
+        for path in &visits {
+            changed |= settings.record_location(path, now);
+        }
+        if changed {
+            let _ = self.queue_settings(settings, SettingsWrite::Visits(visits));
+        }
     }
 
     fn apply_settings(
@@ -431,6 +540,11 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !disk.target.as_os_str().is_empty()
+            && let Some(parent) = disk.path.parent()
+        {
+            self.record_location(parent.to_owned());
+        }
         if let Some(doc) = self.documents.iter_mut().find(|d| d.disk.same_file(&disk)) {
             if !preview {
                 doc.preview = false;
@@ -472,44 +586,49 @@ impl Shell {
             input.set_auto_indent(self.settings.auto_indent, cx);
             input
         });
-        self.subscriptions.push(
-            cx.subscribe_in(&input, window, move |this, _, event, _, cx| {
-                if !matches!(event, InputEvent::Change) {
-                    return;
-                }
-                if let Some(doc) = this.documents.iter_mut().find(|d| d.id == id) {
-                    this.finishing.invalidate();
-                    doc.generation += 1;
-                    glimpse::metrics::event("change", id, doc.generation);
-                    doc.preview = false;
-                    if !this.request.pick {
-                        this.io.send(Job::Recover(
-                            id,
-                            storage::Draft {
-                                path: doc.disk.path.clone(),
-                                target: Some(doc.disk.target.clone()),
-                                text: doc.input.read(cx).value().to_string(),
-                                base: doc.disk.bytes.clone(),
-                                generation: doc.generation,
-                            },
-                        ));
-                    }
-                }
-                if let Some(doc) = this.documents.iter().find(|d| d.id == id) {
-                    this.syntax.request(
+        let subscription = cx.subscribe_in(&input, window, move |this, _, event, _, cx| {
+            if !matches!(event, InputEvent::Change) {
+                return;
+            }
+            if let Some(doc) = this.documents.iter_mut().find(|d| d.id == id) {
+                this.finishing.invalidate();
+                doc.generation += 1;
+                glimpse::metrics::event("change", id, doc.generation);
+                doc.preview = false;
+                if !this.request.pick {
+                    this.io.send(Job::Recover(
                         id,
-                        doc.generation,
-                        &doc.input.read(cx).value(),
-                        &doc.disk.path,
-                        cx.theme().is_dark(),
-                    );
+                        storage::Draft {
+                            path: doc.disk.path.clone(),
+                            target: Some(doc.disk.target.clone()),
+                            text: doc.input.read(cx).value().to_string(),
+                            base: doc.disk.bytes.clone(),
+                            generation: doc.generation,
+                        },
+                    ));
                 }
-                cx.notify();
-            }),
-        );
+            }
+            if let Some(doc) = this.documents.iter().find(|d| d.id == id) {
+                this.syntax.request(
+                    id,
+                    doc.generation,
+                    &doc.input.read(cx).value(),
+                    &doc.disk.path,
+                    cx.theme().is_dark(),
+                );
+            }
+            cx.notify();
+        });
         if self.request.files.contains(&disk.path) {
             self.requested.push((id, disk.path.clone()));
         }
+        let tab_focus = cx.focus_handle();
+        let tab_subscription = cx.on_focus_in(&tab_focus, window, move |this, _, cx| {
+            if let Some(index) = this.documents.iter().position(|doc| doc.id == id) {
+                this.tab_scroll.scroll_to_item(index);
+                cx.notify();
+            }
+        });
         self.documents.push(Document {
             id,
             disk,
@@ -520,7 +639,10 @@ impl Shell {
             saving: false,
             restored: false,
             external: None,
+            tab_focus,
+            _subscriptions: vec![subscription, tab_subscription],
         });
+        self.tab_scroll.scroll_to_item(self.documents.len() - 1);
         self.syntax.request(
             id,
             0,
@@ -572,6 +694,13 @@ impl Shell {
     }
 
     fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(index) = self
+            .documents
+            .iter()
+            .position(|doc| Some(doc.id) == self.active)
+        {
+            self.tab_scroll.scroll_to_item(index);
+        }
         if let Some(doc) = self.documents.iter().find(|d| Some(d.id) == self.active) {
             self.syntax.request(
                 doc.id,
@@ -593,6 +722,20 @@ impl Shell {
             String::new()
         };
         self.query.update(cx, |input, cx| {
+            input.set_placeholder(
+                match panel {
+                    Panel::Path => "Absolute or relative path",
+                    Panel::Filter => "Filter filenames",
+                    Panel::Files => "Filename to find",
+                    Panel::Text => "Text in saved files",
+                    Panel::Palette => "Search commands",
+                    Panel::Recovery => "Search recovery records",
+                    Panel::Line => "Line number",
+                    Panel::NewFile | Panel::NewFolder | Panel::Rename => "One filename",
+                },
+                window,
+                cx,
+            );
             input.set_value(value, window, cx);
             input.focus(window, cx);
         });
@@ -606,10 +749,9 @@ impl Shell {
         match self.panel {
             Some(Panel::Palette) => {
                 let query = value.to_lowercase();
-                if let Some(command) = glimpse::commands::COMMANDS
-                    .iter()
-                    .find(|command| command.label.to_lowercase().contains(&query))
-                {
+                if let Some(command) = glimpse::commands::COMMANDS.iter().find(|command| {
+                    command.label.to_lowercase().contains(&query) || command.id.contains(&query)
+                }) {
                     self.panel = None;
                     self.focus(window, cx);
                     self.command(command.id, window, cx);
@@ -702,6 +844,10 @@ impl Shell {
         }
         while let Ok(reply) = self.io.replies.try_recv() {
             match reply {
+                Reply::Volumes(result) => match result {
+                    Ok(volumes) => self.volumes = Some(volumes),
+                    Err(error) => self.status = format!("Mounted folders: {error}"),
+                },
                 Reply::OpenDirectory(path, token)
                     if self.opening.remove(&token).is_some() && token == self.open_token =>
                 {
@@ -886,34 +1032,72 @@ impl Shell {
                         }
                     }
                 }
-                Reply::SettingsLoaded(result) => match result {
-                    Ok(settings) => {
-                        self.apply_settings(settings, window, cx);
-                        if self.preferences.is_some() {
-                            self.open_preferences(self.settings.clone(), window, cx);
-                            self.status = "Preferences reloaded".into();
+                Reply::SettingsLoaded(result) => {
+                    self.settings_reloading = false;
+                    self.settings_loaded = true;
+                    match result {
+                        Ok(settings) => {
+                            self.apply_settings(settings, window, cx);
+                            if self.preferences.is_some() {
+                                self.open_preferences(self.settings.clone(), window, cx);
+                                self.status = "Preferences reloaded".into();
+                            }
+                        }
+                        Err(e) => {
+                            if let Some(preferences) = &self.preferences {
+                                preferences.update(cx, |view, cx| view.failed(e.clone(), cx));
+                            }
+                            self.settings.warning = Some(e.clone());
+                            self.status = e;
                         }
                     }
-                    Err(e) => {
-                        if let Some(preferences) = &self.preferences {
-                            preferences.update(cx, |view, cx| view.failed(e.clone(), cx));
+                    self.flush_locations();
+                }
+                Reply::SettingsSaved(result) => {
+                    let Some(purpose) = self.settings_write.take() else {
+                        continue;
+                    };
+                    match result {
+                        Ok(settings) => {
+                            match purpose {
+                                SettingsWrite::Preferences => {
+                                    self.apply_settings(settings, window, cx);
+                                    self.close_preferences(window, cx);
+                                    self.status = "Preferences saved".into();
+                                }
+                                SettingsWrite::Live => self.apply_settings(settings, window, cx),
+                                SettingsWrite::Pin => {
+                                    self.settings = settings;
+                                    self.status = "Pinned locations saved".into();
+                                }
+                                SettingsWrite::Visits(_) => self.settings = settings,
+                            }
+                            self.flush_locations();
                         }
-                        self.status = e;
-                    }
-                },
-                Reply::SettingsSaved(result) => match result {
-                    Ok(settings) => {
-                        self.apply_settings(settings, window, cx);
-                        self.close_preferences(window, cx);
-                        self.status = "Preferences saved".into();
-                    }
-                    Err(error) => {
-                        if let Some(preferences) = &self.preferences {
-                            preferences.update(cx, |view, cx| view.failed(error.clone(), cx));
+                        Err(error) => {
+                            match purpose {
+                                SettingsWrite::Preferences => {
+                                    if let Some(view) = &self.preferences {
+                                        view.update(cx, |view, cx| view.failed(error.clone(), cx));
+                                    }
+                                }
+                                SettingsWrite::Visits(visits) => {
+                                    let mut pending = visits;
+                                    for path in std::mem::take(&mut self.location_visits_pending) {
+                                        pending.retain(|older| *older != path);
+                                        pending.push(path);
+                                    }
+                                    if pending.len() > 32 {
+                                        pending.drain(..pending.len() - 32);
+                                    }
+                                    self.location_visits_pending = pending;
+                                }
+                                _ => {}
+                            }
+                            self.status = format!("Settings not saved: {error}");
                         }
-                        self.status = error;
                     }
-                },
+                }
                 Reply::Records(result) => match result {
                     Ok(inventory) => {
                         self.records = inventory.records;
@@ -1207,6 +1391,48 @@ impl Shell {
             cx.quit();
         }
     }
+    fn shortcut(&mut self, key: &Keystroke, window: &mut Window, cx: &mut Context<Self>) {
+        if self.preferences.is_some() || (!key.modifiers.control && !key.modifiers.platform) {
+            return;
+        }
+        let bindings = glimpse::commands::bindings(&self.settings.keymaps).unwrap_or_default();
+        let command = bindings
+            .iter()
+            .find(|binding| {
+                let name = match binding.key.name() {
+                    "ArrowLeft" => "left",
+                    "ArrowRight" => "right",
+                    "ArrowUp" => "up",
+                    "ArrowDown" => "down",
+                    "Comma" => ",",
+                    other => other,
+                };
+                name.eq_ignore_ascii_case(&key.key)
+                    && platform::shortcut(&binding.modifiers, &key.modifiers)
+            })
+            .and_then(|binding| {
+                glimpse::commands::COMMANDS
+                    .iter()
+                    .find(|command| command.action == binding.action)
+            });
+        if let Some(command) = command {
+            self.command(command.id, window, cx);
+            window.prevent_default();
+            cx.stop_propagation();
+        } else if key.key.eq_ignore_ascii_case("f")
+            && platform::shortcut(
+                &glimpse::commands::Modifiers {
+                    command: true,
+                    ..Default::default()
+                },
+                &key.modifiers,
+            )
+        {
+            window.prevent_default();
+            cx.stop_propagation();
+        }
+    }
+
     fn command(&mut self, command: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.request.pick
             && matches!(
@@ -1216,6 +1442,9 @@ impl Shell {
                     | "rename"
                     | "recovery"
                     | "settings"
+                    | "pin"
+                    | "indent"
+                    | "outdent"
                     | "save-settings"
                     | "wrap"
                     | "numbers"
@@ -1267,7 +1496,7 @@ impl Shell {
                 self.search_id = self.search.cancel();
                 self.focus(window, cx);
             }
-            "cancel-close" => {
+            "cancel-close" | "cancel-closing" => {
                 self.close_pending = None;
                 for id in self.closings.cancel() {
                     if let Some(doc) = self.documents.iter_mut().find(|d| d.id == id) {
@@ -1298,18 +1527,32 @@ impl Shell {
                 self.destination = None;
                 self.destination_busy = false;
             }
-            "save-settings" => self.io.send(Job::Settings(self.settings.clone())),
-            "wrap" | "numbers" => {
-                if command == "wrap" {
-                    self.settings.wrap = !self.settings.wrap;
-                } else {
-                    self.settings.line_numbers = !self.settings.line_numbers;
+            "save-settings" => {
+                if let Err(error) = self.queue_settings(self.settings.clone(), SettingsWrite::Live)
+                {
+                    self.status = error;
                 }
-                for doc in &self.documents {
-                    doc.input.update(cx, |input, cx| {
-                        input.set_soft_wrap(self.settings.wrap, window, cx);
-                        input.set_line_number(self.settings.line_numbers, window, cx);
-                    });
+            }
+            "wrap" | "numbers" => {
+                let mut settings = self.settings.clone();
+                if command == "wrap" {
+                    settings.wrap = !settings.wrap;
+                } else {
+                    settings.line_numbers = !settings.line_numbers;
+                }
+                if let Err(error) = self.queue_settings(settings, SettingsWrite::Live) {
+                    self.status = error;
+                }
+            }
+            "pin" => {
+                let mut settings = self.settings.clone();
+                if settings.pins.contains(&self.current) {
+                    settings.pins.retain(|path| *path != self.current);
+                } else {
+                    settings.pins.push(self.current.clone());
+                }
+                if let Err(error) = self.queue_settings(settings, SettingsWrite::Pin) {
+                    self.status = error;
                 }
             }
 
@@ -1321,7 +1564,7 @@ impl Shell {
                 }
                 self.continue_close(window, cx);
             }
-            "retry-close" => {
+            "retry-close" | "retry-cleanup" => {
                 for (id, generation) in self.closings.retry() {
                     self.io.send(Job::ClearThrough(id, generation));
                 }
@@ -1377,7 +1620,29 @@ impl Shell {
                 }
             }
             "refresh" => self.refresh(),
+            "refresh-volumes" => {
+                self.io.send(Job::Volumes);
+                self.status = "Refreshing mounted folders; reopen Locations for the result".into();
+            }
+            "indent" | "outdent" => {
+                self.focus(window, cx);
+                let action: Box<dyn Action> = if command == "indent" {
+                    Box::new(gpui_component::input::Indent)
+                } else {
+                    Box::new(gpui_component::input::Outdent)
+                };
+                window.dispatch_action(action, cx);
+            }
             "read" => self.reading = !self.reading,
+            "keep-tab" => {
+                if let Some(doc) = self
+                    .documents
+                    .iter_mut()
+                    .find(|doc| Some(doc.id) == self.active)
+                {
+                    doc.preview = false;
+                }
+            }
             "scope" => {
                 self.scope = if self.scope.is_some() {
                     None
@@ -1530,7 +1795,16 @@ impl Shell {
         command: &'static str,
         cx: &Context<Self>,
     ) -> Button {
-        Button::new(command)
+        self.command_button(command, label, command, cx)
+    }
+    fn command_button(
+        &self,
+        id: impl Into<ElementId>,
+        label: impl Into<SharedString>,
+        command: &'static str,
+        cx: &Context<Self>,
+    ) -> Button {
+        Button::new(id)
             .label(label)
             .small()
             .compact()
@@ -1556,7 +1830,12 @@ impl Render for Shell {
             window.request_animation_frame();
         }
         let narrow = self.narrow(window);
-        let mut toolbar = div().flex().flex_wrap().gap_2().p_2().bg(cx.theme().muted);
+        let mut toolbar = div()
+            .flex()
+            .flex_wrap()
+            .gap(px(8.))
+            .p(px(8.))
+            .bg(cx.theme().muted);
         if narrow {
             toolbar = toolbar
                 .child(self.button(
@@ -1568,10 +1847,11 @@ impl Render for Shell {
                     "toggle-navigator",
                     cx,
                 ))
-                .child(self.button("Location", "path", cx))
-                .child(self.button("Commands", "commands", cx));
+                .child(self.locations_menu(cx))
+                .child(self.main_menu(cx));
         } else {
             toolbar = toolbar
+                .child(self.main_menu(cx))
                 .child(self.button("‹", "back", cx))
                 .child(self.button("›", "forward", cx))
                 .child(self.button("↑", "parent", cx))
@@ -1579,6 +1859,7 @@ impl Render for Shell {
                     self.button("Location", "path", cx)
                         .tooltip(paths::display(&self.current)),
                 )
+                .child(self.locations_menu(cx))
                 .child(self.button("Navigator", "toggle-navigator", cx))
                 .child(self.button("Open", "open", cx))
                 .child(self.button("Filter", "filter", cx))
@@ -1687,39 +1968,74 @@ impl Render for Shell {
                         .children(
                             glimpse::commands::COMMANDS
                                 .iter()
-                                .filter(|c| c.label.to_lowercase().contains(&query))
-                                .map(|command| self.button(command.label, command.id, cx)),
+                                .filter(|c| {
+                                    c.label.to_lowercase().contains(&query) || c.id.contains(&query)
+                                })
+                                .map(|command| {
+                                    let key = self
+                                        .settings
+                                        .keymaps
+                                        .get(command.id)
+                                        .map(String::as_str)
+                                        .unwrap_or(command.shortcut);
+                                    let label = if key.is_empty() {
+                                        command.label.to_owned()
+                                    } else {
+                                        format!(
+                                            "{}  {}",
+                                            command.label,
+                                            platform::shortcut_label(key)
+                                        )
+                                    };
+                                    self.command_button(
+                                        SharedString::from(format!("palette-{}", command.id)),
+                                        label,
+                                        command.id,
+                                        cx,
+                                    )
+                                }),
                         ),
                 );
             }
             if panel == Panel::Recovery {
+                let query = self.query.read(cx).value().to_lowercase();
                 root = root.child(
                     div()
                         .id("records")
                         .max_h(px(240.))
                         .overflow_y_scroll()
-                        .children(self.records.iter().enumerate().map(|(i, record)| {
-                            let path = record.path.clone();
-                            let history = record.history;
-                            div()
-                                .id(("record", i))
-                                .p_2()
-                                .child(format!(
-                                    "Restore {}: {}",
-                                    if history { "saved version" } else { "draft" },
+                        .children(
+                            self.records
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, record)| {
                                     paths::display(&record.original)
-                                ))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    let id = this.next_id;
-                                    this.next_id += 1;
-                                    this.io.send(if history {
-                                        Job::RestoreHistory(id, path.clone())
-                                    } else {
-                                        Job::Import(id, path.clone())
-                                    });
-                                    cx.notify();
-                                }))
-                        })),
+                                        .to_lowercase()
+                                        .contains(&query)
+                                })
+                                .map(|(i, record)| {
+                                    let path = record.path.clone();
+                                    let history = record.history;
+                                    div()
+                                        .id(("record", i))
+                                        .p_2()
+                                        .child(format!(
+                                            "Restore {}: {}",
+                                            if history { "saved version" } else { "draft" },
+                                            paths::display(&record.original)
+                                        ))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            let id = this.next_id;
+                                            this.next_id += 1;
+                                            this.io.send(if history {
+                                                Job::RestoreHistory(id, path.clone())
+                                            } else {
+                                                Job::Import(id, path.clone())
+                                            });
+                                            cx.notify();
+                                        }))
+                                }),
+                        ),
                 );
             }
         }
@@ -1834,54 +2150,50 @@ impl Render for Shell {
         let tabs = div()
             .id("tabs")
             .w_full()
+            .flex()
+            .gap_1()
+            .p(px(4.))
             .overflow_x_scroll()
             .flex_shrink_0()
-            .child(
-                div()
-                    .flex()
-                    .gap_1()
-                    .p_1()
-                    .children(self.documents.iter().map(|doc| {
-                        let id = doc.id;
-                        let name = paths::name(&doc.disk.path);
-                        let duplicate = self.documents.iter().any(|other| {
-                            other.id != id
-                                && other.disk.path.file_name() == doc.disk.path.file_name()
-                        });
-                        let title = format!(
-                            "{}{}{}{}{}",
-                            name,
-                            if duplicate {
-                                format!(
-                                    " — {}",
-                                    paths::display(
-                                        doc.disk.path.parent().unwrap_or(&doc.disk.path)
-                                    )
-                                )
-                            } else {
-                                String::new()
-                            },
-                            if doc.dirty(cx) { " •" } else { "" },
-                            if doc.preview { " (preview)" } else { "" },
-                            if doc.external.is_some() {
-                                " (conflict)"
-                            } else {
-                                ""
+            .track_scroll(&self.tab_scroll)
+            .children(self.documents.iter().map(|doc| {
+                let id = doc.id;
+                let title = format!(
+                    "{}{}{}{}",
+                    paths::tab_label(
+                        &doc.disk.path,
+                        self.documents.iter().map(|doc| doc.disk.path.as_path())
+                    ),
+                    if doc.dirty(cx) { " •" } else { "" },
+                    if doc.preview { " (preview)" } else { "" },
+                    if doc.external.is_some() {
+                        " (conflict)"
+                    } else {
+                        ""
+                    }
+                );
+                div().track_focus(&doc.tab_focus).flex_shrink_0().child(
+                    Button::new(("tab", id))
+                        .label(title)
+                        .tooltip(paths::display(&doc.disk.path))
+                        .small()
+                        .compact()
+                        .selected(Some(id) == self.active)
+                        .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                            this.active = Some(id);
+                            if event.click_count() > 1
+                                && let Some(doc) =
+                                    this.documents.iter_mut().find(|doc| doc.id == id)
+                            {
+                                doc.preview = false;
                             }
-                        );
-                        Button::new(("tab", id))
-                            .label(title)
-                            .small()
-                            .selected(Some(id) == self.active)
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.active = Some(id);
-                                this.reading = false;
-                                this.navigation_only = false;
-                                this.focus(window, cx);
-                                cx.notify();
-                            }))
-                    })),
-            );
+                            this.reading = false;
+                            this.navigation_only = false;
+                            this.focus(window, cx);
+                            cx.notify();
+                        })),
+                )
+            }));
         let mut content = div()
             .flex_1()
             .h_full()
@@ -2055,44 +2367,6 @@ impl Render for Shell {
                         this.command("cancel-destination", window, cx);
                     }
                     this.command("dismiss", window, cx);
-                    return;
-                }
-                if key.modifiers.control || key.modifiers.platform {
-                    let binding =
-                        glimpse::commands::bindings(&this.settings.keymaps).unwrap_or_default();
-                    if let Some(command) = binding
-                        .iter()
-                        .find(|binding| {
-                            let name = match binding.key.name() {
-                                "ArrowLeft" => "left",
-                                "ArrowRight" => "right",
-                                "ArrowUp" => "up",
-                                "ArrowDown" => "down",
-                                "Comma" => ",",
-                                other => other,
-                            };
-                            name.eq_ignore_ascii_case(&key.key)
-                                && platform::shortcut(&binding.modifiers, &key.modifiers)
-                        })
-                        .and_then(|binding| {
-                            glimpse::commands::COMMANDS
-                                .iter()
-                                .find(|command| command.action == binding.action)
-                        })
-                    {
-                        if command.id != "find" {
-                            this.command(command.id, window, cx);
-                            cx.stop_propagation();
-                        }
-                        return;
-                    }
-                    let command = match (key.key.as_str(), key.modifiers.shift) {
-                        ("g", _) => "line",
-                        ("e", true) => "navigator",
-                        _ => return,
-                    };
-                    this.command(command, window, cx);
-                    cx.stop_propagation();
                 }
             }))
     }

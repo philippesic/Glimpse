@@ -32,7 +32,13 @@ impl Key {
                 .strip_prefix('F')
                 .and_then(|n| n.parse::<u8>().ok())
                 .is_some_and(|n| (1..=24).contains(&n)))
-        .then(|| Self(name.to_owned()))
+        .then(|| {
+            Self(if name.len() == 1 {
+                name.to_ascii_uppercase()
+            } else {
+                name.to_owned()
+            })
+        })
     }
     pub fn name(&self) -> &str {
         &self.0
@@ -84,6 +90,12 @@ pub enum Action {
     RetryCleanup,
     CancelClosing,
     RetainCleanup,
+    Navigator,
+    ToggleNavigator,
+    Line,
+    Filter,
+    KeepPreview,
+    RefreshVolumes,
 }
 pub struct Command {
     pub action: Action,
@@ -110,10 +122,26 @@ commands![
     (Text, "find-text", "Find Text in Saved Files", "Cmd+Shift+F"),
     (Find, "find", "Find / Replace in Document", "Cmd+F"),
     (Read, "read", "Read / Edit Markdown", ""),
-    (Settings, "settings", "Settings", "Cmd+Comma"),
+    (Settings, "settings", "Preferences", "Cmd+Comma"),
     (Recovery, "recovery", "Recovery and Saved Versions", ""),
     (Palette, "commands", "Commands", "Cmd+Shift+P"),
     (Path, "path", "Enter Path", "Cmd+L"),
+    (Navigator, "navigator", "Focus Navigator", "Cmd+Shift+E"),
+    (
+        ToggleNavigator,
+        "toggle-navigator",
+        "Show / Hide Navigator",
+        "Cmd+Alt+E"
+    ),
+    (Line, "line", "Go to Line…", "Cmd+G"),
+    (Filter, "filter", "Filter This Folder", ""),
+    (KeepPreview, "keep-tab", "Keep Preview Tab", ""),
+    (
+        RefreshVolumes,
+        "refresh-volumes",
+        "Refresh Mounted Folders",
+        ""
+    ),
     (Pin, "pin", "Pin / Unpin Current Folder", ""),
     (Scope, "scope", "Pin / Unpin Search Scope Here", ""),
     (GoScope, "go-scope", "Go to Search Folder", ""),
@@ -121,7 +149,7 @@ commands![
     (CopyRelative, "copy-relative", "Copy Relative Path", ""),
     (Reveal, "reveal", "Reveal Document in Navigator", ""),
     (External, "external", "Open Selected Externally", ""),
-    (Finder, "finder", "Reveal Selected in Finder", ""),
+    (Finder, "finder", "Reveal Selected in File Manager", ""),
     (NewFolder, "new-folder", "New Folder…", "Cmd+Shift+N"),
     (NamedFile, "named-file", "New Named File…", ""),
     (Rename, "rename", "Rename Selected…", ""),
@@ -178,6 +206,9 @@ pub fn parse(value: &str) -> Result<(Modifiers, Key), String> {
             }
         }
     }
+    if !cfg!(target_os = "macos") {
+        modifiers.ctrl = false;
+    }
     let key = key.ok_or_else(|| format!("Missing key: {value}"))?;
     if ["Copy", "Cut", "Paste", "BrowserBack"].contains(&key.name()) {
         return Err("Use a keyboard key name for an app shortcut.".into());
@@ -230,6 +261,18 @@ pub fn bindings(overrides: &BTreeMap<String, String>) -> Result<Vec<Binding>, St
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn effective_shortcuts_cannot_collide_through_case_or_primary_control_aliases() {
+        let mut overrides = BTreeMap::new();
+        overrides.insert("new".into(), "Cmd+s".into());
+        assert!(bindings(&overrides).is_err());
+        if !cfg!(target_os = "macos") {
+            overrides.insert("new".into(), "Cmd+Ctrl+S".into());
+            assert!(bindings(&overrides).is_err());
+            assert!(parse("Cmd+Ctrl+A").is_err());
+        }
+    }
+
     #[test]
     fn defaults_and_overrides_preserve_editing_keys() {
         assert!(bindings(&BTreeMap::new()).is_ok());
