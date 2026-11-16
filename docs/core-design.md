@@ -20,7 +20,7 @@ The component's default text operations preserve the authoritative buffer. Perfo
 
 DiskFile retains observed identity, symlink binding and bytes. Save stages beside the target, preserves supported metadata, syncs, validates and atomically replaces. Hard links, unsupported ownership/metadata and changed destinations stop saving. Atomic replacement is not compare-and-swap against unrelated writers. External observation retains the existing binding when a symlink target changes, even when both targets have identical bytes; ordinary Save stays blocked until an explicit resolution.
 
-Save As rebinds after success; Save Copy retains the original binding. Existing destinations require confirmation of an observed version. Destinations already open in another tab must be closed first. Recovery remains mandatory for normal saves. Failure retains local text and reports the error; the earlier one-attempt recovery bypass is not exposed.
+Save As rebinds after success; Save Copy retains the original binding. Existing destinations require a modal confirmation of an observed version. Destination identity checks run on the I/O path. Destinations already open in another tab must be closed first. A waiting CLI request requires explicit abandonment before Save As to another path; cancellation or failed saving keeps it waiting, while successful rebinding returns exit 1. Recovery remains mandatory for normal saves. Failure retains local text and reports the error; the earlier one-attempt recovery bypass is not exposed.
 
 Linux rename uses `renameat2(RENAME_NOREPLACE)` and Trash uses the trash crate's freedesktop implementation. Linux saving copies permissions and extended attributes; failures stop replacement. macOS retains `renamex_np`, NSFileManager Trash and `fcopyfile` metadata preservation behind platform configuration. Linux Reveal opens the containing directory with xdg-open. GPUI supplies native portal file dialogs.
 
@@ -29,6 +29,10 @@ Recovery keeps private, locked session records with exact local text and observe
 Conflict decisions capture the document, local generation and specific observed disk version. Compare exposes selectable, read-only local and disk text. Reload revalidates the observed version and acknowledges recovery cleanup before replacing the buffer; the old local text remains in Undo and history. Overwrite uses the normal validated-save path against the explicitly observed version. Both operations retain local text on failure.
 
 Requested CLI files complete only after destination validation and recovery cleanup. Clean close can complete a request; closing one of several requested files leaves the others waiting. Dirty Finish offers Save, Discard and Cancel. Save alone keeps waiting; Discard or Reload that abandons requested local edits returns failure. Generation checks, exact disk bases and authoritative buffer comparisons reject obsolete completion and cleanup replies.
+
+A completed save updates newer automatic recovery to the saved disk base before acknowledgment. Save As also transfers the newer draft’s destination. Late updates made against the preceding binding are translated only through the UI’s adoption generation; later observations retain their own bases. Recovery writes and rebinding serialize on a worker-only lock, while the UI’s acknowledgment touches only brief metadata locks.
+
+GPUI is vendored at 0.2.2 for a Linux Wayland startup fix: modifier masks received before a keymap are deferred until it arrives, and untranslatable key events are ignored safely. The other upstream platform implementations remain unchanged by this patch. macOS compilation and interaction remain unqualified.
 
 ## Preferences and layout
 
@@ -49,5 +53,3 @@ The product contract and native Linux evaluation determine qualification. The fo
 - Large-file/long-line performance, real IME, accessibility, the complete size/theme/settings matrix and macOS behavior. Modal behavior across asynchronous completions still requires qualification.
 
 The new view virtualizes directory rows and stores per-folder selection and scroll state. Syntax work remains bounded, but extracting full buffer text on edits can be costly. Linux native checks qualify only their executed scenarios. Whole-app performance, safety and accessibility require current-build evidence for the complete acceptance matrix.
-
-Save As for a waiting requested file still requires finishing or aborting the request first; its explicit abandonment decision remains incomplete.
