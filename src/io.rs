@@ -26,7 +26,7 @@ pub enum Job {
     Prepare(SaveDestination),
     SaveTo(SaveDestination),
     Reload(Box<Reload>),
-    BindingApplied(u64, u64),
+    BindingApplied(u64, u64, u64),
     Recover(u64, storage::Draft),
     Wake,
     Inventory,
@@ -89,17 +89,19 @@ pub enum Reply {
     SavedTo(Box<SaveDestination>, Result<DiskFile, String>),
     Checked(u64, u64, Result<(DiskFile, String), String>),
     Open(PathBuf, u64, Result<(DiskFile, String), String>),
-    Save(u64, String, Result<DiskFile, String>),
+    Save(u64, u64, String, Result<DiskFile, String>),
 }
 
 struct Rebinding {
     generation: u64,
+    through: AtomicU64,
     from: DiskFile,
     to: DiskFile,
 }
 impl Rebinding {
     fn apply(&self, draft: &mut storage::Draft) {
         if draft.generation > self.generation
+            && draft.generation <= self.through.load(Ordering::Acquire)
             && draft.path == self.from.path
             && draft.target.as_deref().unwrap_or(std::path::Path::new("")) == self.from.target
         {
@@ -108,6 +110,11 @@ impl Rebinding {
             draft.base = self.to.bytes.clone();
         }
     }
+}
+#[derive(Default)]
+struct Rebindings {
+    entries: Mutex<HashMap<u64, Arc<Rebinding>>>,
+    writes: Mutex<()>,
 }
 pub struct IoWorker {
     jobs: Option<mpsc::SyncSender<Job>>,
@@ -122,6 +129,7 @@ pub struct IoWorker {
     pending: Arc<AtomicUsize>,
     preview: Arc<AtomicU64>,
     wake: wake::Context,
+    rebindings: Arc<Rebindings>,
 }
 struct RecoveryStore {
     root: PathBuf,
@@ -176,7 +184,7 @@ impl IoWorker {
         let errors = results.clone();
         let drafts = Arc::new(Mutex::new(HashMap::<u64, storage::Draft>::new()));
         let preview = Arc::new(AtomicU64::new(0));
-        let rebindings = Arc::new(Mutex::new(HashMap::<u64, Rebinding>::new()));
+        let rebindings = Arc::new(Rebindings::default());
         let recovery_store = Arc::new(RecoveryStore {
             root: root.clone(),
             session: Mutex::new(None),
@@ -243,8 +251,9 @@ impl IoWorker {
                         ctx.request_repaint();
                     }
                     for (id, mut draft) in updates {
-                        let bindings = rebindings.lock().unwrap();
-                        if let Some(binding) = bindings.get(&id) {
+                        let _writes = rebindings.writes.lock().unwrap();
+                        let binding = rebindings.entries.lock().unwrap().get(&id).cloned();
+                        if let Some(binding) = binding {
                             binding.apply(&mut draft);
                         }
                         if let Err(error) = recovery
@@ -276,8 +285,8 @@ impl IoWorker {
                             continue;
                         }
                         Job::Wake => continue,
-                        Job::BindingApplied(id, generation) => {
-                            let mut bindings = rebindings.lock().unwrap();
+                        Job::BindingApplied(id, generation, _) => {
+                            let mut bindings = rebindings.entries.lock().unwrap();
                             if bindings
                                 .get(&id)
                                 .is_some_and(|binding| binding.generation == generation)
@@ -427,36 +436,22 @@ impl IoWorker {
                                     .map_err(Clone::clone),
                                 &results,
                             );
-                            if !destination.copy
-                                && let Ok(disk) = &result
-                            {
-                                let mut bindings = rebindings.lock().unwrap();
-                                let rebound = recovery.as_ref().as_ref().map_or(Ok(()), |r| {
-                                    r.rebind(
+                            if !destination.copy {
+                                result = result.and_then(|disk| {
+                                    publish_binding(
                                         destination.id,
                                         destination.generation,
                                         &destination.original,
                                         disk,
+                                        recovery
+                                            .as_ref()
+                                            .as_ref()
+                                            .map(|r| &**r)
+                                            .map_err(Clone::clone),
+                                        &rebindings,
+                                        destination.without_recovery,
                                     )
                                 });
-                                match rebound {
-                                    Ok(()) => {
-                                        bindings.insert(
-                                            destination.id,
-                                            Rebinding {
-                                                generation: destination.generation,
-                                                from: destination.original.clone(),
-                                                to: disk.clone(),
-                                            },
-                                        );
-                                    }
-                                    Err(error) => {
-                                        result = Err(format!(
-                                            "A copy was saved at {}, but recovery could not follow the new binding: {error}. The original document binding was retained.",
-                                            crate::paths::display(&destination.path)
-                                        ))
-                                    }
-                                }
                             }
                             crate::metrics::event(
                                 "save-to-worker-done",
@@ -538,8 +533,23 @@ impl IoWorker {
                                         Ok(saved)
                                     })
                             };
+                            let result = result.and_then(|saved| {
+                                publish_binding(
+                                    id,
+                                    generation,
+                                    &disk,
+                                    saved,
+                                    recovery
+                                        .as_ref()
+                                        .as_ref()
+                                        .map(|r| &**r)
+                                        .map_err(Clone::clone),
+                                    &rebindings,
+                                    without_recovery,
+                                )
+                            });
                             crate::metrics::event("save-worker-done", id, generation);
-                            Reply::Save(id, text, result)
+                            Reply::Save(id, generation, text, result)
                         }
                     };
                     if was_tracked {
@@ -573,6 +583,7 @@ impl IoWorker {
             pending,
             preview,
             wake: ctx,
+            rebindings,
         }
     }
     pub fn pending_mutations(&self) -> usize {
@@ -582,6 +593,19 @@ impl IoWorker {
         self.preview.store(token, Ordering::Relaxed);
     }
     pub fn send(&self, job: Job) {
+        if let Job::BindingApplied(id, saved, adopted) = &job
+            && let Some(binding) = self
+                .rebindings
+                .entries
+                .lock()
+                .unwrap()
+                .get(id)
+                .filter(|binding| binding.generation == *saved)
+        {
+            binding
+                .through
+                .store(adopted.saturating_sub(1), Ordering::Release);
+        }
         if let Job::Open(_, token, _) = &job {
             self.preview.store(*token, Ordering::Relaxed);
         }
@@ -674,7 +698,12 @@ impl IoWorker {
                     Job::RecentLocation(_) => Reply::RecentLocation(None),
                     Job::Volumes => Reply::Volumes(Err(message)),
                     Job::Settings(_) => Reply::SettingsSaved(Err(message)),
-                    Job::Save { id, text, .. } => Reply::Save(id, text, Err(message)),
+                    Job::Save {
+                        id,
+                        generation,
+                        text,
+                        ..
+                    } => Reply::Save(id, generation, text, Err(message)),
                     Job::SaveTo(d) | Job::Prepare(d) => Reply::SavedTo(Box::new(d), Err(message)),
                     Job::Choose(path, _) => Reply::Chosen(path, Err(message)),
                     Job::Finish(id, generation, attempt, disk, _) => {
@@ -695,6 +724,29 @@ impl IoWorker {
         }
     }
 }
+fn publish_binding(
+    id: u64,
+    generation: u64,
+    original: &DiskFile,
+    disk: DiskFile,
+    recovery: Result<&storage::Recovery, String>,
+    rebindings: &Rebindings,
+    without_recovery: bool,
+) -> Result<DiskFile, String> {
+    let _writes = rebindings.writes.lock().unwrap();
+    if !without_recovery {
+        recovery.and_then(|recovery| recovery.rebind(id, generation, original, &disk)).map_err(|error| format!("File was written at {}, but newer recovery could not be updated: {error}. The document is still associated with its previous file version.", crate::paths::display(&disk.path)))?;
+    }
+    let binding = Arc::new(Rebinding {
+        generation,
+        through: AtomicU64::new(u64::MAX),
+        from: original.clone(),
+        to: disk.clone(),
+    });
+    rebindings.entries.lock().unwrap().insert(id, binding);
+    Ok(disk)
+}
+
 fn reload_document(
     reload: &Reload,
     recovery: Result<&storage::Recovery, String>,
@@ -845,6 +897,62 @@ mod tests {
     }
 
     #[test]
+    fn save_recovery_uses_the_completed_base_without_rewriting_later_observations() {
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join("original.txt");
+        std::fs::write(&original, "original bytes\n").unwrap();
+        let disk = DiskFile::open(original.clone()).unwrap().0;
+        let recovery_root = root.path().join("recovery");
+        let io = IoWorker::new_in(wake::Context::default(), recovery_root.clone());
+        let draft = |generation, text: &str| storage::Draft {
+            path: original.clone(),
+            target: Some(disk.target.clone()),
+            text: text.into(),
+            base: disk.bytes.clone(),
+            generation,
+        };
+        io.send(Job::Recover(7, draft(9, "newer local λ\n")));
+        barrier(&io);
+        io.send(Job::Save {
+            id: 7,
+            disk: disk.clone(),
+            text: "saved snapshot\n".into(),
+            generation: 8,
+            without_recovery: false,
+        });
+        loop {
+            match io
+                .replies
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+            {
+                Reply::Save(7, 8, _, Ok(_)) => break,
+                Reply::Save(_, _, _, Err(error)) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        let path = record(&recovery_root, 7);
+        let read =
+            || serde_json::from_slice::<storage::Draft>(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(read().base, b"saved snapshot\n");
+        assert_eq!(read().text, "newer local λ\n");
+        let (started, paused) = mpsc::channel();
+        let (release, hold) = mpsc::channel();
+        io.send(Job::HoldMaintenance(started, hold));
+        paused
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        io.send(Job::Recover(7, draft(10, "late old-base edit\n")));
+        io.send(Job::BindingApplied(7, 8, 12));
+        io.send(Job::Recover(7, draft(12, "edit after a later reload\n")));
+        release.send(()).unwrap();
+        barrier(&io);
+        assert_eq!(read().base, b"original bytes\n");
+        assert_eq!(read().text, "edit after a later reload\n");
+        assert_eq!(std::fs::read(&original).unwrap(), b"saved snapshot\n");
+    }
+
+    #[test]
     fn save_as_moves_newer_recovery_and_late_updates_to_the_new_binding() {
         let root = tempfile::tempdir().unwrap();
         let original = root.path().join("original.txt");
@@ -893,7 +1001,7 @@ mod tests {
         assert_eq!(restored.text, "newer local λ\n");
         assert_eq!(restored.base, b"saved snapshot\n");
         io.send(Job::Recover(7, draft(10, "late old-binding edit β\n")));
-        io.send(Job::BindingApplied(7, 8));
+        io.send(Job::BindingApplied(7, 8, 11));
         barrier(&io);
         let restored = read();
         assert_eq!(restored.path, target);

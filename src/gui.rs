@@ -1091,8 +1091,8 @@ impl Shell {
                         glimpse::closing::Outcome::Ignored => {}
                     }
                 }
-                Reply::Save(id, text, result) => {
-                    glimpse::metrics::event("save-reply", id, 0);
+                Reply::Save(id, generation, text, result) => {
+                    glimpse::metrics::event("save-reply", id, generation);
                     let succeeded = result.is_ok();
                     if let Some(doc) = self.documents.iter_mut().find(|d| d.id == id) {
                         doc.saving = false;
@@ -1102,6 +1102,23 @@ impl Shell {
                                 doc.saved = text;
                                 doc.restored = false;
                                 doc.external = None;
+                                doc.generation += 1;
+                                if doc.dirty(cx) {
+                                    self.io.send(Job::Recover(
+                                        id,
+                                        storage::Draft {
+                                            path: doc.disk.path.clone(),
+                                            target: Some(doc.disk.target.clone()),
+                                            text: doc.input.read(cx).value().to_string(),
+                                            base: doc.disk.bytes.clone(),
+                                            generation: doc.generation,
+                                        },
+                                    ));
+                                } else {
+                                    self.io.send(Job::ClearThrough(id, doc.generation));
+                                }
+                                self.io
+                                    .send(Job::BindingApplied(id, generation, doc.generation));
                                 self.status = "Saved".into();
                             }
                             Err(e) => self.status = e,
@@ -1144,9 +1161,14 @@ impl Shell {
                                             generation: doc.generation,
                                         },
                                     ));
+                                } else {
+                                    self.io.send(Job::ClearThrough(doc.id, doc.generation));
                                 }
-                                self.io
-                                    .send(Job::BindingApplied(doc.id, destination.generation));
+                                self.io.send(Job::BindingApplied(
+                                    doc.id,
+                                    destination.generation,
+                                    doc.generation,
+                                ));
                             }
                             if !destination.copy
                                 && self.abandon_destination.as_ref().is_some_and(
