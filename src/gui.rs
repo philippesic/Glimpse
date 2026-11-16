@@ -1,3 +1,4 @@
+mod completion;
 mod conflict;
 mod decision;
 mod menus;
@@ -22,7 +23,10 @@ use gpui_component::{
     input::{Input, InputEvent, InputState, Position},
     text::TextView,
 };
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
 
 pub fn run(request: cli::Request) {
     Application::new()
@@ -113,11 +117,15 @@ struct CloseDecision {
     quit: bool,
     documents: Vec<u64>,
     saving: bool,
+    finish: bool,
+    validating: bool,
+    discard: bool,
 }
 enum DecisionAction {
     TrashRecord(PathBuf),
     Conflict(Box<conflict::Snapshot>),
     Compare,
+    Close,
 }
 
 enum SettingsWrite {
@@ -191,6 +199,11 @@ struct Shell {
     startup_failed: bool,
     requested: Vec<(u64, PathBuf)>,
     finished: bool,
+    validation_disks: HashMap<u64, DiskFile>,
+    cleanup_texts: HashMap<u64, (u64, String)>,
+    completed: HashSet<u64>,
+    validated: HashSet<u64>,
+    keep_after_cleanup: HashSet<u64>,
     finishing: glimpse::validation::Validations,
 }
 impl Shell {
@@ -322,6 +335,11 @@ impl Shell {
             startup_failed: false,
             requested: vec![],
             finished: false,
+            validation_disks: HashMap::new(),
+            cleanup_texts: HashMap::new(),
+            completed: HashSet::new(),
+            validated: HashSet::new(),
+            keep_after_cleanup: HashSet::new(),
             finishing: glimpse::validation::Validations::default(),
             search_id: 0,
             hits: vec![],
@@ -505,16 +523,23 @@ impl Shell {
                     if let Some(focus) = this.decision_return.take() {
                         window.focus(&focus);
                     }
-                    if choice.0 != 0 {
-                        match action {
-                            Some(DecisionAction::TrashRecord(path)) => {
-                                this.io.send(Job::TrashRecord(path))
-                            }
-                            Some(DecisionAction::Conflict(snapshot)) => {
-                                this.resolve_conflict(*snapshot, window, cx)
-                            }
-                            Some(DecisionAction::Compare) | None => {}
+                    match action {
+                        Some(DecisionAction::Close) => this.command(
+                            match choice.0 {
+                                1 => "save-close",
+                                2 => "discard-close",
+                                _ => "cancel-close",
+                            },
+                            window,
+                            cx,
+                        ),
+                        Some(DecisionAction::TrashRecord(path)) if choice.0 != 0 => {
+                            this.io.send(Job::TrashRecord(path))
                         }
+                        Some(DecisionAction::Conflict(snapshot)) if choice.0 != 0 => {
+                            this.resolve_conflict(*snapshot, window, cx)
+                        }
+                        _ => {}
                     }
                     cx.notify();
                 }),
@@ -656,7 +681,14 @@ impl Shell {
                 return;
             }
             if let Some(doc) = this.documents.iter_mut().find(|d| d.id == id) {
-                this.finishing.invalidate();
+                if this.finishing.invalidate_document(id) {
+                    this.validation_disks.clear();
+                    this.close_pending = None;
+                    this.status =
+                        "Completion cancelled because a requested document changed".into();
+                }
+                this.validated.remove(&id);
+                this.completed.remove(&id);
                 doc.generation += 1;
                 glimpse::metrics::event("change", id, doc.generation);
                 doc.preview = false;
@@ -967,29 +999,66 @@ impl Shell {
                     }
                 }
                 Reply::Cleared(id, generation, result) => {
+                    if let Some((pending_generation, text)) = self.cleanup_texts.get(&id)
+                        && *pending_generation == generation
+                        && let Some(doc) = self.documents.iter_mut().find(|doc| doc.id == id)
+                        && doc.input.read(cx).value().as_str() != text
+                    {
+                        doc.generation += 1;
+                        self.io.send(Job::Recover(
+                            id,
+                            storage::Draft {
+                                path: doc.disk.path.clone(),
+                                target: Some(doc.disk.target.clone()),
+                                text: doc.input.read(cx).value().to_string(),
+                                base: doc.disk.bytes.clone(),
+                                generation: doc.generation,
+                            },
+                        ));
+                    }
                     let current = self
                         .documents
                         .iter()
                         .find(|d| d.id == id)
                         .map_or(generation, |d| d.generation);
                     match self.closings.acknowledge(id, generation, current, result) {
-                        glimpse::closing::Outcome::Completed { .. } => {
-                            if !self.finished
-                                && self.requested.iter().any(|(requested, _)| *requested == id)
+                        glimpse::closing::Outcome::Completed { discard } => {
+                            self.cleanup_texts.remove(&id);
+                            let requested =
+                                self.requested.iter().any(|(requested, _)| *requested == id);
+                            if discard
+                                && requested
+                                && self
+                                    .documents
+                                    .iter()
+                                    .any(|doc| doc.id == id && doc.dirty(cx))
+                                && self.request.wait
+                                && !self.finished
                             {
                                 let _ = lifecycle::notify(b'1');
                                 self.finished = true;
                             }
-                            self.documents.retain(|d| d.id != id);
-                            if self.active == Some(id) {
-                                self.active = self.documents.last().map(|d| d.id);
+                            if self.validated.remove(&id) {
+                                self.completed.insert(id);
                             }
+                            if !self.keep_after_cleanup.remove(&id) {
+                                self.documents.retain(|d| d.id != id);
+                                self.checks.invalidate(id);
+                                if self.active == Some(id) {
+                                    self.active = self.documents.last().map(|d| d.id);
+                                }
+                            }
+                            self.complete_request();
                             self.focus(window, cx);
                             self.finish_close(cx);
                         }
                         glimpse::closing::Outcome::Changed => {
+                            self.cleanup_texts.remove(&id);
+                            self.keep_after_cleanup.remove(&id);
+                            self.validated.remove(&id);
                             self.quit_after_cleanup = false;
-                            self.status = "Close cancelled because the document changed".into();
+                            self.status =
+                                "Completion cancelled because the document changed".into();
                         }
                         glimpse::closing::Outcome::Failed(error) => {
                             self.status =
@@ -1015,8 +1084,12 @@ impl Shell {
                         }
                     }
                     self.check_document(id);
-                    if succeeded && self.close_pending.as_ref().is_some_and(|d| d.saving) {
-                        self.continue_close(window, cx);
+                    if self.close_pending.as_ref().is_some_and(|d| d.saving) {
+                        if succeeded {
+                            self.continue_close(window, cx);
+                        } else {
+                            self.close_pending = None;
+                        }
                     }
                 }
                 Reply::SavedTo(destination, result) => {
@@ -1039,8 +1112,12 @@ impl Shell {
                         }
                         Err(e) => self.status = e,
                     }
-                    if succeeded && self.close_pending.as_ref().is_some_and(|d| d.saving) {
-                        self.continue_close(window, cx);
+                    if self.close_pending.as_ref().is_some_and(|d| d.saving) {
+                        if succeeded {
+                            self.continue_close(window, cx);
+                        } else {
+                            self.close_pending = None;
+                        }
                     }
                 }
                 Reply::Prepared(mut destination, result) => match result {
@@ -1257,29 +1334,8 @@ impl Shell {
                     }
                     Err(e) => self.status = e,
                 },
-                Reply::Finished(id, generation, attempt, result) => {
-                    glimpse::metrics::event("finish-reply", id, generation);
-                    match self.finishing.acknowledge(attempt, id, generation, result) {
-                        Ok(Some(snapshots)) => {
-                            let valid = snapshots.iter().all(|(id, generation)| {
-                                self.documents.iter().any(|doc| {
-                                    doc.id == *id
-                                        && doc.generation == *generation
-                                        && !doc.dirty(cx)
-                                        && !doc.saving
-                                })
-                            });
-                            if valid && !self.finished {
-                                self.finished = true;
-                                let _ = lifecycle::notify(b'0');
-                                self.status = "CLI request finished".into();
-                            } else {
-                                self.status = "Documents changed during validation; Finish again after saving".into();
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(error) => self.status = error,
-                    }
+                Reply::Finished(id, generation, attempt, disk, result) => {
+                    self.finished_validation((id, generation, attempt, disk), result, cx);
                 }
                 Reply::Done(Err(error)) | Reply::HistoryWarning(error) => self.status = error,
                 Reply::Changed(result) => match result {
@@ -1429,6 +1485,12 @@ impl Shell {
                     }
                     cx.notify();
                 });
+            } else {
+                let _ = this.update(cx, |this, cx| {
+                    this.close_pending = None;
+                    this.status = "Save cancelled. The document remains open.".into();
+                    cx.notify();
+                });
             }
         })
         .detach();
@@ -1445,7 +1507,11 @@ impl Shell {
             }
             return;
         }
-        if self.io.pending_mutations() > 0 || self.destination_busy || !self.closings.is_empty() {
+        if self.io.pending_mutations() > 0
+            || self.destination_busy
+            || !self.closings.is_empty()
+            || self.finishing.pending()
+        {
             self.status = "Wait for pending writes or recovery cleanup".into();
             cx.notify();
             return;
@@ -1460,6 +1526,9 @@ impl Shell {
             quit,
             documents,
             saving: false,
+            finish: false,
+            validating: false,
+            discard: false,
         });
         self.continue_close(window, cx);
     }
@@ -1467,15 +1536,42 @@ impl Shell {
         let Some(decision) = &self.close_pending else {
             return;
         };
+        if decision.validating {
+            return;
+        }
         let dirty = self
             .documents
             .iter()
-            .find(|d| decision.documents.contains(&d.id) && d.dirty(cx))
-            .map(|d| d.id);
+            .find(|doc| decision.documents.contains(&doc.id) && doc.dirty(cx))
+            .map(|doc| doc.id);
         if let Some(id) = dirty {
             if decision.saving {
+                if self
+                    .documents
+                    .iter()
+                    .any(|doc| doc.id == id && doc.external.is_some())
+                {
+                    self.close_pending = None;
+                    self.status =
+                        "Resolve the external change before saving and completing this decision"
+                            .into();
+                    cx.notify();
+                    return;
+                }
                 self.active = Some(id);
                 self.save(window, cx);
+            } else if self.decision.is_none() {
+                let names = self
+                    .documents
+                    .iter()
+                    .filter(|doc| decision.documents.contains(&doc.id) && doc.dirty(cx))
+                    .map(|doc| paths::display(&doc.disk.path))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let finish = decision.finish;
+                self.ask_decision(DecisionAction::Close, if finish { "Finish Editing?" } else { "Close with unsaved changes?" }.into(),
+                    format!("Unsaved documents:\n{names}\nSave writes these documents before continuing. Discard closes these documents and retires their automatic drafts. Cancel keeps them open."),
+                    vec!["Cancel", if finish { "Save and Finish" } else { "Save and Close" }, "Discard"], window, cx);
             }
         } else {
             self.commit_close(false, cx);
@@ -1483,6 +1579,12 @@ impl Shell {
         cx.notify();
     }
     fn commit_close(&mut self, discard: bool, cx: &mut Context<Self>) {
+        if let Some(decision) = self.close_pending.as_mut() {
+            decision.discard = discard;
+        }
+        if self.validate_before_cleanup(cx) {
+            return;
+        }
         let Some(decision) = self.close_pending.take() else {
             return;
         };
@@ -1491,6 +1593,13 @@ impl Shell {
             if decision.documents.contains(&doc.id)
                 && self.closings.begin(doc.id, doc.generation, discard)
             {
+                if decision.finish && !discard {
+                    self.keep_after_cleanup.insert(doc.id);
+                }
+                self.cleanup_texts.insert(
+                    doc.id,
+                    (doc.generation, doc.input.read(cx).value().to_string()),
+                );
                 self.io.send(Job::ClearThrough(doc.id, doc.generation));
             }
         }
@@ -1619,7 +1728,12 @@ impl Shell {
                 self.focus(window, cx);
             }
             "cancel-close" | "cancel-closing" => {
+                self.finishing.invalidate();
                 self.close_pending = None;
+                self.keep_after_cleanup.clear();
+                self.cleanup_texts.clear();
+                self.validation_disks.clear();
+                self.validated.clear();
                 for id in self.closings.cancel() {
                     if let Some(doc) = self.documents.iter_mut().find(|d| d.id == id) {
                         doc.generation += 1;
@@ -1780,45 +1894,13 @@ impl Shell {
             "close" => self.close(false, window, cx),
             "quit" => self.close(true, window, cx),
             "abort" => {
+                self.finishing.invalidate();
+                self.close_pending = None;
                 let _ = lifecycle::notify(b'1');
                 self.finished = true;
                 self.status = "CLI request aborted".into();
             }
-            "finish" => {
-                if !self.request.wait || self.finished {
-                    self.status = "No CLI editing request is waiting".into();
-                } else if self.requested.iter().any(|(id, _)| {
-                    self.documents
-                        .iter()
-                        .any(|doc| doc.id == *id && (doc.dirty(cx) || doc.saving))
-                }) {
-                    self.status = "Save requested documents before finishing".into();
-                } else {
-                    let mut paths: std::collections::BTreeMap<u64, Vec<PathBuf>> =
-                        std::collections::BTreeMap::new();
-                    for (id, path) in &self.requested {
-                        paths.entry(*id).or_default().push(path.clone());
-                    }
-                    let snapshots: Vec<_> = self
-                        .documents
-                        .iter()
-                        .filter(|doc| paths.contains_key(&doc.id))
-                        .map(|doc| (doc.id, doc.generation))
-                        .collect();
-                    let attempt = self.finishing.begin(snapshots);
-                    for (id, aliases) in paths {
-                        if let Some(doc) = self.documents.iter().find(|doc| doc.id == id) {
-                            self.io.send(Job::Finish(
-                                id,
-                                doc.generation,
-                                attempt,
-                                doc.disk.clone(),
-                                aliases,
-                            ));
-                        }
-                    }
-                }
-            }
+            "finish" => self.finish_requested(window, cx),
             "choose" if self.request.pick => {
                 let path = if self.request.directory {
                     self.current.clone()
@@ -2116,23 +2198,12 @@ impl Render for Shell {
             }
         }
 
-        if let Some(decision) = &self.close_pending {
-            let names = self
-                .documents
-                .iter()
-                .filter(|d| decision.documents.contains(&d.id) && d.dirty(cx))
-                .map(|d| paths::display(&d.disk.path))
-                .collect::<Vec<_>>()
-                .join(", ");
+        if self.finishing.pending() {
             root = root.child(
                 div()
-                    .flex()
-                    .gap_2()
                     .p_2()
-                    .child(format!("Unsaved changes: {names}"))
-                    .child(self.button("Save and close", "save-close", cx))
-                    .child(self.button("Discard", "discard-close", cx))
-                    .child(self.button("Cancel", "cancel-close", cx)),
+                    .child("Validating requested destinations…")
+                    .child(self.button("Cancel completion", "cancel-close", cx)),
             );
         }
         if !self.closings.is_empty() {
@@ -2141,7 +2212,7 @@ impl Render for Shell {
                     .flex()
                     .gap_2()
                     .p_2()
-                    .child("Resolving recovery before closing")
+                    .child("Resolving recovery before completing the decision")
                     .child(self.button("Retry cleanup", "retry-close", cx))
                     .child(self.button("Keep open", "cancel-close", cx)),
             );

@@ -21,11 +21,26 @@ impl Validations {
         });
         self.next
     }
+    pub fn invalidate_document(&mut self, id: u64) -> bool {
+        let included = self
+            .active
+            .as_ref()
+            .is_some_and(|batch| batch.snapshots.contains_key(&id));
+        if included {
+            self.invalidate();
+        }
+        included
+    }
     pub fn invalidate(&mut self) {
         self.active = None;
     }
     pub fn pending(&self) -> bool {
         self.active.is_some()
+    }
+    pub fn accepts(&self, attempt: u64, id: u64, generation: u64) -> bool {
+        self.active.as_ref().is_some_and(|batch| {
+            batch.attempt == attempt && batch.pending.get(&id) == Some(&generation)
+        })
     }
     pub fn acknowledge(
         &mut self,
@@ -57,6 +72,19 @@ impl Validations {
 #[cfg(test)]
 mod tests {
     use super::Validations;
+    #[test]
+    fn unrelated_edits_do_not_cancel_requested_validation() {
+        let mut state = Validations::default();
+        let attempt = state.begin([(1, 3)]);
+        assert!(!state.invalidate_document(2));
+        assert_eq!(
+            state.acknowledge(attempt, 1, 3, Ok(())).unwrap(),
+            Some(vec![(1, 3)])
+        );
+        state.begin([(1, 4)]);
+        assert!(state.invalidate_document(1));
+        assert!(!state.pending());
+    }
     #[test]
     fn an_edit_cancels_every_acknowledgement_from_the_attempt() {
         let mut state = Validations::default();

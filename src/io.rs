@@ -74,7 +74,7 @@ pub enum Reply {
     SettingsSaved(Result<storage::Settings, String>),
     Changed(Result<(), String>),
     Records(Result<storage::Inventory, String>),
-    Finished(u64, u64, u64, Result<(), String>),
+    Finished(u64, u64, u64, DiskFile, Result<(), String>),
     Chosen(PathBuf, Result<(), String>),
     OpenDirectory(PathBuf, u64),
     HistoryWarning(String),
@@ -324,7 +324,7 @@ impl IoWorker {
                             }
                             let result = disk.revalidate_paths(&paths);
                             crate::metrics::event("finish-worker-done", id, generation);
-                            Reply::Finished(id, generation, attempt, result)
+                            Reply::Finished(id, generation, attempt, disk, result)
                         }
                         Job::Check(id, path, generation) => {
                             Reply::Checked(id, generation, DiskFile::open(path))
@@ -589,8 +589,8 @@ impl IoWorker {
                     Job::Save { id, text, .. } => Reply::Save(id, text, Err(message)),
                     Job::SaveTo(d) | Job::Prepare(d) => Reply::SavedTo(Box::new(d), Err(message)),
                     Job::Choose(path, _) => Reply::Chosen(path, Err(message)),
-                    Job::Finish(id, generation, attempt, _, _) => {
-                        Reply::Finished(id, generation, attempt, Err(message))
+                    Job::Finish(id, generation, attempt, disk, _) => {
+                        Reply::Finished(id, generation, attempt, disk, Err(message))
                     }
                     Job::Open(path, token, _) => Reply::Open(path, token, Err(message)),
                     Job::Import(id, _)
