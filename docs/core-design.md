@@ -50,11 +50,15 @@ The path bar exposes ancestor buttons and inline entry. Tab and Shift-Tab cycle 
 
 Open requests retain the user interaction generation that issued them. A late explicit file open becomes a background tab after the user moves on; a stale preview is discarded. Cursor positioning for a background document does not focus it. A requested CLI file that becomes a directory during startup fails the request rather than reporting successful readiness.
 
+Directory refresh retains the current rows until the replacement listing completes. A returning location waits for its complete listing before reusing the saved scroll handle, so empty or partial frames cannot reset its position. Initial visits still stream batches. The shell sorts once per drained batch group and caches visible indices over shared immutable entries. Hidden-file decisions inspect native names before display escaping.
+
+Loading, slow reads, empty folders, filtering and unavailable or partial listings remain visible in the navigator. Error details expose the full path, failure and Retry. Stop Reading rejects late results and stays paused through filesystem notifications until explicit refresh or navigation; document-change checks continue. Obsolete directory requests are cancelled when Location changes. A full directory queue is an explicit failure rather than indefinite startup waiting.
+
 ## Presentation gaps and qualification
 
 The product contract and native Linux evaluation determine qualification. The following remain incomplete:
 
-- Complete contextual command availability, persistent directory-read states and refresh continuity. macOS system-menu integration remains unverified.
+- Complete contextual command availability. macOS system-menu integration remains unverified.
 - Filename-index controls. Content-result activation rejects changed disk fingerprints and dirty open buffers.
 - The earlier bounded Markdown paging, local raster images, relative-link handling and complete dialect parity. The current read view escapes HTML and omits images, including remote images.
 - Large-file/long-line performance, real IME, accessibility, the complete size/theme/settings matrix and macOS behavior. Modal behavior across asynchronous completions still requires qualification.
