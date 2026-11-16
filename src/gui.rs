@@ -776,7 +776,10 @@ impl Shell {
         self.listing_paused = false;
         self.directories.retain(std::slice::from_ref(&self.current));
         match self.directories.request(self.current.clone()) {
-            Ok(id) => self.listing_id = id,
+            Ok(id) => {
+                self.listing_id = id;
+                glimpse::metrics::event("directory-request", id, 0);
+            }
             Err(error) => {
                 self.listing_id = 0;
                 self.listing_done = true;
@@ -1210,9 +1213,23 @@ impl Shell {
         let mut listing_changed = false;
         while let Ok(batch) = self.directories.replies.try_recv() {
             if batch.path == self.current && batch.generation == self.listing_id {
+                if self.listing_buffer.is_empty() && !batch.entries.is_empty() {
+                    glimpse::metrics::event(
+                        "directory-first",
+                        batch.generation,
+                        batch.entries.len() as u64,
+                    );
+                }
                 self.listing_buffer.extend(batch.entries);
                 listing_changed = true;
                 self.listing_done = batch.done;
+                if batch.done {
+                    glimpse::metrics::event(
+                        "directory-complete",
+                        batch.generation,
+                        self.listing_buffer.len() as u64,
+                    );
+                }
                 if let Some(error) = batch.error {
                     self.startup_failed |= !self.ready;
                     self.listing_error = Some(error);
@@ -1235,6 +1252,11 @@ impl Shell {
                     self.listing_buffer.clone()
                 });
                 self.entries_revision += 1;
+                glimpse::metrics::event(
+                    "directory-installed",
+                    self.listing_id,
+                    self.entries.len() as u64,
+                );
             }
         }
         while let Ok(reply) = self.io.replies.try_recv() {
@@ -1922,6 +1944,15 @@ impl Shell {
         }
         while let Ok(result) = self.search.replies.try_recv() {
             if result.generation == self.search_id {
+                glimpse::metrics::event(
+                    if result.completed {
+                        "search-complete"
+                    } else {
+                        "search-batch"
+                    },
+                    result.generation,
+                    result.hits.len() as u64,
+                );
                 let selected = self
                     .search_ui
                     .selection

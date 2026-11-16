@@ -263,6 +263,7 @@ impl IoWorker {
                         ctx.request_repaint();
                     }
                     for (id, mut draft) in updates {
+                        crate::metrics::event("recovery-worker", id, draft.generation);
                         let _writes = rebindings.writes.lock().unwrap();
                         let binding = rebindings.entries.lock().unwrap().get(&id).cloned();
                         if let Some(binding) = binding {
@@ -274,6 +275,7 @@ impl IoWorker {
                             .map_err(Clone::clone)
                             .and_then(|r| r.write(id, &draft))
                             .map_err(|error| format!("Recovery failed: {error}"));
+                        crate::metrics::event("recovery-worker-done", id, draft.generation);
                         let _ = results.send(Reply::Recovered(id, draft.generation, result));
                         ctx.request_repaint();
                     }

@@ -107,6 +107,7 @@ impl Shell {
             self.search_filters(),
         ) {
             Ok(id) => {
+                glimpse::metrics::event("search-request", id, u64::from(content));
                 self.search_id = id;
                 self.search_ui.started = true;
                 self.search_ui.running = true;
@@ -141,6 +142,7 @@ impl Shell {
             self.search_filters(),
         ) {
             Ok(id) => {
+                glimpse::metrics::event("index-request", id, 0);
                 self.search_id = id;
                 self.search_ui.running = true;
                 self.search_ui.building = true;
