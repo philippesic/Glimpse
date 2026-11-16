@@ -9,6 +9,7 @@ mod panes;
 mod path;
 mod platform;
 mod preferences;
+mod reading;
 mod recovery;
 mod searching;
 mod theme;
@@ -189,6 +190,7 @@ struct Shell {
     gesture: glimpse::gesture::Gesture,
     future: Vec<PathBuf>,
     nav_focus: FocusHandle,
+    reading_focus: FocusHandle,
     pane_state: Entity<panes::Divider>,
     navigation_only: bool,
     navigator_visible: bool,
@@ -222,6 +224,7 @@ struct Shell {
     panel: Option<Panel>,
     query: Entity<InputState>,
     reading: bool,
+    reading_view: Option<reading::View>,
     status: String,
     warnings: Vec<String>,
     omitted_warnings: u64,
@@ -353,6 +356,7 @@ impl Shell {
             gesture: glimpse::gesture::Gesture::default(),
             future: vec![],
             nav_focus: cx.focus_handle().tab_stop(true),
+            reading_focus: cx.focus_handle().tab_stop(true),
             pane_state: cx.new(panes::Divider::new),
             navigation_only: false,
             navigator_visible: true,
@@ -386,6 +390,7 @@ impl Shell {
             panel: None,
             query,
             reading: false,
+            reading_view: None,
             status: String::new(),
             warnings: Vec::new(),
             omitted_warnings: 0,
@@ -1196,6 +1201,9 @@ impl Shell {
         }
         while let Ok(reply) = self.io.replies.try_recv() {
             match reply {
+                Reply::Markdown(id, generation, path, result) => {
+                    self.reading_ready(id, generation, path, result, cx)
+                }
                 Reply::PathCompleted(token, value, result) => {
                     self.path_completed(token, value, result, window, cx)
                 }
@@ -2532,7 +2540,21 @@ impl Shell {
                 };
                 window.dispatch_action(action, cx);
             }
-            "read" => self.reading = !self.reading,
+            "read" => {
+                self.reading = !self.reading;
+                if self.reading {
+                    self.reading_focus.focus(window);
+                } else {
+                    if let Some(doc) = self
+                        .documents
+                        .iter()
+                        .find(|doc| Some(doc.id) == self.active)
+                    {
+                        doc.input.read(cx).focus_handle(cx).focus(window);
+                    }
+                }
+            }
+            "reading-retry" => self.reading_view = None,
             "keep-tab" => {
                 if let Some(doc) = self
                     .documents
@@ -2699,6 +2721,7 @@ impl Shell {
 }
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.prepare_reading(cx);
         if !self.ready
             && self.listing_done
             && self.opening.is_empty()
@@ -3132,7 +3155,10 @@ impl Render for Shell {
             content = content.child(if narrow {
                 actions
                     .child(self.button("Save", "save", cx))
-                    .child(self.button("Read / Edit", "read", cx))
+                    .child(
+                        self.button(if self.reading { "Edit" } else { "Read" }, "read", cx)
+                            .selected(self.reading),
+                    )
                     .child(self.button("Close", "close", cx))
             } else {
                 actions
@@ -3140,7 +3166,10 @@ impl Render for Shell {
                     .child(self.button("Save", "save", cx))
                     .child(self.button("Save As", "save-as", cx))
                     .child(self.button("Save Copy", "save-copy", cx))
-                    .child(self.button("Read / Edit", "read", cx))
+                    .child(
+                        self.button(if self.reading { "Edit" } else { "Read" }, "read", cx)
+                            .selected(self.reading),
+                    )
                     .child(self.button("Line", "line", cx))
                     .child(self.button("Close tab", "close", cx))
                     .child(self.button("Reload disk", "reload", cx))
@@ -3220,20 +3249,7 @@ impl Render for Shell {
                 );
             }
             if self.reading {
-                content = content.child(
-                    div()
-                        .id("reading")
-                        .flex_1()
-                        .overflow_y_scroll()
-                        .p_4()
-                        .text_size(px(self.settings.markdown_font_size * self.settings.ui_scale))
-                        .child(TextView::markdown(
-                            "markdown",
-                            reading_source(&doc.input.read(cx).value()),
-                            window,
-                            cx,
-                        )),
-                );
+                content = content.child(self.reading_element(window, cx));
             } else {
                 content = content.child(
                     div()
@@ -3384,30 +3400,4 @@ fn disk_path(documents: &[Document], id: u64) -> PathBuf {
         .disk
         .path
         .clone()
-}
-
-fn reading_source(source: &str) -> String {
-    use pulldown_cmark::{Event, Options, Parser, Tag};
-    let mut result = String::new();
-    let mut cursor = 0;
-    for (event, range) in Parser::new_ext(source, Options::all()).into_offset_iter() {
-        let replacement = match event {
-            Event::Start(Tag::Image { .. }) => Some("*Image omitted in this port*".to_owned()),
-            Event::Html(html) | Event::InlineHtml(html) => Some(
-                html.replace('&', "&amp;")
-                    .replace('<', "&lt;")
-                    .replace('>', "&gt;"),
-            ),
-            _ => None,
-        };
-        if let Some(replacement) = replacement
-            && range.start >= cursor
-        {
-            result.push_str(&source[cursor..range.start]);
-            result.push_str(&replacement);
-            cursor = range.end;
-        }
-    }
-    result.push_str(&source[cursor..]);
-    result
 }

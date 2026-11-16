@@ -21,6 +21,7 @@ pub mod observe;
 pub mod path_completion;
 pub mod paths;
 pub mod picker_state;
+pub mod reading;
 pub mod reservations;
 pub mod search;
 pub mod storage;

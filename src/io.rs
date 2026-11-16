@@ -15,6 +15,7 @@ pub enum Job {
     Hold(mpsc::Sender<()>, mpsc::Receiver<()>),
     #[cfg(test)]
     HoldMaintenance(mpsc::Sender<()>, mpsc::Receiver<()>),
+    ReadMarkdown(u64, u64, String, PathBuf),
     CompletePath(u64, String, PathBuf),
     Visit(PathBuf),
     RecentLocation(Vec<PathBuf>),
@@ -71,6 +72,7 @@ pub struct SaveDestination {
     pub recovery_copy: bool,
 }
 pub enum Reply {
+    Markdown(u64, u64, PathBuf, Result<crate::reading::Prepared, String>),
     PathCompleted(u64, String, Result<crate::path_completion::Matches, String>),
     RecentLocation(Option<PathBuf>),
     Volumes(Result<crate::locations::Volumes, String>),
@@ -383,6 +385,12 @@ impl IoWorker {
                             crate::metrics::event("finish-worker-done", id, generation);
                             Reply::Finished(id, generation, attempt, disk, result)
                         }
+                        Job::ReadMarkdown(id, generation, source, path) => Reply::Markdown(
+                            id,
+                            generation,
+                            path.clone(),
+                            Ok(crate::reading::prepare(source, &path)),
+                        ),
                         Job::Check(id, path, generation) => {
                             Reply::Checked(id, generation, DiskFile::open(path))
                         }
@@ -698,6 +706,7 @@ impl IoWorker {
             #[cfg(test)]
             Job::HoldMaintenance(..) => &self.maintenance,
             Job::Volumes
+            | Job::ReadMarkdown(..)
             | Job::CompletePath(..)
             | Job::Open(..)
             | Job::Choose(..)
@@ -731,6 +740,9 @@ impl IoWorker {
                 };
                 let message = "I/O queue unavailable. Operation was not queued; retry. Current buffer remains in memory.".to_owned();
                 let reply = match job {
+                    Job::ReadMarkdown(id, generation, _, path) => {
+                        Reply::Markdown(id, generation, path, Err(message))
+                    }
                     Job::CompletePath(token, value, _) => {
                         Reply::PathCompleted(token, value, Err(message))
                     }

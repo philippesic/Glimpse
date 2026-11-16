@@ -49,19 +49,23 @@ impl RenderOnce for TextViewElement {
             v_flex()
                 .size_full()
                 .map(|this| match &mut state.parsed_result {
-                    Some(Ok(content)) => this.child(content.root_node.render_root(
-                        self.list_state.clone(),
-                        &content.node_cx,
-                        window,
-                        cx,
-                    )),
+                    Some(Ok(content)) => {
+                        let mut node_cx = content.node_cx.clone();
+                        node_cx.resources = state.resources.clone();
+                        this.child(content.root_node.render_root(
+                            self.list_state.clone(),
+                            &node_cx,
+                            window,
+                            cx,
+                        ))
+                    }
                     Some(Err(err)) => this.child(
                         v_flex()
                             .gap_1()
                             .child("Failed to parse content")
                             .child(err.to_string()),
                     ),
-                    None => this,
+                    None => this.child("Preparing reading view…"),
                 })
         })
     }
@@ -148,7 +152,7 @@ impl UpdateFuture {
             highlight_theme,
             current_style: style,
             current_text: text,
-            timer: Timer::never(),
+            timer: Timer::after(Duration::ZERO),
             rx: Box::pin(rx),
             tx_result,
             delay,
@@ -220,6 +224,7 @@ pub(crate) struct TextViewState {
     parent_entity: Option<EntityId>,
     tx: Option<smol::channel::Sender<Update>>,
     parsed_result: Option<Result<ParsedContent, SharedString>>,
+    resources: Arc<super::TextViewResources>,
     focus_handle: Option<FocusHandle>,
     /// The bounds of the text view
     bounds: Bounds<Pixels>,
@@ -238,6 +243,7 @@ impl TextViewState {
             parent_entity: None,
             tx: None,
             parsed_result: None,
+            resources: Arc::default(),
             focus_handle: Some(focus_handle),
             bounds: Bounds::default(),
             selection_positions: (None, None),
@@ -524,6 +530,18 @@ impl TextView {
         cx.write_to_clipboard(ClipboardItem::new_string(selected_text.trim().to_string()));
     }
 
+    pub fn focus_handle(self, focus: FocusHandle, cx: &mut App) -> Self {
+        self.state
+            .update(cx, |state, _| state.focus_handle = Some(focus));
+        self
+    }
+
+    pub fn resources(self, resources: Arc<super::TextViewResources>, cx: &mut App) -> Self {
+        self.state
+            .update(cx, |state, _| state.resources = resources);
+        self
+    }
+
     /// Set custom block actions for code blocks.
     ///
     /// The closure receives the [`CodeBlock`],
@@ -580,18 +598,10 @@ impl Element for TextView {
             let (tx, rx) = smol::channel::unbounded::<Update>();
             let (tx_result, rx_result) =
                 smol::channel::unbounded::<Result<ParsedContent, SharedString>>();
-            let parsed_result = parse_content(
-                type_,
-                &text,
-                style.clone(),
-                &highlight_theme,
-                &code_block_actions,
-            );
-
             self.state.update(cx, {
                 let tx = tx.clone();
                 |state, _| {
-                    state.parsed_result = Some(parsed_result);
+                    state.parsed_result = None;
                     state.tx = Some(tx);
                 }
             });
@@ -608,6 +618,7 @@ impl Element for TextView {
                                     app.notify(parent_entity);
                                 }
                                 state.clear_selection();
+                                cx.notify();
                             });
                         } else {
                             // state released, stopping processing
@@ -651,6 +662,31 @@ impl Element for TextView {
                 let state = self.state.clone();
                 move |_: &input::Copy, _, cx| {
                     Self::on_action_copy(&state, cx);
+                }
+            })
+            .on_key_down({
+                let state = self.state.clone();
+                let scrollable = self.scrollable;
+                move |event, _, cx| {
+                    if !scrollable {
+                        return;
+                    }
+                    state.update(cx, |state, cx| {
+                        let page = state.bounds.size.height.max(px(100.));
+                        match event.keystroke.key.as_str() {
+                            "up" => state.list_state.scroll_by(-px(24.)),
+                            "down" => state.list_state.scroll_by(px(24.)),
+                            "pageup" => state.list_state.scroll_by(-page),
+                            "pagedown" | "space" => state.list_state.scroll_by(page),
+                            "home" => state.list_state.scroll_to(gpui::ListOffset::default()),
+                            "end" => state.list_state.scroll_to_reveal_item(
+                                state.list_state.item_count().saturating_sub(1),
+                            ),
+                            _ => return,
+                        }
+                        cx.stop_propagation();
+                        cx.notify();
+                    });
                 }
             })
             .child(TextViewElement {

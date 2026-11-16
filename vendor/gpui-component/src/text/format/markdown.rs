@@ -22,17 +22,20 @@ pub(crate) fn parse(
     cx: &mut NodeContext,
     highlight_theme: &HighlightTheme,
 ) -> Result<node::Node, SharedString> {
-    markdown::to_mdast(&raw, &ParseOptions::gfm())
+    let mut options = ParseOptions::gfm();
+    options.constructs.gfm_footnote_definition = false;
+    options.constructs.gfm_label_start_footnote = false;
+    markdown::to_mdast(&raw, &options)
         .map(|n| ast_to_node(n, style, cx, highlight_theme))
         .map_err(|e| e.to_string().into())
 }
 
-fn parse_table_row(table: &mut Table, node: &mdast::TableRow, cx: &mut NodeContext) {
+fn parse_table_row(table: &mut Table, node: &mdast::TableRow) {
     let mut row = TableRow::default();
     node.children.iter().for_each(|c| {
         match c {
             Node::TableCell(cell) => {
-                parse_table_cell(&mut row, cell, cx);
+                parse_table_cell(&mut row, cell);
             }
             _ => {}
         };
@@ -40,10 +43,10 @@ fn parse_table_row(table: &mut Table, node: &mdast::TableRow, cx: &mut NodeConte
     table.children.push(row);
 }
 
-fn parse_table_cell(row: &mut node::TableRow, node: &mdast::TableCell, cx: &mut NodeContext) {
+fn parse_table_cell(row: &mut node::TableRow, node: &mdast::TableCell) {
     let mut paragraph = Paragraph::default();
     node.children.iter().for_each(|c| {
-        parse_paragraph(&mut paragraph, c, cx);
+        parse_paragraph(&mut paragraph, c);
     });
     let table_cell = node::TableCell {
         children: paragraph,
@@ -52,7 +55,7 @@ fn parse_table_cell(row: &mut node::TableRow, node: &mdast::TableCell, cx: &mut 
     row.children.push(table_cell);
 }
 
-fn parse_paragraph(paragraph: &mut Paragraph, node: &mdast::Node, cx: &mut NodeContext) -> String {
+fn parse_paragraph(paragraph: &mut Paragraph, node: &mdast::Node) -> String {
     let span = node.position().map(|pos| Span {
         start: pos.start.offset,
         end: pos.end.offset,
@@ -66,7 +69,7 @@ fn parse_paragraph(paragraph: &mut Paragraph, node: &mdast::Node, cx: &mut NodeC
     match node {
         Node::Paragraph(val) => {
             val.children.iter().for_each(|c| {
-                text.push_str(&parse_paragraph(paragraph, c, cx));
+                text.push_str(&parse_paragraph(paragraph, c));
             });
         }
         Node::Text(val) => {
@@ -76,7 +79,7 @@ fn parse_paragraph(paragraph: &mut Paragraph, node: &mdast::Node, cx: &mut NodeC
         Node::Emphasis(val) => {
             let mut child_paragraph = Paragraph::default();
             for child in val.children.iter() {
-                text.push_str(&parse_paragraph(&mut child_paragraph, &child, cx));
+                text.push_str(&parse_paragraph(&mut child_paragraph, &child));
             }
             paragraph.push(
                 InlineNode::new(&text).marks(vec![(0..text.len(), TextMark::default().italic())]),
@@ -85,7 +88,7 @@ fn parse_paragraph(paragraph: &mut Paragraph, node: &mdast::Node, cx: &mut NodeC
         Node::Strong(val) => {
             let mut child_paragraph = Paragraph::default();
             for child in val.children.iter() {
-                text.push_str(&parse_paragraph(&mut child_paragraph, &child, cx));
+                text.push_str(&parse_paragraph(&mut child_paragraph, &child));
             }
             paragraph.push(
                 InlineNode::new(&text).marks(vec![(0..text.len(), TextMark::default().bold())]),
@@ -94,7 +97,7 @@ fn parse_paragraph(paragraph: &mut Paragraph, node: &mdast::Node, cx: &mut NodeC
         Node::Delete(val) => {
             let mut child_paragraph = Paragraph::default();
             for child in val.children.iter() {
-                text.push_str(&parse_paragraph(&mut child_paragraph, &child, cx));
+                text.push_str(&parse_paragraph(&mut child_paragraph, &child));
             }
             paragraph.push(
                 InlineNode::new(&text)
@@ -116,7 +119,7 @@ fn parse_paragraph(paragraph: &mut Paragraph, node: &mdast::Node, cx: &mut NodeC
 
             let mut child_paragraph = Paragraph::default();
             for child in val.children.iter() {
-                text.push_str(&parse_paragraph(&mut child_paragraph, &child, cx));
+                text.push_str(&parse_paragraph(&mut child_paragraph, &child));
             }
 
             // FIXME: GPUI InteractiveText does not support inline images yet.
@@ -156,25 +159,10 @@ fn parse_paragraph(paragraph: &mut Paragraph, node: &mdast::Node, cx: &mut NodeC
             paragraph
                 .push(InlineNode::new(&text).marks(vec![(0..text.len(), TextMark::default())]));
         }
-        Node::Html(val) => match super::html::parse(&val.value, cx) {
-            Ok(el) => {
-                if el.is_break() {
-                    text = "\n".to_owned();
-                    paragraph.push(InlineNode::new(&text));
-                } else {
-                    if cfg!(debug_assertions) {
-                        tracing::warn!("unsupported inline html tag: {:#?}", el);
-                    }
-                }
-            }
-            Err(err) => {
-                if cfg!(debug_assertions) {
-                    tracing::warn!("failed parsing html: {:#?}", err);
-                }
-
-                text.push_str(&val.value);
-            }
-        },
+        Node::Html(val) => {
+            text = val.value.clone();
+            paragraph.push_str(&text);
+        }
         Node::FootnoteReference(foot) => {
             let prefix = format!("[{}]", foot.identifier);
             paragraph.push(InlineNode::new(&prefix).marks(vec![(
@@ -189,7 +177,7 @@ fn parse_paragraph(paragraph: &mut Paragraph, node: &mdast::Node, cx: &mut NodeC
             let mut child_paragraph = Paragraph::default();
             let mut child_text = String::new();
             for child in link.children.iter() {
-                child_text.push_str(&parse_paragraph(&mut child_paragraph, child, cx));
+                child_text.push_str(&parse_paragraph(&mut child_paragraph, child));
             }
 
             let link_mark = LinkMark {
@@ -224,17 +212,19 @@ fn ast_to_node(
 ) -> node::Node {
     match value {
         Node::Root(val) => {
-            let children = val
+            let children: Vec<_> = val
                 .children
                 .into_iter()
                 .map(|c| ast_to_node(c, style, cx, highlight_theme))
                 .collect();
-            node::Node::Root { children }
+            node::Node::Root {
+                children: children.into(),
+            }
         }
         Node::Paragraph(val) => {
             let mut paragraph = Paragraph::default();
             val.children.iter().for_each(|c| {
-                parse_paragraph(&mut paragraph, c, cx);
+                parse_paragraph(&mut paragraph, c);
             });
 
             node::Node::Paragraph(paragraph)
@@ -280,7 +270,7 @@ fn ast_to_node(
         Node::Heading(val) => {
             let mut paragraph = Paragraph::default();
             val.children.iter().for_each(|c| {
-                parse_paragraph(&mut paragraph, c, cx);
+                parse_paragraph(&mut paragraph, c);
             });
 
             node::Node::Heading {
@@ -294,16 +284,7 @@ fn ast_to_node(
             style,
             highlight_theme,
         )),
-        Node::Html(val) => match super::html::parse(&val.value, cx) {
-            Ok(el) => el,
-            Err(err) => {
-                if cfg!(debug_assertions) {
-                    tracing::warn!("error parsing html: {:#?}", err);
-                }
-
-                node::Node::Paragraph(Paragraph::new(val.value))
-            }
-        },
+        Node::Html(val) => node::Node::Paragraph(Paragraph::new(val.value)),
         Node::MdxFlowExpression(val) => node::Node::CodeBlock(CodeBlock::new(
             val.value.into(),
             Some("mdx".into()),
@@ -325,14 +306,14 @@ fn ast_to_node(
         Node::MdxJsxTextElement(val) => {
             let mut paragraph = Paragraph::default();
             val.children.iter().for_each(|c| {
-                parse_paragraph(&mut paragraph, c, cx);
+                parse_paragraph(&mut paragraph, c);
             });
             node::Node::Paragraph(paragraph)
         }
         Node::MdxJsxFlowElement(val) => {
             let mut paragraph = Paragraph::default();
             val.children.iter().for_each(|c| {
-                parse_paragraph(&mut paragraph, c, cx);
+                parse_paragraph(&mut paragraph, c);
             });
             node::Node::Paragraph(paragraph)
         }
@@ -347,7 +328,7 @@ fn ast_to_node(
                 .collect();
             val.children.iter().for_each(|c| {
                 if let Node::TableRow(row) = c {
-                    parse_table_row(&mut table, row, cx);
+                    parse_table_row(&mut table, row);
                 }
             });
 
@@ -365,7 +346,7 @@ fn ast_to_node(
             )]));
 
             def.children.iter().for_each(|c| {
-                parse_paragraph(&mut paragraph, c, cx);
+                parse_paragraph(&mut paragraph, c);
             });
             node::Node::Paragraph(paragraph)
         }
@@ -391,5 +372,30 @@ fn ast_to_node(
             }
             node::Node::Unknown
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn declared_dialect_keeps_html_literal() {
+        let style = TextViewStyle::default();
+        let mut context = NodeContext::default();
+        let node=parse("<script>raw</script>\n\n**bold** *italic* ~~strike~~ [link](next.md)\n\n- [x] done\n\n| left | right |\n| --- | --- |\n| a | b |",&style,&mut context,&style.highlight_theme).unwrap();
+        let node::Node::Root { children } = node else {
+            panic!("expected blocks")
+        };
+        let node::Node::Paragraph(html) = &children[0] else {
+            panic!("expected literal HTML")
+        };
+        assert_eq!(html.children[0].text.as_str(), "<script>raw</script>");
+        assert!(children
+            .iter()
+            .any(|node| matches!(node, node::Node::Table(_))));
+        assert!(children
+            .iter()
+            .any(|node| matches!(node, node::Node::List { .. })));
+        assert!(context.link_refs.is_empty());
     }
 }

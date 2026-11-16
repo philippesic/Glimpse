@@ -6,9 +6,9 @@ use std::{
 
 use gpui::{
     AnyElement, App, DefiniteLength, Div, Element, ElementId, FontStyle, FontWeight, Half,
-    HighlightStyle, InteractiveElement as _, IntoElement, Length, ListState, ObjectFit,
-    ParentElement, SharedString, SharedUri, StatefulInteractiveElement, Styled, StyledImage as _,
-    Window, div, img, prelude::FluentBuilder as _, px, relative, rems,
+    HighlightStyle, InteractiveElement as _, IntoElement, ListState, ObjectFit, ParentElement,
+    SharedString, SharedUri, StatefulInteractiveElement, Styled, StyledImage as _, Window, div,
+    img, prelude::FluentBuilder as _, px, relative, rems,
 };
 use markdown::mdast;
 use ropey::Rope;
@@ -377,6 +377,7 @@ impl CodeBlock {
             .child(
                 div()
                     .id("codeblock")
+                    .overflow_x_scroll()
                     .p_3()
                     .rounded(cx.theme().radius)
                     .bg(cx.theme().muted)
@@ -389,6 +390,7 @@ impl CodeBlock {
                         self.state.clone(),
                         vec![],
                         self.styles.clone(),
+                        None,
                     ))
                     .when_some(node_cx.code_block_actions.clone(), |this, actions| {
                         this.child(
@@ -410,6 +412,7 @@ impl CodeBlock {
 #[derive(Default, Clone)]
 pub(crate) struct NodeContext {
     pub(crate) link_refs: HashMap<SharedString, LinkMark>,
+    pub(crate) resources: Arc<super::TextViewResources>,
     pub(crate) style: TextViewStyle,
     pub(crate) code_block_actions: Option<Arc<CodeBlockActionsFn>>,
 }
@@ -431,7 +434,7 @@ impl PartialEq for NodeContext {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Node {
     Root {
-        children: Vec<Node>,
+        children: Arc<Vec<Node>>,
     },
     Paragraph(Paragraph),
     Heading {
@@ -472,14 +475,10 @@ impl Node {
         matches!(self, Self::ListItem { .. })
     }
 
-    pub(super) fn is_break(&self) -> bool {
-        matches!(self, Self::Break { .. })
-    }
-
     /// Combine all children, omitting the empt parent nodes.
     pub(super) fn compact(self) -> Node {
         match self {
-            Self::Root { mut children } if children.len() == 1 => children.remove(0).compact(),
+            Self::Root { children } if children.len() == 1 => children[0].clone().compact(),
             _ => self,
         }
     }
@@ -601,30 +600,52 @@ impl Paragraph {
                             inline_node.state.clone(),
                             links.clone(),
                             highlights.clone(),
+                            node_cx.resources.on_link.clone(),
                         )
                         .into_any_element(),
                     );
                 }
-                child_nodes.push(
-                    img(image.url.clone())
-                        .id(ix)
-                        .object_fit(ObjectFit::Contain)
-                        .max_w(relative(1.))
-                        .when_some(image.width, |this, width| this.w(width))
-                        .when_some(image.link.clone(), |this, link| {
-                            let title = image.title();
-                            this.cursor_pointer()
-                                .tooltip(move |window, cx| {
-                                    Tooltip::new(title.clone()).build(window, cx)
-                                })
-                                .on_click(move |_, _, cx| {
-                                    cx.stop_propagation();
-                                    cx.open_url(&link.url);
-                                })
-                        })
-                        .into_any_element(),
-                );
-
+                if node_cx.resources.restrict_images
+                    && !node_cx.resources.images.contains_key(&image.url)
+                {
+                    child_nodes.push(
+                        div()
+                            .child(format!("[Image unavailable: {}]", image.title()))
+                            .into_any_element(),
+                    );
+                } else {
+                    let image_source = node_cx
+                        .resources
+                        .images
+                        .get(&image.url)
+                        .cloned()
+                        .map(gpui::ImageSource::from)
+                        .unwrap_or_else(|| image.url.clone().into());
+                    let on_link = node_cx.resources.on_link.clone();
+                    child_nodes.push(
+                        img(image_source)
+                            .id(ix)
+                            .object_fit(ObjectFit::Contain)
+                            .max_w(relative(1.))
+                            .when_some(image.width, |this, width| this.w(width))
+                            .when_some(image.link.clone(), |this, link| {
+                                let title = image.title();
+                                this.cursor_pointer()
+                                    .tooltip(move |window, cx| {
+                                        Tooltip::new(title.clone()).build(window, cx)
+                                    })
+                                    .on_click(move |_, window, cx| {
+                                        cx.stop_propagation();
+                                        if let Some(on_link) = &on_link {
+                                            on_link(&link.url, window, cx);
+                                        } else {
+                                            cx.open_url(&link.url);
+                                        }
+                                    })
+                            })
+                            .into_any_element(),
+                    );
+                }
                 text.clear();
                 links.clear();
                 highlights.clear();
@@ -680,8 +701,16 @@ impl Paragraph {
         // Add the last text node
         if text.len() > 0 {
             self.state.lock().unwrap().set_text(text.into());
-            child_nodes
-                .push(Inline::new(ix, self.state.clone(), links, highlights).into_any_element());
+            child_nodes.push(
+                Inline::new(
+                    ix,
+                    self.state.clone(),
+                    links,
+                    highlights,
+                    node_cx.resources.on_link.clone(),
+                )
+                .into_any_element(),
+            );
         }
 
         div().id(span.unwrap_or_default()).children(child_nodes)
@@ -1033,6 +1062,7 @@ impl Node {
                     div()
                         .id("table")
                         .w_full()
+                        .overflow_x_scroll()
                         .border_1()
                         .border_color(cx.theme().border)
                         .rounded(cx.theme().radius)
@@ -1042,7 +1072,16 @@ impl Node {
                                 rows.push(
                                     div()
                                         .id("row")
-                                        .w_full()
+                                        .min_w_full()
+                                        .w(rems(
+                                            col_lens
+                                                .iter()
+                                                .map(|len| len.min(&MAX_LENGTH))
+                                                .sum::<usize>()
+                                                as f32
+                                                * 0.6
+                                                + col_lens.len() as f32,
+                                        ))
                                         .when(row_ix < table.children.len() - 1, |this| {
                                             this.border_b_1()
                                         })
@@ -1072,14 +1111,14 @@ impl Node {
                                                             align == ColumnumnAlign::Right,
                                                             |this| this.justify_end(),
                                                         )
-                                                        .w(Length::Definite(relative(len as f32)))
+                                                        .flex_shrink_0()
+                                                        .w(rems(len as f32 * 0.6 + 1.))
                                                         .px_2()
                                                         .py_1()
                                                         .when(!is_last_col, |this| {
                                                             this.border_r_1()
                                                                 .border_color(cx.theme().border)
                                                         })
-                                                        .truncate()
                                                         .child(
                                                             cell.children
                                                                 .render(node_cx, window, cx),
@@ -1156,7 +1195,7 @@ impl Node {
                 .id("div")
                 .children(
                     children
-                        .into_iter()
+                        .iter()
                         .map(move |node| node.render_block(options, node_cx, window, cx)),
                 )
                 .into_any_element(),

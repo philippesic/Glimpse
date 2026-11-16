@@ -406,7 +406,9 @@ fn parse_node(
                 if children.len() > 0 {
                     children.push(heading);
 
-                    Some(node::Node::Root { children })
+                    Some(node::Node::Root {
+                        children: children.into(),
+                    })
                 } else {
                     Some(heading)
                 }
@@ -438,7 +440,9 @@ fn parse_node(
 
                 if children.len() > 0 {
                     children.push(node::Node::Paragraph(paragraph));
-                    Some(node::Node::Root { children })
+                    Some(node::Node::Root {
+                        children: children.into(),
+                    })
                 } else {
                     Some(node::Node::Paragraph(paragraph))
                 }
@@ -503,7 +507,9 @@ fn parse_node(
                 let table = node::Node::Table(table);
                 if children.len() > 0 {
                     children.push(table);
-                    Some(node::Node::Root { children })
+                    Some(node::Node::Root {
+                        children: children.into(),
+                    })
                 } else {
                     Some(table)
                 }
@@ -535,7 +541,9 @@ fn parse_node(
                     if children.is_empty() {
                         None
                     } else {
-                        Some(node::Node::Root { children })
+                        Some(node::Node::Root {
+                            children: children.into(),
+                        })
                     }
                 } else {
                     // Others to as Inline
@@ -551,7 +559,9 @@ fn parse_node(
         },
         NodeData::Document => {
             let children = consume_children_nodes(node, paragraph, cx);
-            Some(node::Node::Root { children })
+            Some(node::Node::Root {
+                children: children.into(),
+            })
         }
         NodeData::Doctype { .. }
         | NodeData::Comment { .. }
