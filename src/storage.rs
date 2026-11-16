@@ -507,6 +507,9 @@ fn read_draft(path: &Path) -> Result<Draft, String> {
         return Err("Recovery record exceeds the supported size".into());
     }
     let draft: Draft = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    if draft.generation > i64::MAX as u64 {
+        return Err("Recovery generation is invalid".into());
+    }
     if draft.text.len() > crate::document::MAX_BYTES as usize
         || draft.base.len() > crate::document::MAX_BYTES as usize
     {
@@ -761,6 +764,25 @@ impl Drop for Recovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn malformed_recovery_generations_are_rejected_without_removing_records() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("record.json");
+        for generation in [u64::MAX, u64::MAX - 1] {
+            let draft = Draft {
+                path: "original".into(),
+                text: "local β".into(),
+                base: vec![],
+                target: None,
+                generation,
+            };
+            let bytes = serde_json::to_vec(&draft).unwrap();
+            fs::write(&path, &bytes).unwrap();
+            assert!(read_draft(&path).is_err());
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+    }
+
     #[test]
     fn frequent_locations_coalesce_visits_and_decay_old_usage() {
         let mut settings = Settings::default();

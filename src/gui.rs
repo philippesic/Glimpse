@@ -1,8 +1,10 @@
+mod decision;
 mod menus;
 mod modal;
 mod panes;
 mod platform;
 mod preferences;
+mod recovery;
 mod theme;
 
 use glimpse::directory::Entry;
@@ -111,6 +113,10 @@ struct CloseDecision {
     documents: Vec<u64>,
     saving: bool,
 }
+enum DecisionAction {
+    TrashRecord(PathBuf),
+}
+
 enum SettingsWrite {
     Preferences,
     Live,
@@ -165,12 +171,19 @@ struct Shell {
     preferences_subscription: Option<Subscription>,
     preferences_return: Option<FocusHandle>,
     subscriptions: Vec<Subscription>,
+    decision: Option<Entity<decision::Decision>>,
+    decision_action: Option<DecisionAction>,
+    decision_subscription: Option<Subscription>,
+    decision_return: Option<FocusHandle>,
     close_pending: Option<CloseDecision>,
     closings: glimpse::closing::Closings,
     quit_after_cleanup: bool,
     destination: Option<SaveDestination>,
     destination_busy: bool,
     records: Vec<storage::Record>,
+    recovery_usage: storage::RecoveryUsage,
+    records_truncated: bool,
+    importing: bool,
     ready: bool,
     startup_failed: bool,
     requested: Vec<(u64, PathBuf)>,
@@ -289,12 +302,19 @@ impl Shell {
             preferences_subscription: None,
             preferences_return: None,
             subscriptions: vec![subscription, shortcut_subscription],
+            decision: None,
+            decision_action: None,
+            decision_subscription: None,
+            decision_return: None,
             close_pending: None,
             closings: glimpse::closing::Closings::default(),
             quit_after_cleanup: false,
             destination: None,
             destination_busy: false,
             records: vec![],
+            recovery_usage: storage::RecoveryUsage::default(),
+            records_truncated: false,
+            importing: false,
             ready: false,
             startup_failed: false,
             requested: vec![],
@@ -456,6 +476,45 @@ impl Shell {
         }
         self.refresh();
         self.focus(window, cx);
+        cx.notify();
+    }
+
+    fn ask_decision(
+        &mut self,
+        action: DecisionAction,
+        title: String,
+        detail: String,
+        actions: Vec<&'static str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.decision.is_some() {
+            return;
+        }
+        self.decision_return = window.focused(cx);
+        let view = cx.new(|cx| decision::Decision::new(title, detail, actions, window, cx));
+        self.decision_subscription =
+            Some(
+                cx.subscribe_in(&view, window, |this, _, choice, window, cx| {
+                    let action = this.decision_action.take();
+                    this.decision = None;
+                    this.decision_subscription = None;
+                    if let Some(focus) = this.decision_return.take() {
+                        window.focus(&focus);
+                    }
+                    if choice.0 != 0 {
+                        match action {
+                            Some(DecisionAction::TrashRecord(path)) => {
+                                this.io.send(Job::TrashRecord(path))
+                            }
+                            None => {}
+                        }
+                    }
+                    cx.notify();
+                }),
+            );
+        self.decision_action = Some(action);
+        self.decision = Some(view);
         cx.notify();
     }
 
@@ -1100,28 +1159,67 @@ impl Shell {
                 }
                 Reply::Records(result) => match result {
                     Ok(inventory) => {
+                        self.recovery_usage = inventory.usage;
+                        self.records_truncated = inventory.records_truncated;
                         self.records = inventory.records;
                         self.status = format!("{} recovery/history records", self.records.len());
                     }
                     Err(e) => self.status = e,
                 },
-                Reply::Imported(import_id, result) => match result {
-                    Ok((draft, _)) => {
-                        let mut disk = DiskFile::draft();
-                        disk.path = draft.path.clone();
-                        disk.bytes = draft.base.clone();
-                        disk.bom = draft.base.starts_with(&[0xef, 0xbb, 0xbf]);
-                        let next_id = self.next_id;
-                        self.next_id = import_id;
-                        self.add_document(disk, draft.text, false, None, window, cx);
-                        self.next_id = self.next_id.max(next_id);
-                        if let Some(doc) = self.documents.last_mut() {
-                            doc.restored = true;
-                            doc.generation = draft.generation + 1;
+                Reply::Imported(import_id, result) => {
+                    self.importing = false;
+                    match result {
+                        Ok((draft, mut disk)) => {
+                            let duplicate =
+                                self.documents.iter().any(|doc| doc.disk.same_file(&disk));
+                            if duplicate {
+                                let mut copy = DiskFile::draft();
+                                copy.path = draft.path.clone();
+                                copy.bytes = draft.base.clone();
+                                copy.bom = disk.bom;
+                                disk = copy;
+                            }
+                            let next_id = self.next_id;
+                            self.next_id = import_id;
+                            self.add_document(disk, draft.text, false, None, window, cx);
+                            self.next_id = self.next_id.max(next_id);
+                            self.requested.retain(|(id, _)| *id != import_id);
+                            if let Some(doc) =
+                                self.documents.iter_mut().find(|doc| doc.id == import_id)
+                            {
+                                doc.restored = true;
+                                doc.generation = draft.generation + 1;
+                                self.io.send(Job::Recover(
+                                    import_id,
+                                    storage::Draft {
+                                        path: doc.disk.path.clone(),
+                                        target: Some(doc.disk.target.clone()),
+                                        text: doc.input.read(cx).value().to_string(),
+                                        base: doc.disk.bytes.clone(),
+                                        generation: doc.generation,
+                                    },
+                                ));
+                            }
+                            self.panel = None;
+                            self.status = if duplicate {
+                                "Restored a separate copy because the original is already open. Use Save As.".into()
+                            } else {
+                                "Recovered local text. The original file has not been changed."
+                                    .into()
+                            };
+                            self.check_document(import_id);
                         }
+                        Err(error) => self.status = error,
                     }
-                    Err(e) => self.status = e,
-                },
+                    self.io.send(Job::Inventory);
+                }
+                Reply::RecordTrashed(result) => {
+                    self.status = match result {
+                        Ok(()) => "Recovery record moved to Trash".into(),
+                        Err(error) => error,
+                    };
+                    self.io.send(Job::Inventory);
+                }
                 Reply::Chosen(path, result) => match result {
                     Ok(()) => {
                         use std::{io::Write, os::unix::ffi::OsStrExt};
@@ -1318,6 +1416,9 @@ impl Shell {
         .detach();
     }
     fn close(&mut self, quit: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.decision.is_some() {
+            return;
+        }
         if let Some(preferences) = &self.preferences {
             if preferences.read(cx).busy() {
                 self.status = "Wait for the settings operation to finish".into();
@@ -1392,7 +1493,10 @@ impl Shell {
         }
     }
     fn shortcut(&mut self, key: &Keystroke, window: &mut Window, cx: &mut Context<Self>) {
-        if self.preferences.is_some() || (!key.modifiers.control && !key.modifiers.platform) {
+        if self.decision.is_some()
+            || self.preferences.is_some()
+            || (!key.modifiers.control && !key.modifiers.platform)
+        {
             return;
         }
         let bindings = glimpse::commands::bindings(&self.settings.keymaps).unwrap_or_default();
@@ -1600,6 +1704,9 @@ impl Shell {
             "commands" => self.panel(Panel::Palette, window, cx),
             "settings" => self.open_preferences(self.settings.clone(), window, cx),
             "recovery" => self.panel(Panel::Recovery, window, cx),
+            "refresh-recovery" => {
+                self.io.send(Job::Inventory);
+            }
             "line" => self.panel(Panel::Line, window, cx),
             "parent" => {
                 if let Some(path) = self.current.parent().map(|p| p.to_owned()) {
@@ -1910,7 +2017,9 @@ impl Render for Shell {
                     .p_2()
                     .child(title)
                     .child(Input::new(&self.query).flex_1().min_w_0())
-                    .child(self.button("Apply", "submit", cx).into_any_element())
+                    .when(!matches!(panel, Panel::Recovery | Panel::Filter), |row| {
+                        row.child(self.button("Apply", "submit", cx))
+                    })
                     .child(self.button("Close", "dismiss", cx)),
             );
             if matches!(panel, Panel::Files | Panel::Text) {
@@ -1998,47 +2107,10 @@ impl Render for Shell {
                 );
             }
             if panel == Panel::Recovery {
-                let query = self.query.read(cx).value().to_lowercase();
-                root = root.child(
-                    div()
-                        .id("records")
-                        .max_h(px(240.))
-                        .overflow_y_scroll()
-                        .children(
-                            self.records
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, record)| {
-                                    paths::display(&record.original)
-                                        .to_lowercase()
-                                        .contains(&query)
-                                })
-                                .map(|(i, record)| {
-                                    let path = record.path.clone();
-                                    let history = record.history;
-                                    div()
-                                        .id(("record", i))
-                                        .p_2()
-                                        .child(format!(
-                                            "Restore {}: {}",
-                                            if history { "saved version" } else { "draft" },
-                                            paths::display(&record.original)
-                                        ))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            let id = this.next_id;
-                                            this.next_id += 1;
-                                            this.io.send(if history {
-                                                Job::RestoreHistory(id, path.clone())
-                                            } else {
-                                                Job::Import(id, path.clone())
-                                            });
-                                            cx.notify();
-                                        }))
-                                }),
-                        ),
-                );
+                root = root.child(self.recovery_view(cx));
             }
         }
+
         if let Some(decision) = &self.close_pending {
             let names = self
                 .documents
@@ -2307,8 +2379,9 @@ impl Render for Shell {
                 )
             })
             .children(self.preferences.clone())
+            .children(self.decision.clone())
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                if this.preferences.is_some() {
+                if this.preferences.is_some() || this.decision.is_some() {
                     return;
                 }
                 let key = &event.keystroke;

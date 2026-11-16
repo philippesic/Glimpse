@@ -240,8 +240,9 @@ impl IoWorker {
                             Reply::Imported(
                                 id,
                                 (|| {
-                                    let draft =
+                                    let mut draft =
                                         storage::restore_snapshot(&path, observed_snapshot)?;
+                                    draft.target = None;
                                     recovery
                                         .as_ref()
                                         .as_ref()
@@ -568,6 +569,10 @@ impl IoWorker {
                         Reply::Finished(id, generation, attempt, Err(message))
                     }
                     Job::Open(path, token, _) => Reply::Open(path, token, Err(message)),
+                    Job::Import(id, _)
+                    | Job::RestoreHistory(id, _)
+                    | Job::RestoreObserved(id, _) => Reply::Imported(id, Err(message)),
+                    Job::TrashRecord(_) => Reply::RecordTrashed(Err(message)),
                     _ => Reply::Done(Err(message)),
                 };
                 let _ = self.errors.send(reply);
@@ -664,6 +669,64 @@ impl Drop for IoWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn restored_history_is_an_unbound_copy_and_import_keeps_its_binding() {
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join("original.txt");
+        std::fs::write(&original, b"\xef\xbb\xbfdisk\r\n").unwrap();
+        let recovery_root = root.path().join("recovery");
+        let source = storage::Recovery::new(&recovery_root).unwrap();
+        let draft = storage::Draft {
+            path: original.clone(),
+            target: Some(original.clone()),
+            text: "local β\r\n".into(),
+            base: std::fs::read(&original).unwrap(),
+            generation: 7,
+        };
+        source.write(41, &draft).unwrap();
+        let record = source.directory.join("41.json");
+        let snapshot = source.checkpoint_version(&draft).unwrap();
+        source.resolved(&snapshot).unwrap();
+        drop(source);
+        let history = storage::inventory(&recovery_root)
+            .unwrap()
+            .records
+            .into_iter()
+            .find(|record| record.history)
+            .unwrap()
+            .path;
+        let io = IoWorker::new_in(wake::Context::default(), recovery_root);
+        io.send(Job::RestoreHistory(8, history.clone()));
+        match io
+            .replies
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+        {
+            Reply::Imported(8, Ok((restored, disk))) => {
+                assert_eq!(restored.text, draft.text);
+                assert!(disk.target.as_os_str().is_empty());
+                assert!(disk.bom);
+                assert!(history.exists());
+            }
+            _ => panic!("history restore failed"),
+        }
+        io.send(Job::Import(9, record.clone()));
+        match io
+            .replies
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+        {
+            Reply::Imported(9, Ok((restored, disk))) => {
+                assert_eq!(restored.text, draft.text);
+                assert_eq!(disk.target, original);
+                assert_eq!(disk.bytes, draft.base);
+                assert!(!record.exists());
+            }
+            _ => panic!("draft import failed"),
+        }
+        assert_eq!(std::fs::read(&original).unwrap(), draft.base);
+    }
+
     #[test]
     fn reloading_settings_cannot_authorize_a_stale_snapshot() {
         let root = tempfile::tempdir().unwrap();
