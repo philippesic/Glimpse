@@ -199,6 +199,15 @@ impl Preferences {
         };
         let mut settings = self.draft.clone();
         settings.font_family = value(Field::Font).trim().to_owned();
+        if !settings.font_family.is_empty()
+            && !cx
+                .text_system()
+                .all_font_names()
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(&settings.font_family))
+        {
+            return Err("Source font family is unavailable. Enter an installed family or clear the field for system monospace.".into());
+        }
         settings.font_size = number(Field::Size, "Source font size")?;
         settings.line_height = number(Field::Height, "Line height")?;
         settings.ui_scale = number(Field::Scale, "Interface scale")?;

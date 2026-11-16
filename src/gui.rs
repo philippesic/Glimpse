@@ -226,6 +226,7 @@ struct Shell {
     reading: bool,
     reading_view: Option<reading::View>,
     status: String,
+    font_warning: Option<String>,
     warnings: Vec<String>,
     omitted_warnings: u64,
     volumes: Option<glimpse::locations::Volumes>,
@@ -392,6 +393,7 @@ impl Shell {
             reading: false,
             reading_view: None,
             status: String::new(),
+            font_warning: None,
             warnings: Vec::new(),
             omitted_warnings: 0,
             volumes: None,
@@ -567,7 +569,7 @@ impl Shell {
         if let Some(warning) = &self.settings.warning {
             self.status = warning.clone();
         }
-        theme::apply(&self.settings, window, cx);
+        self.font_warning = theme::apply(&self.settings, window, cx);
         self.reset_search("Search settings changed; press Enter to search");
         for doc in &self.documents {
             doc.input.update(cx, |input, cx| {
@@ -3318,7 +3320,11 @@ impl Render for Shell {
                         footer.child(self.button("Recovery Warning…", "warnings", cx))
                     })
                     .when(self.warnings.is_empty(), |footer| {
-                        let message = self.status.clone();
+                        let message = match &self.font_warning {
+                            Some(warning) if self.status.is_empty() => warning.clone(),
+                            Some(warning) => format!("{} · {warning}", self.status),
+                            None => self.status.clone(),
+                        };
                         footer.child(
                             div()
                                 .id("status-message")
