@@ -714,6 +714,13 @@ impl Shell {
                 this.validated.remove(&id);
                 this.completed.remove(&id);
                 doc.generation += 1;
+                if this.closings.contains(id) {
+                    this.closings.forget(id);
+                    this.cleanup_texts.remove(&id);
+                    this.keep_after_cleanup.remove(&id);
+                    this.quit_after_cleanup = false;
+                    this.status = "Close cancelled because the document was edited".into();
+                }
                 glimpse::metrics::event("change", id, doc.generation);
                 doc.preview = false;
                 if !this.request.pick && !doc.dirty(cx) {
@@ -1499,6 +1506,7 @@ impl Shell {
         if self.request.pick {
             return;
         }
+        self.cancel_cleanup_for_active(window, cx);
         if let Some(doc) = self
             .documents
             .iter_mut()
@@ -1534,6 +1542,7 @@ impl Shell {
         if self.request.pick || self.destination_busy {
             return;
         }
+        self.cancel_cleanup_for_active(window, cx);
         let Some(doc) = self.documents.iter().find(|d| Some(d.id) == self.active) else {
             return;
         };

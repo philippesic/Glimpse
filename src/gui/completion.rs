@@ -1,6 +1,15 @@
 use super::*;
 
 impl Shell {
+    pub(super) fn cancel_cleanup_for_active(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active.is_some_and(|id| self.closings.contains(id)) {
+            self.command("cancel-close", window, cx);
+        }
+    }
     pub(super) fn finish_requested(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.request.wait || self.finished {
             self.status = "No CLI editing request is waiting".into();

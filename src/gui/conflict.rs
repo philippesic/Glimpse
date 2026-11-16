@@ -20,6 +20,7 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.cancel_cleanup_for_active(window, cx);
         let Some(doc) = self
             .documents
             .iter()
