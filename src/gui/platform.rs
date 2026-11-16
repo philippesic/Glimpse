@@ -33,3 +33,15 @@ pub const MONOSPACE_FAMILIES: &[&str] = &[
     "DejaVu Sans Mono",
     "Noto Sans Mono",
 ];
+
+pub(super) fn configure_allocations() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    for (option, variable) in [
+        (libc::M_MMAP_THRESHOLD, "MALLOC_MMAP_THRESHOLD_"),
+        (libc::M_TRIM_THRESHOLD, "MALLOC_TRIM_THRESHOLD_"),
+    ] {
+        if std::env::var_os(variable).is_none() {
+            unsafe { libc::mallopt(option, 1024 * 1024) };
+        }
+    }
+}

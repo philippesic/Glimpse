@@ -35,6 +35,7 @@ use std::{
 };
 
 pub fn run(request: cli::Request) {
+    platform::configure_allocations();
     Application::new()
         .with_assets(gpui_component_assets::Assets)
         .run(move |cx| {
