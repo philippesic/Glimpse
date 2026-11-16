@@ -747,3 +747,12 @@ priority = -1
 [lints.rust.unexpected_cfgs]
 level = "allow"
 priority = 0
+
+[dependencies.accesskit]
+version = "=0.25.2"
+
+[target.'cfg(target_os = "linux")'.dependencies.accesskit_unix]
+version = "=0.24.1"
+
+[dependencies.async-channel]
+version = "2"

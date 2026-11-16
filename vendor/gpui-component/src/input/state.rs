@@ -2,6 +2,8 @@
 //!
 //! Based on the `Input` example from the `gpui` crate.
 //! https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/input.rs
+mod accessibility;
+
 use anyhow::Result;
 use gpui::{
     Action, App, AppContext, Bounds, ClipboardItem, Context, Entity, EntityInputHandler,
@@ -264,6 +266,7 @@ pub struct InputState {
     pub(super) focus_handle: FocusHandle,
     pub(super) mode: InputMode,
     pub(super) text: Rope,
+    accessibility_label: Option<SharedString>,
     pub(super) text_wrapper: TextWrapper,
     pub(super) history: History<Change>,
     pub(super) blink_cursor: Entity<BlinkCursor>,
@@ -389,6 +392,7 @@ impl InputState {
         let mouse_context_menu = MouseContextMenu::new(cx.entity(), window, cx);
 
         Self {
+            accessibility_label: None,
             external_highlights: None,
             focus_handle: focus_handle.clone(),
             text: "".into(),
@@ -1896,6 +1900,15 @@ impl InputState {
         ))
     }
 
+    pub fn set_accessibility_label(
+        &mut self,
+        label: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        self.accessibility_label = Some(label.into());
+        cx.notify();
+    }
+
     pub fn interaction_active(&self) -> bool {
         self.selecting || self.ime_marked_range.is_some()
     }
@@ -2241,7 +2254,11 @@ impl Render for InputState {
             self._pending_update = false;
         }
 
-        div()
+        let input = cx.entity();
+        let action_input = input.clone();
+        let mapping = Rc::new(std::cell::RefCell::new(accessibility::Mapping::default()));
+        let action_mapping = mapping.clone();
+        let rendered = div()
             .id("input-state")
             .flex_1()
             .when(self.mode.is_multi_line(), |this| this.h_full())
@@ -2250,7 +2267,17 @@ impl Render for InputState {
             .child(TextElement::new(cx.entity().clone()).placeholder(self.placeholder.clone()))
             .children(self.diagnostic_popover.clone())
             .children(self.context_menu.as_ref().map(|menu| menu.render()))
-            .children(self.hover_popover.clone())
+            .children(self.hover_popover.clone());
+        gpui::accessible("input-semantics", rendered, move |id, window, cx| {
+            input
+                .read(cx)
+                .accessibility_info(id, window, &mut mapping.borrow_mut())
+        })
+        .on_action(move |request, _, window, cx| {
+            action_input.update(cx, |state, cx| {
+                state.accessibility_action(request, &action_mapping.borrow(), window, cx)
+            });
+        })
     }
 }
 

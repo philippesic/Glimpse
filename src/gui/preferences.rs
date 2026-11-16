@@ -437,7 +437,9 @@ impl Render for Preferences {
                 }))
                 .into_any_element()
         };
-        div()
+        let semantic_title = "Preferences".to_owned();
+        let semantic_detail = "Appearance, text, editing, search and keyboard settings".to_owned();
+        let rendered = div()
             .id("preferences-overlay")
             .absolute()
             .inset_0()
@@ -525,6 +527,14 @@ impl Render for Preferences {
                                     .on_click(cx.listener(|this, _, _, cx| this.apply(cx))),
                             ),
                     ),
-            )
+            );
+        gpui::accessible("modal-semantics", rendered, move |_, _, _| {
+            let mut node = gpui::accesskit::Node::new(gpui::accesskit::Role::Dialog);
+            node.set_label(semantic_title.clone());
+            node.set_description(semantic_detail.clone());
+            let mut info = gpui::AccessibilityInfo::new(node);
+            info.modal = true;
+            info
+        })
     }
 }

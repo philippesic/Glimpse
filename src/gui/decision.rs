@@ -58,21 +58,26 @@ impl Decision {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.comparison = Some([local, observed].map(|text| {
-            cx.new(|cx| {
-                let mut input = InputState::new(window, cx)
-                    .code_editor("text")
-                    .default_value(text.to_owned());
-                input.set_cursor_blink(false, cx);
-                input
-            })
-        }));
+        self.comparison = Some(
+            [("Local text", local), ("Observed disk text", observed)].map(|(label, text)| {
+                cx.new(|cx| {
+                    let mut input = InputState::new(window, cx)
+                        .code_editor("text")
+                        .default_value(text.to_owned());
+                    input.set_cursor_blink(false, cx);
+                    input.set_accessibility_label(label, cx);
+                    input
+                })
+            }),
+        );
         cx.notify();
     }
 }
 impl Render for Decision {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+        let semantic_title = self.title.clone();
+        let semantic_detail = self.detail.clone();
+        let rendered = div()
             .id("decision-overlay")
             .absolute()
             .inset_0()
@@ -133,6 +138,14 @@ impl Render for Decision {
                                 .on_click(cx.listener(move |_, _, _, cx| cx.emit(Choice(i))))
                         }),
                     )),
-            )
+            );
+        gpui::accessible("modal-semantics", rendered, move |_, _, _| {
+            let mut node = gpui::accesskit::Node::new(gpui::accesskit::Role::Dialog);
+            node.set_label(semantic_title.clone());
+            node.set_description(semantic_detail.clone());
+            let mut info = gpui::AccessibilityInfo::new(node);
+            info.modal = true;
+            info
+        })
     }
 }

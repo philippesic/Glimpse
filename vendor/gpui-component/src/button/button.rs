@@ -447,7 +447,19 @@ impl RenderOnce for Button {
             ButtonRounded::None => Pixels::ZERO,
         };
 
-        self.base
+        let semantic_id = self.id.clone();
+        let semantic_label = self
+            .label
+            .clone()
+            .or_else(|| self.tooltip.as_ref().map(|(label, _)| label.clone()))
+            .unwrap_or_else(|| "Button".into());
+        let semantic_disabled = self.disabled || self.loading;
+        let semantic_selected = self.selected;
+        let semantic_handler = self.on_click.clone();
+        let semantic_focus = focus_handle.clone();
+        let action_focus = focus_handle.clone();
+        let rendered = self
+            .base
             .when(!self.disabled, |this| {
                 this.track_focus(
                     &focus_handle
@@ -617,7 +629,39 @@ impl RenderOnce for Button {
                         .build(window, cx)
                 })
             })
-            .focus_ring(is_focused, px(0.), window, cx)
+            .focus_ring(is_focused, px(0.), window, cx);
+        gpui::accessible(semantic_id, rendered, move |_, window, _| {
+            use gpui::accesskit::{Action, Node, Role};
+            let mut node = Node::new(Role::Button);
+            node.set_label(semantic_label.to_string());
+            node.set_selected(semantic_selected);
+            if semantic_disabled {
+                node.set_disabled();
+            } else {
+                node.add_action(Action::Click);
+                node.add_action(Action::Focus);
+            }
+            let mut info = gpui::AccessibilityInfo::new(node);
+            info.focused = semantic_focus.is_focused(window);
+            info
+        })
+        .on_action(move |request, bounds, window, cx| {
+            use gpui::accesskit::Action;
+            if semantic_disabled {
+                return;
+            }
+            match request.action {
+                Action::Focus => action_focus.focus(window),
+                Action::Click => {
+                    if let Some(handler) = &semantic_handler {
+                        handler(&ClickEvent::default(), window, cx);
+                    } else {
+                        window.dispatch_accessible_click(bounds, cx);
+                    }
+                }
+                _ => {}
+            }
+        })
     }
 }
 

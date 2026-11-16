@@ -8,6 +8,11 @@ extern crate self as gpui;
 
 #[macro_use]
 mod action;
+/// Native accessibility semantics and platform adapters.
+pub mod accessibility;
+/// Cross-platform semantic roles, states and actions.
+pub use accesskit;
+pub use accessibility::{accessible, Accessible, AccessibilityInfo};
 mod app;
 
 mod arena;

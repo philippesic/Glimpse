@@ -66,6 +66,7 @@ pub fn run(request: cli::Request) {
                     ..Default::default()
                 },
                 move |window, cx| {
+                    window.set_window_title("Glimpse");
                     let view = cx.new(|cx| Shell::new(request, window, cx));
                     let weak = view.downgrade();
                     window.on_window_should_close(cx, move |window, cx| {
@@ -875,6 +876,7 @@ impl Shell {
                 .soft_wrap(self.settings.wrap)
                 .default_value(text.clone());
             input.set_cursor_blink(false, cx);
+            input.set_accessibility_label(format!("Source: {}", paths::display(&disk.path)), cx);
             input.set_tab_size(
                 gpui_component::input::TabSize {
                     tab_size: self.settings.indent,
@@ -1454,6 +1456,12 @@ impl Shell {
                                     doc.resolved_through.max(destination.generation);
                                 doc.deferred_external = None;
                                 doc.disk = disk;
+                                doc.input.update(cx, |input, cx| {
+                                    input.set_accessibility_label(
+                                        format!("Source: {}", paths::display(&doc.disk.path)),
+                                        cx,
+                                    )
+                                });
                                 doc.external = None;
                                 doc.saved = destination.text;
                                 doc.restored = false;
