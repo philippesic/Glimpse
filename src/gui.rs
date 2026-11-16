@@ -91,6 +91,10 @@ enum Panel {
     NewFolder,
     Rename,
 }
+struct OpenIntent {
+    preview: bool,
+    position: Option<(usize, usize)>,
+}
 struct CloseDecision {
     quit: bool,
     documents: Vec<u64>,
@@ -122,7 +126,8 @@ struct Shell {
     active: Option<u64>,
     next_id: u64,
     open_token: u64,
-    opening: HashMap<u64, (bool, usize)>,
+    path_request: Option<u64>,
+    opening: HashMap<u64, OpenIntent>,
     hit_versions: HashMap<u64, u64>,
     panel: Option<Panel>,
     query: Entity<InputState>,
@@ -140,7 +145,7 @@ struct Shell {
     startup_failed: bool,
     requested: Vec<(u64, PathBuf)>,
     finished: bool,
-    finish_pending: usize,
+    finishing: glimpse::validation::Validations,
 }
 impl Shell {
     fn new(request: cli::Request, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -171,6 +176,13 @@ impl Shell {
         let subscription = cx.subscribe_in(&query, window, |this, _, event, window, cx| {
             if matches!(event, InputEvent::PressEnter { .. }) {
                 this.submit(window, cx);
+            }
+            if matches!(event, InputEvent::Change)
+                && matches!(this.panel, Some(Panel::Files | Panel::Text))
+            {
+                this.search_id = this.search.cancel();
+                this.hits.clear();
+                cx.notify();
             }
             if matches!(event, InputEvent::Change) && this.panel == Some(Panel::Filter) {
                 this.filter = this.query.read(cx).value().to_string();
@@ -212,6 +224,7 @@ impl Shell {
             active: None,
             next_id: 1,
             open_token: 0,
+            path_request: None,
             opening: HashMap::new(),
             hit_versions: HashMap::new(),
             panel: None,
@@ -230,7 +243,7 @@ impl Shell {
             startup_failed: false,
             requested: vec![],
             finished: false,
-            finish_pending: 0,
+            finishing: glimpse::validation::Validations::default(),
             search_id: 0,
             hits: vec![],
         };
@@ -238,8 +251,9 @@ impl Shell {
         this.refresh();
         this.io.send(Job::LoadSettings);
         let files = this.request.files.clone();
-        for path in files {
-            this.open(path, false, this.request.line);
+        for (index, path) in files.into_iter().enumerate() {
+            let position = (index == 0).then_some((this.request.line, this.request.column));
+            this.open(path, false, position);
         }
         this
     }
@@ -269,40 +283,54 @@ impl Shell {
         self.watch();
     }
     fn navigate(&mut self, path: PathBuf) {
-        if path == self.current {
-            return;
+        if path != self.current {
+            self.history.push(self.current.clone());
+            self.future.clear();
+            self.change_location(path);
         }
+    }
+    fn change_location(&mut self, path: PathBuf) {
         if let Some(selection) = self.selection.take() {
             self.selections.insert(self.current.clone(), selection);
         }
-        self.history
-            .push(std::mem::replace(&mut self.current, path));
-        self.future.clear();
+        self.current = path;
         self.selection = self.selections.get(&self.current).cloned();
         self.filter.clear();
         self.hits.clear();
         self.search_id = self.search.cancel();
         self.refresh();
     }
-    fn open(&mut self, path: PathBuf, preview: bool, line: usize) {
+    fn selected_path(&self) -> Option<PathBuf> {
+        self.selection
+            .as_ref()
+            .filter(|path| {
+                path.parent() == Some(self.current.as_path())
+                    && self.entries.iter().any(|entry| entry.path == **path)
+            })
+            .cloned()
+    }
+    fn open(
+        &mut self,
+        path: PathBuf,
+        preview: bool,
+        position: Option<(usize, usize)>,
+    ) -> Option<u64> {
         if self.destination_busy {
             self.status = "Finish the destination save before opening another file".into();
-            return;
-        }
-        if path.is_dir() {
-            self.navigate(path);
-            return;
+            return None;
         }
         self.open_token += 1;
-        self.opening.insert(self.open_token, (preview, line));
+        self.opening
+            .insert(self.open_token, OpenIntent { preview, position });
         self.io.send(Job::Open(path, self.open_token, false));
+        Some(self.open_token)
     }
     fn add_document(
         &mut self,
         disk: DiskFile,
         text: String,
         preview: bool,
-        line: usize,
+        position: Option<(usize, usize)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -315,8 +343,13 @@ impl Shell {
             {
                 self.requested.push((doc.id, disk.path.clone()));
             }
-            self.active = Some(doc.id);
-            self.focus(window, cx);
+            let id = doc.id;
+            self.active = Some(id);
+            if let Some(position) = position {
+                self.position_document(id, position, window, cx);
+            } else {
+                self.focus(window, cx);
+            }
             return;
         }
         if preview {
@@ -339,6 +372,7 @@ impl Shell {
                     return;
                 }
                 if let Some(doc) = this.documents.iter_mut().find(|d| d.id == id) {
+                    this.finishing.invalidate();
                     doc.generation += 1;
                     glimpse::metrics::event("change", id, doc.generation);
                     doc.preview = false;
@@ -391,8 +425,25 @@ impl Shell {
         self.active = Some(id);
         self.reading = false;
         self.watch();
+        self.position_document(id, position.unwrap_or((1, 1)), window, cx);
+    }
+    fn position_document(
+        &mut self,
+        id: u64,
+        (line, column): (usize, usize),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(input) = self
+            .documents
+            .iter()
+            .find(|doc| doc.id == id)
+            .map(|doc| doc.input.clone())
+        else {
+            return;
+        };
         let text = input.read(cx).value();
-        let (position, clamped) = glimpse::editor::position(&text, line, self.request.column);
+        let (position, clamped) = glimpse::editor::position(&text, line, column);
         let byte = text
             .char_indices()
             .nth(position)
@@ -430,7 +481,7 @@ impl Shell {
     fn panel(&mut self, panel: Panel, window: &mut Window, cx: &mut Context<Self>) {
         self.panel = Some(panel);
         let value = if panel == Panel::Path {
-            paths::display(&self.current)
+            paths::entry(&self.current)
         } else {
             String::new()
         };
@@ -453,18 +504,19 @@ impl Shell {
                     .find(|command| command.label.to_lowercase().contains(&query))
                 {
                     self.panel = None;
+                    self.focus(window, cx);
                     self.command(command.id, window, cx);
                 }
             }
-            Some(Panel::Path) => {
-                let path = PathBuf::from(value);
-                if path.exists() {
-                    self.open(path, false, 1);
-                    self.panel = None;
-                } else {
-                    self.status = "Path does not exist".into();
+            Some(Panel::Path) => match paths::parse_entry(&value, &self.current) {
+                Ok(path) => {
+                    if let Some(old) = self.path_request.take() {
+                        self.opening.remove(&old);
+                    }
+                    self.path_request = self.open(path, false, None);
                 }
-            }
+                Err(error) => self.status = error,
+            },
             Some(Panel::Files | Panel::Text) => {
                 let scope = self.scope.clone().unwrap_or_else(|| self.current.clone());
                 self.search_id = self
@@ -486,14 +538,15 @@ impl Shell {
             }
             Some(Panel::NewFile | Panel::NewFolder | Panel::Rename) => {
                 let path = self.current.join(&value);
-                if value.is_empty() || PathBuf::from(&value).components().count() != 1 {
+                if !paths::single_name(&value) {
                     self.status = "Enter one filename".into();
                 } else if self.panel == Some(Panel::Rename) {
-                    if let Some(source) = self.selection.clone() {
+                    if let Some(source) = self.selected_path() {
                         if self.documents.iter().any(|doc| doc.disk.path == source) {
                             self.status = "Close the file before renaming".into();
                         } else {
-                            self.io.send(Job::Rename(source, path));
+                            let destination = source.with_file_name(&value);
+                            self.io.send(Job::Rename(source, destination));
                             self.panel = None;
                         }
                     }
@@ -542,8 +595,22 @@ impl Shell {
         }
         while let Ok(reply) = self.io.replies.try_recv() {
             match reply {
+                Reply::OpenDirectory(path, token)
+                    if self.opening.remove(&token).is_some() && token == self.open_token =>
+                {
+                    if self.path_request == Some(token) {
+                        self.path_request = None;
+                        self.panel = None;
+                    }
+                    self.navigate(path);
+                    window.focus(&self.nav_focus);
+                }
                 Reply::Open(path, token, result) => {
-                    if let Some((preview, line)) = self.opening.remove(&token) {
+                    if let Some(OpenIntent { preview, position }) = self.opening.remove(&token) {
+                        let from_path = self.path_request == Some(token);
+                        if from_path {
+                            self.path_request = None;
+                        }
                         match result {
                             Ok((disk, text)) => {
                                 if self.destination_busy {
@@ -559,12 +626,18 @@ impl Shell {
                                     self.status = "Search result changed or has unsaved edits. Search again before jumping.".into();
                                     continue;
                                 }
-                                self.add_document(disk, text, preview, line, window, cx)
+                                if from_path {
+                                    self.panel = None;
+                                }
+                                self.add_document(disk, text, preview, position, window, cx)
                             }
                             Err(e) => {
                                 self.startup_failed |=
                                     !self.ready && self.request.files.contains(&path);
                                 self.status = e;
+                                if !from_path {
+                                    self.focus(window, cx);
+                                }
                             }
                         }
                     }
@@ -732,7 +805,7 @@ impl Shell {
                         disk.bom = draft.base.starts_with(&[0xef, 0xbb, 0xbf]);
                         let next_id = self.next_id;
                         self.next_id = import_id;
-                        self.add_document(disk, draft.text, false, 1, window, cx);
+                        self.add_document(disk, draft.text, false, None, window, cx);
                         self.next_id = self.next_id.max(next_id);
                         if let Some(doc) = self.documents.last_mut() {
                             doc.restored = true;
@@ -765,21 +838,36 @@ impl Shell {
                     }
                     Err(e) => self.status = e,
                 },
-                Reply::Finished(_, _, result) => {
-                    self.finish_pending = self.finish_pending.saturating_sub(1);
-                    if let Err(e) = result {
-                        self.status = e;
-                        self.finish_pending = usize::MAX;
-                    }
-                    if self.finish_pending == 0 {
-                        self.finished = true;
-                        let _ = lifecycle::notify(b'0');
-                        self.status = "CLI request finished".into();
+                Reply::Finished(id, generation, attempt, result) => {
+                    glimpse::metrics::event("finish-reply", id, generation);
+                    match self.finishing.acknowledge(attempt, id, generation, result) {
+                        Ok(Some(snapshots)) => {
+                            let valid = snapshots.iter().all(|(id, generation)| {
+                                self.documents.iter().any(|doc| {
+                                    doc.id == *id
+                                        && doc.generation == *generation
+                                        && !doc.dirty(cx)
+                                        && !doc.saving
+                                })
+                            });
+                            if valid && !self.finished {
+                                self.finished = true;
+                                let _ = lifecycle::notify(b'0');
+                                self.status = "CLI request finished".into();
+                            } else {
+                                self.status = "Documents changed during validation; Finish again after saving".into();
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => self.status = error,
                     }
                 }
                 Reply::Done(Err(error)) | Reply::HistoryWarning(error) => self.status = error,
                 Reply::Changed(result) => match result {
-                    Ok(()) => self.refresh(),
+                    Ok(()) => {
+                        self.refresh();
+                        window.focus(&self.nav_focus);
+                    }
                     Err(e) => self.status = e,
                 },
                 _ => {}
@@ -834,7 +922,6 @@ impl Shell {
                 .collect();
             doc.input
                 .update(cx, |input, cx| input.set_external_highlights(spans, cx));
-            let _ = highlight.state;
         }
         cx.notify();
     }
@@ -880,7 +967,11 @@ impl Shell {
         let Some(doc) = self.documents.iter().find(|d| Some(d.id) == self.active) else {
             return;
         };
-        if !copy && !self.finished && self.requested.iter().any(|(id, _)| *id == doc.id) {
+        if !copy
+            && self.request.wait
+            && !self.finished
+            && self.requested.iter().any(|(id, _)| *id == doc.id)
+        {
             self.status = "Finish or Abort the CLI request before rebinding this file".into();
             return;
         }
@@ -1016,8 +1107,15 @@ impl Shell {
             }
             "submit" => self.submit(window, cx),
             "dismiss" => {
+                if let Some(token) = self.path_request.take() {
+                    self.opening.remove(&token);
+                }
+                if self.panel == Some(Panel::Filter) {
+                    self.filter.clear();
+                }
                 self.panel = None;
                 self.hits.clear();
+                self.search_id = self.search.cancel();
                 self.focus(window, cx);
             }
             "cancel-close" => {
@@ -1081,7 +1179,7 @@ impl Shell {
             "save-as" => self.save_as(false, window, cx),
             "save-copy" => self.save_as(true, window, cx),
             "new" if !self.request.pick => {
-                self.add_document(DiskFile::draft(), String::new(), false, 1, window, cx)
+                self.add_document(DiskFile::draft(), String::new(), false, None, window, cx)
             }
             "open" | "folder" => {
                 let prompt = cx.prompt_for_paths(PathPromptOptions {
@@ -1094,7 +1192,7 @@ impl Shell {
                     if let Ok(Ok(Some(paths))) = prompt.await {
                         let _ = this.update(cx, |this, cx| {
                             for path in paths {
-                                this.open(path, false, 1);
+                                this.open(path, false, None);
                             }
                             cx.notify();
                         });
@@ -1118,15 +1216,14 @@ impl Shell {
             "home" => self.navigate(std::env::home_dir().unwrap()),
             "back" => {
                 if let Some(path) = self.history.pop() {
-                    self.future.push(std::mem::replace(&mut self.current, path));
-                    self.refresh();
+                    self.future.push(self.current.clone());
+                    self.change_location(path);
                 }
             }
             "forward" => {
                 if let Some(path) = self.future.pop() {
-                    self.history
-                        .push(std::mem::replace(&mut self.current, path));
-                    self.refresh();
+                    self.history.push(self.current.clone());
+                    self.change_location(path);
                 }
             }
             "refresh" => self.refresh(),
@@ -1148,21 +1245,35 @@ impl Shell {
                 self.status = "CLI request aborted".into();
             }
             "finish" => {
-                if self.requested.iter().any(|(id, _)| {
+                if !self.request.wait || self.finished {
+                    self.status = "No CLI editing request is waiting".into();
+                } else if self.requested.iter().any(|(id, _)| {
                     self.documents
                         .iter()
-                        .any(|d| d.id == *id && (d.dirty(cx) || d.saving))
+                        .any(|doc| doc.id == *id && (doc.dirty(cx) || doc.saving))
                 }) {
                     self.status = "Save requested documents before finishing".into();
-                } else if !self.finished {
-                    self.finish_pending = self.requested.len();
+                } else {
+                    let mut paths: std::collections::BTreeMap<u64, Vec<PathBuf>> =
+                        std::collections::BTreeMap::new();
                     for (id, path) in &self.requested {
-                        if let Some(doc) = self.documents.iter().find(|d| d.id == *id) {
+                        paths.entry(*id).or_default().push(path.clone());
+                    }
+                    let snapshots: Vec<_> = self
+                        .documents
+                        .iter()
+                        .filter(|doc| paths.contains_key(&doc.id))
+                        .map(|doc| (doc.id, doc.generation))
+                        .collect();
+                    let attempt = self.finishing.begin(snapshots);
+                    for (id, aliases) in paths {
+                        if let Some(doc) = self.documents.iter().find(|doc| doc.id == id) {
                             self.io.send(Job::Finish(
-                                *id,
+                                id,
                                 doc.generation,
+                                attempt,
                                 doc.disk.clone(),
-                                vec![path.clone()],
+                                aliases,
                             ));
                         }
                     }
@@ -1171,15 +1282,15 @@ impl Shell {
             "choose" if self.request.pick => {
                 let path = if self.request.directory {
                     self.current.clone()
-                } else if let Some(path) = &self.selection {
-                    path.clone()
+                } else if let Some(path) = self.selected_path() {
+                    path
                 } else {
                     return;
                 };
                 self.io.send(Job::Choose(path, self.request.directory));
             }
             "trash" if !self.request.pick => {
-                if let Some(path) = self.selection.clone() {
+                if let Some(path) = self.selected_path() {
                     if self.documents.iter().any(|d| d.disk.path == path) {
                         self.status = "Close this file before moving it to Trash".into();
                     } else {
@@ -1203,7 +1314,7 @@ impl Shell {
                 }
             }
             "external" | "finder" => {
-                if let Some(path) = self.selection.clone() {
+                if let Some(path) = self.selected_path() {
                     let path = if command == "finder" {
                         path.parent().unwrap_or(&path).to_owned()
                     } else {
@@ -1218,10 +1329,46 @@ impl Shell {
                     }
                 }
             }
-            "copy-path" => {
-                cx.write_to_clipboard(ClipboardItem::new_string(paths::display(
-                    self.selection.as_ref().unwrap_or(&self.current),
-                )));
+            "go-scope" => {
+                if let Some(scope) = self.scope.clone() {
+                    self.navigate(scope);
+                }
+            }
+            "reveal" => {
+                if let Some(path) = self
+                    .documents
+                    .iter()
+                    .find(|doc| {
+                        Some(doc.id) == self.active && !doc.disk.target.as_os_str().is_empty()
+                    })
+                    .map(|doc| doc.disk.path.clone())
+                {
+                    if let Some(parent) = path.parent() {
+                        self.navigate(parent.to_owned());
+                    }
+                    self.selection = Some(path);
+                    window.focus(&self.nav_focus);
+                }
+            }
+            "copy-path" | "copy-relative" => {
+                let path = self.selected_path().unwrap_or_else(|| self.current.clone());
+                let scope = self.scope.as_ref().unwrap_or(&self.current);
+                let value = if command == "copy-relative" {
+                    path.strip_prefix(scope)
+                        .map_err(|_| "Selected path is outside the search folder")
+                } else {
+                    Ok(path.as_path())
+                };
+                match value {
+                    Ok(path) => {
+                        if let Some(value) = path.to_str() {
+                            cx.write_to_clipboard(ClipboardItem::new_string(value.to_owned()));
+                        } else {
+                            self.status = "This path cannot be copied as UTF-8 text. Use the CLI picker for a lossless path.".into();
+                        }
+                    }
+                    Err(error) => self.status = error.into(),
+                }
             }
             _ => self.status = format!("Command not yet available in the GPUI port: {command}"),
         }
@@ -1348,7 +1495,7 @@ impl Render for Shell {
                                     hit.excerpt
                                 ))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.open(path.clone(), false, line);
+                                    this.open(path.clone(), false, Some((line, 1)));
                                     if let Some(fingerprint) = expected {
                                         this.hit_versions.insert(this.open_token, fingerprint);
                                     }
@@ -1510,7 +1657,7 @@ impl Render for Shell {
                                     .on_click(cx.listener(
                                         move |this, event: &ClickEvent, _, cx| {
                                             this.selection = Some(path.clone());
-                                            this.open(path.clone(), event.click_count() < 2, 1);
+                                            this.open(path.clone(), event.click_count() < 2, None);
                                             cx.notify();
                                         },
                                     ))
@@ -1665,7 +1812,7 @@ impl Render for Shell {
                     }
                     "right" | "enter" => {
                         if let Some(path) = this.selection.clone() {
-                            this.open(path, false, 1);
+                            this.open(path, false, None);
                         }
                         cx.notify();
                         return;
@@ -1678,10 +1825,10 @@ impl Render for Shell {
                     this.command("cancel-close", window, cx);
                     return;
                 }
-                this.panel = None;
-                this.hits.clear();
-                this.focus(window, cx);
-                cx.notify();
+                if this.destination.is_some() {
+                    this.command("cancel-destination", window, cx);
+                }
+                this.command("dismiss", window, cx);
                 return;
             }
             if key.modifiers.control || key.modifiers.platform {

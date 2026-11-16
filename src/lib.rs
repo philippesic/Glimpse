@@ -22,6 +22,7 @@ pub mod reservations;
 pub mod search;
 pub mod storage;
 pub mod syntax;
+pub mod validation;
 pub mod wake;
 
 #[cfg(test)]

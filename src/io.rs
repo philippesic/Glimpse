@@ -34,7 +34,7 @@ pub enum Job {
     Settings(storage::Settings),
     LoadSettings,
     Check(u64, PathBuf, u64),
-    Finish(u64, u64, DiskFile, Vec<PathBuf>),
+    Finish(u64, u64, u64, DiskFile, Vec<PathBuf>),
     Choose(PathBuf, bool),
     Open(PathBuf, u64, bool),
     Save {
@@ -62,7 +62,7 @@ pub enum Reply {
     SettingsLoaded(Result<storage::Settings, String>),
     Changed(Result<(), String>),
     Records(Result<storage::Inventory, String>),
-    Finished(u64, u64, Result<(), String>),
+    Finished(u64, u64, u64, Result<(), String>),
     Chosen(PathBuf, Result<(), String>),
     OpenDirectory(PathBuf, u64),
     HistoryWarning(String),
@@ -296,8 +296,19 @@ impl IoWorker {
                                 });
                             Reply::Chosen(path, result)
                         }
-                        Job::Finish(id, generation, disk, paths) => {
-                            Reply::Finished(id, generation, disk.revalidate_paths(&paths))
+                        Job::Finish(id, generation, attempt, disk, paths) => {
+                            crate::metrics::event("finish-worker", id, generation);
+                            #[cfg(feature = "test-support")]
+                            if let Ok(delay) = std::env::var("GLIMPSE_TEST_FINISH_DELAY_MS")
+                                && let Ok(milliseconds) = delay.parse::<u64>()
+                            {
+                                std::thread::sleep(std::time::Duration::from_millis(
+                                    milliseconds.min(10_000),
+                                ));
+                            }
+                            let result = disk.revalidate_paths(&paths);
+                            crate::metrics::event("finish-worker-done", id, generation);
+                            Reply::Finished(id, generation, attempt, result)
                         }
                         Job::Check(id, path, generation) => {
                             Reply::Checked(id, generation, DiskFile::open(path))
@@ -546,8 +557,8 @@ impl IoWorker {
                     Job::Save { id, text, .. } => Reply::Save(id, text, Err(message)),
                     Job::SaveTo(d) | Job::Prepare(d) => Reply::SavedTo(Box::new(d), Err(message)),
                     Job::Choose(path, _) => Reply::Chosen(path, Err(message)),
-                    Job::Finish(id, generation, _, _) => {
-                        Reply::Finished(id, generation, Err(message))
+                    Job::Finish(id, generation, attempt, _, _) => {
+                        Reply::Finished(id, generation, attempt, Err(message))
                     }
                     Job::Open(path, token, _) => Reply::Open(path, token, Err(message)),
                     _ => Reply::Done(Err(message)),
