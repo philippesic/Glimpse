@@ -18,8 +18,10 @@ A Wayland or X11 desktop and a Vulkan driver are required on Linux. GPUI file di
 ```sh
 cargo fmt --check
 CARGO_BUILD_JOBS=4 cargo clippy --locked --all-targets -- -D warnings
-CARGO_BUILD_JOBS=4 cargo test --locked
+CARGO_BUILD_JOBS=4 cargo test --locked --workspace
 ```
+
+Set `GLIMPSE_TRACE=1` to emit monotonic edit/save event timings to stderr. Events identify documents and generations without logging their contents. These timestamps describe application and worker handling, not physical input-to-present latency.
 
 ## Workflow
 
