@@ -1182,7 +1182,7 @@ impl Shell {
                 }
                 Reply::Volumes(result) => match result {
                     Ok(volumes) => self.volumes = Some(volumes),
-                    Err(error) => self.status = format!("Mounted folders: {error}"),
+                    Err(error) => self.status = format!("Mounted locations: {error}"),
                 },
                 Reply::OpenDirectory(path, token) => {
                     if let Some(intent) = self.opening.remove(&token) {
@@ -2459,7 +2459,8 @@ impl Shell {
             }
             "refresh-volumes" => {
                 self.io.send(Job::Volumes);
-                self.status = "Refreshing mounted folders; reopen Locations for the result".into();
+                self.status =
+                    "Refreshing mounted locations; reopen Locations for the result".into();
             }
             "indent" | "outdent" => {
                 self.focus(window, cx);

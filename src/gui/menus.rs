@@ -92,7 +92,7 @@ impl Shell {
                         menu = menu.item(location_item(shell.clone(), path.clone()));
                     }
                 }
-                menu = menu.separator().label("Mounted folders");
+                menu = menu.separator().label("Mounted locations");
                 if let Some(volumes) = &volumes {
                     for path in &volumes.paths {
                         menu = menu.item(location_item(shell.clone(), path.clone()));

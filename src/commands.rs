@@ -144,7 +144,7 @@ commands![
     (
         RefreshVolumes,
         "refresh-volumes",
-        "Refresh Mounted Folders",
+        "Refresh Mounted Locations",
         ""
     ),
     (Pin, "pin", "Pin / Unpin Current Folder", ""),

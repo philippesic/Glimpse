@@ -129,7 +129,13 @@ mod platform {
 
     pub fn mounted() -> Result<Volumes, String> {
         let mut bytes = Vec::new();
-        std::fs::File::open("/proc/self/mountinfo")
+        #[cfg(feature = "test-support")]
+        let source = std::env::var_os("GLIMPSE_TEST_MOUNTS_FILE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/proc/self/mountinfo"));
+        #[cfg(not(feature = "test-support"))]
+        let source = PathBuf::from("/proc/self/mountinfo");
+        std::fs::File::open(source)
             .and_then(|file| file.take(1024 * 1024 + 1).read_to_end(&mut bytes))
             .map_err(|error| error.to_string())?;
         let truncated = bytes.len() > 1024 * 1024;
@@ -142,11 +148,10 @@ mod platform {
         let mut paths = paths(&bytes);
         let limited = paths.len() > 128;
         paths.truncate(128);
-        paths.retain(|path| path.is_dir());
         Ok(Volumes {
             paths,
             note: (limited || truncated).then(|| {
-                "Mounted-folder list is incomplete; use Location to open another path.".into()
+                "Mounted-location list is incomplete; use Location to open another path.".into()
             }),
         })
     }
@@ -223,25 +228,21 @@ mod platform {
     }
 
     pub fn mounted() -> Result<Volumes, String> {
-        let mut paths = vec![PathBuf::from("/")];
-        let mut note = None;
-        for entry in std::fs::read_dir("/Volumes").map_err(|error| error.to_string())? {
-            match entry {
-                Ok(entry) if entry.path().is_dir() => paths.push(entry.path()),
-                Ok(_) => {}
-                Err(error) => {
-                    note = Some(format!("Some mounted folders could not be read: {error}"))
-                }
-            }
-        }
+        let mut paths: Vec<_> = mount_points()?
+            .into_iter()
+            .filter(|path| {
+                path.as_path() == std::path::Path::new("/") || path.starts_with("/Volumes")
+            })
+            .collect();
         paths.sort();
         paths.dedup();
-        if paths.len() > 128 {
-            paths.truncate(128);
-            note = Some(
-                "Mounted-folder list is incomplete; use Location to open another path.".into(),
-            );
-        }
-        Ok(Volumes { paths, note })
+        let truncated = paths.len() > 128;
+        paths.truncate(128);
+        Ok(Volumes {
+            paths,
+            note: truncated.then(|| {
+                "Mounted-location list is incomplete; use Location to open another path.".into()
+            }),
+        })
     }
 }
