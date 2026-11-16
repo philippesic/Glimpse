@@ -1,12 +1,12 @@
 # Glimpse UI design
 
-Implementation descriptions and measurements below refer to the retired macOS prototype. The GPUI port has separate coverage and limitations in [core design](core-design.md); these records do not establish GPUI parity or qualification.
+This document describes the intended native GPUI interface. Current implementation coverage and limitations are recorded in [core design](core-design.md). Requirements are not claims of verified behavior.
 
 Glimpse combines sophisticated appearance with simple functionality and interaction. Its everyday workflow is find a file, inspect it, make a small edit, save, and return to work. Visual refinement should make that workflow feel effortless: well-proportioned controls, readable typography, familiar focus and keyboard behavior, and clear document state. Clean means organized and intentional, with enough context to act confidently.
 
-[glimpse.md](../glimpse.md) governs product scope, navigation and file safety. This document defines how that contract appears on screen; requirements here do not claim that a feature is implemented or qualified. [src/appearance.rs](../src/appearance.rs) holds the built-in appearance tokens.
+[glimpse.md](../glimpse.md) governs product scope, navigation and file safety. This document defines how that contract appears on screen; requirements here do not claim that a feature is implemented or qualified. Shared semantic tokens should govern all GPUI surfaces; historical test-only appearance helpers do not establish runtime behavior.
 
-The [native evaluation guide](native-evaluation.md) assigns the Mac reference apps and defines repeatable walkthroughs and comparison/review loops for implementing this design.
+The [native evaluation guide](native-evaluation.md) defines objective criteria, repeatable walkthroughs and evidence-based review loops for implementing this design.
 
 ## Simple interaction
 
@@ -22,13 +22,11 @@ Judge the experience by the ordinary task: can someone open, locate, edit, save 
 
 ## Composition and hierarchy
 
-Keep the native title bar, traffic lights, window movement, resizing and fullscreen behavior. Use platform menus and conventional shortcuts. Do not imitate macOS window controls inside the rendered content. The native Rust renderer owns the application surfaces; no WebView is used for the UI or Markdown.
+Keep native platform window controls, movement, resizing and fullscreen behavior. Use platform menus and conventional shortcuts. Do not imitate macOS window controls inside the rendered content. The native Rust renderer owns the application surfaces; no WebView is used for the UI or Markdown.
 
 The navigator and document are the two primary surfaces, separated by one resizable divider. Compose the title bar, toolbar, tabs and pane boundaries as one continuous window. Integrate controls with the native window where supported, retaining OS behavior and hit regions. The navigator uses a gently tinted background; the document has a stable, opaque reading canvas. Toolbars and tabs share a coherent chrome treatment.
 
 Use restrained depth in chrome, controls, menus and dialogs. Subtle translucency, tonal gradients, edge highlights and soft shadows may establish material or elevation when they preserve legibility and meet measured performance requirements. Provide an opaque alternative for reduced transparency or insufficient rendering support. Content never needs to shine through source text or file names. Avoid nested cards around ordinary lists, decoration that consumes reading space and permanently empty panels.
-
-Use [Things' OS 26 refresh](https://culturedcode.com/things/blog/2025/09/things-for-os-26/) and [Bear's Tahoe refinement](https://community.bear.app/t/bear-update-os26-ready/18219) as finish references: typography, coherent symbols, gentle material depth and carefully shaped selection. Use [Finder](https://support.apple.com/en-gb/guide/mac-help/mchle9f0a1b2/27/mac/27) and [Nova](https://help.nova.app/welcome/quick-tour/) for window composition and useful file/editor density. Borrow their craft within Glimpse's existing workflow and scope.
 
 Within each surface, establish this reading order:
 
@@ -40,7 +38,7 @@ Use one strong heading per region. Align labels, icons, fields and baselines. Gr
 
 ## Typography, geometry and density
 
-Use the macOS system UI face for controls and file lists, a configurable monospace face for source, and a readable proportional face for Markdown. Register fonts once and retain Unicode fallback. The eframe `system_fonts` feature supplies fallback; it does not by itself select the primary system UI face. Do not ship an icon font or assume that arbitrary Unicode symbols render consistently.
+Use the platform system UI face for controls and file lists, a configurable monospace face for source, and a readable proportional face for Markdown. Register fonts once and retain Unicode fallback. Do not ship an icon font or assume that arbitrary Unicode symbols render consistently.
 
 | Token | Comfortable default | Compact |
 | --- | --- | --- |
@@ -146,15 +144,13 @@ At normal widths keep both primary surfaces usable, with a draggable divider and
 
 Qualify the minimum window size, a wide window, long names, both densities, both themes, large text and multiple display scales. Menus, dialogs, footer state and tab close controls must remain reachable. Settings and errors cannot rely on a fixed dialog width that truncates their actions.
 
-Every command requires a visible/menu route and a useful accessible name. Expose roles, current values, selection, expanded state and modified/conflict state. Provide labelled controls and stable keyboard focus; do not rely on tooltips or painted text for screen-reader semantics. VoiceOver navigation and actual text editing, IME/dead keys, emoji/graphemes and keyboard-only use are separate acceptance checks. Enabling AccessKit does not establish that they work. Respect reduced-motion and increased-contrast preferences when available, and expose a usable manual alternative where platform integration is incomplete.
+Every command requires a visible/menu route and a useful accessible name. Expose roles, current values, selection, expanded state and modified/conflict state. Provide labelled controls and stable keyboard focus; do not rely on tooltips or painted text for screen-reader semantics. Screen-reader navigation and actual text editing, IME/dead keys, emoji/graphemes and keyboard-only use are separate acceptance checks. Toolkit support does not establish that they work. Respect reduced-motion and increased-contrast preferences when available, and expose a usable manual alternative where platform integration is incomplete.
 
 ## Implementation contract
 
-`appearance::install(ctx, Density)` registers the installed SF UI/mono faces once per context and configures both themes. Keep Unicode fallback. Reinstall styles only at setup or density changes; `ctx.set_theme` and `ctx.set_zoom_factor` apply validated preferences. `palette(ui)` resolves semantic colors; `Metrics::for_density` supplies point baselines. Shared symbol buttons expose accessible names and focus rings.
+GPUI owns the native application, editor and Markdown surfaces. Retain one editor entity per document for caret, scroll, selection and undo. Apply validated theme and typography preferences together, keeping font fallback and platform scaling. Overlays contain keyboard focus and restore it deliberately when dismissed. Backend editing locks also disable Find/Replace mutations.
 
-The window uses a transparent native title bar with OS traffic lights, one toolbar, a tinted navigator and grouped document tabs. Empty path chrome provides window dragging. Breadcrumb segments open folder/file menus; Command-L edits the path in place. The toolbar search field is editable, with results in the navigator. Document Find is a dismissible card with a replacement disclosure; AppKit reserves the card’s measured height so its child view cannot cover the Rust controls. Below 760 logical points, explicit Navigator/Document or Navigator/Preview choices replace simultaneous panes. Secondary toolbar actions move into More.
-
-`Editors::begin` and `finish` bracket exactly one presentation pass. Retain native views for caret, scroll and undo. Hide the AppKit source whenever a Rust modal or overlapping menu is open; give forms host focus and restore the relevant source deliberately. Backend editing locks also disable Rust Find/Replace mutations. Native source geometry uses the current zoom exactly once.
+Use one toolbar, a tinted navigator and distinguishable document tabs. Primary-modifier-L edits the location. At narrow widths, provide explicit access to navigator and document instead of clipping simultaneous panes. Secondary actions remain reachable through menus. Keep OS-specific dialogs and services behind platform boundaries; no embedded AppKit editor or WebView renderer is part of this design.
 
 Compare and replacement dialogs display read-only excerpts capped at 16 KiB, 160 lines and 240 characters per line. Scrolling these excerpts never lays out a full large document. No full document clone belongs in an idle dialog redraw. Reload/overwrite decisions capture the observed version and reject a changed local generation or disk snapshot before submitting the existing validated write path.
 
@@ -162,7 +158,7 @@ Compare and replacement dialogs display read-only excerpts capped at 16 KiB, 160
 
 Appearance adds no background worker, index, periodic timer or unconditional repaint. Install themes and load any required fonts/assets at startup or preference changes, not every frame. Resolve colors cheaply. Paint visible rows and retain stable widget IDs. Directory enumeration and sorting remain outside painting. The current navigator still builds a filtered row list from its bounded directory cache; include that cost in large-list measurements. Keep filesystem work outside input handling. Use static pending labels rather than idle spinners. The default caret is steady.
 
-Brief, event-driven transitions may clarify hover, selection, opening a popover or changing presentation. They must be interruptible, never delay input or focus, and stop requesting frames when settled. Respect reduced motion. Avoid decorative looping, exaggerated bounce and mandatory animated scrolling. Profile material effects and transitions in the actual native release build; neither their affordability nor their cost follows from a screenshot. The built-in presentation uses opaque surfaces and static controls, with dialog shadows for elevation. It adds no blur or translucency. Control-state transitions settle within 100 ms; column snapping uses 180 ms. Both respect Reduce motion and do not delay commands.
+Brief, event-driven transitions may clarify hover, selection, opening a popover or changing presentation. They must be interruptible, never delay input or focus, and stop requesting frames when settled. Respect reduced motion. Avoid decorative looping, exaggerated bounce and mandatory animated scrolling. Profile material effects and transitions in the actual native release build; neither their affordability nor their cost follows from a screenshot. Opaque surfaces and static controls are sufficient. Motion must respect Reduce motion and never delay commands.
 
 The current user aspirations are startup under 100 ms, folder and file opening within 100 ms, total RAM below 100 MB and idle CPU at most 0.1% of one core, with active CPU proportional to the interaction. Measure active and idle CPU separately. The earlier baseline additionally asks for 120 Hz interaction. These are aspirations, not measured results; [the product baseline](../glimpse.md#proposed-performance-budgets) retains its separately stated proposed budgets. At 120 Hz one refresh interval is about 8.3 ms; meeting a frame-work budget alone does not establish input-to-present latency. Measure native release builds on a named machine/display, with explicit warm/cold startup, sample counts and idle intervals. Report total RSS alongside any explicitly defined text-memory exclusion, rather than silently subtracting an estimate. Styling does not qualify performance.
 
@@ -183,25 +179,3 @@ A screenshot demonstrates appearance at one instant. It cannot establish focus r
 Favorites are explicit file or folder pins in a compact directory-header menu. Home, Volumes and frequent/recent destinations remain in the folder menu. Repeated document opens within 30 minutes count as one visit; scores decay with a seven-day half-life. Traversal does not add visits. The navigator displays one directory at a stable width, retaining selection and vertical scroll for return visits.
 
 Index This Folder builds one bounded filename snapshot only after a click. It replaces the prior snapshot, lives only for this process, respects search exclusions and never indexes content. Search labels its snapshot coverage and offers Rebuild and Remove Index. Directory and document observation remain separate from snapshot freshness.
-
-## Reference composition refinement
-
-The toolbar groups the current path in a shaped control and keeps search beside it; narrow windows use compact search and overflow controls. Folder filtering opens on request. A single navigation header replaces stacked folder/location rows, and document tabs share the canvas edge without a duplicate absolute-path strip. Folder and file-type symbols provide distinct color/shape cues.
-
-Preferences use General, Appearance, Editor, Search, Shortcuts and Recovery categories, a wide-window category sidebar, grouped controls and functional theme previews. Narrow windows use a category menu. Search results emphasize the file, then its parent path, then a highlighted saved-content excerpt and line number. Arrow keys select results and Return activates them. The filename snapshot controls remain optional and scoped; freshness is visible.
-
-The source editor paints a quiet current-line background without modifying text attributes or creating undo steps. The setting can be disabled. Cmd-L selects the complete path for replacement. Read mode returns to source when activating a code tab. These changes preserve the existing file-safety, recovery and explicit-action boundaries; they do not certify pixel parity with the supplied references.
-
-## Reference geometry in the macOS implementation
-
-The default window is 1280 × 844 logical points. Its header aligns the native traffic-light region, navigator toggle, directory Back/Forward, clickable breadcrumbs and editable search on one centered control row. Tabs remain about 42 points. The single directory pane defaults to 280 points and retains the user's divider width across navigation and editing. Search and Find use compact native child windows so the AppKit source stays visible. The source gutter is measured from number glyphs, with source-font-derived tab stops and zoom-scaled insets. Gutter labels use actual source glyph baselines, including configured paragraph spacing.
-
-The toolbar uses a left-aligned shaped breadcrumb group, editable search, and compact navigation actions. New File lives beside document tabs; named-file and folder creation live in the navigator header. The permanent folder filter is disclosed from the folder menu. Tabs connect to the document canvas; folder and file-type symbols use layered vector shapes. Source uses explicit light/dark syntax colors and an italic comment trait, with the current-line tint continued through the gutter. Native paragraph layout supplies the configured minimum line height; font and spacing changes update attributes without replacing document characters. Saved font sizes remain unchanged when defaults change. Narrow document mode has one toolbar and one tab strip, with a toolbar navigator toggle.
-
-Appearance settings group real theme previews, density, reading controls and everyday editor switches, including font size and line height. Wide settings uses 16-point body text and 17-point category labels with 44-point rows. The full Editor category retains font, indentation and reset controls. Reading mode styles standalone plain headings on small pages; nested/linked headings and pages with reference definitions remain with the CommonMark renderer to preserve semantics. Larger pages retain viewport rendering.
-
-The implementation uses opaque colors rather than the reference's translucent macOS material. Settings is an in-app modal rather than a separate preferences window. Conflict comparison aligns bounded read-only line excerpts, using red local-only and green disk-only rows. It never acts as a merge or save input. CommonMark's code-block copy glyph and complex-page typography also retain library styling. Unimplemented reference controls, including tags and additional appearance options, are omitted.
-
-Search match text uses a yellow fill distinct from selection: light `#FFE878` with `#3B3100` text, dark `#756018` with `#FFF4CA` text. Both pairs pass a 4.5:1 text contrast check.
-
-Conflict alignment reads at most the first 16 KiB and 160 lines per version, showing at most 240 characters per line. A bounded line alignment uses at most 161² cells; results are cached for the local generation and bounded disk prefix. Clipped lines are marked as uncompared, truncation is labelled, and final-newline differences remain explicit. Opposite-side gaps preserve row height. Full original snapshots and destructive resolution validation are independent of this presentation.

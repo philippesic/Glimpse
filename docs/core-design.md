@@ -18,13 +18,13 @@ The component's default text operations preserve the authoritative buffer. Perfo
 
 ## File safety and services
 
-DiskFile retains observed identity, symlink binding and bytes. Save stages beside the target, preserves supported metadata, syncs, validates and atomically replaces. Hard links, unsupported ownership/metadata and changed destinations stop saving. Atomic replacement is not compare-and-swap against unrelated writers.
+DiskFile retains observed identity, symlink binding and bytes. Save stages beside the target, preserves supported metadata, syncs, validates and atomically replaces. Hard links, unsupported ownership/metadata and changed destinations stop saving. Atomic replacement is not compare-and-swap against unrelated writers. External observation retains the existing binding when a symlink target changes, even when both targets have identical bytes; ordinary Save stays blocked until an explicit resolution.
 
 Save As rebinds after success; Save Copy retains the original binding. Existing destinations require confirmation of an observed version. Destinations already open in another tab must be closed first. Recovery remains mandatory for normal saves. Failure retains local text and reports the error; the earlier one-attempt recovery bypass is not exposed.
 
 Linux rename uses `renameat2(RENAME_NOREPLACE)` and Trash uses the trash crate's freedesktop implementation. Linux saving copies permissions and extended attributes; failures stop replacement. macOS retains `renamex_np`, NSFileManager Trash and `fcopyfile` metadata preservation behind platform configuration. Linux Reveal opens the containing directory with xdg-open. GPUI supplies native portal file dialogs.
 
-Recovery keeps private, locked session records with exact local text and observed disk bytes. Abandoned records can be claimed from Recovery. Saved history and observed snapshots remain in the domain store. Their full management interface is not yet ported.
+Recovery keeps private, locked session records with exact local text and observed disk bytes. Abandoned records can be claimed from Recovery. Saved history and observed snapshots remain in the domain store. Their full management interface is not yet ported. Closing waits for acknowledgment that the exact recovery generation was resolved. Cleanup failure keeps the document open with Retry and Keep Open actions; Keep Open creates a newer recovery generation. Close decisions retain the named document IDs across tab switches, and Save and Close saves those documents before cleanup. Edits during cleanup cancel that document’s close.
 
 ## Presentation gaps and qualification
 
