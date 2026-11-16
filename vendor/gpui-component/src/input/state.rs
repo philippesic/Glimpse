@@ -259,6 +259,13 @@ impl LastLayout {
     }
 }
 
+struct Composition {
+    range: Range<usize>,
+    text: String,
+    selection: Selection,
+    reversed: bool,
+}
+
 /// InputState to keep editing state of the [`super::Input`].
 pub struct InputState {
     pub(super) external_highlights: Option<Vec<(std::ops::Range<usize>, gpui::HighlightStyle)>>,
@@ -283,6 +290,7 @@ pub struct InputState {
     pub(super) selection_reversed: bool,
     /// The marked range is the temporary insert text on IME typing.
     pub(super) ime_marked_range: Option<Selection>,
+    composition: Option<Composition>,
     pub(super) last_layout: Option<LastLayout>,
     pub(super) last_cursor: Option<usize>,
     /// The input container bounds
@@ -405,6 +413,7 @@ impl InputState {
             selected_word_range: None,
             selection_reversed: false,
             ime_marked_range: None,
+            composition: None,
             input_bounds: Bounds::default(),
             selecting: false,
             disabled: false,
@@ -1501,6 +1510,7 @@ impl InputState {
         let old_text = text.slice(range.clone()).to_string();
         let new_range = range.start..range.start + new_text.len();
 
+        self.history.clear_redo();
         self.history
             .push(Change::new(range.clone(), &old_text, new_range, new_text));
     }
@@ -2026,6 +2036,20 @@ impl EntityInputHandler for InputState {
     }
 
     fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(original) = self.composition.take() {
+            if let Some(marked) = self.ime_marked_range {
+                let text = self.text.slice(marked.start..marked.end).to_string();
+                if !self.history.ignore {
+                    self.history.new_group();
+                    self.history.clear_redo();
+                    self.history
+                        .push(Change::new(original.range, &original.text, marked, &text));
+                    self.history.new_group();
+                }
+                self.update_search(cx);
+                cx.emit(InputEvent::Change);
+            }
+        }
         self.ime_marked_range = None;
         cx.notify();
     }
@@ -2078,7 +2102,21 @@ impl EntityInputHandler for InputState {
             }
         }
 
-        self.push_history(&old_text, &range, &new_text);
+        if let Some(original) = self.composition.take() {
+            if !self.history.ignore {
+                self.history.new_group();
+                self.history.clear_redo();
+                self.history.push(Change::new(
+                    original.range,
+                    &original.text,
+                    range.start..range.start + new_text.len(),
+                    &new_text,
+                ));
+                self.history.new_group();
+            }
+        } else {
+            self.push_history(&old_text, &range, &new_text);
+        }
         self.history.end_grouping();
         if let Some(diagnostics) = self.mode.diagnostics_mut() {
             diagnostics.reset(&self.text)
@@ -2113,6 +2151,21 @@ impl EntityInputHandler for InputState {
             return;
         }
 
+        if new_text.is_empty() {
+            if let Some(original) = self.composition.take() {
+                let ignored = self.history.ignore;
+                self.history.ignore = true;
+                self.replace_text_in_range_silent(None, &original.text, window, cx);
+                self.history.ignore = ignored;
+                self.selected_range = original.selection;
+                self.selection_reversed = original.reversed;
+                self.update_preferred_column();
+            }
+            self.ime_marked_range = None;
+            cx.notify();
+            return;
+        }
+
         self.lsp.reset();
 
         let range = range_utf16
@@ -2135,6 +2188,15 @@ impl EntityInputHandler for InputState {
             }
         }
 
+        if self.composition.is_none() {
+            self.composition = Some(Composition {
+                range: range.clone(),
+                text: old_text.slice(range.clone()).to_string(),
+                selection: self.selected_range,
+                reversed: self.selection_reversed,
+            });
+            self.history.new_group();
+        }
         if let Some(diagnostics) = self.mode.diagnostics_mut() {
             diagnostics.reset(&self.text)
         }
@@ -2143,22 +2205,17 @@ impl EntityInputHandler for InputState {
         self.mode
             .update_highlighter(&range, &self.text, &new_text, true, cx);
         self.lsp.update(&self.text, window, cx);
-        if new_text.is_empty() {
-            // Cancel selection, when cancel IME input.
-            self.selected_range = (range.start..range.start).into();
-            self.ime_marked_range = None;
-        } else {
-            self.ime_marked_range = Some((range.start..range.start + new_text.len()).into());
-            self.selected_range = new_selected_range_utf16
-                .as_ref()
-                .map(|range_utf16| self.range_from_utf16(range_utf16))
-                .map(|new_range| new_range.start + range.start..new_range.end + range.end)
-                .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len())
-                .into();
-        }
+        self.ime_marked_range = Some((range.start..range.start + new_text.len()).into());
+        let inserted = Rope::from(new_text);
+        self.selected_range = new_selected_range_utf16
+            .as_ref()
+            .map(|selection| {
+                range.start + inserted.offset_utf16_to_offset(selection.start)
+                    ..range.start + inserted.offset_utf16_to_offset(selection.end)
+            })
+            .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len())
+            .into();
         self.mode.update_auto_grow(&self.text_wrapper);
-        self.history.start_grouping();
-        self.push_history(&old_text, &range, new_text);
         cx.notify();
     }
 

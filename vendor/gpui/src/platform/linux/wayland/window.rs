@@ -649,7 +649,7 @@ impl WaylandWindowStatePtr {
                 }
                 ImeInput::DeleteText => {
                     if let Some(marked) = input_handler.marked_text_range() {
-                        input_handler.replace_text_in_range(Some(marked), "");
+                        input_handler.replace_and_mark_text_in_range(Some(marked), "", None);
                     }
                 }
             }

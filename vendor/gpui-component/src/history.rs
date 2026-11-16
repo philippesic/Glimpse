@@ -80,6 +80,10 @@ where
         self.grouping = false;
     }
 
+    pub(crate) fn clear_redo(&mut self) {
+        self.redos.clear();
+    }
+
     pub(crate) fn new_group(&mut self) {
         self.grouping = false;
         self.version += 1;
