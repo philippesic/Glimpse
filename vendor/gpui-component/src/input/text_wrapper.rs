@@ -7,13 +7,16 @@ use smallvec::SmallVec;
 use crate::input::RopeExt;
 
 /// A line with soft wrapped lines info.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(super) struct LineItem {
     length: usize,
+    indent: Option<u32>,
+    word_columns: u32,
+    word_width: Pixels,
     /// The soft wrapped lines relative byte range (0..line.len) of this line (Include first line).
     ///
     /// Not contains the line end `\n`.
-    pub(super) wrapped_lines: Vec<Range<usize>>,
+    pub(super) wrapped_lines: SmallVec<[Range<usize>; 1]>,
 }
 
 impl LineItem {
@@ -144,6 +147,11 @@ impl TextWrapper {
         let mut line_wrapper = cx
             .text_system()
             .line_wrapper(self.font.clone(), self.font_size);
+        if self.edit_uniform_word(changed_text, range, new_text, &mut line_wrapper)
+            || self.append(changed_text, range, new_text, &mut line_wrapper)
+        {
+            return;
+        }
         self._update(
             changed_text,
             range,
@@ -154,6 +162,151 @@ impl TextWrapper {
                     .collect()
             },
         );
+        if self.wrap_width.is_some() {
+            let start = changed_text.offset_to_point(range.start).row;
+            let end = changed_text
+                .offset_to_point(range.start + new_text.len())
+                .row;
+            for row in start..=end {
+                let Some(line) = self.lines.get_mut(row) else {
+                    continue;
+                };
+                if line.length >= 1024 && line.wrapped_lines.len() > 1 {
+                    if let Some(width) =
+                        line_wrapper.uniform_word_width(&changed_text.slice_line(row).to_string())
+                    {
+                        line.word_width = width;
+                        line.word_columns =
+                            line.wrapped_lines.first().map_or(0, |range| range.len()) as u32;
+                    }
+                }
+            }
+        }
+    }
+
+    fn edit_uniform_word(
+        &mut self,
+        changed_text: &Rope,
+        range: &Range<usize>,
+        new_text: &Rope,
+        wrapper: &mut gpui::LineWrapper,
+    ) -> bool {
+        if !self._initialized || self.wrap_width.is_none() {
+            return false;
+        }
+        let row = self.text.offset_to_point(range.start).row;
+        if self.text.offset_to_point(range.end).row != row
+            || range.end > self.text.line_end_offset(row)
+        {
+            return false;
+        }
+        let Some(line) = self.lines.get_mut(row) else {
+            return false;
+        };
+        if line.word_columns == 0
+            || (new_text.len() != 0
+                && wrapper.uniform_word_width(&new_text.to_string()) != Some(line.word_width))
+        {
+            return false;
+        }
+        let length = line.length - range.len() + new_text.len();
+        let columns = line.word_columns as usize;
+        let rows = length.div_ceil(columns).max(1);
+        let old_rows = line.lines_len();
+        line.wrapped_lines.resize(rows, 0..0);
+        for (row, range) in line.wrapped_lines.iter_mut().enumerate() {
+            *range = row * columns..((row + 1) * columns).min(length);
+        }
+        line.length = length;
+        if length == 0 {
+            line.indent = None;
+        }
+        if length < 1024 || rows < 2 {
+            line.word_columns = 0;
+            line.word_width = px(0.);
+        }
+        self.soft_lines = self.soft_lines - old_rows + rows;
+        if self.longest_row.row == row || length >= self.longest_row.len {
+            self.longest_row = self
+                .lines
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, line)| line.length)
+                .map(|(row, line)| LongestRow {
+                    row,
+                    len: line.length,
+                })
+                .unwrap_or_default();
+        }
+        self.text = changed_text.clone();
+        true
+    }
+
+    fn append(
+        &mut self,
+        changed_text: &Rope,
+        range: &Range<usize>,
+        new_text: &Rope,
+        wrapper: &mut gpui::LineWrapper,
+    ) -> bool {
+        let Some(width) = self.wrap_width else {
+            return false;
+        };
+        if !self._initialized || range.start != range.end || new_text.lines_len() != 1 {
+            return false;
+        }
+        let row = self.text.offset_to_point(range.start).row;
+        let Some(line) = self.lines.get_mut(row) else {
+            return false;
+        };
+        if line.wrapped_lines.len() < 2 || range.start != self.text.line_end_offset(row) {
+            return false;
+        }
+        let Some(continuation_indent) = line.indent else {
+            return false;
+        };
+        let prefix = line.wrapped_lines.len().saturating_sub(2);
+        let start = line.wrapped_lines[prefix].start;
+        let classify = line.length < 1024;
+        let length = line.length + new_text.len();
+        let origin = self.text.line_start_offset(row);
+        let tail = changed_text
+            .slice(origin + start..origin + length)
+            .to_string();
+        let fragments = [LineFragment::text(&tail)];
+        let indent = (prefix > 0).then_some(continuation_indent);
+        let old_rows = line.lines_len();
+        line.wrapped_lines.truncate(prefix);
+        let mut previous = start;
+        for boundary in wrapper.wrap_line_with_indent(&fragments, width, indent) {
+            let end = start + boundary.ix;
+            if prefix == 0 {
+                line.indent = Some(boundary.next_indent);
+            }
+            line.wrapped_lines.push(previous..end);
+            previous = end;
+        }
+        if previous < length || previous == start {
+            line.wrapped_lines.push(previous..length);
+        }
+        line.length = length;
+        line.word_columns = 0;
+        line.word_width = px(0.);
+        if classify && length >= 1024 {
+            if let Some(advance) =
+                wrapper.uniform_word_width(&changed_text.slice(origin..origin + length).to_string())
+            {
+                line.word_width = advance;
+                line.word_columns =
+                    line.wrapped_lines.first().map_or(0, |range| range.len()) as u32;
+            }
+        }
+        self.soft_lines = self.soft_lines - old_rows + line.lines_len();
+        if length >= self.longest_row.len {
+            self.longest_row = LongestRow { row, len: length };
+        }
+        self.text = changed_text.clone();
+        true
     }
 
     fn _update<F>(
@@ -197,8 +350,9 @@ impl TextWrapper {
             .enumerate()
         {
             let line_str = line.to_string();
-            let mut wrapped_lines = vec![];
+            let mut wrapped_lines: SmallVec<[Range<usize>; 1]> = SmallVec::new();
             let mut prev_boundary_ix = 0;
+            let mut indent = 0;
 
             if line_str.len() > longest_row_len {
                 longest_row_ix = new_start_row + ix;
@@ -209,6 +363,7 @@ impl TextWrapper {
             if let Some(wrap_width) = wrap_width {
                 // Here only have wrapped line, if there is no wrap meet, the `line_wraps` result will empty.
                 for boundary in wrap_line(&line_str, wrap_width) {
+                    indent = boundary.next_indent;
                     wrapped_lines.push(prev_boundary_ix..boundary.ix);
                     prev_boundary_ix = boundary.ix;
                 }
@@ -221,6 +376,11 @@ impl TextWrapper {
 
             new_lines.push(LineItem {
                 length: line.len(),
+                indent: (line_str.bytes().take_while(|&byte| byte == b' ').count()
+                    < wrapped_lines.first().map_or(0, |range| range.end))
+                .then_some(indent),
+                word_columns: 0,
+                word_width: px(0.),
                 wrapped_lines,
             });
         }
@@ -530,6 +690,100 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    fn middle_edits_and_deletions_match_complete_wrapping(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+        let _entity = cx.new(|cx: &mut gpui::Context<()>| {
+            for initial in [
+                "x".repeat(4000),
+                "a1_b-".repeat(800),
+                "long words here ".repeat(200),
+                "中🌱é café ".repeat(200),
+            ] {
+                let original = Rope::from(initial.as_str());
+                for anchor in [0, original.len() / 2, original.len()] {
+                    let start = original.clip_offset(anchor, sum_tree::Bias::Left);
+                    for removed in [0, 5, original.len()] {
+                        let end = original.clip_offset(
+                            start.saturating_add(removed).min(original.len()),
+                            sum_tree::Bias::Right,
+                        );
+                        for inserted in ["X", "", "ASCII", "中文", " ", "\n"] {
+                            let font = gpui::font(".ZedMono");
+                            let mut incremental =
+                                TextWrapper::new(font.clone(), px(16.), Some(px(120.)));
+                            incremental.prepare(
+                                &original,
+                                font.clone(),
+                                px(16.),
+                                Some(px(120.)),
+                                cx,
+                            );
+                            if initial.starts_with('x') {
+                                assert!(incremental.lines[0].word_columns > 0);
+                            }
+                            let mut edited = original.clone();
+                            edited.replace(start..end, inserted);
+                            incremental.update(&edited, &(start..end), &Rope::from(inserted), cx);
+                            let mut complete =
+                                TextWrapper::new(font.clone(), px(16.), Some(px(120.)));
+                            complete.prepare(&edited, font, px(16.), Some(px(120.)), cx);
+                            assert_eq!(
+                                incremental.lines, complete.lines,
+                                "{anchor}, {removed}, {inserted:?}"
+                            );
+                            assert_eq!(incremental.soft_lines, complete.soft_lines);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn incremental_appends_match_complete_wrapping(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+        let _entity = cx.new(|cx: &mut gpui::Context<()>| {
+            for initial in [
+                "alpha beta gamma delta ".repeat(80),
+                format!("     {}", "alpha beta gamma delta ".repeat(80)),
+                format!("{}a", " ".repeat(400)),
+                " ".repeat(400),
+                "x".repeat(4000),
+                "x".repeat(1020),
+                "中🌱é a café ".repeat(80),
+                format!("prefix\n{}\nsuffix", "long words here ".repeat(80)),
+            ] {
+                let mut text = Rope::from(initial.as_str());
+                let row = usize::from(initial.starts_with("prefix\n"));
+                let font = gpui::font(".ZedMono");
+                let mut incremental = TextWrapper::new(font.clone(), px(16.), Some(px(120.)));
+                incremental.prepare(&text, font.clone(), px(16.), Some(px(120.)), cx);
+                for appended in [
+                    "word",
+                    " ",
+                    "中文",
+                    "🌱",
+                    " é ",
+                    "longer words",
+                    "\nnew line",
+                    "x",
+                ] {
+                    let offset = text.line_end_offset(row);
+                    text.insert(offset, appended);
+                    incremental.update(&text, &(offset..offset), &Rope::from(appended), cx);
+                    let mut complete = TextWrapper::new(font.clone(), px(16.), Some(px(120.)));
+                    complete.prepare(&text, font.clone(), px(16.), Some(px(120.)), cx);
+                    assert_eq!(
+                        incremental.lines, complete.lines,
+                        "{initial:?}, {appended:?}"
+                    );
+                    assert_eq!(incremental.soft_lines, complete.soft_lines);
+                }
+            }
+        });
+    }
+
     #[test]
     fn test_update() {
         let font = gpui::Font {
@@ -713,7 +967,7 @@ mod tests {
         wrapper._update(&text, &range, &Rope::from(new_text), &mut fake_wrap_line);
         assert_eq!(text.to_string(), "");
         assert_eq!(wrapper.lines.len(), 1);
-        assert_eq!(wrapper.lines[0].wrapped_lines, vec![0..0]);
+        assert_eq!(wrapper.lines[0].wrapped_lines.as_slice(), &[0..0]);
 
         // Test update_all
         let range = 0..text.len();
@@ -757,22 +1011,34 @@ mod tests {
             // range: 0..15
             LineItem {
                 length: "Hello, 世界!\r".len(),
-                wrapped_lines: vec![0..15],
+                wrapped_lines: smallvec::smallvec![0..15],
+                indent: Some(0),
+                word_columns: 0,
+                word_width: px(0.),
             },
             // range: 16..36
             LineItem {
                 length: "This is second line.".len(),
-                wrapped_lines: vec![0..10, 10..20],
+                wrapped_lines: smallvec::smallvec![0..10, 10..20],
+                indent: Some(0),
+                word_columns: 0,
+                word_width: px(0.),
             },
             // range: 37..56
             LineItem {
                 length: "This is third line.".len(),
-                wrapped_lines: vec![0..9, 9..15, 15..20],
+                wrapped_lines: smallvec::smallvec![0..9, 9..15, 15..20],
+                indent: Some(0),
+                word_columns: 0,
+                word_width: px(0.),
             },
             // range: 57..79
             LineItem {
                 length: "这里是第 4 行。".len(),
-                wrapped_lines: vec![0..22],
+                wrapped_lines: smallvec::smallvec![0..22],
+                indent: Some(0),
+                word_columns: 0,
+                word_width: px(0.),
             },
         ];
 

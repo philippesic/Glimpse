@@ -35,9 +35,20 @@ impl LineWrapper {
         fragments: &'a [LineFragment],
         wrap_width: Pixels,
     ) -> impl Iterator<Item = Boundary> + 'a {
-        let mut width = px(0.);
-        let mut first_non_whitespace_ix = None;
-        let mut indent = None;
+        self.wrap_line_with_indent(fragments, wrap_width, None)
+    }
+
+    /// Resume wrapping at a previous boundary with its continuation indent.
+    pub fn wrap_line_with_indent<'a>(
+        &'a mut self,
+        fragments: &'a [LineFragment],
+        wrap_width: Pixels,
+        continuation_indent: Option<u32>,
+    ) -> impl Iterator<Item = Boundary> + 'a {
+        let mut width =
+            continuation_indent.map_or(px(0.), |indent| self.width_for_char(' ') * indent as f32);
+        let mut first_non_whitespace_ix = continuation_indent.map(|_| 0);
+        let mut indent = continuation_indent;
         let mut last_candidate_ix = 0;
         let mut last_candidate_width = px(0.);
         let mut last_wrap_ix = 0;
@@ -187,6 +198,22 @@ impl LineWrapper {
         matches!(c, '-' | '_' | '.' | '\'' | '$' | '%' | '@' | '#' | '^' | '~' | ',' | '=' | ':') ||
         // `⋯` character is special used in Zed, to keep this at the end of the line.
         matches!(c, '⋯')
+    }
+
+    /// Return the shared advance of an ASCII word, when every character has equal width.
+    pub fn uniform_word_width(&mut self, text: &str) -> Option<Pixels> {
+        let first = text.bytes().next()?;
+        if !first.is_ascii() || !Self::is_word_char(first as char) {
+            return None;
+        }
+        let width = self.width_for_char(first as char);
+        text.bytes()
+            .all(|byte| {
+                byte.is_ascii()
+                    && Self::is_word_char(byte as char)
+                    && self.width_for_char(byte as char) == width
+            })
+            .then_some(width)
     }
 
     #[inline(always)]
