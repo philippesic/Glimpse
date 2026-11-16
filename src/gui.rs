@@ -91,6 +91,11 @@ enum Panel {
     NewFolder,
     Rename,
 }
+struct CloseDecision {
+    quit: bool,
+    documents: Vec<u64>,
+    saving: bool,
+}
 struct Shell {
     request: cli::Request,
     io: IoWorker,
@@ -124,7 +129,9 @@ struct Shell {
     status: String,
     settings: storage::Settings,
     subscriptions: Vec<Subscription>,
-    close_pending: Option<bool>,
+    close_pending: Option<CloseDecision>,
+    closings: glimpse::closing::Closings,
+    quit_after_cleanup: bool,
     destination: Option<SaveDestination>,
     destination_busy: bool,
     records: Vec<storage::Record>,
@@ -207,6 +214,8 @@ impl Shell {
             settings: storage::Settings::default(),
             subscriptions: vec![subscription],
             close_pending: None,
+            closings: glimpse::closing::Closings::default(),
+            quit_after_cleanup: false,
             destination: None,
             destination_busy: false,
             records: vec![],
@@ -534,7 +543,40 @@ impl Shell {
                         }
                     }
                 }
+                Reply::Cleared(id, generation, result) => {
+                    let current = self
+                        .documents
+                        .iter()
+                        .find(|d| d.id == id)
+                        .map_or(generation, |d| d.generation);
+                    match self.closings.acknowledge(id, generation, current, result) {
+                        glimpse::closing::Outcome::Completed { .. } => {
+                            if !self.finished
+                                && self.requested.iter().any(|(requested, _)| *requested == id)
+                            {
+                                let _ = lifecycle::notify(b'1');
+                                self.finished = true;
+                            }
+                            self.documents.retain(|d| d.id != id);
+                            if self.active == Some(id) {
+                                self.active = self.documents.last().map(|d| d.id);
+                            }
+                            self.focus(window, cx);
+                            self.finish_close(cx);
+                        }
+                        glimpse::closing::Outcome::Changed => {
+                            self.quit_after_cleanup = false;
+                            self.status = "Close cancelled because the document changed".into();
+                        }
+                        glimpse::closing::Outcome::Failed(error) => {
+                            self.status =
+                                format!("Recovery cleanup failed; document kept open: {error}")
+                        }
+                        glimpse::closing::Outcome::Ignored => {}
+                    }
+                }
                 Reply::Save(id, text, result) => {
+                    let succeeded = result.is_ok();
                     if let Some(doc) = self.documents.iter_mut().find(|d| d.id == id) {
                         doc.saving = false;
                         match result {
@@ -547,8 +589,12 @@ impl Shell {
                             Err(e) => self.status = e,
                         }
                     }
+                    if succeeded && self.close_pending.as_ref().is_some_and(|d| d.saving) {
+                        self.continue_close(window, cx);
+                    }
                 }
                 Reply::SavedTo(destination, result) => {
+                    let succeeded = result.is_ok();
                     self.destination_busy = false;
                     match result {
                         Ok(disk) => {
@@ -563,6 +609,9 @@ impl Shell {
                             self.status = "Saved".into();
                         }
                         Err(e) => self.status = e,
+                    }
+                    if succeeded && self.close_pending.as_ref().is_some_and(|d| d.saving) {
+                        self.continue_close(window, cx);
                     }
                 }
                 Reply::Prepared(mut destination, result) => match result {
@@ -587,6 +636,14 @@ impl Shell {
                         .find(|d| d.id == id && d.generation == generation)
                     {
                         match result {
+                            Ok((disk, text)) if disk.target != doc.disk.target => {
+                                self.status = format!(
+                                    "Destination changed from {} to {}. Local text retained; use Save Copy or explicitly Reload disk.",
+                                    paths::display(&doc.disk.target),
+                                    paths::display(&disk.target)
+                                );
+                                doc.external = Some((disk, text));
+                            }
                             Ok((disk, text)) if disk.bytes != doc.disk.bytes => {
                                 if doc.dirty(cx) {
                                     doc.external = Some((disk, text));
@@ -747,7 +804,7 @@ impl Shell {
         }
         cx.notify();
     }
-    fn save(&mut self, cx: &mut Context<Self>) {
+    fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.request.pick {
             return;
         }
@@ -760,7 +817,7 @@ impl Shell {
                 return;
             }
             if doc.disk.target.as_os_str().is_empty() {
-                self.status = "Use Save As for this draft".into();
+                self.save_as(false, window, cx);
                 return;
             }
             if doc.external.is_some() {
@@ -823,46 +880,70 @@ impl Shell {
         })
         .detach();
     }
-    fn close(&mut self, quit: bool, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.io.pending_mutations() > 0 || self.destination_busy {
-            self.status = "Wait for pending writes".into();
+    fn close(&mut self, quit: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.io.pending_mutations() > 0 || self.destination_busy || !self.closings.is_empty() {
+            self.status = "Wait for pending writes or recovery cleanup".into();
             cx.notify();
             return;
         }
-        if self
+        let documents = self
             .documents
             .iter()
-            .any(|d| (quit || Some(d.id) == self.active) && d.dirty(cx))
-        {
-            self.close_pending = Some(quit);
-            cx.notify();
-            return;
-        }
-        self.discard_close(quit, cx);
+            .filter(|d| quit || Some(d.id) == self.active)
+            .map(|d| d.id)
+            .collect();
+        self.close_pending = Some(CloseDecision {
+            quit,
+            documents,
+            saving: false,
+        });
+        self.continue_close(window, cx);
     }
-    fn discard_close(&mut self, quit: bool, cx: &mut Context<Self>) {
-        self.close_pending = None;
-        if quit {
-            for doc in &self.documents {
+    fn continue_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(decision) = &self.close_pending else {
+            return;
+        };
+        let dirty = self
+            .documents
+            .iter()
+            .find(|d| decision.documents.contains(&d.id) && d.dirty(cx))
+            .map(|d| d.id);
+        if let Some(id) = dirty {
+            if decision.saving {
+                self.active = Some(id);
+                self.save(window, cx);
+            }
+        } else {
+            self.commit_close(false, cx);
+        }
+        cx.notify();
+    }
+    fn commit_close(&mut self, discard: bool, cx: &mut Context<Self>) {
+        let Some(decision) = self.close_pending.take() else {
+            return;
+        };
+        self.quit_after_cleanup = decision.quit;
+        for doc in &self.documents {
+            if decision.documents.contains(&doc.id)
+                && self.closings.begin(doc.id, doc.generation, discard)
+            {
                 self.io.send(Job::ClearThrough(doc.id, doc.generation));
+            }
+        }
+        self.finish_close(cx);
+    }
+    fn finish_close(&mut self, cx: &mut Context<Self>) {
+        if self.quit_after_cleanup && self.closings.is_empty() {
+            if !self.documents.is_empty() {
+                self.quit_after_cleanup = false;
+                self.status = "Quit cancelled because another document is open".into();
+                return;
             }
             if !self.finished && (self.request.wait || self.request.pick) {
                 let _ = lifecycle::notify(b'1');
                 crate::EXIT_STATUS.store(1, std::sync::atomic::Ordering::Relaxed);
             }
             cx.quit();
-        } else {
-            if let Some(id) = self.active {
-                if !self.finished && self.requested.iter().any(|(requested, _)| *requested == id) {
-                    let _ = lifecycle::notify(b'1');
-                    self.finished = true;
-                }
-                if let Some(doc) = self.documents.iter().find(|d| d.id == id) {
-                    self.io.send(Job::ClearThrough(id, doc.generation));
-                }
-                self.documents.retain(|d| d.id != id);
-            }
-            self.active = self.documents.last().map(|d| d.id);
         }
     }
     fn command(&mut self, command: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -902,7 +983,28 @@ impl Shell {
                 self.hits.clear();
                 self.focus(window, cx);
             }
-            "cancel-close" => self.close_pending = None,
+            "cancel-close" => {
+                self.close_pending = None;
+                for id in self.closings.cancel() {
+                    if let Some(doc) = self.documents.iter_mut().find(|d| d.id == id) {
+                        doc.generation += 1;
+                        if doc.dirty(cx) {
+                            self.io.send(Job::Recover(
+                                id,
+                                storage::Draft {
+                                    path: doc.disk.path.clone(),
+                                    target: Some(doc.disk.target.clone()),
+                                    text: doc.input.read(cx).value().to_string(),
+                                    base: doc.disk.bytes.clone(),
+                                    generation: doc.generation,
+                                },
+                            ));
+                        }
+                    }
+                }
+                self.quit_after_cleanup = false;
+                self.focus(window, cx);
+            }
             "replace-destination" => {
                 if let Some(destination) = self.destination.take() {
                     self.io.send(Job::SaveTo(destination));
@@ -927,7 +1029,18 @@ impl Shell {
                 }
             }
 
-            "save" => self.save(cx),
+            "save" => self.save(window, cx),
+            "save-close" => {
+                if let Some(decision) = self.close_pending.as_mut() {
+                    decision.saving = true;
+                }
+                self.continue_close(window, cx);
+            }
+            "retry-close" => {
+                for (id, generation) in self.closings.retry() {
+                    self.io.send(Job::ClearThrough(id, generation));
+                }
+            }
             "save-as" => self.save_as(false, window, cx),
             "save-copy" => self.save_as(true, window, cx),
             "new" if !self.request.pick => {
@@ -1259,20 +1372,38 @@ impl Render for Shell {
                 );
             }
         }
-        if let Some(quit) = self.close_pending {
+        if let Some(decision) = &self.close_pending {
+            let names = self
+                .documents
+                .iter()
+                .filter(|d| decision.documents.contains(&d.id) && d.dirty(cx))
+                .map(|d| paths::display(&d.disk.path))
+                .collect::<Vec<_>>()
+                .join(", ");
             root =
                 root.child(
                     div()
                         .flex()
                         .gap_2()
                         .p_2()
-                        .child("Unsaved changes: Save, then close again; or Discard / Cancel.")
-                        .child(self.button("Save", "save", cx))
+                        .child(format!("Unsaved changes: {names}"))
+                        .child(self.button("Save and close", "save-close", cx))
                         .child(div().id("discard").p_2().child("Discard").on_click(
-                            cx.listener(move |this, _, _, cx| this.discard_close(quit, cx)),
+                            cx.listener(move |this, _, _, cx| this.commit_close(true, cx)),
                         ))
                         .child(self.button("Cancel", "cancel-close", cx)),
                 );
+        }
+        if !self.closings.is_empty() {
+            root = root.child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .p_2()
+                    .child("Resolving recovery before closing")
+                    .child(self.button("Retry cleanup", "retry-close", cx))
+                    .child(self.button("Keep open", "cancel-close", cx)),
+            );
         }
         if self.destination.is_some() {
             root = root.child(
@@ -1489,6 +1620,10 @@ impl Render for Shell {
                 }
             }
             if key.key == "escape" {
+                if this.close_pending.is_some() || !this.closings.is_empty() {
+                    this.command("cancel-close", window, cx);
+                    return;
+                }
                 this.panel = None;
                 this.hits.clear();
                 this.focus(window, cx);
