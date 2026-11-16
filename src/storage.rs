@@ -32,16 +32,32 @@ pub fn private_dir(path: &Path) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 pub fn atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    atomic_write(path, |file| {
+        file.write_all(bytes).map_err(|error| error.to_string())
+    })
+}
+fn atomic_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
+    atomic_write(path, |file| {
+        let mut writer = std::io::BufWriter::with_capacity(65536, file);
+        serde_json::to_writer(&mut writer, value).map_err(|error| error.to_string())?;
+        writer.flush().map_err(|error| error.to_string())
+    })
+}
+fn atomic_write(
+    path: &Path,
+    write: impl FnOnce(&mut fs::File) -> Result<(), String>,
+) -> Result<(), String> {
     private_dir(path.parent().ok_or("Missing parent")?)?;
-    let mut temp =
-        tempfile::NamedTempFile::new_in(path.parent().unwrap()).map_err(|e| e.to_string())?;
+    let mut temp = tempfile::NamedTempFile::new_in(path.parent().unwrap())
+        .map_err(|error| error.to_string())?;
     temp.as_file()
         .set_permissions(fs::Permissions::from_mode(0o600))
-        .map_err(|e| e.to_string())?;
-    temp.write_all(bytes)
-        .and_then(|_| temp.as_file().sync_all())
-        .map_err(|e| e.to_string())?;
-    temp.persist(path).map_err(|e| e.to_string())?;
+        .map_err(|error| error.to_string())?;
+    write(temp.as_file_mut())?;
+    temp.as_file()
+        .sync_all()
+        .map_err(|error| error.to_string())?;
+    temp.persist(path).map_err(|error| error.to_string())?;
     Ok(())
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -596,16 +612,17 @@ impl Recovery {
             return Ok(());
         }
         let path = self.directory.join(format!("{id}.json"));
+        #[derive(Deserialize)]
+        struct Generation {
+            generation: u64,
+        }
         if let Ok(bytes) = fs::read(&path)
-            && let Ok(existing) = serde_json::from_slice::<Draft>(&bytes)
+            && let Ok(existing) = serde_json::from_slice::<Generation>(&bytes)
             && existing.generation > draft.generation
         {
             return Ok(());
         }
-        atomic(
-            &self.directory.join(format!("{id}.json")),
-            &serde_json::to_vec(draft).map_err(|e| e.to_string())?,
-        )
+        atomic_json(&path, draft)
     }
     pub fn claim(&self, source: &Path, id: u64) -> Result<(Draft, Option<String>), String> {
         let parent = source.parent().ok_or("Invalid recovery record")?;
@@ -642,10 +659,7 @@ impl Recovery {
                 .unwrap()
                 .as_nanos()
         ));
-        atomic(
-            &path,
-            &serde_json::to_vec(draft).map_err(|e| e.to_string())?,
-        )?;
+        atomic_json(&path, draft)?;
         Ok(path)
     }
     pub fn resolved(&self, candidate: &Path) -> Result<(), String> {
@@ -717,10 +731,7 @@ impl Recovery {
             draft.path = to.path.clone();
             draft.target = Some(to.target.clone());
             draft.base = to.bytes.clone();
-            atomic(
-                &path,
-                &serde_json::to_vec(&draft).map_err(|error| error.to_string())?,
-            )?;
+            atomic_json(&path, &draft)?;
         }
         Ok(())
     }
@@ -828,6 +839,30 @@ impl Drop for Recovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn interrupted_atomic_writes_leave_original_and_no_partial_record() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("record.json");
+        fs::write(&path, b"original bytes").unwrap();
+        let result = atomic_write(&path, |file| {
+            file.write_all(b"partial replacement").unwrap();
+            Err("injected interrupted write".into())
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"original bytes");
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+        let draft = draft(9);
+        atomic_json(&path, &draft).unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            serde_json::to_vec(&draft).unwrap()
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
     #[test]
     fn shared_snapshots_preserve_legacy_recovery_contents() {
         let record = r#"{"path":"original","text":"local β\r\n","base":[239,187,191,98,97,115,101,13,10],"target":null,"generation":4}"#;
