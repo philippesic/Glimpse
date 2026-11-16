@@ -1,3 +1,6 @@
+mod panes;
+mod theme;
+
 use glimpse::directory::Entry;
 use glimpse::{
     cli, directory,
@@ -7,7 +10,8 @@ use glimpse::{
 };
 use gpui::{prelude::*, *};
 use gpui_component::{
-    Root,
+    ActiveTheme, Root, Selectable, Sizable,
+    button::Button,
     input::{Input, InputEvent, InputState, Position},
     text::TextView,
 };
@@ -42,6 +46,8 @@ pub fn run(request: cli::Request) {
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    app_id: Some("glimpse".into()),
+                    window_min_size: Some(size(px(520.), px(400.))),
                     ..Default::default()
                 },
                 move |window, cx| {
@@ -115,6 +121,9 @@ struct Shell {
     history: Vec<PathBuf>,
     future: Vec<PathBuf>,
     nav_focus: FocusHandle,
+    pane_state: Entity<panes::Divider>,
+    navigation_only: bool,
+    navigator_visible: bool,
     scrolls: HashMap<PathBuf, UniformListScrollHandle>,
     selection: Option<PathBuf>,
     selections: HashMap<PathBuf, PathBuf>,
@@ -212,7 +221,10 @@ impl Shell {
             current,
             history: vec![],
             future: vec![],
-            nav_focus: cx.focus_handle(),
+            nav_focus: cx.focus_handle().tab_stop(true),
+            pane_state: cx.new(panes::Divider::new),
+            navigation_only: false,
+            navigator_visible: true,
             scrolls: HashMap::new(),
             selection: None,
             selections: HashMap::new(),
@@ -249,6 +261,8 @@ impl Shell {
         };
         window.focus(&this.nav_focus);
         this.refresh();
+        this.subscriptions
+            .push(cx.observe(&this.pane_state, |_, _, cx| cx.notify()));
         this.io.send(Job::LoadSettings);
         let files = this.request.files.clone();
         for (index, path) in files.into_iter().enumerate() {
@@ -345,6 +359,7 @@ impl Shell {
             }
             let id = doc.id;
             self.active = Some(id);
+            self.navigation_only = false;
             if let Some(position) = position {
                 self.position_document(id, position, window, cx);
             } else {
@@ -395,7 +410,7 @@ impl Shell {
                         doc.generation,
                         &doc.input.read(cx).value(),
                         &doc.disk.path,
-                        true,
+                        cx.theme().is_dark(),
                     );
                 }
                 cx.notify();
@@ -420,10 +435,11 @@ impl Shell {
             0,
             &input.read(cx).value(),
             &disk_path(&self.documents, id),
-            true,
+            cx.theme().is_dark(),
         );
         self.active = Some(id);
         self.reading = false;
+        self.navigation_only = false;
         self.watch();
         self.position_document(id, position.unwrap_or((1, 1)), window, cx);
     }
@@ -471,7 +487,7 @@ impl Shell {
                 doc.generation,
                 &doc.input.read(cx).value(),
                 &doc.disk.path,
-                true,
+                cx.theme().is_dark(),
             );
             doc.input.update(cx, |input, cx| input.focus(window, cx));
         } else {
@@ -603,6 +619,7 @@ impl Shell {
                         self.panel = None;
                     }
                     self.navigate(path);
+                    self.navigation_only = true;
                     window.focus(&self.nav_focus);
                 }
                 Reply::Open(path, token, result) => {
@@ -781,6 +798,7 @@ impl Shell {
                 Reply::SettingsLoaded(result) => match result {
                     Ok(settings) => {
                         self.settings = settings;
+                        theme::apply(&self.settings, window, cx);
                         for doc in &self.documents {
                             doc.input.update(cx, |input, cx| {
                                 input.set_soft_wrap(self.settings.wrap, window, cx);
@@ -904,7 +922,7 @@ impl Shell {
                 .map(|span| {
                     let start = glimpse::editor::utf16_to_byte(&text, span.start);
                     let end = glimpse::editor::utf16_to_byte(&text, span.start + span.length);
-                    let color = glimpse::syntax::readable_rgb(span.rgb, [24, 29, 37]);
+                    let color = glimpse::syntax::readable_rgb(span.rgb, theme::canvas(cx));
                     (
                         start..end,
                         HighlightStyle {
@@ -1100,7 +1118,23 @@ impl Shell {
             "named-file" => self.panel(Panel::NewFile, window, cx),
             "new-folder" => self.panel(Panel::NewFolder, window, cx),
             "rename" => self.panel(Panel::Rename, window, cx),
-            "navigator" => window.focus(&self.nav_focus),
+            "navigator" => {
+                self.navigation_only = true;
+                self.navigator_visible = true;
+                window.focus(&self.nav_focus);
+            }
+            "toggle-navigator" => {
+                if window.viewport_size().width < px(760.) {
+                    self.navigation_only = !self.navigation_only;
+                    if self.navigation_only {
+                        window.focus(&self.nav_focus);
+                    } else {
+                        self.focus(window, cx);
+                    }
+                } else {
+                    self.navigator_visible = !self.navigator_visible;
+                }
+            }
             "find" => {
                 self.focus(window, cx);
                 window.dispatch_action(Box::new(gpui_component::input::Search), cx);
@@ -1165,6 +1199,7 @@ impl Shell {
             }
 
             "save" => self.save(window, cx),
+            "discard-close" => self.commit_close(true, cx),
             "save-close" => {
                 if let Some(decision) = self.close_pending.as_mut() {
                     decision.saving = true;
@@ -1379,15 +1414,11 @@ impl Shell {
         label: impl Into<SharedString>,
         command: &'static str,
         cx: &Context<Self>,
-    ) -> impl IntoElement {
-        div()
-            .id(command)
-            .px_2()
-            .py_1()
-            .rounded_md()
-            .bg(rgb(0x303944))
-            .cursor_pointer()
-            .child(label.into())
+    ) -> Button {
+        Button::new(command)
+            .label(label)
+            .small()
+            .outline()
             .on_click(cx.listener(move |this, _, window, cx| this.command(command, window, cx)))
     }
 }
@@ -1410,13 +1441,18 @@ impl Render for Shell {
         }
         let mut toolbar = div()
             .flex()
+            .flex_wrap()
             .gap_2()
             .p_2()
-            .bg(rgb(0x222933))
+            .bg(cx.theme().muted)
             .child(self.button("‹", "back", cx))
             .child(self.button("›", "forward", cx))
             .child(self.button("↑", "parent", cx))
-            .child(self.button(paths::display(&self.current), "path", cx))
+            .child(
+                self.button("Location", "path", cx)
+                    .tooltip(paths::display(&self.current)),
+            )
+            .child(self.button("Navigator", "toggle-navigator", cx))
             .child(self.button("Open", "open", cx))
             .child(self.button("Filter", "filter", cx))
             .child(self.button("Files", "find-files", cx))
@@ -1431,10 +1467,19 @@ impl Render for Shell {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(0x181d25))
-            .text_color(rgb(0xdce3ee))
-            .text_size(px(14.))
-            .child(toolbar);
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
+            .text_size(px(14. * self.settings.ui_scale))
+            .child(toolbar)
+            .child(
+                div()
+                    .id("location-summary")
+                    .px_2()
+                    .py_1()
+                    .text_size(px(12. * self.settings.ui_scale))
+                    .truncate()
+                    .child(paths::display(&self.current)),
+            );
         if let Some(panel) = self.panel {
             let title = match panel {
                 Panel::Path => "Location",
@@ -1455,7 +1500,7 @@ impl Render for Shell {
                     .gap_2()
                     .p_2()
                     .child(title)
-                    .child(Input::new(&self.query))
+                    .child(Input::new(&self.query).flex_1().min_w_0())
                     .child(self.button("Apply", "submit", cx).into_any_element())
                     .child(self.button("Close", "dismiss", cx)),
             );
@@ -1569,19 +1614,16 @@ impl Render for Shell {
                 .map(|d| paths::display(&d.disk.path))
                 .collect::<Vec<_>>()
                 .join(", ");
-            root =
-                root.child(
-                    div()
-                        .flex()
-                        .gap_2()
-                        .p_2()
-                        .child(format!("Unsaved changes: {names}"))
-                        .child(self.button("Save and close", "save-close", cx))
-                        .child(div().id("discard").p_2().child("Discard").on_click(
-                            cx.listener(move |this, _, _, cx| this.commit_close(true, cx)),
-                        ))
-                        .child(self.button("Cancel", "cancel-close", cx)),
-                );
+            root = root.child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .p_2()
+                    .child(format!("Unsaved changes: {names}"))
+                    .child(self.button("Save and close", "save-close", cx))
+                    .child(self.button("Discard", "discard-close", cx))
+                    .child(self.button("Cancel", "cancel-close", cx)),
+            );
         }
         if !self.closings.is_empty() {
             root = root.child(
@@ -1621,9 +1663,9 @@ impl Render for Shell {
         let navigator = div()
             .id("navigator")
             .track_focus(&self.nav_focus)
-            .w(px(280.))
+            .w_full()
             .h_full()
-            .bg(rgb(0x202630))
+            .bg(cx.theme().sidebar)
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, window, _| window.focus(&this.nav_focus)),
@@ -1640,13 +1682,14 @@ impl Render for Shell {
                                 let selected = this.selection.as_ref() == Some(&path);
                                 div()
                                     .id(("entry", i))
-                                    .h(px(28.))
+                                    .h(px(if this.settings.compact { 28. } else { 32. }
+                                        * this.settings.ui_scale))
                                     .px_3()
                                     .py_1()
                                     .bg(if selected {
-                                        rgb(0x344c68)
+                                        cx.theme().selection
                                     } else {
-                                        rgb(0x202630)
+                                        cx.theme().sidebar
                                     })
                                     .cursor_pointer()
                                     .child(format!(
@@ -1669,38 +1712,56 @@ impl Render for Shell {
                 .track_scroll(scroll),
             );
         let tabs = div()
-            .flex()
-            .gap_1()
-            .p_1()
-            .children(self.documents.iter().map(|doc| {
-                let id = doc.id;
+            .id("tabs")
+            .w_full()
+            .overflow_x_scroll()
+            .flex_shrink_0()
+            .child(
                 div()
-                    .id(("tab", id))
-                    .px_3()
-                    .py_2()
-                    .bg(if Some(id) == self.active {
-                        rgb(0x344152)
-                    } else {
-                        rgb(0x222933)
-                    })
-                    .child(format!(
-                        "{}{}{}{}",
-                        paths::name(&doc.disk.path),
-                        if doc.dirty(cx) { " •" } else { "" },
-                        if doc.preview { " (preview)" } else { "" },
-                        if doc.external.is_some() {
-                            " (conflict)"
-                        } else {
-                            ""
-                        }
-                    ))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.active = Some(id);
-                        this.reading = false;
-                        this.focus(window, cx);
-                        cx.notify();
-                    }))
-            }));
+                    .flex()
+                    .gap_1()
+                    .p_1()
+                    .children(self.documents.iter().map(|doc| {
+                        let id = doc.id;
+                        let name = paths::name(&doc.disk.path);
+                        let duplicate = self.documents.iter().any(|other| {
+                            other.id != id
+                                && other.disk.path.file_name() == doc.disk.path.file_name()
+                        });
+                        let title = format!(
+                            "{}{}{}{}{}",
+                            name,
+                            if duplicate {
+                                format!(
+                                    " — {}",
+                                    paths::display(
+                                        doc.disk.path.parent().unwrap_or(&doc.disk.path)
+                                    )
+                                )
+                            } else {
+                                String::new()
+                            },
+                            if doc.dirty(cx) { " •" } else { "" },
+                            if doc.preview { " (preview)" } else { "" },
+                            if doc.external.is_some() {
+                                " (conflict)"
+                            } else {
+                                ""
+                            }
+                        );
+                        Button::new(("tab", id))
+                            .label(title)
+                            .small()
+                            .selected(Some(id) == self.active)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.active = Some(id);
+                                this.reading = false;
+                                this.navigation_only = false;
+                                this.focus(window, cx);
+                                cx.notify();
+                            }))
+                    })),
+            );
         let mut content = div()
             .flex_1()
             .h_full()
@@ -1712,6 +1773,7 @@ impl Render for Shell {
             content = content.child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .gap_2()
                     .p_1()
                     .child(self.button("New", "new", cx))
@@ -1751,10 +1813,11 @@ impl Render for Shell {
                     div()
                         .flex_1()
                         .min_h_0()
-                        .font_family("monospace")
-                        .text_size(px(self.settings.font_size))
+                        .font_family(cx.theme().mono_font_family.clone())
                         .child(
                             Input::new(&doc.input)
+                                .text_size(px(self.settings.font_size * self.settings.ui_scale))
+                                .line_height(relative(self.settings.line_height))
                                 .h_full()
                                 .disabled(self.request.pick || self.destination_busy),
                         ),
@@ -1767,109 +1830,131 @@ impl Render for Shell {
                     .child("Select a file to preview, or open a file."),
             );
         }
-        root.child(
+        let narrow = window.viewport_size().width < px(760.);
+        let body = if narrow {
+            if self.navigation_only || self.active.is_none() {
+                navigator.into_any_element()
+            } else {
+                content.into_any_element()
+            }
+        } else if self.navigator_visible {
             div()
                 .flex()
-                .flex_1()
-                .min_h_0()
-                .child(navigator)
-                .child(content),
-        )
-        .child(div().p_2().child(self.status.clone()))
-        .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-            let key = &event.keystroke;
-            if this.nav_focus.is_focused(window)
-                && !key.modifiers.control
-                && !key.modifiers.platform
-            {
-                let query = this.filter.to_lowercase();
-                let rows: Vec<_> = this
-                    .entries
-                    .iter()
-                    .filter(|entry| paths::name(&entry.path).to_lowercase().contains(&query))
-                    .cloned()
-                    .collect();
-                let index = rows
-                    .iter()
-                    .position(|entry| Some(&entry.path) == this.selection.as_ref());
-                match key.key.as_str() {
-                    "up" | "down" if !rows.is_empty() => {
-                        let next = if key.key == "down" {
-                            index.map_or(0, |i| (i + 1).min(rows.len() - 1))
-                        } else {
-                            index.unwrap_or(0).saturating_sub(1)
-                        };
-                        this.selection = Some(rows[next].path.clone());
-                        if let Some(scroll) = this.scrolls.get(&this.current) {
-                            scroll.scroll_to_item(next, ScrollStrategy::Top);
-                        }
-                        cx.notify();
-                        return;
-                    }
-                    "left" => {
-                        this.command("parent", window, cx);
-                        return;
-                    }
-                    "right" | "enter" => {
-                        if let Some(path) = this.selection.clone() {
-                            this.open(path, false, None);
-                        }
-                        cx.notify();
-                        return;
-                    }
-                    _ => {}
-                }
-            }
-            if key.key == "escape" {
-                if this.close_pending.is_some() || !this.closings.is_empty() {
-                    this.command("cancel-close", window, cx);
-                    return;
-                }
-                if this.destination.is_some() {
-                    this.command("cancel-destination", window, cx);
-                }
-                this.command("dismiss", window, cx);
-                return;
-            }
-            if key.modifiers.control || key.modifiers.platform {
-                let binding =
-                    glimpse::commands::bindings(&this.settings.keymaps).unwrap_or_default();
-                if let Some(command) = binding
-                    .iter()
-                    .find(|binding| {
-                        let name = match binding.key.name() {
-                            "ArrowLeft" => "left",
-                            "ArrowRight" => "right",
-                            "ArrowUp" => "up",
-                            "ArrowDown" => "down",
-                            "Comma" => ",",
-                            other => other,
-                        };
-                        name.eq_ignore_ascii_case(&key.key)
-                            && binding.modifiers.shift == key.modifiers.shift
-                            && binding.modifiers.alt == key.modifiers.alt
-                    })
-                    .and_then(|binding| {
-                        glimpse::commands::COMMANDS
-                            .iter()
-                            .find(|command| command.action == binding.action)
-                    })
+                .size_full()
+                .child(
+                    div()
+                        .w(self.pane_state.read(cx).width(window))
+                        .h_full()
+                        .flex_shrink_0()
+                        .child(navigator),
+                )
+                .child(self.pane_state.clone())
+                .child(content)
+                .into_any_element()
+        } else {
+            content.into_any_element()
+        };
+        root.child(div().flex_1().min_h_0().child(body))
+            .child(
+                div()
+                    .p_2()
+                    .text_size(px(12. * self.settings.ui_scale))
+                    .child(self.status.clone()),
+            )
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                let key = &event.keystroke;
+                if this.nav_focus.is_focused(window)
+                    && !key.modifiers.control
+                    && !key.modifiers.platform
                 {
-                    if command.id != "find" {
-                        this.command(command.id, window, cx);
-                        cx.stop_propagation();
+                    let query = this.filter.to_lowercase();
+                    let rows: Vec<_> = this
+                        .entries
+                        .iter()
+                        .filter(|entry| paths::name(&entry.path).to_lowercase().contains(&query))
+                        .cloned()
+                        .collect();
+                    let index = rows
+                        .iter()
+                        .position(|entry| Some(&entry.path) == this.selection.as_ref());
+                    match key.key.as_str() {
+                        "up" | "down" if !rows.is_empty() => {
+                            let next = if key.key == "down" {
+                                index.map_or(0, |i| (i + 1).min(rows.len() - 1))
+                            } else {
+                                index.unwrap_or(0).saturating_sub(1)
+                            };
+                            this.selection = Some(rows[next].path.clone());
+                            if let Some(scroll) = this.scrolls.get(&this.current) {
+                                scroll.scroll_to_item(next, ScrollStrategy::Top);
+                            }
+                            cx.notify();
+                            return;
+                        }
+                        "left" => {
+                            this.command("parent", window, cx);
+                            return;
+                        }
+                        "right" | "enter" => {
+                            if let Some(path) = this.selection.clone() {
+                                this.open(path, false, None);
+                            }
+                            cx.notify();
+                            return;
+                        }
+                        _ => {}
                     }
+                }
+                if key.key == "escape" {
+                    if this.close_pending.is_some() || !this.closings.is_empty() {
+                        this.command("cancel-close", window, cx);
+                        return;
+                    }
+                    if this.destination.is_some() {
+                        this.command("cancel-destination", window, cx);
+                    }
+                    this.command("dismiss", window, cx);
                     return;
                 }
-                let command = match (key.key.as_str(), key.modifiers.shift) {
-                    ("g", _) => "line",
-                    ("e", true) => "navigator",
-                    _ => return,
-                };
-                this.command(command, window, cx);
-                cx.stop_propagation();
-            }
-        }))
+                if key.modifiers.control || key.modifiers.platform {
+                    let binding =
+                        glimpse::commands::bindings(&this.settings.keymaps).unwrap_or_default();
+                    if let Some(command) = binding
+                        .iter()
+                        .find(|binding| {
+                            let name = match binding.key.name() {
+                                "ArrowLeft" => "left",
+                                "ArrowRight" => "right",
+                                "ArrowUp" => "up",
+                                "ArrowDown" => "down",
+                                "Comma" => ",",
+                                other => other,
+                            };
+                            name.eq_ignore_ascii_case(&key.key)
+                                && binding.modifiers.shift == key.modifiers.shift
+                                && binding.modifiers.alt == key.modifiers.alt
+                        })
+                        .and_then(|binding| {
+                            glimpse::commands::COMMANDS
+                                .iter()
+                                .find(|command| command.action == binding.action)
+                        })
+                    {
+                        if command.id != "find" {
+                            this.command(command.id, window, cx);
+                            cx.stop_propagation();
+                        }
+                        return;
+                    }
+                    let command = match (key.key.as_str(), key.modifiers.shift) {
+                        ("g", _) => "line",
+                        ("e", true) => "navigator",
+                        _ => return,
+                    };
+                    this.command(command, window, cx);
+                    cx.stop_propagation();
+                }
+            }))
     }
 }
 
