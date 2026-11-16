@@ -119,6 +119,8 @@ impl Shell {
             }))
             .child(
                 self.command_button("edit-location", "…", "path", cx)
+                    .flex_1()
+                    .min_w(px(28.))
                     .tooltip("Edit path"),
             )
             .into_any_element()
@@ -133,6 +135,9 @@ impl Shell {
             return div().into_any_element();
         };
         div()
+            .flex()
+            .flex_col()
+            .items_start()
             .id("path-completions")
             .max_h(px(160.))
             .overflow_y_scroll()

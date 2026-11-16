@@ -8,6 +8,7 @@ pub mod directory;
 pub mod document;
 pub mod editor;
 pub mod fileops;
+pub mod gesture;
 pub mod io;
 pub mod lifecycle;
 pub mod locations;

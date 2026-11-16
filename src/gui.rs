@@ -179,6 +179,7 @@ struct Shell {
     scope: Option<PathBuf>,
     current: PathBuf,
     history: Vec<PathBuf>,
+    gesture: glimpse::gesture::Gesture,
     future: Vec<PathBuf>,
     nav_focus: FocusHandle,
     pane_state: Entity<panes::Divider>,
@@ -333,6 +334,7 @@ impl Shell {
             syntax,
             current,
             history: vec![],
+            gesture: glimpse::gesture::Gesture::default(),
             future: vec![],
             nav_focus: cx.focus_handle().tab_stop(true),
             pane_state: cx.new(panes::Divider::new),
@@ -2510,7 +2512,40 @@ impl Render for Shell {
         let mut root = div()
             .size_full()
             .relative()
-            .capture_any_mouse_down(cx.listener(|this, _, _, _| this.interaction += 1))
+            .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                this.interaction += 1;
+                if this.preferences.is_none()
+                    && this.decision.is_none()
+                    && let MouseButton::Navigate(direction) = event.button
+                {
+                    this.command(
+                        if direction == NavigationDirection::Back {
+                            "back"
+                        } else {
+                            "forward"
+                        },
+                        window,
+                        cx,
+                    );
+                    cx.stop_propagation();
+                }
+            }))
+            .can_drop({
+                let enabled = self.preferences.is_none() && self.decision.is_none();
+                move |_, _, _| enabled
+            })
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                this.interaction += 1;
+                for path in paths.paths().iter().take(64) {
+                    this.open(path.clone(), false, None);
+                }
+                if paths.paths().len() > 64 {
+                    this.status =
+                        "Requested the first 64 dropped paths; drop the remaining paths separately"
+                            .into();
+                }
+                cx.notify();
+            }))
             .flex()
             .flex_col()
             .bg(cx.theme().background)
@@ -2676,6 +2711,33 @@ impl Render for Shell {
             .w_full()
             .h_full()
             .bg(cx.theme().sidebar)
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
+                if this.preferences.is_some() || this.decision.is_some() {
+                    return;
+                }
+                let delta = event.delta.pixel_delta(px(24.));
+                let phase = if !event.delta.precise() {
+                    glimpse::gesture::Phase::Wheel
+                } else {
+                    match event.touch_phase {
+                        TouchPhase::Started => glimpse::gesture::Phase::Started,
+                        TouchPhase::Moved => glimpse::gesture::Phase::Moved,
+                        TouchPhase::Ended => glimpse::gesture::Phase::Ended,
+                    }
+                };
+                let (horizontal, direction) = this.gesture.update(
+                    delta.x.into(),
+                    delta.y.into(),
+                    phase,
+                    std::time::Instant::now(),
+                );
+                if let Some(back) = direction {
+                    this.command(if back { "back" } else { "forward" }, window, cx);
+                }
+                if horizontal {
+                    cx.stop_propagation();
+                }
+            }))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, window, _| window.focus(&this.nav_focus)),
