@@ -1488,6 +1488,11 @@ impl Element for TextElement {
             }
         }
 
+        if self.state.read(cx).scroll_handle.offset() != prepaint.cursor_scroll_offset {
+            let state = self.state.clone();
+            window.on_next_frame(move |_, cx| state.update(cx, |_, cx| cx.notify()));
+            window.request_animation_frame();
+        }
         self.state.update(cx, |state, cx| {
             state.last_layout = Some(prepaint.last_layout.clone());
             state.last_bounds = Some(bounds);
