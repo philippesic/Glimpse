@@ -59,7 +59,7 @@ The memory aspiration and the long-line responsiveness envelope remain failed en
 
 ## Reference refinement and current aspirations
 
-The current targets are app opening below 100 ms, visually instant folder/file opening, total RAM below 100 MB, and CPU below 0.1% during active use. Active CPU and idle CPU are separate acceptance conditions.
+The current targets are app opening below 100 ms, folder and file opening within 100 ms, total RAM below 100 MB and idle CPU at most 0.1% of one core, with active CPU proportional to the interaction. Active and idle CPU are reported separately.
 
 On Mac15,10 / Apple M3 Max / 36 GiB / macOS 27.0, five warm nonactivating release launches measured private readiness acknowledgment at 180–227 ms for a tiny Rust file (p95 227 ms), and 146–158 ms for a folder (p95 158 ms). RSS at acknowledgment was 151–157 MiB for the file and 119–120 MiB for the folder. Nonactivating readiness does not establish physical visible-frame or input latency; cold launch remains unmeasured.
 

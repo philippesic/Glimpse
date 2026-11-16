@@ -310,7 +310,7 @@ Reuse maintained libraries or components when they meet the design and reduce ma
 
 ### Proposed performance budgets
 
-The current user aspirations are app opening below 100 ms, visually instant folder/file opening, total RAM below 100 MB and CPU below 0.1% during **active use**. Active and idle CPU are separate workloads; the active target must not be reported as an idle target. These supersede the earlier launch/RAM aspirations for current acceptance; the baseline table below remains historical engineering context. Report actual failures, cache conditions and instrumentation limits.
+The current user aspirations are app opening below 100 ms, folder and file opening within 100 ms, total RAM below 100 MB and idle CPU at most 0.1% of one core. During active use, CPU work stays proportional to the interaction and returns to idle promptly; report active and idle CPU separately. These supersede the earlier launch/RAM aspirations for current acceptance; the baseline table below remains historical engineering context. Report actual failures, cache conditions and instrumentation limits.
 
 Measure optimized release builds on a named reference machine, OS, display refresh rate, and storage configuration. Establish the initial reference on an ordinary Apple Silicon laptop with local SSD storage; record the actual model and memory before collecting results. Repeat on representative Windows and Linux machines before claiming support. Report p50/p95/p99 where meaningful, sample counts, and cache state.
 
@@ -318,7 +318,7 @@ Measure optimized release builds on a named reference machine, OS, display refre
 | --- | --- |
 | New process, OS caches warm, one local text file up to 1 MiB | p95 first editable frame within 250 ms |
 | Launch into an already-running GUI, if reuse is implemented | p95 requested document usable within 150 ms |
-| Normal editing within the supported envelope | 120 Hz interaction; 8.33 ms frame-work budget. Physical input-to-present must be measured separately |
+| Normal editing within the supported envelope | 120 Hz interaction; 8.33 ms frame-work budget. Report physical input-to-present latency when it can be measured; it is not a release gate |
 | Cached local folder with 10,000 entries | First usable batch within 100 ms; subsequent enumeration does not block input |
 | Filename query over 100,000 already-known candidate paths | Updated first results within 100 ms; stale query abandoned within 50 ms |
 | Slow filesystem or cold recursive search | Input remains responsive; progress and cancellation remain usable; completion time reported rather than hidden behind a universal latency claim |
