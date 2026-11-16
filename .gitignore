@@ -1,0 +1,24 @@
+# Rust and release outputs
+/target/
+/build/
+/dist/
+/coverage/
+*.profraw
+*.profdata
+*.rs.bk
+
+# Private working material and disposable checkouts
+/.local/
+/.worktrees/
+
+# Local environment files; examples are intentional project content
+/.env
+/.env.*
+!/.env.example
+
+# OS and editor residue
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
