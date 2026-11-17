@@ -1,5 +1,6 @@
 //! Highlighting runs outside the event loop; obsolete documents never recolor a newer edit.
 use crate::wake;
+use gpui_component::input::{LineType, Rope};
 use std::{
     sync::{
         Arc, Mutex,
@@ -9,7 +10,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use syntect::{easy::HighlightLines, util::LinesWithEndings};
+use syntect::easy::HighlightLines;
 
 fn luminance(rgb: [u8; 3]) -> f64 {
     let linear = rgb.map(|c| {
@@ -109,7 +110,7 @@ pub struct Highlight {
 struct Request {
     id: u64,
     generation: u64,
-    text: Arc<str>,
+    text: Rope,
     extension: &'static str,
     dark: bool,
     token: u64,
@@ -164,6 +165,24 @@ pub fn grammar_extension(path: &std::path::Path, text: &str) -> Option<&'static 
     }
     None
 }
+
+pub fn grammar_for_text(path: &std::path::Path, text: &Rope) -> Option<&'static str> {
+    if let Some(extension) = grammar_extension(path, "") {
+        return Some(extension);
+    }
+    if !text.chunks().next()?.starts_with('#') {
+        return None;
+    }
+    let mut prefix = Vec::with_capacity(256);
+    for chunk in text.chunks() {
+        let count = (256 - prefix.len()).min(chunk.len());
+        prefix.extend_from_slice(&chunk.as_bytes()[..count]);
+        if prefix.len() == 256 {
+            break;
+        }
+    }
+    grammar_extension(path, &String::from_utf8_lossy(&prefix))
+}
 pub struct Syntax {
     pending: Arc<Mutex<Option<Request>>>,
     ready: Arc<Mutex<Option<Highlight>>>,
@@ -193,7 +212,11 @@ impl Syntax {
                 let mut offset = 0;
                 let started = Instant::now();
                 let mut state = syntax.name.clone();
-                for line in LinesWithEndings::from(request.text.as_ref()) {
+                for line in request
+                    .text
+                    .lines(LineType::LF)
+                    .filter(|line| line.len() != 0)
+                {
                     if current.load(Ordering::Relaxed) != request.token {
                         break;
                     }
@@ -204,7 +227,11 @@ impl Syntax {
                         state.push_str(" · partial highlighting (work limit)");
                         break;
                     }
-                    match parser.highlight_line(line, syntaxes) {
+                    let line = line.as_str().map_or_else(
+                        || std::borrow::Cow::Owned(line.to_string()),
+                        std::borrow::Cow::Borrowed,
+                    );
+                    match parser.highlight_line(&line, syntaxes) {
                         Ok(parts) => {
                             for (style, part) in parts {
                                 if spans.len() == 30000 {
@@ -257,13 +284,12 @@ impl Syntax {
         &self,
         id: u64,
         generation: u64,
-        text: impl Into<Arc<str>>,
+        text: Rope,
         path: &std::path::Path,
         dark: bool,
     ) {
         let token = self.token.fetch_add(1, Ordering::Relaxed) + 1;
-        let text = text.into();
-        let Some(extension) = grammar_extension(path, &text) else {
+        let Some(extension) = grammar_for_text(path, &text) else {
             self.pending.lock().unwrap().take();
             *self.ready.lock().unwrap() = Some(Highlight {
                 id,
@@ -302,8 +328,20 @@ mod tests {
     #[test]
     fn plain_text_is_immediate_and_invalidates_pending_grammar_work() {
         let syntax = Syntax::new(wake::Context::default());
-        syntax.request(1, 1, "fn old() {}", std::path::Path::new("x.rs"), true);
-        syntax.request(1, 2, "plain 🦀", std::path::Path::new("x.txt"), false);
+        syntax.request(
+            1,
+            1,
+            Rope::from("fn old() {}"),
+            std::path::Path::new("x.rs"),
+            true,
+        );
+        syntax.request(
+            1,
+            2,
+            Rope::from("plain 🦀"),
+            std::path::Path::new("x.txt"),
+            false,
+        );
         let result = syntax.take().unwrap();
         assert_eq!(result.generation, 2);
         assert_eq!(result.state, "Plain text");
@@ -350,9 +388,24 @@ mod tests {
     #[test]
     fn latest_generation_has_matching_byte_ranges() {
         let syntax = Syntax::new(wake::Context::default());
-        syntax.request(1, 1, "obsolete", std::path::Path::new("x.rs"), true);
-        let text = "let 🦀 = \"café 中文 é\";\r\n";
-        syntax.request(1, 2, text, std::path::Path::new("x.rs"), true);
+        syntax.request(
+            1,
+            1,
+            Rope::from("obsolete"),
+            std::path::Path::new("x.rs"),
+            true,
+        );
+        let text = format!(
+            "let 🦀 = \"café 中文 é\";\r\n// {}\r\nlet done = true;\n",
+            "é 字 café ".repeat(450)
+        );
+        syntax.request(
+            1,
+            2,
+            Rope::from(text.as_str()),
+            std::path::Path::new("x.rs"),
+            true,
+        );
         let until = Instant::now() + Duration::from_secs(5);
         loop {
             if let Some(result) = syntax.take() {

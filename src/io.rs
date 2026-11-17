@@ -1,6 +1,6 @@
 use crate::wake;
 use crate::{document::DiskFile, fileops, storage};
-use gpui_component::input::PreparedInput;
+use gpui_component::input::{PreparedInput, Rope};
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -109,7 +109,7 @@ struct Rebinding {
     to: DiskFile,
 }
 impl Rebinding {
-    fn apply(&self, draft: &mut storage::Draft) {
+    fn apply(&self, draft: &mut storage::Draft<impl Sized>) {
         if draft.generation > self.generation
             && draft.generation <= self.through.load(Ordering::Acquire)
             && draft.path == self.from.path
@@ -132,7 +132,7 @@ pub struct IoWorker {
     maintenance: Option<mpsc::SyncSender<Job>>,
     pub replies: mpsc::Receiver<Reply>,
     errors: mpsc::Sender<Reply>,
-    drafts: Arc<Mutex<HashMap<u64, storage::Draft>>>,
+    drafts: Arc<Mutex<HashMap<u64, storage::Draft<RecoveryText>>>>,
     handles: Vec<thread::JoinHandle<()>>,
     clears: Arc<Mutex<HashMap<u64, u64>>>,
     cleared_through: Arc<Mutex<HashMap<u64, u64>>>,
@@ -140,6 +140,20 @@ pub struct IoWorker {
     preview: Arc<AtomicU64>,
     wake: wake::Context,
     rebindings: Arc<Rebindings>,
+}
+
+enum RecoveryText {
+    Flat(Arc<str>),
+    Revision(Rope),
+}
+
+impl serde::Serialize for RecoveryText {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Flat(text) => serializer.serialize_str(text),
+            Self::Revision(text) => serializer.collect_str(text),
+        }
+    }
 }
 struct RecoveryStore {
     root: PathBuf,
@@ -192,7 +206,9 @@ impl IoWorker {
         let (maintenance, maintenance_jobs) = mpsc::sync_channel(16);
         let (results, replies) = mpsc::channel();
         let errors = results.clone();
-        let drafts = Arc::new(Mutex::new(HashMap::<u64, storage::Draft>::new()));
+        let drafts = Arc::new(Mutex::new(
+            HashMap::<u64, storage::Draft<RecoveryText>>::new(),
+        ));
         let preview = Arc::new(AtomicU64::new(0));
         let rebindings = Arc::new(Rebindings::default());
         let recovery_store = Arc::new(RecoveryStore {
@@ -691,27 +707,7 @@ impl IoWorker {
             return;
         }
         let job = if let Job::Recover(id, draft) = job {
-            if self
-                .cleared_through
-                .lock()
-                .unwrap()
-                .get(&id)
-                .is_some_and(|g| *g >= draft.generation)
-            {
-                return;
-            }
-            let generation = draft.generation;
-            self.drafts.lock().unwrap().insert(id, draft);
-            if let Some(tx) = &self.maintenance
-                && let Err(mpsc::TrySendError::Disconnected(_)) = tx.try_send(Job::Wake)
-            {
-                let _ = self.errors.send(Reply::Recovered(
-                    id,
-                    generation,
-                    Err("Recovery service stopped; local text remains in memory".into()),
-                ));
-                self.wake.request_repaint();
-            }
+            self.queue_recovery(id, draft.map_text(RecoveryText::Flat));
             return;
         } else {
             job
@@ -791,6 +787,34 @@ impl IoWorker {
                 let _ = self.errors.send(reply);
                 self.wake.request_repaint();
             }
+        }
+    }
+
+    pub fn recover_edit(&self, id: u64, draft: storage::Draft<Rope>) {
+        self.queue_recovery(id, draft.map_text(RecoveryText::Revision));
+    }
+
+    fn queue_recovery(&self, id: u64, draft: storage::Draft<RecoveryText>) {
+        if self
+            .cleared_through
+            .lock()
+            .unwrap()
+            .get(&id)
+            .is_some_and(|generation| *generation >= draft.generation)
+        {
+            return;
+        }
+        let generation = draft.generation;
+        self.drafts.lock().unwrap().insert(id, draft);
+        if let Some(tx) = &self.maintenance
+            && let Err(mpsc::TrySendError::Disconnected(_)) = tx.try_send(Job::Wake)
+        {
+            let _ = self.errors.send(Reply::Recovered(
+                id,
+                generation,
+                Err("Recovery service stopped; local text remains in memory".into()),
+            ));
+            self.wake.request_repaint();
         }
     }
 }
@@ -881,7 +905,7 @@ fn save_destination(
         let r = recovery
             .as_ref()
             .map_err(|e| format!("Recovery unavailable: {e}"))?;
-        let draft = storage::Draft {
+        let draft: storage::Draft = storage::Draft {
             path: destination.original.path.clone(),
             text: destination.text.clone().into(),
             base: destination.original.bytes.clone(),
@@ -958,6 +982,17 @@ impl Drop for IoWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_editor_recovery_preserves_the_wire_text() {
+        let text = "\u{feff}café 👩‍👩‍👧‍👦 \"quoted\" \\ path\r\nline\rthird\n".repeat(450);
+        let revision = Rope::from(text.as_str());
+        assert!(revision.chunks().count() > 1);
+        assert_eq!(
+            serde_json::to_vec(&RecoveryText::Revision(revision)).unwrap(),
+            serde_json::to_vec(&text).unwrap()
+        );
+    }
     #[test]
     fn recovery_copies_are_new_files_and_never_replace_or_rebind() {
         let root = tempfile::tempdir().unwrap();
@@ -1163,7 +1198,7 @@ mod tests {
             disk,
             text,
         };
-        let draft = |generation, text: &str| storage::Draft {
+        let draft = |generation, text: &str| storage::Draft::<Arc<str>> {
             path: path.clone(),
             text: text.into(),
             base: reload.original.bytes.clone(),

@@ -27,7 +27,7 @@ use gpui::{prelude::*, *};
 use gpui_component::{
     ActiveTheme, Disableable, Root, Selectable, Sizable,
     button::{Button, ButtonVariants},
-    input::{Input, InputEvent, InputState, Position, PreparedInput},
+    input::{Input, InputEvent, InputState, Position, PreparedInput, Rope},
     text::TextView,
 };
 use std::{
@@ -92,7 +92,7 @@ struct Document {
     id: u64,
     disk: DiskFile,
     input: Entity<InputState>,
-    verified_clean: RefCell<Option<SharedString>>,
+    disk_comparison: RefCell<Option<(Rope, bool)>>,
     status_cursor: usize,
     generation: u64,
     preview: bool,
@@ -138,30 +138,36 @@ impl Document {
         if self.restored {
             return true;
         }
-        let value = self.input.read(cx).value();
-        let mut verified = self.verified_clean.borrow_mut();
-        if verified
-            .as_ref()
-            .is_some_and(|saved| std::ptr::eq(saved.as_str(), value.as_str()))
+        let input = self.input.read(cx);
+        let mut comparison = self.disk_comparison.borrow_mut();
+        if let Some((revision, clean)) = comparison.as_ref()
+            && input.has_text_revision(revision)
         {
-            return false;
+            return !clean;
         }
-        let clean = self.disk.content_bytes() == value.as_bytes();
-        *verified = clean.then_some(value);
+        let text = input.text();
+        let mut disk = self.disk.content_bytes();
+        let clean = text.len() == disk.len()
+            && text.chunks().all(|chunk| {
+                if let Some(remaining) = disk.strip_prefix(chunk.as_bytes()) {
+                    disk = remaining;
+                    true
+                } else {
+                    false
+                }
+            });
+        *comparison = Some((text.clone(), clean));
         !clean
     }
 
     fn set_disk(&mut self, disk: DiskFile) {
         self.disk = disk;
-        self.verified_clean.get_mut().take();
+        self.disk_comparison.get_mut().take();
     }
 
     fn grammar(&self, cx: &App) -> Option<&'static str> {
         if self.restored {
-            return glimpse::syntax::grammar_extension(
-                &self.disk.path,
-                &self.input.read(cx).value(),
-            );
+            return glimpse::syntax::grammar_for_text(&self.disk.path, self.input.read(cx).text());
         }
         let content = self.disk.content_bytes();
         let first_line = if content.starts_with(b"#!") {
@@ -1081,23 +1087,23 @@ impl Shell {
                 if !this.request.pick && !doc.dirty(cx) {
                     this.io.send(Job::ClearThrough(id, doc.generation));
                 } else if !this.request.pick {
-                    this.io.send(Job::Recover(
+                    this.io.recover_edit(
                         id,
                         storage::Draft {
                             path: doc.disk.path.clone(),
                             target: Some(doc.disk.target.clone()),
-                            text: doc.input.read(cx).value().into(),
+                            text: doc.input.read(cx).text().clone(),
                             base: doc.disk.bytes.clone(),
                             generation: doc.generation,
                         },
-                    ));
+                    );
                 }
             }
             if let Some(doc) = this.documents.iter().find(|d| d.id == id) {
                 this.syntax.request(
                     id,
                     doc.generation,
-                    std::sync::Arc::<str>::from(doc.input.read(cx).value()),
+                    doc.input.read(cx).text().clone(),
                     &doc.disk.path,
                     cx.theme().is_dark(),
                 );
@@ -1130,7 +1136,7 @@ impl Shell {
             id,
             disk,
             input: input.clone(),
-            verified_clean: RefCell::default(),
+            disk_comparison: RefCell::default(),
             status_cursor: 0,
             generation: 0,
             preview,
@@ -1152,7 +1158,7 @@ impl Shell {
         self.syntax.request(
             id,
             0,
-            std::sync::Arc::<str>::from(input.read(cx).value()),
+            input.read(cx).text().clone(),
             &disk_path(&self.documents, id),
             cx.theme().is_dark(),
         );
@@ -1230,7 +1236,7 @@ impl Shell {
             self.syntax.request(
                 doc.id,
                 doc.generation,
-                std::sync::Arc::<str>::from(doc.input.read(cx).value()),
+                doc.input.read(cx).text().clone(),
                 &doc.disk.path,
                 cx.theme().is_dark(),
             );

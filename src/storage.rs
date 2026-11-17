@@ -345,10 +345,10 @@ impl Settings {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct Draft {
+pub struct Draft<Text = std::sync::Arc<str>> {
     #[serde(with = "native_path")]
     pub path: PathBuf,
-    pub text: std::sync::Arc<str>,
+    pub text: Text,
     #[serde(with = "encoded_bytes")]
     pub base: crate::document::FileBytes,
     #[serde(
@@ -358,6 +358,18 @@ pub struct Draft {
     )]
     pub target: Option<PathBuf>,
     pub generation: u64,
+}
+
+impl<Text> Draft<Text> {
+    pub(crate) fn map_text<Output>(self, map: impl FnOnce(Text) -> Output) -> Draft<Output> {
+        Draft {
+            path: self.path,
+            text: map(self.text),
+            base: self.base,
+            target: self.target,
+            generation: self.generation,
+        }
+    }
 }
 #[derive(Clone)]
 pub struct Record {
@@ -654,7 +666,7 @@ impl Recovery {
             io: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
-    pub fn write(&self, id: u64, draft: &Draft) -> Result<(), String> {
+    pub fn write(&self, id: u64, draft: &Draft<impl Serialize>) -> Result<(), String> {
         let finished = self.io.lock().unwrap();
         if finished
             .get(&id)
@@ -985,7 +997,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("record.json");
         for generation in [u64::MAX, u64::MAX - 1] {
-            let draft = Draft {
+            let draft: Draft = Draft {
                 path: "original".into(),
                 text: "local β".into(),
                 base: Default::default(),

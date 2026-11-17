@@ -1104,6 +1104,10 @@ impl InputState {
         &self.text
     }
 
+    pub fn has_text_revision(&self, text: &Rope) -> bool {
+        ropey::extra::esoterica::ropes_are_instances(&self.text, text)
+    }
+
     /// Return the (0-based) [`Position`] of the cursor.
     pub fn cursor_position(&self) -> Position {
         let offset = self.cursor();
