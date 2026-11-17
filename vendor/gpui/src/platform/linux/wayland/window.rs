@@ -85,6 +85,7 @@ struct InProgressConfigure {
 pub struct WaylandWindowState {
     xdg_surface: xdg_surface::XdgSurface,
     acknowledged_first_configure: bool,
+    frame_pending: bool,
     pub surface: wl_surface::WlSurface,
     decoration: Option<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1>,
     app_id: Option<String>,
@@ -160,6 +161,7 @@ impl WaylandWindowState {
         Ok(Self {
             xdg_surface,
             acknowledged_first_configure: false,
+            frame_pending: false,
             surface,
             decoration,
             app_id: None,
@@ -218,6 +220,14 @@ impl WaylandWindowState {
         match self.decorations {
             WindowDecorations::Server => px(0.0),
             WindowDecorations::Client => self.client_inset.unwrap_or(px(0.0)),
+        }
+    }
+
+    fn request_frame(&mut self) {
+        if self.acknowledged_first_configure && !self.frame_pending {
+            self.frame_pending = true;
+            self.surface.frame(&self.globals.qh, self.surface.id());
+            self.surface.commit();
         }
     }
 }
@@ -355,7 +365,7 @@ impl WaylandWindowStatePtr {
 
     pub fn frame(&self) {
         let mut state = self.state.borrow_mut();
-        state.surface.frame(&state.globals.qh, state.surface.id());
+        state.frame_pending = false;
         state.resize_throttle = false;
         drop(state);
 
@@ -983,6 +993,15 @@ impl PlatformWindow for WaylandWindow {
 
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
         self.0.callbacks.borrow_mut().request_frame = Some(callback);
+    }
+
+    fn frame_requester(&self) -> Option<Rc<dyn Fn()>> {
+        let state = Rc::downgrade(&self.0.state);
+        Some(Rc::new(move || {
+            if let Some(state) = state.upgrade() {
+                state.borrow_mut().request_frame();
+            }
+        }))
     }
 
     fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> crate::DispatchEventResult>) {
