@@ -3521,11 +3521,18 @@ impl Render for Shell {
                         .flex_wrap()
                         .items_center()
                         .gap_2()
-                        .child(match doc.failure_action {
-                            FailureAction::Save => "Last save failed",
-                            FailureAction::Reload => "Reload stopped",
-                            FailureAction::Check => "File unavailable",
-                            FailureAction::Choose(_) => "Destination unavailable",
+                        .child({
+                            let message = match doc.failure_action {
+                                FailureAction::Save => "Last save failed",
+                                FailureAction::Reload => "Reload stopped",
+                                FailureAction::Check => "File unavailable",
+                                FailureAction::Choose(_) => "Destination unavailable",
+                            };
+                            accessibility::message(
+                                "operation-failure",
+                                message.into(),
+                                div().child(message),
+                            )
                         })
                         .child(self.button("Details and Retry…", "failure-details", cx)),
                 );
@@ -3539,7 +3546,14 @@ impl Render for Shell {
                         .w_full()
                         .flex_shrink_0()
                         .p_2()
-                        .child("Changed on disk. Local text retained; ordinary Save is blocked.")
+                        .child(accessibility::message(
+                            "external-conflict",
+                            "Changed on disk. Local text retained; ordinary Save is blocked."
+                                .into(),
+                            div().child(
+                                "Changed on disk. Local text retained; ordinary Save is blocked.",
+                            ),
+                        ))
                         .child(
                             div()
                                 .w_full()
@@ -3643,7 +3657,9 @@ impl Render for Shell {
                             Some(warning) => format!("{} · {warning}", self.status),
                             None => self.status.clone(),
                         };
-                        footer.child(
+                        footer.child(accessibility::message(
+                            "application-status",
+                            message.clone(),
                             div()
                                 .id("status-message")
                                 .flex_1()
@@ -3654,7 +3670,7 @@ impl Render for Shell {
                                     gpui_component::tooltip::Tooltip::new(message.clone())
                                         .build(window, cx)
                                 }),
-                        )
+                        ))
                     })
                     .when_some(
                         self.documents

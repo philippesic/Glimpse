@@ -1,6 +1,19 @@
 use super::*;
 use gpui::accesskit::{Action, Node, Role};
 
+pub(super) fn message(
+    id: &'static str,
+    label: String,
+    child: impl IntoElement,
+) -> impl IntoElement {
+    accessible(id, child, move |_, _, _| {
+        let mut node = Node::new(Role::Status);
+        node.set_label(label.clone());
+        node.set_live(gpui::accesskit::Live::Polite);
+        AccessibilityInfo::new(node)
+    })
+}
+
 pub(super) fn collection(
     id: &'static str,
     label: String,
