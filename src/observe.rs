@@ -114,28 +114,85 @@ mod tests {
 #[derive(Default)]
 pub struct Checks {
     next: u64,
-    pending: std::collections::HashMap<u64, (u64, u64)>,
+    pending: std::collections::HashMap<u64, Pending>,
+    waiting: HashSet<u64>,
+    queue: std::collections::VecDeque<u64>,
+}
+struct Pending {
+    token: u64,
+    generation: u64,
+    valid: bool,
 }
 impl Checks {
-    pub fn begin(&mut self, id: u64, generation: u64) -> u64 {
-        self.next += 1;
-        self.pending.insert(id, (self.next, generation));
-        self.next
+    pub fn request(&mut self, id: u64) {
+        if self.waiting.insert(id) {
+            self.queue.push_back(id);
+        }
+    }
+    pub fn next(&mut self, mut generation: impl FnMut(u64) -> Option<u64>) -> Option<(u64, u64)> {
+        if self.pending.len() >= 2 {
+            return None;
+        }
+        for _ in 0..self.queue.len() {
+            let id = self.queue.pop_front()?;
+            if self.pending.contains_key(&id) {
+                self.queue.push_back(id);
+                continue;
+            }
+            self.waiting.remove(&id);
+            let Some(generation) = generation(id) else {
+                continue;
+            };
+            self.next += 1;
+            self.pending.insert(
+                id,
+                Pending {
+                    token: self.next,
+                    generation,
+                    valid: true,
+                },
+            );
+            return Some((id, self.next));
+        }
+        None
     }
     pub fn invalidate(&mut self, id: u64) {
-        self.pending.remove(&id);
+        if let Some(pending) = self.pending.get_mut(&id) {
+            pending.valid = false;
+        }
+        self.waiting.remove(&id);
+        self.queue.retain(|queued| *queued != id);
     }
-    pub fn accept(&mut self, id: u64, token: u64, generation: u64) -> bool {
+    pub fn complete(&mut self, id: u64, token: u64, generation: Option<u64>) -> bool {
         if self
             .pending
             .get(&id)
-            .is_some_and(|(pending, _)| *pending == token)
+            .is_none_or(|pending| pending.token != token)
         {
-            self.pending
-                .remove(&id)
-                .is_some_and(|(_, observed)| observed == generation)
-        } else {
-            false
+            return false;
+        }
+        let pending = self.pending.remove(&id).unwrap();
+        let Some(generation) = generation else {
+            self.invalidate(id);
+            return false;
+        };
+        let again = self.waiting.contains(&id);
+        if pending.valid && pending.generation == generation && !again {
+            return true;
+        }
+        if pending.valid || again {
+            self.request(id);
+        }
+        false
+    }
+    pub fn retry(&mut self, id: u64, token: u64) {
+        if self
+            .pending
+            .get(&id)
+            .is_some_and(|pending| pending.token == token)
+        {
+            self.pending.remove(&id);
+            self.request(id);
         }
     }
 }
@@ -146,20 +203,71 @@ mod check_tests {
     #[test]
     fn a_write_invalidates_reads_even_without_a_local_edit() {
         let mut checks = Checks::default();
-        let old = checks.begin(4, 7);
+        checks.request(4);
+        let (_, old) = checks.next(|_| Some(7)).unwrap();
         checks.invalidate(4);
-        let after_save = checks.begin(4, 7);
-        assert!(!checks.accept(4, old, 7));
-        assert!(checks.accept(4, after_save, 7));
-        assert!(!checks.accept(4, after_save, 7));
+        checks.request(4);
+        assert!(checks.next(|_| Some(7)).is_none());
+        assert!(!checks.complete(4, old, Some(7)));
+        let (_, after_save) = checks.next(|_| Some(7)).unwrap();
+        assert!(checks.complete(4, after_save, Some(7)));
+        assert!(!checks.complete(4, after_save, Some(7)));
     }
     #[test]
     fn old_reads_and_edited_buffers_cannot_install_observations() {
         let mut checks = Checks::default();
-        let old = checks.begin(2, 3);
-        let current = checks.begin(2, 3);
-        assert!(!checks.accept(2, old, 3));
-        assert!(!checks.accept(2, current, 4));
-        assert!(!checks.accept(2, current, 3));
+        checks.request(2);
+        let (_, old) = checks.next(|_| Some(3)).unwrap();
+        checks.request(2);
+        assert!(checks.next(|_| Some(4)).is_none());
+        assert!(!checks.complete(2, old, Some(4)));
+        let (_, current) = checks.next(|_| Some(4)).unwrap();
+        assert!(!checks.complete(2, old, Some(4)));
+        assert!(checks.complete(2, current, Some(4)));
+        assert!(!checks.complete(2, current, Some(4)));
+    }
+    #[test]
+    fn quiet_local_edits_retry_and_notifications_coalesce_with_fairness() {
+        let mut checks = Checks::default();
+        for id in 1..=3 {
+            checks.request(id);
+        }
+        let (_, first) = checks.next(|_| Some(0)).unwrap();
+        let (_, second) = checks.next(|_| Some(0)).unwrap();
+        assert!(checks.next(|_| Some(0)).is_none());
+        for _ in 0..1000 {
+            checks.request(1);
+        }
+        assert_eq!(checks.queue.len(), 2);
+        assert_eq!(checks.pending.len(), 2);
+        assert!(!checks.complete(1, first, Some(1000)));
+        let (id, third) = checks.next(|_| Some(0)).unwrap();
+        assert_eq!(id, 3);
+        assert!(checks.complete(2, second, Some(0)));
+        let (id, latest) = checks.next(|_| Some(1000)).unwrap();
+        assert_eq!(id, 1);
+        assert!(checks.complete(3, third, Some(0)));
+        assert!(checks.complete(1, latest, Some(1000)));
+        checks.request(4);
+        let (_, token) = checks.next(|_| Some(0)).unwrap();
+        assert!(!checks.complete(4, token, Some(1)));
+        let (_, retry) = checks.next(|_| Some(1)).unwrap();
+        assert!(checks.complete(4, retry, Some(1)));
+    }
+    #[test]
+    fn closed_documents_and_deferred_old_tokens_cannot_resurrect_work() {
+        let mut checks = Checks::default();
+        checks.request(1);
+        let (_, token) = checks.next(|_| Some(0)).unwrap();
+        checks.invalidate(1);
+        assert!(!checks.complete(1, token, None));
+        checks.retry(1, token);
+        assert!(checks.next(|_| Some(0)).is_none());
+        checks.request(2);
+        let (_, deferred) = checks.next(|_| Some(0)).unwrap();
+        checks.retry(2, deferred);
+        let (_, current) = checks.next(|_| Some(1)).unwrap();
+        checks.retry(2, deferred);
+        assert!(checks.complete(2, current, Some(1)));
     }
 }

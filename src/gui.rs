@@ -722,19 +722,48 @@ impl Shell {
     fn watch(&mut self) {
         let mut parents = std::collections::HashSet::from([self.current.clone()]);
         for doc in &self.documents {
-            if let Some(p) = doc.disk.path.parent() {
-                parents.insert(p.to_owned());
+            for disk in [
+                Some(&doc.disk),
+                doc.external.as_ref().map(|(disk, _)| disk),
+                doc.deferred_external.as_ref().map(|(disk, _)| disk),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                for path in [&disk.path, &disk.target] {
+                    if let Some(parent) = path.parent() {
+                        parents.insert(parent.to_owned());
+                    }
+                }
             }
         }
         self.observer.update(parents);
     }
     fn check_document(&mut self, id: u64) {
-        if let Some(doc) = self
+        if self
             .documents
             .iter()
-            .find(|d| d.id == id && !d.saving && !d.disk.target.as_os_str().is_empty())
+            .any(|d| d.id == id && !d.saving && !d.disk.target.as_os_str().is_empty())
         {
-            let token = self.checks.begin(id, doc.generation);
+            self.checks.request(id);
+            self.dispatch_checks();
+        }
+    }
+    fn dispatch_checks(&mut self) {
+        loop {
+            let documents = &self.documents;
+            let Some((id, token)) = self.checks.next(|id| {
+                documents
+                    .iter()
+                    .find(|doc| {
+                        doc.id == id && !doc.saving && !doc.disk.target.as_os_str().is_empty()
+                    })
+                    .map(|doc| doc.generation)
+            }) else {
+                break;
+            };
+            let doc = self.documents.iter().find(|doc| doc.id == id).unwrap();
+            glimpse::metrics::event("check-request", id, token);
             self.io.send(Job::Check(id, doc.disk.path.clone(), token));
         }
     }
@@ -1600,6 +1629,8 @@ impl Shell {
                         Err(error) => self.destination_failed(&destination, error),
                     }
                     self.abandon_destination = None;
+                    self.watch();
+                    self.check_document(id);
                     if self.close_pending.as_ref().is_some_and(|d| d.saving) {
                         if succeeded {
                             self.continue_close(window, cx);
@@ -1635,10 +1666,9 @@ impl Shell {
                     let generation = self
                         .documents
                         .iter()
-                        .find(|d| d.id == id)
+                        .find(|d| d.id == id && !d.saving)
                         .map(|d| d.generation);
-                    if generation
-                        .is_some_and(|generation| self.checks.accept(id, token, generation))
+                    if self.checks.complete(id, token, generation)
                         && let Some(doc) =
                             self.documents.iter_mut().find(|d| d.id == id && !d.saving)
                     {
@@ -1673,7 +1703,20 @@ impl Shell {
                             }
                         }
                         self.apply_external(id, window, cx);
+                        self.watch();
                     }
+                    self.dispatch_checks();
+                }
+                Reply::CheckDeferred(id, token) => {
+                    glimpse::metrics::event("check-deferred", id, token);
+                    cx.spawn(async move |this, cx| {
+                        Timer::after(std::time::Duration::from_millis(100)).await;
+                        let _ = this.update(cx, |this, _| {
+                            this.checks.retry(id, token);
+                            this.dispatch_checks();
+                        });
+                    })
+                    .detach();
                 }
                 Reply::Reloaded(reload, result) => self.reloaded(*reload, result, window, cx),
                 Reply::SettingsLoaded(result) => {

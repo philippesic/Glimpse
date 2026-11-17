@@ -15,6 +15,8 @@ pub enum Job {
     Hold(mpsc::Sender<()>, mpsc::Receiver<()>),
     #[cfg(test)]
     HoldMaintenance(mpsc::Sender<()>, mpsc::Receiver<()>),
+    #[cfg(test)]
+    HoldRead(mpsc::Sender<()>, mpsc::Receiver<()>),
     ReadMarkdown(u64, u64, String, PathBuf),
     CompletePath(u64, String, PathBuf),
     Visit(PathBuf),
@@ -94,6 +96,7 @@ pub enum Reply {
     Visit(PathBuf, bool),
     SavedTo(Box<SaveDestination>, Result<DiskFile, String>),
     Checked(u64, u64, Result<(DiskFile, String), String>),
+    CheckDeferred(u64, u64),
     Open(PathBuf, u64, Result<(DiskFile, String), String>),
     Save(u64, u64, String, Result<DiskFile, String>),
 }
@@ -288,7 +291,9 @@ impl IoWorker {
                                 .find(|path| std::fs::read_dir(path).is_ok()),
                         ),
                         #[cfg(test)]
-                        Job::Hold(started, release) | Job::HoldMaintenance(started, release) => {
+                        Job::Hold(started, release)
+                        | Job::HoldMaintenance(started, release)
+                        | Job::HoldRead(started, release) => {
                             let _ = started.send(());
                             let _ = release.recv();
                             if was_tracked {
@@ -394,7 +399,12 @@ impl IoWorker {
                             Ok(crate::reading::prepare(source, &path)),
                         ),
                         Job::Check(id, path, generation) => {
-                            Reply::Checked(id, generation, DiskFile::open(path))
+                            crate::metrics::event("check-worker", id, generation);
+                            #[cfg(feature = "test-support")]
+                            crate::metrics::delay("CHECK");
+                            let result = DiskFile::open(path);
+                            crate::metrics::event("check-worker-done", id, generation);
+                            Reply::Checked(id, generation, result)
                         }
                         Job::Volumes => Reply::Volumes(crate::locations::mounted()),
                         Job::Settings(mut settings) => {
@@ -706,6 +716,8 @@ impl IoWorker {
         };
         let channel = match &job {
             #[cfg(test)]
+            Job::HoldRead(..) => &self.reads,
+            #[cfg(test)]
             Job::HoldMaintenance(..) => &self.maintenance,
             Job::Volumes
             | Job::ReadMarkdown(..)
@@ -737,11 +749,14 @@ impl IoWorker {
                 if counted {
                     self.pending.fetch_sub(1, Ordering::AcqRel);
                 }
+                let full = matches!(&error, mpsc::TrySendError::Full(_));
                 let job = match error {
                     mpsc::TrySendError::Full(job) | mpsc::TrySendError::Disconnected(job) => job,
                 };
                 let message = "I/O queue unavailable. Operation was not queued; retry. Current buffer remains in memory.".to_owned();
                 let reply = match job {
+                    Job::Check(id, _, token) if full => Reply::CheckDeferred(id, token),
+                    Job::Check(id, _, token) => Reply::Checked(id, token, Err(message)),
                     Job::ReadMarkdown(id, generation, _, path) => {
                         Reply::Markdown(id, generation, path, Err(message))
                     }
@@ -1530,5 +1545,48 @@ mod tests {
             Reply::Open(_, _, Ok((_, text))) => assert_eq!(text, "available"),
             _ => panic!("document worker did not run independently"),
         }
+    }
+    #[test]
+    fn full_read_queue_returns_a_typed_deferred_check_without_losing_queued_reads() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("source.txt");
+        std::fs::write(&path, "disk bytes").unwrap();
+        let io = IoWorker::new_in(wake::Context::default(), root.path().join("recovery"));
+        let (entered, seen) = mpsc::channel();
+        let mut holds = Vec::new();
+        for _ in 0..2 {
+            let (release, wait) = mpsc::channel();
+            io.send(Job::HoldRead(entered.clone(), wait));
+            holds.push(release);
+        }
+        for _ in 0..2 {
+            seen.recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+        }
+        for id in 0..32 {
+            io.send(Job::Check(id, path.clone(), id));
+        }
+        io.send(Job::Check(99, path, 500));
+        assert!(matches!(
+            io.replies
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap(),
+            Reply::CheckDeferred(99, 500)
+        ));
+        drop(holds);
+        let mut completed = std::collections::HashSet::new();
+        for _ in 0..32 {
+            let Reply::Checked(id, token, result) = io
+                .replies
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+            else {
+                panic!("Expected checked file");
+            };
+            assert_eq!(id, token);
+            assert_eq!(result.unwrap().1, "disk bytes");
+            completed.insert(id);
+        }
+        assert_eq!(completed.len(), 32);
     }
 }
