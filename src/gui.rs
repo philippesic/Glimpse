@@ -3328,6 +3328,9 @@ impl Render for Shell {
             .w_full()
             .h_full()
             .bg(cx.theme().sidebar)
+            .border_2()
+            .border_color(cx.theme().sidebar)
+            .focus(|style| style.border_color(cx.theme().foreground))
             .flex()
             .flex_col()
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
@@ -3397,6 +3400,12 @@ impl Render for Shell {
                                     .id(("entry", i))
                                     .h(px(if this.settings.compact { 28. } else { 32. }
                                         * this.settings.ui_scale))
+                                    .border_l(px(3. * this.settings.ui_scale))
+                                    .border_color(if selected {
+                                        cx.theme().foreground
+                                    } else {
+                                        gpui::transparent_black()
+                                    })
                                     .px_3()
                                     .py_1()
                                     .bg(if selected {
