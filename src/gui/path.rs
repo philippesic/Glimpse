@@ -1,5 +1,9 @@
 use super::*;
-use gpui_component::button::ButtonVariants;
+use gpui_component::{
+    IconName,
+    button::ButtonVariants,
+    menu::{DropdownMenu, PopupMenuItem},
+};
 
 pub(super) struct Completions {
     pub matches: glimpse::path_completion::Matches,
@@ -76,7 +80,12 @@ impl Shell {
             Err(error) => self.status = format!("Path completion failed: {error}"),
         }
     }
-    pub(super) fn path_bar(&mut self, window: &mut Window, cx: &Context<Self>) -> AnyElement {
+    pub(super) fn path_bar(
+        &mut self,
+        short: bool,
+        window: &mut Window,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         if self.panel == Some(Panel::Path) {
             return div()
                 .flex()
@@ -91,62 +100,83 @@ impl Shell {
         let mut ancestors: Vec<_> = self
             .current
             .ancestors()
-            .map(|path| path.to_owned())
+            .skip(1)
+            .map(PathBuf::from)
             .collect();
         ancestors.reverse();
-        let count = ancestors.len();
-        let view = (
-            self.current.clone(),
-            window.viewport_size().width,
-            self.settings.ui_scale,
-        );
-        if self.breadcrumb_view.as_ref() != Some(&view) {
-            let scroll = self.breadcrumb_scroll.clone();
-            window.on_next_frame(move |window, _| {
-                scroll.scroll_to_item(count.saturating_sub(1) * 2);
-                window.refresh();
-            });
-            self.breadcrumb_view = Some(view);
-        }
+        let scale = self.settings.ui_scale;
+        let segment_width = px(140. * scale);
+        let room = (window.viewport_size().width - px(420. * scale)).max(px(0.));
+        let visible = (room / (segment_width + px(24. * scale))) as usize;
+        let first_visible = ancestors.len().saturating_sub(visible);
+        let visible_ancestors = ancestors.split_off(first_visible);
+        let shell = cx.entity().downgrade();
         div()
             .flex()
             .items_center()
             .gap_2()
             .px_2()
-            .py_1()
+            .when(!short, |bar| bar.py_1())
+            .when(!ancestors.is_empty(), |bar| {
+                bar.child(
+                    Button::new("ancestor-folders")
+                        .icon(IconName::Ellipsis)
+                        .tooltip("Ancestor folders")
+                        .small()
+                        .outline()
+                        .dropdown_menu(move |mut menu, window, _| {
+                            menu = menu
+                                .scrollable(true)
+                                .max_w((window.viewport_size().width - px(16.)).min(px(620.)))
+                                .max_h((window.viewport_size().height - px(96.)).max(px(100.)));
+                            for path in ancestors.iter().rev() {
+                                let label = match path.parent() {
+                                    Some(parent) => {
+                                        format!(
+                                            "{} — {}",
+                                            paths::name(path),
+                                            paths::display(parent)
+                                        )
+                                    }
+                                    None => paths::display(path),
+                                };
+                                let path = path.clone();
+                                let shell = shell.clone();
+                                menu = menu.item(PopupMenuItem::new(label).on_click(
+                                    move |_, window, cx| {
+                                        let shell = shell.clone();
+                                        let path = path.clone();
+                                        window.defer(cx, move |window, cx| {
+                                            let _ = shell.update(cx, |shell, cx| {
+                                                shell.activate_breadcrumb(path, window, cx);
+                                            });
+                                        });
+                                    },
+                                ));
+                            }
+                            menu
+                        }),
+                )
+            })
+            .children(visible_ancestors.into_iter().map(|path| {
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_shrink_0()
+                    .gap_1()
+                    .child(Self::breadcrumb(path, false, cx).max_w(segment_width))
+                    .child("›")
+            }))
             .child(
                 div()
-                    .id("breadcrumbs")
                     .flex()
+                    .items_center()
                     .flex_1()
                     .min_w_0()
-                    .items_center()
-                    .gap_1()
-                    .overflow_x_scroll()
-                    .track_scroll(&self.breadcrumb_scroll)
-                    .children(ancestors.into_iter().enumerate().flat_map(|(i, path)| {
-                        let label = paths::name(&path);
-                        let button = Button::new(("crumb", i))
-                            .label(label)
-                            .tooltip(paths::display(&path))
-                            .small()
-                            .compact()
-                            .ghost()
-                            .flex_shrink_0()
-                            .selected(i + 1 == count)
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.navigate(path.clone());
-                                this.navigation_only = true;
-                                window.focus(&this.nav_focus);
-                                cx.notify();
-                            }))
-                            .into_any_element();
-                        if i == 0 {
-                            vec![button]
-                        } else {
-                            vec![div().flex_shrink_0().child("›").into_any_element(), button]
-                        }
-                    })),
+                    .child(Self::breadcrumb(self.current.clone(), true, cx).max_w_full())
+                    .child(div().id("edit-path-space").flex_1().h_6().on_click(
+                        cx.listener(|this, _, window, cx| this.command("path", window, cx)),
+                    )),
             )
             .child(
                 self.command_button("edit-location", "Edit path…", "path", cx)
@@ -154,6 +184,29 @@ impl Shell {
                     .tooltip(paths::display(&self.current)),
             )
             .into_any_element()
+    }
+
+    fn breadcrumb(path: PathBuf, current: bool, cx: &Context<Self>) -> Button {
+        Button::new((
+            ElementId::from("crumb"),
+            SharedString::from(paths::display(&path)),
+        ))
+        .label(paths::name(&path))
+        .tooltip(paths::display(&path))
+        .small()
+        .compact()
+        .ghost()
+        .selected(current)
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.activate_breadcrumb(path.clone(), window, cx);
+        }))
+    }
+
+    fn activate_breadcrumb(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.navigate(path);
+        self.navigation_only = true;
+        window.focus(&self.nav_focus);
+        cx.notify();
     }
 
     pub(super) fn path_matches(&self, cx: &Context<Self>) -> AnyElement {

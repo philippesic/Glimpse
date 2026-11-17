@@ -282,8 +282,6 @@ struct Shell {
     documents: Vec<Document>,
     active: Option<u64>,
     tab_scroll: ScrollHandle,
-    breadcrumb_scroll: ScrollHandle,
-    breadcrumb_view: Option<(PathBuf, Pixels, f32)>,
     next_id: u64,
     open_token: u64,
     interaction: u64,
@@ -456,8 +454,6 @@ impl Shell {
             documents: vec![],
             active: None,
             tab_scroll: ScrollHandle::new(),
-            breadcrumb_scroll: ScrollHandle::new(),
-            breadcrumb_view: None,
             next_id: 1,
             open_token: 0,
             interaction: 0,
@@ -3116,6 +3112,7 @@ impl Render for Shell {
             self.window_title = title;
         }
         let narrow = self.narrow(window);
+        let short = narrow && window.viewport_size().height < px(280. * self.settings.ui_scale);
         let source_visible = !self.reading && (!narrow || !self.navigation_only);
         self.report_startup_ready(source_visible, window, cx);
         if !self.listing_done && self.listing_waiter.is_none() {
@@ -3240,7 +3237,7 @@ impl Render for Shell {
             .text_color(cx.theme().foreground)
             .text_size(px(14. * self.settings.ui_scale))
             .child(toolbar)
-            .child(self.path_bar(window, cx))
+            .child(self.path_bar(short, window, cx))
             .when(self.request.pick, |root| {
                 let candidate = if self.request.directory {
                     Some(self.current.clone())
@@ -3574,7 +3571,7 @@ impl Render for Shell {
             .flex()
             .flex_col()
             .child(tabs);
-        if !self.request.pick {
+        if !self.request.pick && !short {
             let actions = div().flex().flex_wrap().gap_2().p_1();
             content = content.child(if narrow {
                 actions
@@ -3740,40 +3737,50 @@ impl Render for Shell {
         root.child(div().flex_1().min_h_0().child(body))
             .child(
                 div()
-                    .h(px(if narrow { 48. } else { 36. } * self.settings.ui_scale))
+                    .h(px((if short {
+                        28.
+                    } else if narrow {
+                        48.
+                    } else {
+                        36.
+                    }) * self.settings.ui_scale))
                     .flex_shrink_0()
                     .px_2()
                     .flex()
                     .items_center()
                     .gap_2()
                     .text_size(px(12. * self.settings.ui_scale))
-                    .when(narrow, |footer| {
+                    .when(narrow && !short, |footer| {
                         footer.flex_col().items_start().justify_center().gap_0()
                     })
                     .when(!self.warnings.is_empty(), |footer| {
                         footer.child(self.button("Warnings…", "warnings", cx))
                     })
-                    .when(self.warnings.is_empty(), |footer| {
-                        let message = match &self.font_warning {
-                            Some(warning) if self.status.is_empty() => warning.clone(),
-                            Some(warning) => format!("{} · {warning}", self.status),
-                            None => self.status.clone(),
-                        };
-                        footer.child(accessibility::message(
-                            "application-status",
-                            message.clone(),
-                            div()
-                                .id("status-message")
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .child(message.clone())
-                                .tooltip(move |window, cx| {
-                                    gpui_component::tooltip::Tooltip::new(message.clone())
-                                        .build(window, cx)
-                                }),
-                        ))
-                    })
+                    .when(
+                        self.warnings.is_empty()
+                            && (!short || !self.status.is_empty() || self.font_warning.is_some()),
+                        |footer| {
+                            let message = match &self.font_warning {
+                                Some(warning) if self.status.is_empty() => warning.clone(),
+                                Some(warning) => format!("{} · {warning}", self.status),
+                                None => self.status.clone(),
+                            };
+                            footer.child(accessibility::message(
+                                "application-status",
+                                message.clone(),
+                                div()
+                                    .id("status-message")
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(message.clone())
+                                    .tooltip(move |window, cx| {
+                                        gpui_component::tooltip::Tooltip::new(message.clone())
+                                            .build(window, cx)
+                                    }),
+                            ))
+                        },
+                    )
                     .when_some(
                         self.documents
                             .iter()
@@ -3782,7 +3789,17 @@ impl Render for Shell {
                             let information = doc.information(cx, self.reading);
                             footer.child(accessible(
                                 "document-information",
-                                div().flex_shrink_0().child(information.clone()),
+                                div()
+                                    .when(short, |info| {
+                                        info.truncate().when(
+                                            !self.status.is_empty()
+                                                || self.font_warning.is_some()
+                                                || !self.warnings.is_empty(),
+                                            |info| info.max_w(rems(10.)),
+                                        )
+                                    })
+                                    .flex_shrink_0()
+                                    .child(information.clone()),
                                 move |_, _, _| {
                                     let mut node =
                                         gpui::accesskit::Node::new(gpui::accesskit::Role::Status);
