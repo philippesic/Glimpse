@@ -11,7 +11,7 @@ use std::{
 use gpui::{
     App, AppContext as _, Context, Empty, Entity, FocusHandle, Focusable, Half,
     InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Pixels, Render, Styled,
-    Subscription, Window, actions, canvas, div, prelude::FluentBuilder as _,
+    Subscription, WeakEntity, Window, actions, canvas, div, prelude::FluentBuilder as _,
 };
 use ropey::Rope;
 
@@ -208,7 +208,7 @@ struct SearchRequest {
 }
 
 pub(super) struct SearchPanel {
-    editor: Entity<InputState>,
+    editor: WeakEntity<InputState>,
     search_input: Entity<InputState>,
     replace_input: Entity<InputState>,
     case_insensitive: bool,
@@ -271,7 +271,7 @@ impl InputState {
         let editor = cx.entity();
         let selected_text = Rope::from(self.selected_text());
         search_panel.update(cx, |this, cx| {
-            this.editor = editor;
+            this.editor = editor.downgrade();
             this.show(&selected_text, window, cx);
             this.request_search(text, offset, cx);
         });
@@ -300,7 +300,7 @@ impl SearchPanel {
                 ];
 
             Self {
-                editor,
+                editor: editor.downgrade(),
                 search_input,
                 replace_input,
                 case_insensitive: true,
@@ -337,7 +337,10 @@ impl SearchPanel {
     }
 
     fn update_search_query(&mut self, cx: &mut Context<Self>) {
-        let editor = self.editor.read(cx);
+        let Some(editor) = self.editor.upgrade() else {
+            return;
+        };
+        let editor = editor.read(cx);
         let text = editor.text.clone();
         let offset = editor
             .last_layout
@@ -406,7 +409,7 @@ impl SearchPanel {
                     }
                 }
                 this.start_search(cx);
-                this.editor.update(cx, |_, cx| cx.notify());
+                let _ = this.editor.update(cx, |_, cx| cx.notify());
                 cx.notify();
             });
         })
@@ -423,14 +426,16 @@ impl SearchPanel {
             .matched_ranges
             .get(self.matcher.current_match_ix)
         {
-            self.editor.update(cx, |state, cx| {
+            let _ = self.editor.update(cx, |state, cx| {
                 state.selected_range = range.clone().into();
                 state.selection_reversed = false;
                 state.scroll_to(range.end, Some(MoveDirection::Down), cx);
                 cx.notify();
             });
         }
-        self.editor.read(cx).focus_handle.focus(window);
+        if let Some(editor) = self.editor.upgrade() {
+            editor.read(cx).focus_handle.focus(window);
+        }
         cx.notify();
     }
 
@@ -452,7 +457,7 @@ impl SearchPanel {
 
     fn prev(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(range) = self.matcher.next_back() {
-            self.editor.update(cx, |state, cx| {
+            let _ = self.editor.update(cx, |state, cx| {
                 state.selected_range = range.clone().into();
                 state.selection_reversed = false;
                 state.scroll_to(range.start, Some(MoveDirection::Up), cx);
@@ -463,7 +468,7 @@ impl SearchPanel {
 
     fn next(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(range) = self.matcher.next() {
-            self.editor.update(cx, |state, cx| {
+            let _ = self.editor.update(cx, |state, cx| {
                 state.selected_range = range.clone().into();
                 state.selection_reversed = false;
                 state.scroll_to(range.end, Some(MoveDirection::Down), cx);
@@ -489,13 +494,16 @@ impl SearchPanel {
             .get(self.matcher.current_match_ix)
             .cloned()
         {
+            let Some(editor) = self.editor.upgrade() else {
+                return;
+            };
+            let original = editor.read(cx).text.clone();
             let text_state = self.editor.clone();
-            let original = text_state.read(cx).text.clone();
 
             let next_range = self.matcher.peek().unwrap_or(range.clone());
             cx.spawn_in(window, async move |_, cx| {
                 cx.update(|window, cx| {
-                    text_state.update(cx, |state, cx| {
+                    let _ = text_state.update(cx, |state, cx| {
                         if state.text != original {
                             return;
                         }
@@ -524,8 +532,11 @@ impl SearchPanel {
             return;
         }
 
-        let editor = self.editor.clone();
+        let Some(editor) = self.editor.upgrade() else {
+            return;
+        };
         let original = editor.read(cx).text.clone();
+        let editor = self.editor.clone();
         let cancellation = self.cancellation.clone();
         let worker_cancel = cancellation.clone();
         let worker_original = original.clone();
@@ -551,7 +562,7 @@ impl SearchPanel {
                 return;
             };
             _ = cx.update(|window, cx| {
-                editor.update(cx, |state, cx| {
+                let _ = editor.update(cx, |state, cx| {
                     if cancellation.load(Ordering::Relaxed) || state.text != original {
                         return;
                     }
@@ -761,6 +772,43 @@ impl Render for SearchPanel {
 
 #[cfg(test)]
 mod tests {
+    #[gpui::test]
+    fn closing_an_input_releases_its_menu_and_search_fields(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::init);
+        let cx = cx.add_empty_window();
+        for with_search in [false, true] {
+            let (editor, menu, search_fields) = cx.update(|window, cx| {
+                let editor = cx.new(|cx| {
+                    super::InputState::new(window, cx)
+                        .multi_line(true)
+                        .default_value("document text")
+                        .searchable(true)
+                });
+                if with_search {
+                    editor.update(cx, |state, cx| state.show_search(window, cx));
+                }
+                let state = editor.read(cx);
+                let menu = state.mouse_context_menu.downgrade();
+                let search_fields = state.search_panel.as_ref().map(|panel| {
+                    let search = panel.read(cx);
+                    (
+                        panel.downgrade(),
+                        search.search_input.downgrade(),
+                        search.replace_input.downgrade(),
+                    )
+                });
+                (editor.downgrade(), menu, search_fields)
+            });
+            cx.run_until_parked();
+            assert!(editor.upgrade().is_none());
+            assert!(menu.upgrade().is_none());
+            if let Some((panel, query, replacement)) = search_fields {
+                assert!(panel.upgrade().is_none());
+                assert!(query.upgrade().is_none());
+                assert!(replacement.upgrade().is_none());
+            }
+        }
+    }
     use super::*;
 
     #[test]
