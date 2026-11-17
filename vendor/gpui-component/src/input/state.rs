@@ -15,12 +15,12 @@ use gpui::{
 use ropey::{Rope, RopeSlice};
 use serde::Deserialize;
 use std::ops::Range;
-use std::rc::Rc;
+use std::{rc::Rc, sync::Arc};
 use unicode_segmentation::*;
 
 use super::{
     blink_cursor::BlinkCursor, change::Change, element::TextElement, mask_pattern::MaskPattern,
-    mode::InputMode, number_input, text_wrapper::TextWrapper,
+    mode::InputMode, number_input, text_metadata::LineEndings, text_wrapper::TextWrapper,
 };
 use crate::Size;
 use crate::actions::{SelectDown, SelectLeft, SelectRight, SelectUp};
@@ -352,7 +352,87 @@ pub struct InputState {
 
 impl EventEmitter<InputEvent> for InputState {}
 
+pub(super) struct PreparedReplacement {
+    previous: SharedString,
+    value: SharedString,
+    text: Rope,
+    endings: LineEndings,
+    layout: TextWrapper,
+}
+
+impl PreparedReplacement {
+    pub(super) fn new(
+        previous: SharedString,
+        value: SharedString,
+        mut layout: TextWrapper,
+        text_system: &Arc<gpui::TextSystem>,
+    ) -> Self {
+        let text = Rope::from(value.as_str());
+        let endings = LineEndings::new(&value);
+        layout.prepare_replacement(&text, text_system);
+        Self {
+            previous,
+            value,
+            text,
+            endings,
+            layout,
+        }
+    }
+}
+
 impl InputState {
+    pub(super) fn replacement_layout(&self) -> Option<TextWrapper> {
+        (self.mode.is_multi_line()
+            && self.external_highlights.is_some()
+            && self.composition.is_none()
+            && self.ime_marked_range.is_none()
+            && !self.disabled)
+            .then(|| self.text_wrapper.replacement_layout())
+    }
+
+    pub(super) fn cached_value(&self) -> Option<SharedString> {
+        self.value_cache.borrow().clone()
+    }
+
+    pub(super) fn apply_prepared_replacement(
+        &mut self,
+        prepared: PreparedReplacement,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.replacement_layout().is_none()
+            || !self.text_wrapper.uses_same_layout(&prepared.layout)
+        {
+            return false;
+        }
+        let end = prepared.text.len();
+        self.pause_blink_cursor(cx);
+        if !self.history.ignore {
+            self.history.clear_redo();
+            self.history.push(Change::from_shared(
+                0..self.text.len(),
+                prepared.previous,
+                0..end,
+                prepared.value.clone(),
+            ));
+        }
+        self.history.end_grouping();
+        self.text = prepared.text;
+        self.line_endings = prepared.endings;
+        *self.value_cache.get_mut() = Some(prepared.value);
+        self.text_wrapper = prepared.layout;
+        if let Some(diagnostics) = self.mode.diagnostics_mut() {
+            diagnostics.reset(&self.text);
+        }
+        self.lsp.update(&self.text, window, cx);
+        self.selected_range = (end..end).into();
+        self.update_preferred_column();
+        self.update_search(cx);
+        self.mode.update_auto_grow(&self.text_wrapper);
+        cx.emit(InputEvent::Change);
+        cx.notify();
+        true
+    }
     pub fn set_auto_indent(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.auto_indent = enabled;
         cx.notify();

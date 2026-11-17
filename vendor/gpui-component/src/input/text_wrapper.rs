@@ -1,6 +1,9 @@
 use std::ops::Range;
+use std::sync::Arc;
 
-use gpui::{App, Font, LineFragment, Pixels, Point, ShapedLine, Size, Window, point, px, size};
+use gpui::{
+    App, Font, LineFragment, Pixels, Point, ShapedLine, Size, TextSystem, Window, point, px, size,
+};
 use ropey::Rope;
 use smallvec::SmallVec;
 
@@ -152,9 +155,35 @@ impl TextWrapper {
         new_text: &Rope,
         cx: &mut App,
     ) {
-        let mut line_wrapper = cx
-            .text_system()
-            .line_wrapper(self.font.clone(), self.font_size);
+        self.update_with_text_system(changed_text, range, new_text, cx.text_system());
+    }
+
+    pub(super) fn replacement_layout(&self) -> Self {
+        let mut result = Self::new(self.font.clone(), self.font_size, self.wrap_width);
+        result._initialized = self._initialized;
+        result
+    }
+
+    pub(super) fn uses_same_layout(&self, prepared: &Self) -> bool {
+        self.font == prepared.font
+            && self.font_size == prepared.font_size
+            && self.wrap_width == prepared.wrap_width
+            && self._initialized == prepared._initialized
+    }
+
+    pub(super) fn prepare_replacement(&mut self, text: &Rope, text_system: &Arc<TextSystem>) {
+        self.set_default_text(text);
+        self.update_with_text_system(text, &(0..text.len()), text, text_system);
+    }
+
+    fn update_with_text_system(
+        &mut self,
+        changed_text: &Rope,
+        range: &Range<usize>,
+        new_text: &Rope,
+        text_system: &Arc<TextSystem>,
+    ) {
+        let mut line_wrapper = text_system.line_wrapper(self.font.clone(), self.font_size);
         if self.edit_uniform_word(changed_text, range, new_text, &mut line_wrapper)
             || self.resume_edit(changed_text, range, new_text, &mut line_wrapper)
             || self.append(changed_text, range, new_text, &mut line_wrapper)

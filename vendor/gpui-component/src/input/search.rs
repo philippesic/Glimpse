@@ -27,6 +27,7 @@ use crate::{
     label::Label,
     v_flex,
 };
+use super::state::PreparedReplacement;
 
 const CONTEXT: &'static str = "SearchPanel";
 
@@ -536,15 +537,19 @@ impl SearchPanel {
         let Some(editor) = self.editor.upgrade() else {
             return;
         };
-        let original = editor.read(cx).text.clone();
+        let state = editor.read(cx);
+        let original = state.text.clone();
+        let layout = state.replacement_layout();
+        let value = state.cached_value();
         let editor = self.editor.clone();
         let cancellation = self.cancellation.clone();
         let worker_cancel = cancellation.clone();
         let worker_original = original.clone();
+        let text_system = cx.text_system().clone();
         self.searching = true;
         self.matcher.matched_ranges = Arc::new(Vec::new());
         let task = cx.background_spawn(async move {
-            let text = worker_original.to_string();
+            let text = value.unwrap_or_else(|| worker_original.to_string().into());
             let mut output = String::new();
             let mut offset = 0;
             for (index, range) in ranges.iter().enumerate() {
@@ -556,10 +561,16 @@ impl SearchPanel {
                 offset = range.end;
             }
             output.push_str(&text[offset..]);
-            (!worker_cancel.load(Ordering::Relaxed)).then_some(output)
+            if worker_cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            let output: gpui::SharedString = output.into();
+            let prepared = layout
+                .map(|layout| PreparedReplacement::new(text, output.clone(), layout, &text_system));
+            (!worker_cancel.load(Ordering::Relaxed)).then_some((output, prepared))
         });
         cx.spawn_in(window, async move |_, cx| {
-            let Some(replaced) = task.await else {
+            let Some((replaced, prepared)) = task.await else {
                 return;
             };
             _ = cx.update(|window, cx| {
@@ -567,9 +578,13 @@ impl SearchPanel {
                     if cancellation.load(Ordering::Relaxed) || state.text != original {
                         return;
                     }
-                    let full_range = state.range_to_utf16(&(0..state.text.len()));
                     state.history.new_group();
-                    state.replace_text_in_range_silent(Some(full_range), &replaced, window, cx);
+                    if !prepared
+                        .is_some_and(|edit| state.apply_prepared_replacement(edit, window, cx))
+                    {
+                        let full_range = state.range_to_utf16(&(0..state.text.len()));
+                        state.replace_text_in_range_silent(Some(full_range), &replaced, window, cx);
+                    }
                     state.history.new_group();
                     state.scroll_to(0, Some(MoveDirection::Down), cx);
                 });
