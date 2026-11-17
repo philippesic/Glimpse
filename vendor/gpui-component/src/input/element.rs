@@ -86,17 +86,7 @@ impl TextElement {
         }
         let is_selected_all = selected_range.len() == state.text.len();
 
-        let mut cursor = state.cursor();
-        if state.masked {
-            // Because masked use `*`, 1 char with 1 byte.
-            selected_range.start = state.text.offset_to_char_index(selected_range.start);
-            selected_range.end = state.text.offset_to_char_index(selected_range.end);
-            cursor = state.text.offset_to_char_index(cursor);
-        }
-
-        let mut current_row = None;
         let mut scroll_offset = state.scroll_handle.offset();
-        let mut cursor_bounds = None;
 
         // If the input has a fixed height (Otherwise is auto-grow), we need to add a bottom margin to the input.
         let top_bottom_margin = if state.mode.is_auto_grow() {
@@ -107,76 +97,36 @@ impl TextElement {
             BOTTOM_MARGIN_ROWS * line_height
         };
 
-        // The cursor corresponds to the current cursor position in the text no only the line.
-        let mut cursor_pos = None;
-        let mut cursor_start = None;
-        let mut cursor_end = None;
-
-        let mut prev_lines_offset = 0;
-        let mut offset_y = px(0.);
-        for (ix, wrap_line) in text_wrapper.lines.iter().enumerate() {
-            let row = ix;
-            let line_origin = point(px(0.), offset_y);
-
-            // break loop if all cursor positions are found
-            if cursor_pos.is_some() && cursor_start.is_some() && cursor_end.is_some() {
-                break;
-            }
-
-            let in_visible_range = ix >= visible_range.start;
-            if let Some(line) = in_visible_range
-                .then(|| lines.get(ix.saturating_sub(visible_range.start)))
-                .flatten()
-            {
-                // If in visible range lines
-                if cursor_pos.is_none() {
-                    let offset = cursor.saturating_sub(prev_lines_offset);
-                    if let Some(pos) = line.position_for_index(offset, line_height) {
-                        current_row = Some(row);
-                        cursor_pos = Some(line_origin + pos);
-                    }
-                }
-                if cursor_start.is_none() {
-                    let offset = selected_range.start.saturating_sub(prev_lines_offset);
-                    if let Some(pos) = line.position_for_index(offset, line_height) {
-                        cursor_start = Some(line_origin + pos);
-                    }
-                }
-                if cursor_end.is_none() {
-                    let offset = selected_range.end.saturating_sub(prev_lines_offset);
-                    if let Some(pos) = line.position_for_index(offset, line_height) {
-                        cursor_end = Some(line_origin + pos);
-                    }
-                }
-
-                offset_y += line.size(line_height).height;
-                // +1 for the last `\n`
-                prev_lines_offset += line.len() + 1;
+        let position = |offset| {
+            let location = state.text.offset_to_point(offset);
+            let row = location.row;
+            let wrapped = text_wrapper.line(row)?;
+            let column = if state.masked {
+                state
+                    .text
+                    .slice(state.text.line_start_offset(row)..offset)
+                    .chars()
+                    .count()
             } else {
-                // If not in the visible range.
+                location.column
+            };
+            let top = text_wrapper.soft_row_start(row) * line_height;
+            let local = row
+                .checked_sub(visible_range.start)
+                .and_then(|index| lines.get(index))
+                .and_then(|line| line.position_for_index(column, line_height))
+                .unwrap_or_else(|| point(px(0.), wrapped.row_at(column) * line_height));
+            Some((row, point(local.x, top + local.y)))
+        };
 
-                // Just increase the offset_y and prev_lines_offset.
-                // This will let the scroll_offset to track the cursor position correctly.
-                if prev_lines_offset >= cursor && cursor_pos.is_none() {
-                    current_row = Some(row);
-                    cursor_pos = Some(line_origin);
-                }
-                if prev_lines_offset >= selected_range.start && cursor_start.is_none() {
-                    cursor_start = Some(line_origin);
-                }
-                if prev_lines_offset >= selected_range.end && cursor_end.is_none() {
-                    cursor_end = Some(line_origin);
-                }
-
-                offset_y += wrap_line.height(line_height);
-                // +1 for the last `\n`
-                prev_lines_offset += wrap_line.len() + 1;
-            }
-        }
-
-        if let (Some(cursor_pos), Some(cursor_start), Some(cursor_end)) =
-            (cursor_pos, cursor_start, cursor_end)
-        {
+        let mut current_row = None;
+        let mut cursor_bounds = None;
+        if let (Some((row, cursor_pos)), Some((_, cursor_start)), Some((_, cursor_end))) = (
+            position(state.cursor()),
+            position(selected_range.start),
+            position(selected_range.end),
+        ) {
+            current_row = Some(row);
             let selection_changed = state.last_selected_range != Some(selected_range);
             if selection_changed && !is_selected_all {
                 scroll_offset.x = if scroll_offset.x + cursor_pos.x
@@ -533,38 +483,26 @@ impl TextElement {
         line_height: Pixels,
         input_height: Pixels,
     ) -> (Range<usize>, Pixels) {
-        // Add extra rows to avoid showing empty space when scroll to bottom.
-        let extra_rows = 1;
-        let mut visible_top = px(0.);
         if state.mode.is_single_line() {
-            return (0..1, visible_top);
+            return (0..1, px(0.));
         }
 
-        let total_lines = state.text_wrapper.len();
         let scroll_top = if let Some(deferred_scroll_offset) = state.deferred_scroll_offset {
             deferred_scroll_offset.y
         } else {
             state.scroll_handle.offset().y
         };
 
-        let mut visible_range = 0..total_lines;
-        let mut line_bottom = px(0.);
-        for (ix, line) in state.text_wrapper.lines.iter().enumerate() {
-            let wrapped_height = line.height(line_height);
-            line_bottom += wrapped_height;
-
-            if line_bottom < -scroll_top {
-                visible_top = line_bottom - wrapped_height;
-                visible_range.start = ix;
-            }
-
-            if line_bottom + scroll_top >= input_height {
-                visible_range.end = (ix + extra_rows).min(total_lines);
-                break;
-            }
-        }
-
-        (visible_range, visible_top)
+        let text = &state.text_wrapper;
+        let row_at = |edge: Pixels| {
+            let row = (f32::from(edge) / f32::from(line_height)).ceil() as usize;
+            text.hard_row_at(row.saturating_sub(1)).map(|(row, _)| row)
+        };
+        let start = row_at(-scroll_top).map_or(text.lines.len().saturating_sub(1), |row| {
+            row.saturating_sub(1)
+        });
+        let end = row_at(input_height - scroll_top).map_or(text.lines.len(), |row| row + 1);
+        (start..end, text.soft_row_start(start) * line_height)
     }
 
     /// Return (line_number_width, line_number_len)

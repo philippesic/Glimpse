@@ -1618,24 +1618,20 @@ impl InputState {
 
         let row = point.row;
 
-        let mut row_offset_y = px(0.);
-        for (ix, wrap_line) in self.text_wrapper.lines.iter().enumerate() {
-            if ix == row {
-                break;
-            }
+        let local_row = self
+            .text_wrapper
+            .line(row)
+            .map_or(0, |line| line.row_at(point.column));
+        let row_offset_y = (self.text_wrapper.soft_row_start(row) + local_row) * line_height;
 
-            row_offset_y += wrap_line.height(line_height);
-        }
-
-        if let Some(line) = last_layout
-            .lines
-            .get(row.saturating_sub(last_layout.visible_range.start))
+        if let Some(line) = row
+            .checked_sub(last_layout.visible_range.start)
+            .and_then(|index| last_layout.lines.get(index))
         {
             // Check to scroll horizontally and soft wrap lines
             if let Some(pos) = line.position_for_index(point.column, line_height) {
                 let bounds_width = bounds.size.width - last_layout.line_number_width;
                 let col_offset_x = pos.x;
-                row_offset_y += pos.y;
                 if col_offset_x - RIGHT_MARGIN < -scroll_offset.x {
                     // If the position is out of the visible area, scroll to make it visible
                     scroll_offset.x = -col_offset_x + RIGHT_MARGIN;

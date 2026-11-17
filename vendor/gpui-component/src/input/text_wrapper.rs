@@ -67,12 +67,6 @@ impl LineItem {
         })
     }
 
-    /// Get the bytes length of this line.
-    #[inline]
-    pub(super) fn len(&self) -> usize {
-        self.length
-    }
-
     /// Get number of soft wrapped lines of this line (include the first line).
     #[inline]
     pub(super) fn lines_len(&self) -> usize {
@@ -108,6 +102,7 @@ pub(super) struct TextWrapper {
     pub(super) longest_row: LongestRow,
     /// The lines by split \n
     pub(super) lines: Vec<LineItem>,
+    block_starts: Vec<usize>,
 
     checkpoints: std::collections::BTreeMap<usize, Vec<WrapCheckpoint>>,
     _initialized: bool,
@@ -128,6 +123,8 @@ struct WrapCheckpoint {
 
 #[allow(unused)]
 impl TextWrapper {
+    const LINES_PER_BLOCK: usize = 128;
+
     pub(super) fn new(font: Font, font_size: Pixels, wrap_width: Option<Pixels>) -> Self {
         Self {
             text: Rope::new(),
@@ -137,6 +134,7 @@ impl TextWrapper {
             soft_lines: 0,
             longest_row: LongestRow::default(),
             lines: Vec::new(),
+            block_starts: Vec::new(),
             checkpoints: std::collections::BTreeMap::new(),
             _initialized: false,
         }
@@ -156,7 +154,66 @@ impl TextWrapper {
     /// Get the line item by row index.
     #[inline]
     pub(super) fn line(&self, row: usize) -> Option<&LineItem> {
-        self.lines.iter().skip(row).next()
+        self.lines.get(row)
+    }
+
+    pub(super) fn soft_row_start(&self, row: usize) -> usize {
+        if row >= self.lines.len() {
+            return self.soft_lines;
+        }
+        let block = row / Self::LINES_PER_BLOCK;
+        let start = block * Self::LINES_PER_BLOCK;
+        self.block_starts[block]
+            + self.lines[start..row]
+                .iter()
+                .map(LineItem::lines_len)
+                .sum::<usize>()
+    }
+
+    pub(super) fn hard_row_at(&self, soft_row: usize) -> Option<(usize, usize)> {
+        if soft_row >= self.soft_lines {
+            return None;
+        }
+        let block = self.block_starts.partition_point(|&row| row <= soft_row) - 1;
+        let first = block * Self::LINES_PER_BLOCK;
+        let mut start = self.block_starts[block];
+        self.lines[first..]
+            .iter()
+            .take(Self::LINES_PER_BLOCK)
+            .enumerate()
+            .find_map(|(index, line)| {
+                let end = start + line.lines_len();
+                let found = (soft_row < end).then_some((first + index, start));
+                start = end;
+                found
+            })
+    }
+
+    fn rebuild_index_from(&mut self, row: usize) {
+        let block = row / Self::LINES_PER_BLOCK;
+        let start = (block * Self::LINES_PER_BLOCK).min(self.lines.len());
+        let mut top = self
+            .block_starts
+            .get(block)
+            .copied()
+            .unwrap_or(self.soft_lines);
+        self.block_starts.truncate(block);
+        for lines in self.lines[start..].chunks(Self::LINES_PER_BLOCK) {
+            self.block_starts.push(top);
+            top += lines.iter().map(LineItem::lines_len).sum::<usize>();
+        }
+        self.soft_lines = top;
+    }
+
+    fn update_soft_rows(&mut self, row: usize, before: usize, after: usize) {
+        if before == after {
+            return;
+        }
+        let next_block = row / Self::LINES_PER_BLOCK + 1;
+        for start in &mut self.block_starts[next_block..] {
+            *start = *start - before + after;
+        }
+        self.soft_lines = self.soft_lines - before + after;
     }
 
     pub(super) fn set_wrap_width(&mut self, wrap_width: Option<Pixels>, cx: &mut App) {
@@ -248,7 +305,6 @@ impl TextWrapper {
                     let mut layout = Self::prepare_initial(config, &part, &text_system);
                     if end < rows {
                         layout.lines.pop();
-                        layout.soft_lines -= 1;
                     }
                     (start, layout)
                 })
@@ -267,7 +323,6 @@ impl TextWrapper {
                     len: part.longest_row.len,
                 };
             }
-            layout.soft_lines += part.soft_lines;
             layout.lines.append(&mut part.lines);
             layout.checkpoints.extend(
                 part.checkpoints
@@ -275,6 +330,7 @@ impl TextWrapper {
                     .map(|(row, points)| (row + start, points)),
             );
         }
+        layout.rebuild_index_from(0);
         layout
     }
 
@@ -316,7 +372,8 @@ impl TextWrapper {
 
     pub(super) fn retain_for_history(self) -> Option<Self> {
         const MAX_LAYOUT_BYTES: usize = 4 * 1024 * 1024;
-        let lines = self.lines.capacity() * std::mem::size_of::<LineItem>();
+        let lines = self.lines.capacity() * std::mem::size_of::<LineItem>()
+            + self.block_starts.capacity() * std::mem::size_of::<usize>();
         let wraps: usize = self
             .lines
             .iter()
@@ -500,8 +557,8 @@ impl TextWrapper {
         if !reused && (previous < length || (rows == 0 && wrapped.is_empty())) {
             wrapped.push(previous..length);
         }
+        self.update_soft_rows(row, self.lines[row].lines_len(), rows + wrapped.len());
         let line = &mut self.lines[row];
-        self.soft_lines = self.soft_lines - line.lines_len() + rows + wrapped.len();
         line.length = length;
         if rows + wrapped.len() <= 1 {
             line.wraps = None;
@@ -595,7 +652,7 @@ impl TextWrapper {
                 wraps.word_width = px(0.);
             }
         }
-        self.soft_lines = self.soft_lines - old_rows + rows;
+        self.update_soft_rows(row, old_rows, rows);
         if self.longest_row.row == row || length >= self.longest_row.len {
             self.longest_row = self
                 .lines
@@ -676,7 +733,8 @@ impl TextWrapper {
             wraps.word_width = advance;
             wraps.word_columns = wraps.ranges[0].len() as u32;
         }
-        self.soft_lines = self.soft_lines - old_rows + line.lines_len();
+        let rows = line.lines_len();
+        self.update_soft_rows(row, old_rows, rows);
         if length >= self.longest_row.len {
             self.longest_row = LongestRow { row, len: length };
         }
@@ -769,10 +827,13 @@ impl TextWrapper {
             new_lines.push(LineItem::new(line.len(), indent, wrapped_lines));
         }
 
-        if self.lines.len() == 0 {
+        if self.lines.is_empty() {
             self.lines = new_lines;
             self.checkpoints = new_checkpoints;
+            self.rebuild_index_from(0);
         } else {
+            let one_row_changed = rows_range.start() == rows_range.end() && new_lines.len() == 1;
+            let previous_rows = self.lines[start_row].lines_len();
             self.checkpoints.retain(|row, _| !rows_range.contains(row));
             let suffix = self.checkpoints.split_off(&(end_row + 1));
             let delta = new_lines.len() as isize - rows_range.clone().count() as isize;
@@ -783,10 +844,14 @@ impl TextWrapper {
             );
             self.checkpoints.extend(new_checkpoints);
             self.lines.splice(rows_range, new_lines);
+            if one_row_changed {
+                self.update_soft_rows(start_row, previous_rows, self.lines[start_row].lines_len());
+            } else {
+                self.rebuild_index_from(start_row);
+            }
         }
 
         self.text = changed_text.clone();
-        self.soft_lines = self.lines.iter().map(|l| l.lines_len()).sum();
         self.longest_row = LongestRow {
             row: longest_row_ix,
             len: longest_row_len,
@@ -808,12 +873,7 @@ impl TextWrapper {
         let start = self.text.line_start_offset(row);
         let line = &self.lines[row];
 
-        let mut wrapped_row = self
-            .lines
-            .iter()
-            .take(row)
-            .map(|l| l.lines_len())
-            .sum::<usize>();
+        let wrapped_row = self.soft_row_start(row);
 
         let local_offset = offset.saturating_sub(start);
         let ix = line.row_at(local_offset);
@@ -829,23 +889,11 @@ impl TextWrapper {
     ///
     /// Panics if the `point.row` is out of bounds.
     pub(crate) fn display_point_to_offset(&self, point: DisplayPoint) -> usize {
-        let mut wrapped_row = 0;
-        for (row, line) in self.lines.iter().enumerate() {
-            if wrapped_row + line.lines_len() > point.row {
-                let line_start = self.text.line_start_offset(row);
-                let local_row = point.row.saturating_sub(wrapped_row);
-                if let Some(range) = line.range(local_row) {
-                    return line_start + (range.start + point.column).min(range.end);
-                } else {
-                    // If not found, return the end of the line.
-                    return line_start + line.len();
-                }
-            }
-
-            wrapped_row += line.lines_len();
-        }
-
-        return self.text.len();
+        let Some((row, start)) = self.hard_row_at(point.row) else {
+            return self.text.len();
+        };
+        let range = self.lines[row].range(point.row - start).unwrap();
+        self.text.line_start_offset(row) + (range.start + point.column).min(range.end)
     }
 
     pub(crate) fn display_point_to_point(&self, point: DisplayPoint) -> tree_sitter::Point {
@@ -1050,6 +1098,50 @@ mod tests {
         assert_eq!(line.row_at(5), 1);
         assert_eq!(line.row_at(12), 1);
         assert_eq!(line.range(1), Some(5..12));
+    }
+
+    #[test]
+    fn row_index_tracks_wraps_and_line_edits_across_blocks() {
+        let font = Font {
+            family: "monospace".into(),
+            features: FontFeatures::default(),
+            weight: FontWeight::NORMAL,
+            style: FontStyle::Normal,
+            fallbacks: None,
+        };
+        let mut wrapper = TextWrapper::new(font, px(14.), Some(px(64.)));
+        let mut text = Rope::new();
+        let mut wrap = |line: RopeSlice<'_>, _| {
+            let boundaries = (8..line.len())
+                .step_by(8)
+                .map(|ix| Boundary { ix, next_indent: 0 })
+                .collect();
+            (boundaries, Vec::new())
+        };
+        for (row, count, replacement) in [
+            (0, 0, "A short line\n".repeat(400)),
+            (127, 0, "A word that increases the wrap count ".into()),
+            (128, 0, "new first row\nnew second row\n".into()),
+            (256, 3, String::new()),
+            (0, 399, "Final".into()),
+        ] {
+            let start = text.line_start_offset(row);
+            let end = text.line_start_offset(row + count);
+            let range = start..end;
+            let inserted = Rope::from(replacement.as_str());
+            text.replace(range.clone(), &replacement);
+            wrapper._update(&text, &range, &inserted, &mut wrap);
+            let mut expected = 0;
+            for (row, line) in wrapper.lines.iter().enumerate() {
+                assert_eq!(wrapper.soft_row_start(row), expected);
+                for local in 0..line.lines_len() {
+                    assert_eq!(wrapper.hard_row_at(expected + local), Some((row, expected)));
+                }
+                expected += line.lines_len();
+            }
+            assert_eq!(wrapper.len(), expected);
+            assert_eq!(wrapper.hard_row_at(expected), None);
+        }
     }
 
     #[gpui::test]
@@ -1586,7 +1678,7 @@ mod tests {
                         .collect::<Vec<_>>(),
                 );
                 // +1 \n
-                offset += line.len() + 1;
+                offset += line.length + 1;
             }
             assert_eq!(actual_lines, expected_lines);
         }
@@ -1796,6 +1888,7 @@ mod tests {
             // range: 57..79
             LineItem::new("这里是第 4 行。".len(), Some(0), smallvec::smallvec![0..22]),
         ];
+        wrapper.rebuild_index_from(0);
 
         assert_eq!(
             wrapper.offset_to_display_point(12),
