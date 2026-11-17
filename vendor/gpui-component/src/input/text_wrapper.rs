@@ -69,6 +69,13 @@ pub(super) struct TextWrapper {
     _initialized: bool,
 }
 
+#[derive(Clone, PartialEq)]
+pub(super) struct LayoutConfig {
+    pub(super) font: Font,
+    pub(super) font_size: Pixels,
+    pub(super) wrap_width: Option<Pixels>,
+}
+
 #[derive(Clone)]
 struct WrapCheckpoint {
     state: gpui::LineWrapState,
@@ -137,6 +144,24 @@ impl TextWrapper {
         self.font_size = font_size;
         self.wrap_width = wrap_width;
         self.update_all(text, cx);
+    }
+
+    pub(super) fn matches_config(&self, config: &LayoutConfig) -> bool {
+        self._initialized
+            && self.font == config.font
+            && self.font_size == config.font_size
+            && self.wrap_width == config.wrap_width
+    }
+
+    pub(super) fn prepare_initial(
+        config: LayoutConfig,
+        text: &Rope,
+        text_system: &Arc<TextSystem>,
+    ) -> Self {
+        let mut layout = Self::new(config.font, config.font_size, config.wrap_width);
+        layout._initialized = true;
+        layout.prepare_replacement(text, text_system);
+        layout
     }
 
     /// Update the text wrapper and recalculate the wrapped lines.

@@ -26,7 +26,7 @@ use super::{
     mode::InputMode,
     number_input,
     text_metadata::LineEndings,
-    text_wrapper::TextWrapper,
+    text_wrapper::{LayoutConfig, TextWrapper},
 };
 use crate::Size;
 use crate::actions::{SelectDown, SelectLeft, SelectRight, SelectUp};
@@ -102,6 +102,7 @@ pub enum InputEvent {
     PressEnter { secondary: bool },
     Focus,
     Blur,
+    InitialLayoutReady,
 }
 
 pub(super) const CONTEXT: &str = "Input";
@@ -283,6 +284,9 @@ pub struct InputState {
     accessibility_label: Option<SharedString>,
     accessibility_mapping: Rc<std::cell::RefCell<accessibility::Mapping>>,
     pub(super) text_wrapper: TextWrapper,
+    defer_initial_layout: bool,
+    requested_initial_layout: Option<LayoutConfig>,
+    initial_layout_task: Option<Task<()>>,
     history_layout: Option<TextWrapper>,
     pub(super) history: History<Change>,
     pub(super) blink_cursor: Entity<BlinkCursor>,
@@ -383,6 +387,60 @@ impl PreparedReplacement {
 }
 
 impl InputState {
+    pub fn defer_large_initial_layout(mut self) -> Self {
+        self.defer_initial_layout = true;
+        self
+    }
+
+    pub fn initial_layout_pending(&self) -> bool {
+        self.defer_initial_layout
+            && self.mode.is_multi_line()
+            && self.soft_wrap
+            && self.text.len() >= 512 * 1024
+            && self.last_layout.is_none()
+    }
+
+    pub(super) fn prepare_layout(&mut self, config: LayoutConfig, cx: &mut Context<Self>) -> bool {
+        if !self.initial_layout_pending() || self.text_wrapper.matches_config(&config) {
+            self.requested_initial_layout = None;
+            self.text_wrapper.prepare(
+                &self.text,
+                config.font,
+                config.font_size,
+                config.wrap_width,
+                cx,
+            );
+            return true;
+        }
+
+        self.requested_initial_layout = Some(config.clone());
+        if self.initial_layout_task.is_none() {
+            let text = self.text.clone();
+            let text_system = cx.text_system().clone();
+            let task = cx.background_spawn({
+                let text = text.clone();
+                let config = config.clone();
+                async move {
+                    let _wrap = gpui::work_trace::Span::new("editor_wrap_worker");
+                    TextWrapper::prepare_initial(config, &text, &text_system)
+                }
+            });
+            self.initial_layout_task = Some(cx.spawn(async move |this, cx| {
+                let layout = task.await;
+                _ = this.update(cx, |state, cx| {
+                    state.initial_layout_task.take();
+                    if state.requested_initial_layout.as_ref() == Some(&config)
+                        && ropey::extra::esoterica::ropes_are_instances(&state.text, &text)
+                    {
+                        state.text_wrapper = layout;
+                    }
+                    cx.notify();
+                });
+            }));
+        }
+        false
+    }
+
     fn can_install_revision(&self) -> bool {
         self.mode.is_multi_line()
             && self.external_highlights.is_some()
@@ -517,6 +575,9 @@ impl InputState {
             value_cache: std::cell::RefCell::new(None),
             line_endings: Default::default(),
             text_wrapper: TextWrapper::new(text_style.font(), window.rem_size(), None),
+            defer_initial_layout: false,
+            requested_initial_layout: None,
+            initial_layout_task: None,
             history_layout: None,
             blink_cursor,
             history,
@@ -862,6 +923,10 @@ impl InputState {
     pub fn set_soft_wrap(&mut self, wrap: bool, _: &mut Window, cx: &mut Context<Self>) {
         debug_assert!(self.mode.is_multi_line());
         self.soft_wrap = wrap;
+        if self.defer_initial_layout && self.last_layout.is_none() {
+            cx.notify();
+            return;
+        }
         if wrap {
             let wrap_width = self
                 .last_layout
@@ -2537,6 +2602,66 @@ mod refresh_tests {
 #[cfg(test)]
 mod revision_tests {
     use super::*;
+
+    #[gpui::test]
+    fn initial_wrap_waits_for_the_latest_revision_and_width(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::init);
+        let cx = cx.add_empty_window();
+        let before = "  café 👩‍👩‍👧‍👦 and wrapped words\r\n".repeat(15_000);
+        let after = format!("{before}different final line\n");
+        let config = LayoutConfig {
+            font: gpui::font(".ZedMono"),
+            font_size: px(16.),
+            wrap_width: Some(px(216.)),
+        };
+        let final_config = LayoutConfig {
+            wrap_width: Some(px(231.)),
+            ..config.clone()
+        };
+        let editor = cx.update(|window, cx| {
+            cx.new(|cx| {
+                InputState::new(window, cx)
+                    .code_editor("text")
+                    .defer_large_initial_layout()
+                    .default_value(before)
+            })
+        });
+        cx.update(|window, cx| {
+            editor.update(cx, |state, cx| {
+                assert!(state.initial_layout_pending());
+                assert!(!state.prepare_layout(config.clone(), cx));
+                state.set_external_highlights(Vec::new(), cx);
+                state.set_value(after.clone(), window, cx);
+                assert!(!state.prepare_layout(config.clone(), cx));
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            editor.update(cx, |state, cx| {
+                assert!(!state.text_wrapper.matches_config(&config));
+                assert!(!state.prepare_layout(config.clone(), cx));
+                assert!(!state.prepare_layout(final_config.clone(), cx));
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            editor.update(cx, |state, cx| {
+                assert!(!state.text_wrapper.matches_config(&config));
+                assert!(!state.prepare_layout(final_config.clone(), cx));
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            editor.update(cx, |state, cx| {
+                assert!(state.prepare_layout(final_config.clone(), cx));
+                assert_eq!(state.value().as_str(), after);
+                assert_eq!(state.line_endings, LineEndings::new(&after));
+                let exact =
+                    TextWrapper::prepare_initial(final_config, &state.text, cx.text_system());
+                assert_eq!(state.text_wrapper.lines, exact.lines);
+            });
+        });
+    }
 
     #[gpui::test]
     fn whole_revision_history_preserves_text_and_wrapping(cx: &mut gpui::TestAppContext) {

@@ -1002,6 +1002,7 @@ impl Shell {
                 .code_editor("text")
                 .line_number(self.settings.line_numbers)
                 .soft_wrap(self.settings.wrap)
+                .defer_large_initial_layout()
                 .default_value(text.clone());
             input.set_external_highlights(Vec::new(), cx);
             input.set_cursor_blink(false, cx);
@@ -1017,6 +1018,10 @@ impl Shell {
             input
         });
         let subscription = cx.subscribe_in(&input, window, move |this, _, event, _, cx| {
+            if matches!(event, InputEvent::InitialLayoutReady) {
+                cx.notify();
+                return;
+            }
             if !matches!(event, InputEvent::Change) {
                 return;
             }
@@ -3061,10 +3066,16 @@ impl Render for Shell {
             window.set_window_title(&title);
             self.window_title = title;
         }
+        let narrow = self.narrow(window);
+        let source_visible = !self.reading && (!narrow || !self.navigation_only);
         if !self.ready
             && self.listing_done
             && self.opening.is_empty()
             && self.startup_recovery.is_none()
+            && (!source_visible
+                || !self.documents.iter().any(|doc| {
+                    Some(doc.id) == self.active && doc.input.read(cx).initial_layout_pending()
+                }))
         {
             self.ready = true;
             let failed = self.startup_failed;
@@ -3096,8 +3107,6 @@ impl Render for Shell {
                 });
             }));
         }
-        let narrow = self.narrow(window);
-        let source_visible = !self.reading && (!narrow || !self.navigation_only);
         for doc in &self.documents {
             if !source_visible || Some(doc.id) != self.active {
                 doc.input

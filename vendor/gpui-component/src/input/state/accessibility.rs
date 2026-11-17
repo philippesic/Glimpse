@@ -295,7 +295,7 @@ impl InputState {
         let owner = window.accessibility_text_run_ids(id);
         let work = mapping.prepare(owner, text.clone());
         let current = &mapping.current;
-        let ready = current.matches(&text);
+        let ready = current.matches(&text) && !self.initial_layout_pending();
         let mut node = Node::new(if self.mode.is_multi_line() {
             Role::MultilineTextInput
         } else {

@@ -14,11 +14,11 @@ use crate::{
     input::{
         RopeExt as _,
         blink_cursor::CURSOR_WIDTH,
-        text_wrapper::{LineLayout, WrappedLine},
+        text_wrapper::{LayoutConfig, LineLayout, WrappedLine},
     },
 };
 
-use super::{InputState, LastLayout, mode::InputMode};
+use super::{InputEvent, InputState, LastLayout, mode::InputMode};
 
 const BOTTOM_MARGIN_ROWS: usize = 3;
 pub(super) const RIGHT_MARGIN: Pixels = px(10.);
@@ -961,7 +961,7 @@ fn print_points_as_svg_path(
 
 impl Element for TextElement {
     type RequestLayoutState = ();
-    type PrepaintState = PrepaintState;
+    type PrepaintState = Option<PrepaintState>;
 
     fn id(&self) -> Option<ElementId> {
         None
@@ -1022,12 +1022,20 @@ impl Element for TextElement {
         } else {
             None
         };
-        self.state.update(cx, |state, cx| {
+        let prepared = self.state.update(cx, |state, cx| {
             let _wrap = gpui::work_trace::Span::new("editor_wrap");
-            state
-                .text_wrapper
-                .prepare(&state.text, font, text_size, wrap_width, cx);
+            state.prepare_layout(
+                LayoutConfig {
+                    font,
+                    font_size: text_size,
+                    wrap_width,
+                },
+                cx,
+            )
         });
+        if !prepared {
+            return None;
+        }
 
         let state = self.state.read(cx);
         let line_height = window.line_height();
@@ -1305,7 +1313,7 @@ impl Element for TextElement {
         let indent_guides_path =
             self.layout_indent_guides(state, &bounds, &last_layout, &text_style, window);
 
-        PrepaintState {
+        Some(PrepaintState {
             bounds,
             last_layout,
             scroll_size,
@@ -1322,7 +1330,7 @@ impl Element for TextElement {
             ghost_first_line,
             ghost_lines,
             ghost_lines_height,
-        }
+        })
     }
 
     fn paint(
@@ -1335,6 +1343,25 @@ impl Element for TextElement {
         window: &mut Window,
         cx: &mut App,
     ) {
+        let Some(prepaint) = prepaint else {
+            let text: SharedString = "Preparing editor…".into();
+            let style = window.text_style();
+            let line = window.text_system().shape_line(
+                text.clone(),
+                style.font_size.to_pixels(window.rem_size()),
+                &[TextRun {
+                    len: text.len(),
+                    font: style.font(),
+                    color: cx.theme().muted_foreground,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                }],
+                None,
+            );
+            _ = line.paint(input_bounds.origin, window.line_height(), window, cx);
+            return;
+        };
         let focus_handle = self.state.read(cx).focus_handle.clone();
         let show_cursor = self.state.read(cx).show_cursor(window, cx);
         let focused = focus_handle.is_focused(window);
@@ -1543,6 +1570,7 @@ impl Element for TextElement {
             window.request_animation_frame();
         }
         self.state.update(cx, |state, cx| {
+            let initial_layout_completed = state.initial_layout_pending();
             state.last_layout = Some(prepaint.last_layout.clone());
             state.last_bounds = Some(bounds);
             state.last_cursor = Some(state.cursor());
@@ -1552,6 +1580,9 @@ impl Element for TextElement {
             state.update_scroll_offset(Some(prepaint.cursor_scroll_offset), cx);
             state.deferred_scroll_offset = None;
 
+            if initial_layout_completed {
+                cx.emit(InputEvent::InitialLayoutReady);
+            }
             cx.notify();
         });
 
