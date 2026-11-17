@@ -881,6 +881,30 @@ mod tests {
     }
 
     #[test]
+    fn streamed_recovery_bases_preserve_chunk_boundaries_and_wire_format() {
+        use base64::Engine;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("record.json");
+        for size in [0, 1, 2, 3, 1023, 1024, 1025, 4097, 1024 * 1024] {
+            let bytes: Vec<_> = (0..size).map(|index| index as u8).collect();
+            let draft = Draft {
+                base: bytes.clone().into(),
+                ..draft(8)
+            };
+            atomic_json(&path, &draft).unwrap();
+            let stored: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(
+                stored["base"],
+                base64::engine::general_purpose::STANDARD.encode(&bytes)
+            );
+            let restored: Draft = serde_json::from_value(stored).unwrap();
+            assert_eq!(restored.base.as_ref(), bytes);
+            assert_eq!(restored.text, draft.text);
+        }
+    }
+
+    #[test]
     fn malformed_recovery_generations_are_rejected_without_removing_records() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("record.json");
@@ -1276,9 +1300,10 @@ mod encoded_bytes {
     use super::*;
     use base64::Engine;
     pub fn serialize<S: serde::Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
-        base64::engine::general_purpose::STANDARD
-            .encode(bytes)
-            .serialize(serializer)
+        serializer.collect_str(&base64::display::Base64Display::new(
+            bytes,
+            &base64::engine::general_purpose::STANDARD,
+        ))
     }
     pub fn deserialize<'de, D: serde::Deserializer<'de>>(
         deserializer: D,
