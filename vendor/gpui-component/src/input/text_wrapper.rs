@@ -171,6 +171,30 @@ impl TextWrapper {
             && self._initialized == prepared._initialized
     }
 
+    pub(super) fn matches_revision(&self, text: &Rope, layout: &Self) -> bool {
+        self.uses_same_layout(layout) && self.text == *text
+    }
+
+    pub(super) fn retain_for_history(self) -> Option<Self> {
+        const MAX_LAYOUT_BYTES: usize = 4 * 1024 * 1024;
+        let lines = self.lines.capacity() * std::mem::size_of::<LineItem>();
+        let wraps: usize = self
+            .lines
+            .iter()
+            .filter(|line| line.wrapped_lines.spilled())
+            .map(|line| line.wrapped_lines.capacity() * std::mem::size_of::<Range<usize>>())
+            .sum();
+        let checkpoints: usize = self
+            .checkpoints
+            .values()
+            .map(|points| {
+                points.capacity() * std::mem::size_of::<WrapCheckpoint>()
+                    + 4 * std::mem::size_of::<(usize, Vec<WrapCheckpoint>)>()
+            })
+            .sum();
+        (self._initialized && lines + wraps + checkpoints <= MAX_LAYOUT_BYTES).then_some(self)
+    }
+
     pub(super) fn prepare_replacement(&mut self, text: &Rope, text_system: &Arc<TextSystem>) {
         self.set_default_text(text);
         self.update_with_text_system(text, &(0..text.len()), text, text_system);

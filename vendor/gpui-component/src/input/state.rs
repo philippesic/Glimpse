@@ -19,8 +19,14 @@ use std::{rc::Rc, sync::Arc};
 use unicode_segmentation::*;
 
 use super::{
-    blink_cursor::BlinkCursor, change::Change, element::TextElement, mask_pattern::MaskPattern,
-    mode::InputMode, number_input, text_metadata::LineEndings, text_wrapper::TextWrapper,
+    blink_cursor::BlinkCursor,
+    change::{Change, HistoryText, Revision},
+    element::TextElement,
+    mask_pattern::MaskPattern,
+    mode::InputMode,
+    number_input,
+    text_metadata::LineEndings,
+    text_wrapper::TextWrapper,
 };
 use crate::Size;
 use crate::actions::{SelectDown, SelectLeft, SelectRight, SelectUp};
@@ -277,6 +283,7 @@ pub struct InputState {
     accessibility_label: Option<SharedString>,
     accessibility_mapping: Rc<std::cell::RefCell<accessibility::Mapping>>,
     pub(super) text_wrapper: TextWrapper,
+    history_layout: Option<TextWrapper>,
     pub(super) history: History<Change>,
     pub(super) blink_cursor: Entity<BlinkCursor>,
     pub(super) loading: bool,
@@ -353,16 +360,13 @@ pub struct InputState {
 impl EventEmitter<InputEvent> for InputState {}
 
 pub(super) struct PreparedReplacement {
-    previous: SharedString,
     value: SharedString,
-    text: Rope,
-    endings: LineEndings,
+    revision: Revision,
     layout: TextWrapper,
 }
 
 impl PreparedReplacement {
     pub(super) fn new(
-        previous: SharedString,
         value: SharedString,
         mut layout: TextWrapper,
         text_system: &Arc<gpui::TextSystem>,
@@ -371,22 +375,24 @@ impl PreparedReplacement {
         let endings = LineEndings::new(&value);
         layout.prepare_replacement(&text, text_system);
         Self {
-            previous,
             value,
-            text,
-            endings,
+            revision: Revision { text, endings },
             layout,
         }
     }
 }
 
 impl InputState {
-    pub(super) fn replacement_layout(&self) -> Option<TextWrapper> {
-        (self.mode.is_multi_line()
+    fn can_install_revision(&self) -> bool {
+        self.mode.is_multi_line()
             && self.external_highlights.is_some()
             && self.composition.is_none()
             && self.ime_marked_range.is_none()
-            && !self.disabled)
+            && !self.disabled
+    }
+
+    pub(super) fn replacement_layout(&self) -> Option<TextWrapper> {
+        self.can_install_revision()
             .then(|| self.text_wrapper.replacement_layout())
     }
 
@@ -400,38 +406,57 @@ impl InputState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.replacement_layout().is_none()
-            || !self.text_wrapper.uses_same_layout(&prepared.layout)
-        {
+        if !self.can_install_revision() || !self.text_wrapper.uses_same_layout(&prepared.layout) {
             return false;
         }
-        let end = prepared.text.len();
-        self.pause_blink_cursor(cx);
         if !self.history.ignore {
             self.history.clear_redo();
-            self.history.push(Change::from_shared(
-                0..self.text.len(),
-                prepared.previous,
-                0..end,
-                prepared.value.clone(),
+            self.history.push(Change::from_revisions(
+                Revision {
+                    text: self.text.clone(),
+                    endings: self.line_endings,
+                },
+                prepared.revision.clone(),
             ));
         }
         self.history.end_grouping();
-        self.text = prepared.text;
-        self.line_endings = prepared.endings;
-        *self.value_cache.get_mut() = Some(prepared.value);
-        self.text_wrapper = prepared.layout;
+        self.install_revision(
+            prepared.revision,
+            Some(prepared.value),
+            prepared.layout,
+            window,
+            cx,
+        );
+        true
+    }
+
+    fn install_revision(
+        &mut self,
+        revision: Revision,
+        value: Option<SharedString>,
+        layout: TextWrapper,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pause_blink_cursor(cx);
+        self.text = revision.text;
+        self.line_endings = revision.endings;
+        *self.value_cache.get_mut() = value;
+        self.history_layout =
+            std::mem::replace(&mut self.text_wrapper, layout).retain_for_history();
         if let Some(diagnostics) = self.mode.diagnostics_mut() {
             diagnostics.reset(&self.text);
         }
         self.lsp.update(&self.text, window, cx);
-        self.selected_range = (end..end).into();
+        self.selected_range = (0..0).into();
+        self.selection_reversed = false;
+        self.deferred_scroll_offset = None;
+        self.scroll_handle.set_offset(point(px(0.), px(0.)));
         self.update_preferred_column();
         self.update_search(cx);
         self.mode.update_auto_grow(&self.text_wrapper);
         cx.emit(InputEvent::Change);
         cx.notify();
-        true
     }
     pub fn set_auto_indent(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.auto_indent = enabled;
@@ -492,6 +517,7 @@ impl InputState {
             value_cache: std::cell::RefCell::new(None),
             line_endings: Default::default(),
             text_wrapper: TextWrapper::new(text_style.font(), window.rem_size(), None),
+            history_layout: None,
             blink_cursor,
             history,
             selected_range: Selection::default(),
@@ -1620,8 +1646,7 @@ impl InputState {
         self.history.ignore = true;
         if let Some(changes) = self.history.undo() {
             for change in changes {
-                let range_utf16 = self.range_to_utf16(&change.new_range.into());
-                self.replace_text_in_range_silent(Some(range_utf16), &change.old_text, window, cx);
+                self.apply_history(change.new_range, change.old_text, window, cx);
             }
         }
         self.history.ignore = false;
@@ -1631,11 +1656,43 @@ impl InputState {
         self.history.ignore = true;
         if let Some(changes) = self.history.redo() {
             for change in changes {
-                let range_utf16 = self.range_to_utf16(&change.old_range.into());
-                self.replace_text_in_range_silent(Some(range_utf16), &change.new_text, window, cx);
+                self.apply_history(change.old_range, change.new_text, window, cx);
             }
         }
         self.history.ignore = false;
+    }
+
+    fn apply_history(
+        &mut self,
+        range: Selection,
+        text: HistoryText,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match text {
+            HistoryText::Fragment(text) => {
+                let range_utf16 = self.range_to_utf16(&range.into());
+                self.replace_text_in_range_silent(Some(range_utf16), &text, window, cx);
+            }
+            HistoryText::Revision(revision) => {
+                if self.can_install_revision()
+                    && range.start == 0
+                    && range.end == self.text.len()
+                    && let Some(layout) = self.history_layout.take()
+                    && layout.matches_revision(&revision.text, &self.text_wrapper)
+                {
+                    self.install_revision(revision, None, layout, window, cx);
+                } else {
+                    let range_utf16 = self.range_to_utf16(&range.into());
+                    self.replace_text_in_range_silent(
+                        Some(range_utf16),
+                        &revision.text.to_string(),
+                        window,
+                        cx,
+                    );
+                }
+            }
+        }
     }
 
     /// Get byte offset of the cursor.
@@ -2193,6 +2250,7 @@ impl EntityInputHandler for InputState {
         }
 
         self.value_cache.get_mut().take();
+        self.history_layout = None;
         if self.mode.is_single_line() {
             self.line_endings = super::text_metadata::LineEndings::new(&self.text.to_string());
         } else {
@@ -2287,6 +2345,7 @@ impl EntityInputHandler for InputState {
         }
 
         self.value_cache.get_mut().take();
+        self.history_layout = None;
         if self.mode.is_single_line() {
             self.line_endings = super::text_metadata::LineEndings::new(&self.text.to_string());
         } else {
@@ -2472,6 +2531,82 @@ mod refresh_tests {
         assert_eq!(refreshed_offset(9, &(4..9), 2), (6, false));
         assert_eq!(refreshed_offset(7, &(4..9), 2), (6, true));
         assert_eq!(refreshed_offset(9, &(4..4), 3), (12, false));
+    }
+}
+
+#[cfg(test)]
+mod revision_tests {
+    use super::*;
+
+    #[gpui::test]
+    fn whole_revision_history_preserves_text_and_wrapping(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::init);
+        let cx = cx.add_empty_window();
+        cx.update(|window, cx| {
+            for (before, after) in [
+                ("old 🙂 line\r\nsecond line\r\n", "new 🦀 wrapped line\r\n"),
+                ("one\r\ntwo\rthree\n", "first\nsecond\r\nthird\r"),
+                ("old\r\n", ""),
+            ] {
+                let editor = cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .code_editor("text")
+                        .default_value(before)
+                });
+                editor.update(cx, |state, cx| {
+                    let font = gpui::font(".ZedMono");
+                    let size = px(16.);
+                    let width = Some(px(64.));
+                    state.set_external_highlights(Vec::new(), cx);
+                    state
+                        .text_wrapper
+                        .prepare(&state.text, font.clone(), size, width, cx);
+                    let before_lines = state.text_wrapper.lines.clone();
+                    let mut expected = TextWrapper::new(font.clone(), size, width);
+                    expected.prepare(&Rope::from(after), font.clone(), size, width, cx);
+                    let prepared = PreparedReplacement::new(
+                        after.to_owned().into(),
+                        state.replacement_layout().unwrap(),
+                        cx.text_system(),
+                    );
+                    assert!(state.apply_prepared_replacement(prepared, window, cx));
+                    assert_eq!(state.value().as_str(), after);
+                    assert_eq!(state.line_endings, LineEndings::new(after));
+                    assert_eq!(state.text_wrapper.lines, expected.lines);
+                    assert_eq!(state.cursor(), 0);
+                    assert!(state.history_layout.is_some());
+
+                    state.undo(&Undo, window, cx);
+                    assert_eq!(state.value().as_str(), before);
+                    assert_eq!(state.line_endings, LineEndings::new(before));
+                    assert_eq!(state.text_wrapper.lines, before_lines);
+                    assert!(state.history_layout.is_some());
+
+                    state.redo(&Redo, window, cx);
+                    assert_eq!(state.value().as_str(), after);
+                    assert_eq!(state.text_wrapper.lines, expected.lines);
+                    assert!(state.history_layout.is_some());
+
+                    let resized = Some(px(81.));
+                    let prepared = PreparedReplacement::new(
+                        before.to_owned().into(),
+                        state.replacement_layout().unwrap(),
+                        cx.text_system(),
+                    );
+                    state
+                        .text_wrapper
+                        .prepare(&state.text, font.clone(), size, resized, cx);
+                    assert!(!state.apply_prepared_replacement(prepared, window, cx));
+                    assert_eq!(state.value().as_str(), after);
+                    state.undo(&Undo, window, cx);
+                    expected.prepare(&Rope::from(before), font, size, resized, cx);
+                    assert_eq!(state.value().as_str(), before);
+                    assert_eq!(state.line_endings, LineEndings::new(before));
+                    assert_eq!(state.text_wrapper.lines, expected.lines);
+                    assert!(state.history_layout.is_none());
+                });
+            }
+        });
     }
 }
 

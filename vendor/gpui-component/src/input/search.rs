@@ -565,8 +565,8 @@ impl SearchPanel {
                 return None;
             }
             let output: gpui::SharedString = output.into();
-            let prepared = layout
-                .map(|layout| PreparedReplacement::new(text, output.clone(), layout, &text_system));
+            let prepared =
+                layout.map(|layout| PreparedReplacement::new(output.clone(), layout, &text_system));
             (!worker_cancel.load(Ordering::Relaxed)).then_some((output, prepared))
         });
         cx.spawn_in(window, async move |_, cx| {
