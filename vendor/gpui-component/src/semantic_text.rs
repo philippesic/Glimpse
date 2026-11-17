@@ -34,39 +34,87 @@ pub(crate) fn segments(text: &str) -> Vec<Segment> {
         let mut byte = offset;
         let mut lengths = Vec::new();
         let mut starts = Vec::new();
-        let pieces = line.graphemes(true).flat_map(|grapheme| {
-            if grapheme.len() <= u8::MAX as usize {
+        let end = offset + line.len();
+        while byte < end {
+            let local = byte - offset;
+            let ascii = line.as_bytes()[local..]
+                .iter()
+                .take_while(|byte| byte.is_ascii())
+                .count();
+            let safe_ascii = if local + ascii == line.len() {
+                if line.as_bytes().ends_with(b"\r\n") {
+                    ascii.saturating_sub(2)
+                } else {
+                    ascii
+                }
+            } else {
+                ascii.saturating_sub(1)
+            };
+            let ascii_end = byte + safe_ascii;
+            while byte < ascii_end {
+                if lengths.len() == 255 {
+                    segments.push(Segment {
+                        range: start..byte,
+                        lengths,
+                        words: starts,
+                        line: line_index,
+                    });
+                    start = byte;
+                    lengths = Vec::new();
+                    starts = Vec::new();
+                }
+                let count = (255 - lengths.len()).min(ascii_end - byte);
+                while words.peek().is_some_and(|&word| word < byte) {
+                    words.next();
+                }
+                while let Some(&word) = words.peek().filter(|&&word| word < byte + count) {
+                    starts.push((lengths.len() + word - byte) as u8);
+                    words.next();
+                }
+                lengths.resize(lengths.len() + count, 1);
+                byte += count;
+            }
+            if byte == end {
+                break;
+            }
+            let grapheme = line[byte - offset..].graphemes(true).next().unwrap();
+            let pieces = if grapheme.len() <= u8::MAX as usize {
                 smallvec::SmallVec::<[u8; 1]>::from_slice(&[grapheme.len() as u8])
             } else {
                 grapheme
                     .chars()
                     .map(|character| character.len_utf8() as u8)
                     .collect()
+            };
+            for length in pieces {
+                if lengths.len() == 255 {
+                    segments.push(Segment {
+                        range: start..byte,
+                        lengths,
+                        words: starts,
+                        line: line_index,
+                    });
+                    start = byte;
+                    lengths = Vec::new();
+                    starts = Vec::new();
+                }
+                while words.peek().is_some_and(|&word| word < byte) {
+                    words.next();
+                }
+                while words
+                    .peek()
+                    .is_some_and(|&word| word < byte + usize::from(length))
+                {
+                    let index = lengths.len() as u8;
+                    if starts.last() != Some(&index) {
+                        starts.push(index);
+                    }
+                    words.next();
+                }
+                lengths.push(length);
+                byte += usize::from(length);
             }
-        });
-        for length in pieces {
-            if lengths.len() == 255 {
-                segments.push(Segment {
-                    range: start..byte,
-                    lengths,
-                    words: starts,
-                    line: line_index,
-                });
-                start = byte;
-                lengths = Vec::new();
-                starts = Vec::new();
-            }
-            while words.peek().is_some_and(|&word| word < byte) {
-                words.next();
-            }
-            if words.peek() == Some(&byte) {
-                starts.push(lengths.len() as u8);
-                words.next();
-            }
-            lengths.push(length);
-            byte += usize::from(length);
         }
-        let end = offset + line.len();
         segments.push(Segment {
             range: start..end,
             lengths,
@@ -253,6 +301,68 @@ mod tests {
             assert_eq!(parts.last().unwrap().range, text.len()..text.len());
         }
     }
+    #[test]
+    fn ascii_spans_preserve_unicode_context_and_run_boundaries() {
+        let pieces = [
+            "A", " ", "\r", "\n", "\t", "\0", "é", "́", "🙂", "\u{200d}", "\u{600}", "🇨🇳", "🇺", "🇸",
+            "क", "्", "ष", "ा", "ᄀ", "ᅡ", "ᆨ", "👩🏽", "🏻", "\u{200c}",
+        ];
+        let padding = [0, 1, 254, 255, 256, 511];
+        for (a, first) in pieces.iter().enumerate() {
+            for (b, second) in pieces.iter().enumerate() {
+                for (c, third) in pieces.iter().enumerate() {
+                    let text = "x".repeat(padding[(a + b + c) % padding.len()])
+                        + first
+                        + second
+                        + third
+                        + "word's 1.2 foo_bar\r\n";
+                    let parts = segments(&text);
+                    let boundaries = text
+                        .grapheme_indices(true)
+                        .map(|(byte, _)| byte)
+                        .collect::<Vec<_>>();
+                    let mut expected_words = text
+                        .unicode_word_indices()
+                        .map(|(byte, _)| {
+                            boundaries[boundaries.partition_point(|&boundary| boundary <= byte) - 1]
+                        })
+                        .collect::<Vec<_>>();
+                    expected_words.dedup();
+                    assert_eq!(
+                        parts
+                            .iter()
+                            .flat_map(|part| part.lengths.iter().copied())
+                            .collect::<Vec<_>>(),
+                        text.graphemes(true)
+                            .map(|cluster| cluster.len() as u8)
+                            .collect::<Vec<_>>(),
+                        "{a}/{b}/{c}"
+                    );
+                    assert_eq!(
+                        parts
+                            .iter()
+                            .flat_map(|part| {
+                                let boundaries = part.boundaries();
+                                part.words
+                                    .iter()
+                                    .map(move |&index| boundaries[index as usize])
+                            })
+                            .collect::<Vec<_>>(),
+                        expected_words,
+                        "{a}/{b}/{c}"
+                    );
+                    assert_eq!(
+                        parts
+                            .iter()
+                            .map(|part| &text[part.range.clone()])
+                            .collect::<String>(),
+                        text
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn long_line_segments_preserve_every_word_and_grapheme() {
         let text = "🙂 café alpha_ 中文 é ".repeat(100_000);
