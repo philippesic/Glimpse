@@ -741,6 +741,91 @@ mod tests {
     }
 
     #[gpui::test]
+    fn repeated_unicode_middle_edits_match_full_layout(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+        let _entity = cx.new(|cx: &mut gpui::Context<()>| {
+            for width in [75., 120., 311.] {
+                for initial in [
+                    "α🙂 beta ".repeat(500),
+                    format!("    {}", "中🌱é café words ".repeat(400)),
+                    format!("first\n{}\nlast", "abc אבג 👩‍👩‍👧‍👦 ".repeat(300)),
+                    "中日本語🙂".repeat(500),
+                ] {
+                    let font = gpui::font(".ZedMono");
+                    let mut text = Rope::from(initial.as_str());
+                    let mut incremental = TextWrapper::new(font.clone(), px(16.), Some(px(width)));
+                    incremental.prepare(&text, font.clone(), px(16.), Some(px(width)), cx);
+                    for step in 0usize..60 {
+                        let anchor = text.len() * (step % 7 + 1) / 9;
+                        let start = text.clip_offset(anchor, sum_tree::Bias::Left);
+                        let end = text.clip_offset(
+                            (start + step % 19).min(text.len()),
+                            sum_tree::Bias::Right,
+                        );
+                        let inserted = ["x", "", " 中文 ", "é🙂", "  ", "\nnew line\n"][step % 6];
+                        text.replace(start..end, inserted);
+                        incremental.update(&text, &(start..end), &Rope::from(inserted), cx);
+                        let mut complete = TextWrapper::new(font.clone(), px(16.), Some(px(width)));
+                        complete.prepare(&text, font.clone(), px(16.), Some(px(width)), cx);
+                        assert_eq!(
+                            incremental.lines, complete.lines,
+                            "width {width}, step {step}, {start}..{end}, {inserted:?}"
+                        );
+                        assert_eq!(incremental.soft_lines, complete.soft_lines);
+                    }
+                }
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn long_line_repeated_edits_preserve_every_wrap_boundary(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+        let _entity = cx.new(|cx: &mut gpui::Context<()>| {
+            for width in [75., 120., 311.] {
+                for initial in [
+                    "α🙂 beta ".repeat(800),
+                    "中日本語🙂".repeat(600),
+                    " a.b -xx   é 👩‍👩‍👧‍👦 אבג ".repeat(400),
+                ] {
+                    let font = gpui::font(".ZedMono");
+                    let mut text = Rope::from(initial.as_str());
+                    let mut incremental = TextWrapper::new(font.clone(), px(16.), Some(px(width)));
+                    incremental.prepare(&text, font.clone(), px(16.), Some(px(width)), cx);
+                    let mut random = 17u64;
+                    for step in 0..300 {
+                        random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+                        let start = text
+                            .clip_offset(random as usize % (text.len() + 1), sum_tree::Bias::Left);
+                        let end = text.clip_offset(
+                            (start + (random >> 32) as usize % 27).min(text.len()),
+                            sum_tree::Bias::Right,
+                        );
+                        let inserted = [
+                            "x",
+                            "",
+                            " 中文 ",
+                            "é🙂",
+                            "  ",
+                            "long_word.with-punctuation",
+                            "👩‍👩‍👧‍👦",
+                        ][step % 7];
+                        text.replace(start..end, inserted);
+                        incremental.update(&text, &(start..end), &Rope::from(inserted), cx);
+                        let mut complete = TextWrapper::new(font.clone(), px(16.), Some(px(width)));
+                        complete.prepare(&text, font.clone(), px(16.), Some(px(width)), cx);
+                        assert_eq!(
+                            incremental.lines, complete.lines,
+                            "width {width}, step {step}, {start}..{end}, {inserted:?}"
+                        );
+                        assert_eq!(incremental.soft_lines, complete.soft_lines);
+                    }
+                }
+            }
+        });
+    }
+
+    #[gpui::test]
     fn incremental_appends_match_complete_wrapping(cx: &mut gpui::TestAppContext) {
         use gpui::AppContext;
         let _entity = cx.new(|cx: &mut gpui::Context<()>| {
