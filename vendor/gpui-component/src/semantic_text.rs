@@ -24,118 +24,112 @@ impl Segment {
 }
 pub(crate) fn visit_segments(text: &str, mut visit: impl FnMut(Segment)) {
     let mut offset = 0;
-    let mut had_line = false;
     for (line_index, line) in text
         .split_inclusive('\n')
-        .chain(text.ends_with('\n').then_some(""))
+        .chain((text.is_empty() || text.ends_with('\n')).then_some(""))
         .enumerate()
     {
-        had_line = true;
-        let mut words = line
-            .unicode_word_indices()
-            .map(|(byte, _)| offset + byte)
-            .peekable();
-        let mut start = offset;
-        let mut byte = offset;
-        let mut lengths = Vec::new();
-        let mut starts = Vec::new();
-        let end = offset + line.len();
-        while byte < end {
-            let local = byte - offset;
-            let ascii = line.as_bytes()[local..]
-                .iter()
-                .take_while(|byte| byte.is_ascii())
-                .count();
-            let safe_ascii = if local + ascii == line.len() {
-                if line.as_bytes().ends_with(b"\r\n") {
-                    ascii.saturating_sub(2)
-                } else {
-                    ascii
-                }
+        visit_line_segments(line, line_index, |mut part| {
+            part.range.start += offset;
+            part.range.end += offset;
+            visit(part);
+        });
+        offset += line.len();
+    }
+}
+
+pub(crate) fn visit_line_segments(line: &str, line_index: usize, mut visit: impl FnMut(Segment)) {
+    let mut words = line.unicode_word_indices().map(|(byte, _)| byte).peekable();
+    let mut start = 0;
+    let mut byte = 0;
+    let mut lengths = Vec::new();
+    let mut starts = Vec::new();
+    let end = line.len();
+    while byte < end {
+        let ascii = line.as_bytes()[byte..]
+            .iter()
+            .take_while(|byte| byte.is_ascii())
+            .count();
+        let safe_ascii = if byte + ascii == line.len() {
+            if line.as_bytes().ends_with(b"\r\n") {
+                ascii.saturating_sub(2)
             } else {
-                ascii.saturating_sub(1)
-            };
-            let ascii_end = byte + safe_ascii;
-            while byte < ascii_end {
-                if lengths.len() == MAX_RUN_CHARACTERS {
-                    visit(Segment {
-                        range: start..byte,
-                        lengths,
-                        words: starts,
-                        line: line_index,
-                    });
-                    start = byte;
-                    lengths = Vec::new();
-                    starts = Vec::new();
-                }
-                let count = (MAX_RUN_CHARACTERS - lengths.len()).min(ascii_end - byte);
-                while words.peek().is_some_and(|&word| word < byte) {
-                    words.next();
-                }
-                while let Some(&word) = words.peek().filter(|&&word| word < byte + count) {
-                    starts.push((lengths.len() + word - byte) as u16);
-                    words.next();
-                }
-                lengths.resize(lengths.len() + count, 1);
-                byte += count;
+                ascii
             }
-            if byte == end {
-                break;
+        } else {
+            ascii.saturating_sub(1)
+        };
+        let ascii_end = byte + safe_ascii;
+        while byte < ascii_end {
+            if lengths.len() == MAX_RUN_CHARACTERS {
+                visit(Segment {
+                    range: start..byte,
+                    lengths,
+                    words: starts,
+                    line: line_index,
+                });
+                start = byte;
+                lengths = Vec::new();
+                starts = Vec::new();
             }
-            let grapheme = line[byte - offset..].graphemes(true).next().unwrap();
-            let pieces = if grapheme.len() <= u8::MAX as usize {
-                smallvec::SmallVec::<[u8; 1]>::from_slice(&[grapheme.len() as u8])
-            } else {
-                grapheme
-                    .chars()
-                    .map(|character| character.len_utf8() as u8)
-                    .collect()
-            };
-            for length in pieces {
-                if lengths.len() == MAX_RUN_CHARACTERS {
-                    visit(Segment {
-                        range: start..byte,
-                        lengths,
-                        words: starts,
-                        line: line_index,
-                    });
-                    start = byte;
-                    lengths = Vec::new();
-                    starts = Vec::new();
-                }
-                while words.peek().is_some_and(|&word| word < byte) {
-                    words.next();
-                }
-                while words
-                    .peek()
-                    .is_some_and(|&word| word < byte + usize::from(length))
-                {
-                    let index = lengths.len() as u16;
-                    if starts.last() != Some(&index) {
-                        starts.push(index);
-                    }
-                    words.next();
-                }
-                lengths.push(length);
-                byte += usize::from(length);
+            let count = (MAX_RUN_CHARACTERS - lengths.len()).min(ascii_end - byte);
+            while words.peek().is_some_and(|&word| word < byte) {
+                words.next();
             }
+            while let Some(&word) = words.peek().filter(|&&word| word < byte + count) {
+                starts.push((lengths.len() + word - byte) as u16);
+                words.next();
+            }
+            lengths.resize(lengths.len() + count, 1);
+            byte += count;
         }
-        visit(Segment {
-            range: start..end,
-            lengths,
-            words: starts,
-            line: line_index,
-        });
-        offset = end;
+        if byte == end {
+            break;
+        }
+        let grapheme = line[byte..].graphemes(true).next().unwrap();
+        let pieces = if grapheme.len() <= u8::MAX as usize {
+            smallvec::SmallVec::<[u8; 1]>::from_slice(&[grapheme.len() as u8])
+        } else {
+            grapheme
+                .chars()
+                .map(|character| character.len_utf8() as u8)
+                .collect()
+        };
+        for length in pieces {
+            if lengths.len() == MAX_RUN_CHARACTERS {
+                visit(Segment {
+                    range: start..byte,
+                    lengths,
+                    words: starts,
+                    line: line_index,
+                });
+                start = byte;
+                lengths = Vec::new();
+                starts = Vec::new();
+            }
+            while words.peek().is_some_and(|&word| word < byte) {
+                words.next();
+            }
+            while words
+                .peek()
+                .is_some_and(|&word| word < byte + usize::from(length))
+            {
+                let index = lengths.len() as u16;
+                if starts.last() != Some(&index) {
+                    starts.push(index);
+                }
+                words.next();
+            }
+            lengths.push(length);
+            byte += usize::from(length);
+        }
     }
-    if !had_line {
-        visit(Segment {
-            range: 0..0,
-            lengths: vec![],
-            words: vec![],
-            line: 0,
-        });
-    }
+    visit(Segment {
+        range: start..end,
+        lengths,
+        words: starts,
+        line: line_index,
+    });
 }
 
 pub(crate) fn segments(text: &str) -> Vec<Segment> {
