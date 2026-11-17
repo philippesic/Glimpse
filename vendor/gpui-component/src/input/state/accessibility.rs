@@ -10,12 +10,81 @@ pub(super) struct Mapping {
     text: SharedString,
     runs: Vec<Run>,
     nodes: std::sync::Arc<[(NodeId, Node)]>,
+    next_key: usize,
 }
+#[derive(Clone)]
 struct Run {
     id: NodeId,
     range: Range<usize>,
 }
 impl Mapping {
+    fn update(&mut self, text: SharedString, mut node_id: impl FnMut(usize) -> NodeId) {
+        let (old, new) = changed_lines(&self.text, &text);
+        let prefix = self
+            .runs
+            .partition_point(|run| run.range.end <= old.start && run.range.start < old.start);
+        let suffix = if old.end == self.text.len() {
+            self.runs.len()
+        } else {
+            self.runs.partition_point(|run| run.range.start < old.end)
+        };
+        let mut parts = segments(&text[new.clone()]);
+        if new.end < text.len() && parts.last().is_some_and(|part| part.range.is_empty()) {
+            parts.pop();
+        }
+        let ids: Vec<_> = (0..parts.len())
+            .map(|index| {
+                if let Some(run) = self
+                    .runs
+                    .get(prefix + index)
+                    .filter(|_| prefix + index < suffix)
+                {
+                    run.id
+                } else {
+                    let key = self.next_key;
+                    self.next_key += 1;
+                    node_id(key)
+                }
+            })
+            .collect();
+        let mut nodes = Vec::with_capacity(prefix + parts.len() + self.nodes.len() - suffix);
+        let mut runs = Vec::with_capacity(nodes.capacity());
+        nodes.extend(self.nodes[..prefix].iter().cloned());
+        runs.extend(self.runs[..prefix].iter().cloned());
+        for (index, part) in parts.iter().enumerate() {
+            let mut run = Node::new(Role::TextRun);
+            let range = new.start + part.range.start..new.start + part.range.end;
+            run.set_value(text[range.clone()].to_owned());
+            run.set_character_lengths(
+                part.boundaries
+                    .windows(2)
+                    .map(|pair| (pair[1] - pair[0]) as u8)
+                    .collect::<Vec<_>>(),
+            );
+            run.set_word_starts(part.words.clone());
+            run.set_text_direction(TextDirection::LeftToRight);
+            if index > 0 && parts[index - 1].line == part.line {
+                run.set_previous_on_line(ids[index - 1]);
+            }
+            if index + 1 < parts.len() && parts[index + 1].line == part.line {
+                run.set_next_on_line(ids[index + 1]);
+            }
+            nodes.push((ids[index], run));
+            runs.push(Run {
+                id: ids[index],
+                range,
+            });
+        }
+        nodes.extend(self.nodes[suffix..].iter().cloned());
+        runs.extend(self.runs[suffix..].iter().map(|run| Run {
+            id: run.id,
+            range: run.range.start - old.end + new.end..run.range.end - old.end + new.end,
+        }));
+        self.text = text;
+        self.nodes = nodes.into();
+        self.runs = runs;
+    }
+
     fn offset(&self, position: &TextPosition) -> Option<usize> {
         let index = self.runs.iter().position(|run| run.id == position.node)?;
         let lengths = self.nodes[index].1.character_lengths();
@@ -49,6 +118,62 @@ impl Mapping {
         }
     }
 }
+fn common_bytes(first: &[u8], second: &[u8], reverse: bool) -> usize {
+    let length = first.len().min(second.len());
+    let first = if reverse {
+        &first[first.len() - length..]
+    } else {
+        &first[..length]
+    };
+    let second = if reverse {
+        &second[second.len() - length..]
+    } else {
+        &second[..length]
+    };
+    let mut matched = 0;
+    if reverse {
+        for (first, second) in first.rchunks(1024).zip(second.rchunks(1024)) {
+            if first != second {
+                return matched
+                    + first
+                        .iter()
+                        .rev()
+                        .zip(second.iter().rev())
+                        .take_while(|(a, b)| a == b)
+                        .count();
+            }
+            matched += first.len();
+        }
+    } else {
+        for (first, second) in first.chunks(1024).zip(second.chunks(1024)) {
+            if first != second {
+                return matched + first.iter().zip(second).take_while(|(a, b)| a == b).count();
+            }
+            matched += first.len();
+        }
+    }
+    matched
+}
+fn changed_lines(old: &str, new: &str) -> (Range<usize>, Range<usize>) {
+    let prefix = common_bytes(old.as_bytes(), new.as_bytes(), false);
+    let suffix = common_bytes(&old.as_bytes()[prefix..], &new.as_bytes()[prefix..], true);
+    let start = old.as_bytes()[..prefix]
+        .iter()
+        .rposition(|&byte| byte == b'\n')
+        .map_or(0, |byte| byte + 1);
+    let old_suffix = old.len() - suffix;
+    let new_suffix = new.len() - suffix;
+    let old_end = old.as_bytes()[old_suffix..]
+        .iter()
+        .position(|&byte| byte == b'\n')
+        .map_or(old.len(), |byte| old_suffix + byte + 1);
+    let new_end = new.as_bytes()[new_suffix..]
+        .iter()
+        .position(|&byte| byte == b'\n')
+        .map_or(new.len(), |byte| new_suffix + byte + 1);
+    (start..old_end, start..new_end)
+}
+
 impl InputState {
     pub fn release_accessibility_cache(&mut self) {
         let mut mapping = self.accessibility_mapping.borrow_mut();
@@ -84,45 +209,16 @@ impl InputState {
             return info;
         }
         let first = window.accessibility_child_id(id, ("text-run", 0usize));
-        if mapping.nodes.first().map(|(id, _)| *id) != Some(first)
+        if mapping.nodes.first().map(|(id, _)| *id) != Some(first) {
+            *mapping = Mapping::default();
+        }
+        if mapping.nodes.is_empty()
             || mapping.text.as_ptr() != text.as_ptr()
             || mapping.text.len() != text.len()
         {
-            let segments = segments(&text);
-            let ids: Vec<_> = (0..segments.len())
-                .map(|index| window.accessibility_child_id(id, ("text-run", index)))
-                .collect();
-            let mut nodes = Vec::with_capacity(segments.len());
-            for (index, segment) in segments.iter().enumerate() {
-                let mut run = Node::new(Role::TextRun);
-                run.set_value(text[segment.range.clone()].to_owned());
-                run.set_character_lengths(
-                    segment
-                        .boundaries
-                        .windows(2)
-                        .map(|pair| (pair[1] - pair[0]) as u8)
-                        .collect::<Vec<_>>(),
-                );
-                run.set_word_starts(segment.words.clone());
-                run.set_text_direction(TextDirection::LeftToRight);
-                if index > 0 && segments[index - 1].line == segment.line {
-                    run.set_previous_on_line(ids[index - 1]);
-                }
-                if index + 1 < ids.len() && segments[index + 1].line == segment.line {
-                    run.set_next_on_line(ids[index + 1]);
-                }
-                nodes.push((ids[index], run));
-            }
-            mapping.runs = segments
-                .into_iter()
-                .enumerate()
-                .map(|(index, segment)| Run {
-                    id: ids[index],
-                    range: segment.range,
-                })
-                .collect();
-            mapping.nodes = nodes.into();
-            mapping.text = text.clone();
+            mapping.update(text.clone(), |index| {
+                window.accessibility_child_id(id, ("text-run", index))
+            });
         }
         let mut node = Node::new(if self.mode.is_multi_line() {
             Role::MultilineTextInput
@@ -205,6 +301,83 @@ impl InputState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn assert_complete_mapping(mapping: &Mapping, text: &str) {
+        let parts = segments(text);
+        assert_eq!(mapping.nodes.len(), parts.len());
+        assert_eq!(mapping.runs.len(), parts.len());
+        let mut unique = std::collections::HashSet::new();
+        for (index, ((id, node), part)) in mapping.nodes.iter().zip(&parts).enumerate() {
+            assert!(unique.insert(*id));
+            assert_eq!(mapping.runs[index].id, *id);
+            assert_eq!(mapping.runs[index].range, part.range);
+            assert_eq!(node.value(), Some(&text[part.range.clone()]));
+            assert_eq!(
+                node.character_lengths(),
+                part.boundaries
+                    .windows(2)
+                    .map(|pair| (pair[1] - pair[0]) as u8)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(node.word_starts(), part.words);
+            assert_eq!(
+                node.previous_on_line(),
+                (index > 0 && parts[index - 1].line == part.line)
+                    .then(|| mapping.runs[index - 1].id)
+            );
+            assert_eq!(
+                node.next_on_line(),
+                (index + 1 < parts.len() && parts[index + 1].line == part.line)
+                    .then(|| mapping.runs[index + 1].id)
+            );
+            for &byte in &part.boundaries {
+                let position = mapping.position(byte);
+                assert_eq!(mapping.offset(&position), Some(byte));
+            }
+        }
+    }
+    #[test]
+    fn incremental_accessible_edits_preserve_complete_text_and_positions() {
+        for initial in [
+            String::new(),
+            "α é 👨‍👩‍👧\r\nnext\n".into(),
+            "first café\nsecond 🙂\nthird\nlast".repeat(60),
+            "🙂 café 中文 ".repeat(200),
+            format!("a{}\nend", "́".repeat(400)),
+        ] {
+            let mut text = initial;
+            let mut mapping = Mapping::default();
+            mapping.update(text.clone().into(), |key| NodeId(key as u64 + 10));
+            assert_complete_mapping(&mapping, &text);
+            let mut random = 23u64;
+            for step in 0..100 {
+                random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let boundaries: Vec<_> = text
+                    .char_indices()
+                    .map(|(byte, _)| byte)
+                    .chain(std::iter::once(text.len()))
+                    .collect();
+                let start = random as usize % boundaries.len();
+                let end = (start + (random >> 32) as usize % 9).min(boundaries.len() - 1);
+                let inserted = ["x", "", "\nnew\r\n", "é🙂", "👩‍👩‍👧‍👦", "\r", "中文"][step % 7];
+                text.replace_range(boundaries[start]..boundaries[end], inserted);
+                mapping.update(text.clone().into(), |key| NodeId(key as u64 + 10));
+                assert_complete_mapping(&mapping, &text);
+            }
+        }
+    }
+    #[test]
+    fn unchanged_accessible_lines_keep_their_identity_across_edits() {
+        let mut mapping = Mapping::default();
+        let initial = "first\nsecond\nthird\nlast é🙂";
+        mapping.update(initial.into(), |key| NodeId(key as u64 + 10));
+        let last = mapping.nodes.last().unwrap().clone();
+        mapping.update("changed first\nsecond\nthird\nlast é🙂".into(), |key| {
+            NodeId(key as u64 + 10)
+        });
+        assert_eq!(mapping.nodes.last(), Some(&last));
+        assert_complete_mapping(&mapping, &mapping.text);
+    }
+
     #[test]
     fn compact_positions_match_grapheme_boundaries_and_reject_invalid_actions() {
         for text in [

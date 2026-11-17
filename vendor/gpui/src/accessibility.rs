@@ -259,6 +259,7 @@ impl State {
         let _ = (handle, cx);
     }
     pub(crate) fn publish(&mut self, records: &[Record], focused: bool) {
+        let _profile = crate::work_trace::Span::new("a11y");
         if !self.active.load(Ordering::Acquire) {
             return;
         }
@@ -305,6 +306,7 @@ impl State {
         let mut tree = TreeInfo::new(NodeId(1));
         tree.toolkit_name = Some("GPUI".into());
         tree.toolkit_version = Some(env!("CARGO_PKG_VERSION").into());
+        let collect_profile = crate::work_trace::Span::new("a11y_collect");
         let current_ids: HashSet<_> = nodes
             .keys()
             .copied()
@@ -314,6 +316,8 @@ impl State {
                     .flat_map(|record| record.info.text.iter().map(|(id, _)| *id)),
             )
             .collect();
+        drop(collect_profile);
+        let diff_profile = crate::work_trace::Span::new("a11y_diff");
         let mut text_groups = HashMap::default();
         let mut changed_text = Vec::new();
         for record in records.iter().filter(|record| visible.contains(&record.id)) {
@@ -322,13 +326,31 @@ impl State {
                 .get(&record.id)
                 .is_some_and(|previous| Arc::ptr_eq(previous, &record.info.text))
             {
-                changed_text.extend(record.info.text.iter().cloned());
+                if let Some(previous) = self.text_groups.get(&record.id) {
+                    let previous: HashMap<_, _> =
+                        previous.iter().map(|(id, node)| (*id, node)).collect();
+                    changed_text.extend(
+                        record
+                            .info
+                            .text
+                            .iter()
+                            .filter(|(id, node)| {
+                                previous
+                                    .get(id)
+                                    .is_none_or(|old| !old.shares_data_with(node) && *old != node)
+                            })
+                            .cloned(),
+                    );
+                } else {
+                    changed_text.extend(record.info.text.iter().cloned());
+                }
             }
             if !record.info.text.is_empty() {
                 text_groups.insert(record.id, record.info.text.clone());
             }
         }
         self.text_groups = text_groups;
+        drop(diff_profile);
         let update = TreeUpdate {
             nodes: nodes
                 .into_iter()
@@ -344,6 +366,7 @@ impl State {
         self.visible = visible;
         #[cfg(target_os = "linux")]
         if let Some(adapter) = &mut self.adapter {
+            let _adapter_profile = crate::work_trace::Span::new("a11y_adapter");
             adapter.update_window_focus_state(focused);
             adapter.update_if_active(|| update);
         }

@@ -1824,6 +1824,14 @@ macro_rules! unique_enum_property_methods {
 }
 
 impl Node {
+    pub fn shares_data_with(&self, other: &Self) -> bool {
+        self.role == other.role
+            && self.actions == other.actions
+            && self.child_actions == other.child_actions
+            && self.flags == other.flags
+            && Arc::ptr_eq(&self.properties, &other.properties)
+    }
+
     #[inline]
     pub fn new(role: Role) -> Self {
         Self {
@@ -3396,6 +3404,26 @@ pub trait DeactivationHandler {
 mod tests {
     use super::*;
     use alloc::format;
+
+    #[test]
+    fn shared_identity_checks_include_roles_flags_actions_and_properties() {
+        let mut node = Node::new(Role::TextRun);
+        node.set_value("original");
+        assert!(node.shares_data_with(&node.clone()));
+        let mut changed = node.clone();
+        changed.set_hidden();
+        assert!(!node.shares_data_with(&changed));
+        changed = node.clone();
+        changed.set_role(Role::Button);
+        assert!(!node.shares_data_with(&changed));
+        changed = node.clone();
+        changed.add_action(Action::Click);
+        assert!(!node.shares_data_with(&changed));
+        changed = node.clone();
+        changed.set_value("changed");
+        assert!(!node.shares_data_with(&changed));
+        assert_eq!(node.value(), Some("original"));
+    }
 
     #[test]
     fn cloned_nodes_share_properties_until_a_setter_changes_them() {
