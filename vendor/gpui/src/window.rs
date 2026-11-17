@@ -3408,6 +3408,11 @@ impl Window {
         }
     }
 
+    /// Reset the platform input method, returning whether the caller must unmark its composing text.
+    pub fn reset_input_method(&mut self) -> bool {
+        self.platform_window.reset_input_method()
+    }
+
     /// Sets an input handler, such as [`ElementInputHandler`][element_input_handler], which interfaces with the
     /// platform to receive textual input with proper integration with concerns such
     /// as IME interactions. This handler will be active for the upcoming frame until the following frame is

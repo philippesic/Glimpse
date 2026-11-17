@@ -1752,6 +1752,9 @@ impl InputState {
     }
 
     fn on_blur(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.ime_marked_range.is_some() && window.reset_input_method() {
+            self.unmark_text(window, cx);
+        }
         if self.is_context_menu_open(cx) {
             return;
         }

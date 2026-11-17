@@ -900,6 +900,9 @@ impl PlatformWindow for WaylandWindow {
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler> {
         self.borrow_mut().input_handler.take()
     }
+    fn reset_input_method(&mut self) -> bool {
+        self.borrow().client.reset_input_method()
+    }
 
     fn prompt(
         &self,

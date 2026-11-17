@@ -325,6 +325,24 @@ impl WaylandClientStatePtr {
         }
     }
 
+    pub fn reset_input_method(&self) -> bool {
+        let client = self.get_client();
+        let mut state = client.borrow_mut();
+        if !state.composing || state.text_input.is_none() || state.keyboard_focused_window.is_none()
+        {
+            return false;
+        }
+        state.composing = false;
+        if let Some(text_input) = &state.text_input {
+            text_input.disable();
+            text_input.commit();
+            text_input.enable();
+            text_input.set_content_type(ContentHint::None, ContentPurpose::Normal);
+            text_input.commit();
+        }
+        true
+    }
+
     pub fn update_ime_position(&self, bounds: Bounds<Pixels>) {
         let client = self.get_client();
         let mut state = client.borrow_mut();

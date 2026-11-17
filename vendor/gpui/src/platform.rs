@@ -471,6 +471,9 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn capslock(&self) -> Capslock;
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler);
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler>;
+    fn reset_input_method(&mut self) -> bool {
+        false
+    }
     fn prompt(
         &self,
         level: PromptLevel,
