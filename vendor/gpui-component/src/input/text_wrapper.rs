@@ -14,16 +14,59 @@ use crate::input::RopeExt;
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct LineItem {
     length: usize,
+    wraps: Option<Box<LineWraps>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct LineWraps {
     indent: Option<u32>,
     word_columns: u32,
     word_width: Pixels,
-    /// The soft wrapped lines relative byte range (0..line.len) of this line (Include first line).
-    ///
-    /// Not contains the line end `\n`.
-    pub(super) wrapped_lines: SmallVec<[Range<usize>; 1]>,
+    ranges: Vec<Range<usize>>,
 }
 
 impl LineItem {
+    fn new(length: usize, indent: Option<u32>, ranges: SmallVec<[Range<usize>; 1]>) -> Self {
+        let wraps = (ranges.len() > 1).then(|| {
+            Box::new(LineWraps {
+                indent,
+                word_columns: 0,
+                word_width: px(0.),
+                ranges: ranges.into_vec(),
+            })
+        });
+        Self { length, wraps }
+    }
+
+    #[cfg(test)]
+    fn ranges(&self) -> impl Iterator<Item = Range<usize>> + '_ {
+        self.wraps
+            .is_none()
+            .then_some(0..self.length)
+            .into_iter()
+            .chain(
+                self.wraps
+                    .iter()
+                    .flat_map(|wraps| wraps.ranges.iter().cloned()),
+            )
+    }
+
+    pub(super) fn range(&self, row: usize) -> Option<Range<usize>> {
+        match &self.wraps {
+            Some(wraps) => wraps.ranges.get(row).cloned(),
+            None => (row == 0).then_some(0..self.length),
+        }
+    }
+
+    pub(super) fn row_at(&self, byte: usize) -> usize {
+        self.wraps.as_ref().map_or(0, |wraps| {
+            wraps
+                .ranges
+                .partition_point(|range| range.end <= byte)
+                .min(wraps.ranges.len() - 1)
+        })
+    }
+
     /// Get the bytes length of this line.
     #[inline]
     pub(super) fn len(&self) -> usize {
@@ -33,7 +76,7 @@ impl LineItem {
     /// Get number of soft wrapped lines of this line (include the first line).
     #[inline]
     pub(super) fn lines_len(&self) -> usize {
-        self.wrapped_lines.len()
+        self.wraps.as_ref().map_or(1, |wraps| wraps.ranges.len())
     }
 
     /// Get the height of this line item with given line height.
@@ -277,8 +320,11 @@ impl TextWrapper {
         let wraps: usize = self
             .lines
             .iter()
-            .filter(|line| line.wrapped_lines.spilled())
-            .map(|line| line.wrapped_lines.capacity() * std::mem::size_of::<Range<usize>>())
+            .filter_map(|line| line.wraps.as_ref())
+            .map(|wraps| {
+                std::mem::size_of::<LineWraps>()
+                    + wraps.ranges.capacity() * std::mem::size_of::<Range<usize>>()
+            })
             .sum();
         let checkpoints: usize = self
             .checkpoints
@@ -339,14 +385,13 @@ impl TextWrapper {
                 let Some(line) = self.lines.get_mut(row) else {
                     continue;
                 };
-                if line.length >= 1024 && line.wrapped_lines.len() > 1 {
-                    if let Some(width) = line_wrapper
+                if line.length >= 1024
+                    && let Some(wraps) = line.wraps.as_mut()
+                    && let Some(width) = line_wrapper
                         .uniform_word_width_for_bytes(changed_text.slice_line(row).bytes())
-                    {
-                        line.word_width = width;
-                        line.word_columns =
-                            line.wrapped_lines.first().map_or(0, |range| range.len()) as u32;
-                    }
+                {
+                    wraps.word_width = width;
+                    wraps.word_columns = wraps.ranges[0].len() as u32;
                 }
             }
         }
@@ -386,6 +431,9 @@ impl TextWrapper {
         let state = start.map_or_else(gpui::LineWrapState::default, |point| point.state);
         let rows = start.map_or(0, |point| point.rows);
         let line = &self.lines[row];
+        let Some(wraps) = &line.wraps else {
+            return false;
+        };
         let length = line.length - range.len() + new_text.len();
         let tail = changed_text.slice(origin + state.consumed_bytes()..origin + length);
         let fragments: Vec<_> = tail.chunks().map(LineFragment::text).collect();
@@ -419,7 +467,7 @@ impl TextWrapper {
                         let shift = |offset: usize| offset - range.len() + new_text.len();
                         let row_delta = (rows + wrapped.len()) as isize - point.rows as isize;
                         wrapped.extend(
-                            line.wrapped_lines[point.rows..]
+                            wraps.ranges[point.rows..]
                                 .iter()
                                 .map(|range| shift(range.start)..shift(range.end)),
                         );
@@ -454,24 +502,24 @@ impl TextWrapper {
         }
         let line = &mut self.lines[row];
         self.soft_lines = self.soft_lines - line.lines_len() + rows + wrapped.len();
-        line.wrapped_lines.truncate(rows);
-        line.wrapped_lines.extend(wrapped);
         line.length = length;
-        line.word_columns = 0;
-        line.word_width = px(0.);
-        line.indent = (changed_text
-            .slice(origin..origin + length)
-            .bytes()
-            .take_while(|&byte| byte == b' ')
-            .count()
-            < line.wrapped_lines.first().map_or(0, |range| range.end))
-        .then_some(indent);
-        if length >= 1024 && line.wrapped_lines.len() > 1 && changed_text.byte(origin).is_ascii() {
-            if let Some(advance) = wrapper
-                .uniform_word_width_for_bytes(changed_text.slice(origin..origin + length).bytes())
+        if rows + wrapped.len() <= 1 {
+            line.wraps = None;
+        } else if let Some(wraps) = line.wraps.as_mut() {
+            wraps.ranges.truncate(rows);
+            wraps.ranges.extend(wrapped);
+            wraps.word_columns = 0;
+            wraps.word_width = px(0.);
+            let text = changed_text.slice(origin..origin + length);
+            wraps.indent = (text.bytes().take_while(|&byte| byte == b' ').count()
+                < wraps.ranges[0].end)
+                .then_some(indent);
+            if length >= 1024
+                && changed_text.byte(origin).is_ascii()
+                && let Some(advance) = wrapper.uniform_word_width_for_bytes(text.bytes())
             {
-                line.word_width = advance;
-                line.word_columns = line.wrapped_lines[0].len() as u32;
+                wraps.word_width = advance;
+                wraps.word_columns = wraps.ranges[0].len() as u32;
             }
         }
         let mut next_checkpoint = 1024;
@@ -520,28 +568,32 @@ impl TextWrapper {
         let Some(line) = self.lines.get_mut(row) else {
             return false;
         };
-        if line.word_columns == 0
+        let Some(wraps) = line.wraps.as_mut() else {
+            return false;
+        };
+        if wraps.word_columns == 0
             || (new_text.len() != 0
-                && wrapper.uniform_word_width_for_bytes(new_text.bytes()) != Some(line.word_width))
+                && wrapper.uniform_word_width_for_bytes(new_text.bytes()) != Some(wraps.word_width))
         {
             return false;
         }
         let length = line.length - range.len() + new_text.len();
-        let columns = line.word_columns as usize;
+        let columns = wraps.word_columns as usize;
         let rows = length.div_ceil(columns).max(1);
-        let old_rows = line.lines_len();
-        line.wrapped_lines.resize(rows, 0..0);
-        for (row, range) in line.wrapped_lines.iter_mut().enumerate() {
-            *range = row * columns..((row + 1) * columns).min(length);
-        }
+        let old_rows = wraps.ranges.len();
         self.checkpoints.remove(&row);
         line.length = length;
-        if length == 0 {
-            line.indent = None;
-        }
-        if length < 1024 || rows < 2 {
-            line.word_columns = 0;
-            line.word_width = px(0.);
+        if rows == 1 {
+            line.wraps = None;
+        } else {
+            wraps.ranges.resize(rows, 0..0);
+            for (row, range) in wraps.ranges.iter_mut().enumerate() {
+                *range = row * columns..((row + 1) * columns).min(length);
+            }
+            if length < 1024 {
+                wraps.word_columns = 0;
+                wraps.word_width = px(0.);
+            }
         }
         self.soft_lines = self.soft_lines - old_rows + rows;
         if self.longest_row.row == row || length >= self.longest_row.len {
@@ -577,15 +629,19 @@ impl TextWrapper {
         let Some(line) = self.lines.get_mut(row) else {
             return false;
         };
-        if line.wrapped_lines.len() < 2 || range.start != self.text.line_end_offset(row) {
+        if range.start != self.text.line_end_offset(row) {
             return false;
         }
-        let Some(continuation_indent) = line.indent else {
+        let Some(wraps) = line.wraps.as_mut() else {
+            return false;
+        };
+        let Some(continuation_indent) = wraps.indent else {
             return false;
         };
         self.checkpoints.remove(&row);
-        let prefix = line.wrapped_lines.len().saturating_sub(2);
-        let start = line.wrapped_lines[prefix].start;
+        let old_rows = wraps.ranges.len();
+        let prefix = old_rows - 2;
+        let start = wraps.ranges[prefix].start;
         let classify = line.length < 1024;
         let length = line.length + new_text.len();
         let origin = self.text.line_start_offset(row);
@@ -594,31 +650,31 @@ impl TextWrapper {
             .to_string();
         let fragments = [LineFragment::text(&tail)];
         let indent = (prefix > 0).then_some(continuation_indent);
-        let old_rows = line.lines_len();
-        line.wrapped_lines.truncate(prefix);
+        wraps.ranges.truncate(prefix);
         let mut previous = start;
         for boundary in wrapper.wrap_line_with_indent(&fragments, width, indent) {
             let end = start + boundary.ix;
             if prefix == 0 {
-                line.indent = Some(boundary.next_indent);
+                wraps.indent = Some(boundary.next_indent);
             }
-            line.wrapped_lines.push(previous..end);
+            wraps.ranges.push(previous..end);
             previous = end;
         }
         if previous < length || previous == start {
-            line.wrapped_lines.push(previous..length);
+            wraps.ranges.push(previous..length);
         }
         line.length = length;
-        line.word_columns = 0;
-        line.word_width = px(0.);
-        if classify && length >= 1024 {
-            if let Some(advance) = wrapper
+        wraps.word_columns = 0;
+        wraps.word_width = px(0.);
+        if wraps.ranges.len() <= 1 {
+            line.wraps = None;
+        } else if classify
+            && length >= 1024
+            && let Some(advance) = wrapper
                 .uniform_word_width_for_bytes(changed_text.slice(origin..origin + length).bytes())
-            {
-                line.word_width = advance;
-                line.word_columns =
-                    line.wrapped_lines.first().map_or(0, |range| range.len()) as u32;
-            }
+        {
+            wraps.word_width = advance;
+            wraps.word_columns = wraps.ranges[0].len() as u32;
         }
         self.soft_lines = self.soft_lines - old_rows + line.lines_len();
         if length >= self.longest_row.len {
@@ -703,15 +759,14 @@ impl TextWrapper {
                 wrapped_lines.push(prev_boundary_ix..line.len());
             }
 
-            new_lines.push(LineItem {
-                length: line.len(),
-                indent: (line.bytes().take_while(|&byte| byte == b' ').count()
+            let indent = if wrapped_lines.len() > 1 {
+                (line.bytes().take_while(|&byte| byte == b' ').count()
                     < wrapped_lines.first().map_or(0, |range| range.end))
-                .then_some(indent),
-                word_columns: 0,
-                word_width: px(0.),
-                wrapped_lines,
-            });
+                .then_some(indent)
+            } else {
+                None
+            };
+            new_lines.push(LineItem::new(line.len(), indent, wrapped_lines));
         }
 
         if self.lines.len() == 0 {
@@ -761,21 +816,13 @@ impl TextWrapper {
             .sum::<usize>();
 
         let local_offset = offset.saturating_sub(start);
-        let ix = line
-            .wrapped_lines
-            .partition_point(|range| range.end <= local_offset);
-        if let Some(range) = line
-            .wrapped_lines
-            .get(ix)
-            .filter(|range| range.contains(&local_offset))
-        {
-            return DisplayPoint::new(wrapped_row + ix, ix, local_offset - range.start);
-        }
-
-        // Otherwise return the eof of the line.
-        let last_range = line.wrapped_lines.last().unwrap_or(&(0..0));
-        let ix = line.lines_len().saturating_sub(1);
-        return DisplayPoint::new(wrapped_row + ix, ix, last_range.len());
+        let ix = line.row_at(local_offset);
+        let range = line.range(ix).unwrap();
+        DisplayPoint::new(
+            wrapped_row + ix,
+            ix,
+            local_offset.min(range.end) - range.start,
+        )
     }
 
     /// Return byte offset in the text from the given display point (with soft wrap).
@@ -787,7 +834,7 @@ impl TextWrapper {
             if wrapped_row + line.lines_len() > point.row {
                 let line_start = self.text.line_start_offset(row);
                 let local_row = point.row.saturating_sub(wrapped_row);
-                if let Some(range) = line.wrapped_lines.get(local_row) {
+                if let Some(range) = line.range(local_row) {
                     return line_start + (range.start + point.column).min(range.end);
                 } else {
                     // If not found, return the end of the line.
@@ -988,6 +1035,23 @@ mod tests {
     use super::*;
     use gpui::{Boundary, FontFeatures, FontStyle, FontWeight, px};
 
+    #[test]
+    fn single_row_uses_the_full_line_without_wrap_storage() {
+        for length in [0, "日本語\r".len(), usize::MAX] {
+            let line = LineItem::new(length, None, smallvec::smallvec![0..length]);
+            assert!(line.wraps.is_none());
+            assert_eq!(line.lines_len(), 1);
+            assert_eq!(line.row_at(length), 0);
+            assert_eq!(line.range(0), Some(0..length));
+            assert_eq!(line.range(1), None);
+        }
+        let line = LineItem::new(12, Some(0), smallvec::smallvec![0..5, 5..12]);
+        assert_eq!(line.row_at(4), 0);
+        assert_eq!(line.row_at(5), 1);
+        assert_eq!(line.row_at(12), 1);
+        assert_eq!(line.range(1), Some(5..12));
+    }
+
     #[gpui::test]
     fn partitioned_initial_layout_matches_full_layout(cx: &mut gpui::TestAppContext) {
         let (system, executor) =
@@ -1134,7 +1198,9 @@ mod tests {
                                 cx,
                             );
                             if initial.starts_with('x') {
-                                assert!(incremental.lines[0].word_columns > 0);
+                                assert!(
+                                    incremental.lines[0].wraps.as_ref().unwrap().word_columns > 0
+                                );
                             }
                             let mut edited = original.clone();
                             edited.replace(start..end, inserted);
@@ -1339,7 +1405,7 @@ mod tests {
                         complete.prepare(&text, font.clone(), px(16.), Some(px(width)), cx);
                         assert_eq!(incremental.lines, complete.lines, "{family} {width} {step}");
                         assert_eq!(incremental.len(), complete.len());
-                        for range in &incremental.lines[0].wrapped_lines {
+                        for range in incremental.lines[0].ranges() {
                             for offset in [range.start, range.end] {
                                 assert_eq!(
                                     incremental.offset_to_display_point(offset),
@@ -1515,8 +1581,7 @@ mod tests {
             let mut offset = 0;
             for line in wrapper.lines.iter() {
                 actual_lines.push(
-                    line.wrapped_lines
-                        .iter()
+                    line.ranges()
                         .map(|range| text.slice(offset + range.start..offset + range.end))
                         .collect::<Vec<_>>(),
                 );
@@ -1673,7 +1738,7 @@ mod tests {
         wrapper._update(&text, &range, &Rope::from(new_text), &mut fake_wrap_line);
         assert_eq!(text.to_string(), "");
         assert_eq!(wrapper.lines.len(), 1);
-        assert_eq!(wrapper.lines[0].wrapped_lines.as_slice(), &[0..0]);
+        assert_eq!(wrapper.lines[0].ranges().collect::<Vec<_>>(), [0..0]);
 
         // Test update_all
         let range = 0..text.len();
@@ -1715,37 +1780,21 @@ mod tests {
         );
         wrapper.lines = vec![
             // range: 0..15
-            LineItem {
-                length: "Hello, 世界!\r".len(),
-                wrapped_lines: smallvec::smallvec![0..15],
-                indent: Some(0),
-                word_columns: 0,
-                word_width: px(0.),
-            },
+            LineItem::new("Hello, 世界!\r".len(), Some(0), smallvec::smallvec![0..15]),
             // range: 16..36
-            LineItem {
-                length: "This is second line.".len(),
-                wrapped_lines: smallvec::smallvec![0..10, 10..20],
-                indent: Some(0),
-                word_columns: 0,
-                word_width: px(0.),
-            },
+            LineItem::new(
+                "This is second line.".len(),
+                Some(0),
+                smallvec::smallvec![0..10, 10..20],
+            ),
             // range: 37..56
-            LineItem {
-                length: "This is third line.".len(),
-                wrapped_lines: smallvec::smallvec![0..9, 9..15, 15..20],
-                indent: Some(0),
-                word_columns: 0,
-                word_width: px(0.),
-            },
+            LineItem::new(
+                "This is third line.".len(),
+                Some(0),
+                smallvec::smallvec![0..9, 9..15, 15..20],
+            ),
             // range: 57..79
-            LineItem {
-                length: "这里是第 4 行。".len(),
-                wrapped_lines: smallvec::smallvec![0..22],
-                indent: Some(0),
-                word_columns: 0,
-                word_width: px(0.),
-            },
+            LineItem::new("这里是第 4 行。".len(), Some(0), smallvec::smallvec![0..22]),
         ];
 
         assert_eq!(

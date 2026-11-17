@@ -767,17 +767,13 @@ impl TextElement {
                     && endpoint <= visible_range_offset.start + offset + line.len()
                 {
                     let local = endpoint - visible_range_offset.start - offset;
-                    let index = line_item
-                        .wrapped_lines
-                        .partition_point(|range| range.end <= local)
-                        .min(line_item.lines_len().saturating_sub(1));
-                    needed.insert(index);
+                    needed.insert(line_item.row_at(local));
                 }
             }
             let mut wrapped_lines = SmallVec::new();
             for index in needed {
-                let range = &line_item.wrapped_lines[index];
-                let line_runs = runs_for_range(runs, offset, range);
+                let range = line_item.range(index).unwrap();
+                let line_runs = runs_for_range(runs, offset, &range);
                 let line_runs = if bg_segments.is_empty() {
                     line_runs
                 } else {
@@ -793,7 +789,7 @@ impl TextElement {
                     .shape_line(sub_line, font_size, &line_runs, None);
                 wrapped_lines.push(WrappedLine {
                     row: index,
-                    range: range.clone(),
+                    range,
                     shaped,
                 });
             }
