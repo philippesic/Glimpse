@@ -1,5 +1,5 @@
 use super::*;
-use crate::semantic_text::{text_run, visit_line_segments};
+use crate::semantic_text::{MAX_RUN_CHARACTERS, Segment, text_run, visit_line_segments};
 use gpui::accesskit::{
     Action, ActionData, ActionRequest, Node, NodeId, Role, TextPosition, TextSelection,
 };
@@ -9,6 +9,8 @@ use ropey::{LineType, extra::esoterica::ropes_are_instances};
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+const PACKED_LINE_THRESHOLD: usize = 4096;
 
 #[derive(Default)]
 pub(super) struct Mapping {
@@ -24,6 +26,7 @@ struct TextRuns {
     runs: Arc<[Run]>,
     nodes: Arc<[(NodeId, Node)]>,
     next_key: usize,
+    packed: bool,
 }
 
 pub(super) struct PrepareTextRuns {
@@ -38,6 +41,83 @@ struct Run {
     id: NodeId,
     range: Range<usize>,
 }
+
+#[derive(Default)]
+struct PackedLines {
+    start: usize,
+    text: String,
+    lengths: Vec<u8>,
+    words: Vec<u16>,
+    line_starts: Vec<u16>,
+}
+
+impl PackedLines {
+    fn push(&mut self, start: usize, line: &str, part: Segment) {
+        let characters = self.lengths.len() as u16;
+        if self.text.is_empty() {
+            self.start = start;
+        } else {
+            self.line_starts.push(characters);
+            if part.words.first() != Some(&0) {
+                self.words.push(characters);
+            }
+        }
+        self.text.push_str(line);
+        self.lengths.extend(part.lengths);
+        self.words
+            .extend(part.words.into_iter().map(|word| characters + word));
+    }
+
+    fn flush(&mut self, emit: &mut impl FnMut(Range<usize>, Option<usize>, Node)) {
+        if self.text.is_empty() {
+            return;
+        }
+        let mut node = text_run(
+            &self.text,
+            std::mem::take(&mut self.lengths),
+            std::mem::take(&mut self.words),
+        );
+        if !self.line_starts.is_empty() {
+            node.set_hard_line_starts(std::mem::take(&mut self.line_starts));
+        }
+        emit(self.start..self.start + self.text.len(), None, node);
+        self.text.clear();
+    }
+}
+
+fn visit_source_runs(
+    text: &Rope,
+    range: Range<usize>,
+    packed: bool,
+    mut emit: impl FnMut(Range<usize>, Option<usize>, Node),
+) {
+    let mut block = PackedLines::default();
+    let mut offset = range.start;
+    for (line_index, line) in text.slice(range.clone()).lines(LineType::LF).enumerate() {
+        if line.len() == 0 && range.end < text.len() {
+            break;
+        }
+        let line = line
+            .as_str()
+            .map_or_else(|| Cow::Owned(String::from(line)), Cow::Borrowed);
+        visit_line_segments(&line, line_index, |part| {
+            if packed && !line.is_empty() && part.range.len() == line.len() {
+                if block.lengths.len() + part.lengths.len() > MAX_RUN_CHARACTERS {
+                    block.flush(&mut emit);
+                }
+                block.push(offset, &line, part);
+            } else {
+                block.flush(&mut emit);
+                let range = offset + part.range.start..offset + part.range.end;
+                let node = text_run(&line[part.range], part.lengths, part.words);
+                emit(range, Some(part.line), node);
+            }
+        });
+        offset += line.len();
+    }
+    block.flush(&mut emit);
+}
+
 impl TextRuns {
     #[cfg(test)]
     fn update(&mut self, text: Rope, mut node_id: impl FnMut(usize) -> NodeId) {
@@ -52,9 +132,14 @@ impl TextRuns {
     fn update_changed(
         &mut self,
         text: Rope,
-        (old, new): (Range<usize>, Range<usize>),
+        (mut old, mut new): (Range<usize>, Range<usize>),
         mut node_id: impl FnMut(usize) -> NodeId,
     ) {
+        if !self.packed && text.len_lines(LineType::LF) > PACKED_LINE_THRESHOLD {
+            self.packed = true;
+            old = 0..self.text.len();
+            new = 0..text.len();
+        }
         let prefix = self
             .runs
             .partition_point(|run| run.range.end <= old.start && run.range.start < old.start);
@@ -63,41 +148,36 @@ impl TextRuns {
         } else {
             self.runs.partition_point(|run| run.range.start < old.end)
         };
+        if self.packed && prefix < suffix {
+            let start = self.runs[prefix].range.start;
+            let end = self.runs[suffix - 1].range.end;
+            new.start -= old.start - start;
+            new.end += end - old.end;
+            old.end = end;
+        }
         let mut nodes = Vec::with_capacity(self.nodes.len());
         let mut runs = Vec::with_capacity(self.runs.len());
         nodes.extend(self.nodes[..prefix].iter().cloned());
         runs.extend(self.runs[..prefix].iter().cloned());
-        let mut previous: Option<(usize, NodeId, Node)> = None;
-        let mut offset = new.start;
-        for (line_index, line) in text.slice(new.clone()).lines(LineType::LF).enumerate() {
-            if line.len() == 0 && new.end < text.len() {
-                break;
-            }
-            let line = line
-                .as_str()
-                .map_or_else(|| Cow::Owned(line.to_string()), Cow::Borrowed);
-            visit_line_segments(&line, line_index, |part| {
-                let id = if runs.len() < suffix {
-                    self.runs[runs.len()].id
-                } else {
-                    let key = self.next_key;
-                    self.next_key += 1;
-                    node_id(key)
-                };
-                let range = offset + part.range.start..offset + part.range.end;
-                let mut run = text_run(&line[part.range], part.lengths, part.words);
-                if let Some((line, previous_id, mut previous)) = previous.take() {
-                    if line == part.line {
-                        previous.set_next_on_line(id);
-                        run.set_previous_on_line(previous_id);
-                    }
-                    nodes.push((previous_id, previous));
+        let mut previous = None::<(Option<usize>, NodeId, Node)>;
+        visit_source_runs(&text, new.clone(), self.packed, |range, line, mut run| {
+            let id = if runs.len() < suffix {
+                self.runs[runs.len()].id
+            } else {
+                let key = self.next_key;
+                self.next_key += 1;
+                node_id(key)
+            };
+            if let Some((previous_line, previous_id, mut previous)) = previous.take() {
+                if line.is_some() && previous_line == line {
+                    previous.set_next_on_line(id);
+                    run.set_previous_on_line(previous_id);
                 }
-                previous = Some((part.line, id, run));
-                runs.push(Run { id, range });
-            });
-            offset += line.len();
-        }
+                nodes.push((previous_id, previous));
+            }
+            previous = Some((line, id, run));
+            runs.push(Run { id, range });
+        });
         if let Some((_, id, node)) = previous {
             nodes.push((id, node));
         }
@@ -161,6 +241,7 @@ impl Mapping {
         if let Some(changed) = changed.as_ref()
             && changed.0.len().max(changed.1.len()) <= 64 * 1024
             && self.current.nodes.len() <= 4096
+            && (self.current.packed || text.len_lines(LineType::LF) <= PACKED_LINE_THRESHOLD)
             && text.slice(changed.1.clone()).len_lines(LineType::LF) <= 4096
         {
             self.current
@@ -415,7 +496,7 @@ mod tests {
 
             let pending = mapping.prepare(new_owner, &latest_rope).unwrap();
             mapping.finish(new_owner, pending.build(), &latest_rope);
-            assert_complete_mapping(&mapping.current, &latest);
+            assert_packed_mapping(&mapping.current, &latest);
             assert!(mapping.prepare(new_owner, &latest_rope).is_none());
         });
     }
@@ -456,6 +537,79 @@ mod tests {
                 assert_eq!(mapping.offset(&position), Some(byte));
             }
         }
+    }
+
+    fn assert_packed_mapping(mapping: &TextRuns, text: &str) {
+        assert!(mapping.packed);
+        let parts = segments(text);
+        let mut lengths = Vec::new();
+        let mut end = 0;
+        let mut ids = std::collections::HashSet::new();
+        assert_eq!(mapping.runs.len(), mapping.nodes.len());
+        for (run, (id, node)) in mapping.runs.iter().zip(mapping.nodes.iter()) {
+            assert_eq!(run.range.start, end);
+            assert_eq!(run.id, *id);
+            assert!(ids.insert(*id));
+            end = run.range.end;
+            let content = &text[run.range.clone()];
+            assert_eq!(node.value(), Some(content));
+            assert!(node.character_lengths().len() <= MAX_RUN_CHARACTERS);
+            let mut byte = 0;
+            let mut line_starts = Vec::new();
+            for (index, &length) in node.character_lengths().iter().enumerate() {
+                byte += usize::from(length);
+                if byte < content.len() && content.as_bytes()[byte - 1] == b'\n' {
+                    line_starts.push((index + 1) as u16);
+                    let boundary = run.range.start + byte;
+                    assert_eq!(mapping.offset(&mapping.position(boundary)), Some(boundary));
+                }
+            }
+            assert_eq!(byte, content.len());
+            assert_eq!(node.hard_line_starts(), line_starts);
+            lengths.extend_from_slice(node.character_lengths());
+        }
+        assert_eq!(end, text.len());
+        assert_eq!(
+            lengths,
+            parts
+                .into_iter()
+                .flat_map(|part| part.lengths)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn packed_updates_preserve_boundaries_and_sparse_run_ids() {
+        let long = "é🙂 phrase ".repeat(420);
+        let initial = format!(
+            "{}{}\r\n{}\n",
+            "two β\r\n\r\n".repeat(1700),
+            long,
+            "last 🌿\n".repeat(1000)
+        );
+        let mut text = Rope::from(initial.as_str());
+        let mut mapping = TextRuns::default();
+        let node_id = |key| NodeId(key as u64 + 100);
+        mapping.update(text.clone(), node_id);
+        assert!(mapping.nodes.len() < 40);
+        assert_packed_mapping(&mapping, &initial);
+
+        let suffix = mapping.nodes.last().unwrap().0;
+        let mid = initial.find("two β").unwrap() + 4;
+        text.remove(mid..mid + "β\r\n\r\n".len());
+        text.insert(mid, "é 🙂\n");
+        mapping.update(text.clone(), node_id);
+        assert_packed_mapping(&mapping, &String::from(&text));
+        assert_eq!(mapping.nodes.last().unwrap().0, suffix);
+        assert!(mapping
+            .nodes
+            .iter()
+            .any(|(_, node)| node.next_on_line().is_some()));
+
+        text = Rope::from("new\r\n\nend");
+        mapping.update(text.clone(), node_id);
+        assert_packed_mapping(&mapping, &String::from(&text));
+        assert_eq!(mapping.nodes.len(), 1);
     }
     #[test]
     fn accessible_diff_preserves_lf_boundaries_across_rope_chunks() {

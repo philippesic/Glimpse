@@ -1006,6 +1006,7 @@ enum PropertyId {
     CustomActions,
     TreeId,
     WideWordStarts,
+    HardLineStarts,
 
     // This MUST be last.
     Unset,
@@ -2497,7 +2498,14 @@ length_vec_property_methods! {
 property_methods! {
     /// Word boundaries for a run with more than 255 characters.
     /// A nonempty wide list takes precedence over [`Node::word_starts`].
-    (WideWordStarts, wide_word_starts, get_word_index_vec_property, &[u16], set_wide_word_starts, set_word_index_vec_property, impl Into<Vec<u16>>, clear_wide_word_starts)
+    (WideWordStarts, wide_word_starts, get_word_index_vec_property, &[u16], set_wide_word_starts, set_word_index_vec_property, impl Into<Vec<u16>>, clear_wide_word_starts),
+
+    /// Hard line starts inside a text run, expressed as sorted, distinct
+    /// nonzero indices into [`Node::character_lengths`]. Each index follows a
+    /// newline and precedes at least one character in this run. The first and
+    /// last lines use the ordinary adjacent-run links if they span runs.
+    /// Include these indices in the word starts when providing word navigation.
+    (HardLineStarts, hard_line_starts, get_word_index_vec_property, &[u16], set_hard_line_starts, set_word_index_vec_property, impl Into<Vec<u16>>, clear_hard_line_starts)
 }
 
 coord_vec_property_methods! {
@@ -2895,6 +2903,9 @@ impl fmt::Debug for Node {
         if !self.wide_word_starts().is_empty() {
             fmt.field("wide_word_starts", &self.wide_word_starts());
         }
+        if !self.hard_line_starts().is_empty() {
+            fmt.field("hard_line_starts", &self.hard_line_starts());
+        }
         self.debug_coord_vec_properties(&mut fmt);
         self.debug_bool_properties(&mut fmt);
         self.debug_unique_enum_properties(&mut fmt);
@@ -3095,7 +3106,7 @@ impl<'de> Visitor<'de> for PropertiesVisitor {
                     CharacterLengths,
                     WordStarts
                 },
-                WordIndexVec { WideWordStarts },
+                WordIndexVec { WideWordStarts, HardLineStarts },
                 CoordVec {
                     CharacterPositions,
                     CharacterWidths
@@ -3250,7 +3261,7 @@ impl JsonSchema for Properties {
                 CharacterLengths,
                 WordStarts
             },
-            Vec<u16> { WideWordStarts },
+            Vec<u16> { WideWordStarts, HardLineStarts },
             Vec<f32> {
                 CharacterPositions,
                 CharacterWidths
@@ -3607,17 +3618,23 @@ mod tests {
         let mut node = Node::new(Role::TextRun);
         node.set_word_starts([2, 5]);
         node.set_wide_word_starts([2, 300]);
+        node.set_hard_line_starts([8, 310]);
         let wire = serde_json::to_value(&node).unwrap();
         assert_eq!(wire["properties"]["wordStarts"], serde_json::json!([2, 5]));
         assert_eq!(
             wire["properties"]["wideWordStarts"],
             serde_json::json!([2, 300])
         );
+        assert_eq!(
+            wire["properties"]["hardLineStarts"],
+            serde_json::json!([8, 310])
+        );
         let mut decoded: Node = serde_json::from_value(wire).unwrap();
         assert_eq!(decoded, node);
         decoded.clear_wide_word_starts();
         assert_eq!(decoded.word_starts(), [2, 5]);
         assert!(decoded.wide_word_starts().is_empty());
+        assert_eq!(decoded.hard_line_starts(), [8, 310]);
     }
 
     #[test]
