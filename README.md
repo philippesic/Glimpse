@@ -25,17 +25,29 @@ Set `GLIMPSE_TRACE=1` to emit monotonic edit/save event timings to stderr. Event
 
 Linux tests require util-linux `unshare` and `mount`, with user and mount namespaces available. Bind-mount fixtures run in a private namespace.
 
+## Linux installation
+
+Build a compressed archive with Python 3.11 or later:
+
+```sh
+python3 scripts/package-linux.py
+```
+
+Extract the archive from `build/`, then run `python3 install.py --prefix "$HOME/.local"` from its directory. The installer verifies the payload, installs the executable, icon and desktop entry, and preserves earlier installed files as backups. It does not change default file associations. Installation prefixes containing `%`, `=` or control characters are refused. Launch Glimpse from the desktop menu or `~/.local/bin/glimpse`.
+
+Installer safety checks run with `python3 -m unittest discover -s scripts/tests -v`. Linux CI also checks the Python tools with Ruff 0.17.5 and builds the archive. Native installed-app qualification remains separate from those automated checks.
+
 ## Workflow
 
 The left pane lists one directory. Click folders to enter them and files to preview them. Double-click keeps a tab; editing pins a preview. Back, Forward and Parent change location.
 
-The path bar’s ancestor buttons navigate directly. Ctrl-L selects the location for replacement, Tab completes it, and Escape cancels. Dropping a file opens it; dropping a folder navigates there. Horizontal navigator gestures and Back/Forward mouse buttons traverse history. Ctrl-Shift-E focuses the navigator, and arrow keys and Enter navigate its rows. Ctrl-O opens a native dialog. Unusual names copy in a lossless escaped form that Location can reopen.
+The path bar’s ancestor buttons navigate directly. The current folder stays visible when the path or window size changes; earlier ancestors remain scrollable. Edit Path and Ctrl-L select the location for replacement, Tab completes it, and Escape cancels. Dropping a file opens it; dropping a folder navigates there. Horizontal navigator gestures and Back/Forward mouse buttons traverse history. Ctrl-Shift-E focuses the navigator, and arrow keys and Enter navigate its rows. Ctrl-O opens a native dialog. Unusual names copy in a lossless escaped form that Location can reopen.
 
-Files and Text search recursively under the displayed folder; scope can be pinned independently of location. Search This Folder provides a temporary override. Index This Folder builds a session filename snapshot with visible stale, rebuild and removal controls; text search reads saved files. Results support arrow keys and Enter, and retain coverage and exclusions beside the query.
+Find Files and Find Text search recursively under the displayed folder; scope can be pinned independently of location. Search This Folder provides a temporary override. Index This Folder builds a session filename snapshot with visible stale, rebuild and removal controls; text search reads saved files. Results support arrow keys and Enter, and retain coverage and exclusions beside the query.
 
 Filter affects only the current directory. The navigator reports slow or failed reads; Stop Reading keeps existing rows available, and Refresh resumes listing.
 
-Ctrl-N creates a draft. Ctrl-S saves; Ctrl-Shift-S opens Save As; Ctrl-Alt-S opens Save Copy. Ctrl-F searches the current buffer with case and whole-word options. Replacement is disclosed on request; Replace and Replace All have separate Undo steps. Escape returns to the selected match. Ctrl-G goes to a line. Ctrl-Shift-P opens commands, Ctrl-comma opens preferences, Ctrl-W closes a tab and Ctrl-Q quits. The corresponding Command modifier applies on macOS. Read switches the current buffer to a read-only Markdown presentation; Edit returns to the source position. Local raster images are bounded, remote images are omitted, raw HTML is visible source, and relative file links open from the document’s folder.
+Ctrl-N creates a draft. Ctrl-S saves; Ctrl-Shift-S opens Save As; Ctrl-Alt-S opens Save Copy. Ctrl-F searches the current buffer with case and whole-word options. Replacement is disclosed on request; Replace and Replace All have separate Undo steps. Escape returns to the selected match. Ctrl-G goes to a line. Find and Go to Line return a reading document to its source. Ctrl-Shift-P opens commands, Ctrl-comma opens preferences, Ctrl-W closes a tab and Ctrl-Q quits. The corresponding Command modifier applies on macOS. Read switches the current buffer to a read-only Markdown presentation; Edit returns to the source position. Local raster images are bounded, remote images are omitted, raw HTML is visible source, and relative file links open from the document’s folder.
 
 Save validation, no-clobber creation/rename and recovery use the existing domain workers. Ordinary saves refuse detected external changes. Clean external changes reload with an undo step; dirty buffers retain local text and offer Reload or Save Copy. Dirty close exposes Save, Discard and Cancel. Linux removal uses freedesktop Trash, never permanent deletion. Close an open file before rename or Trash.
 
