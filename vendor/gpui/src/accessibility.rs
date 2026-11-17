@@ -52,7 +52,8 @@ pub(crate) struct State {
     active: Arc<AtomicBool>,
     initialized: bool,
     next_id: u64,
-    ids: HashMap<GlobalElementId, NodeId>,
+    ids: HashMap<Vec<ElementId>, NodeId>,
+    child_ids: HashMap<(NodeId, ElementId), NodeId>,
     visible: HashSet<NodeId>,
     text_groups: HashMap<NodeId, Arc<[(NodeId, Node)]>>,
     pub(crate) parents: Vec<NodeId>,
@@ -339,6 +340,7 @@ impl State {
             focus,
         };
         self.ids.retain(|_, id| current_ids.contains(id));
+        self.child_ids.retain(|_, id| current_ids.contains(id));
         self.visible = visible;
         #[cfg(target_os = "linux")]
         if let Some(adapter) = &mut self.adapter {
@@ -373,14 +375,13 @@ impl Window {
         );
     }
     fn accessibility_id(&mut self, global_id: &GlobalElementId) -> NodeId {
-        *self
-            .accessibility
-            .ids
-            .entry(GlobalElementId(global_id.0.clone()))
-            .or_insert_with(|| {
-                self.accessibility.next_id = self.accessibility.next_id.max(1) + 1;
-                NodeId(self.accessibility.next_id)
-            })
+        if let Some(id) = self.accessibility.ids.get(global_id.0.as_slice()) {
+            return *id;
+        }
+        self.accessibility.next_id = self.accessibility.next_id.max(1) + 1;
+        let id = NodeId(self.accessibility.next_id);
+        self.accessibility.ids.insert(global_id.0.to_vec(), id);
+        id
     }
     /// Allocate a stable text-run identifier below a semantic element.
     pub fn accessibility_child_id(
@@ -388,8 +389,14 @@ impl Window {
         parent: &GlobalElementId,
         id: impl Into<ElementId>,
     ) -> NodeId {
-        let mut global_id = GlobalElementId(parent.0.clone());
-        global_id.0.push(id.into());
-        self.accessibility_id(&global_id)
+        let parent = self.accessibility_id(parent);
+        *self
+            .accessibility
+            .child_ids
+            .entry((parent, id.into()))
+            .or_insert_with(|| {
+                self.accessibility.next_id = self.accessibility.next_id.max(1) + 1;
+                NodeId(self.accessibility.next_id)
+            })
     }
 }

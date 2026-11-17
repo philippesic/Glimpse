@@ -127,6 +127,24 @@ pub(crate) fn text(
 mod tests {
     use super::*;
 
+    #[gpui::test]
+    fn text_run_ids_are_stable_and_distinct_between_parents(cx: &mut gpui::TestAppContext) {
+        let cx = cx.add_empty_window();
+        cx.update(|window, _| {
+            let mut first = gpui::GlobalElementId::default();
+            first.push("first".into());
+            let mut second = gpui::GlobalElementId::default();
+            second.push("second".into());
+            let mut ids = std::collections::HashSet::new();
+            for index in 0..10_000usize {
+                let id = window.accessibility_child_id(&first, ("run", index));
+                assert_eq!(id, window.accessibility_child_id(&first, ("run", index)));
+                assert!(ids.insert(id));
+                assert!(ids.insert(window.accessibility_child_id(&second, ("run", index))));
+            }
+        });
+    }
+
     #[test]
     fn long_line_segments_preserve_every_word_and_grapheme() {
         let text = "🙂 café alpha_ 中文 é ".repeat(100_000);
