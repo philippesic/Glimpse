@@ -1,6 +1,12 @@
 use regex::{Regex, RegexBuilder};
 use rust_i18n::t;
-use std::{ops::Range, rc::Rc};
+use std::{
+    ops::Range,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use gpui::{
     App, AppContext as _, Context, Empty, Entity, FocusHandle, Focusable, Half,
@@ -15,8 +21,7 @@ use crate::{
     button::{Button, ButtonVariants},
     h_flex,
     input::{
-        Enter, Escape, IndentInline, Input, InputEvent, InputState, RopeExt as _, Search,
-        movement::MoveDirection,
+        Enter, Escape, IndentInline, Input, InputEvent, InputState, Search, movement::MoveDirection,
     },
     label::Label,
     v_flex,
@@ -40,10 +45,11 @@ pub struct SearchMatcher {
     pub query: Option<Regex>,
     query_error: bool,
 
-    pub(super) matched_ranges: Rc<Vec<Range<usize>>>,
+    pub(super) matched_ranges: Arc<Vec<Range<usize>>>,
     pub(super) current_match_ix: usize,
     /// Is in replacing mode, if true, the next update will not reset the current match index.
     replacing: bool,
+    cancellation: Option<Arc<AtomicBool>>,
 }
 
 impl SearchMatcher {
@@ -52,13 +58,15 @@ impl SearchMatcher {
             text: "".into(),
             query: None,
             query_error: false,
-            matched_ranges: Rc::new(Vec::new()),
+            matched_ranges: Arc::new(Vec::new()),
             current_match_ix: 0,
             replacing: false,
+            cancellation: None,
         }
     }
 
     /// Update source text and re-match
+    #[cfg(test)]
     pub(crate) fn update(&mut self, text: &Rope) {
         if self.text.eq(text) {
             return;
@@ -69,12 +77,29 @@ impl SearchMatcher {
     }
 
     fn update_matches(&mut self) {
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
+        {
+            return;
+        }
         let mut new_ranges = Vec::new();
         if let Some(query) = &self.query {
             let text = self.text.to_string();
-            new_ranges.extend(query.find_iter(&text).map(|found| found.range()));
+            for found in query.find_iter(&text) {
+                if new_ranges.len() % 1024 == 0
+                    && self
+                        .cancellation
+                        .as_ref()
+                        .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
+                {
+                    return;
+                }
+                new_ranges.push(found.range());
+            }
         }
-        self.matched_ranges = Rc::new(new_ranges);
+        self.matched_ranges = Arc::new(new_ranges);
         if !self.replacing {
             self.current_match_ix = 0;
         }
@@ -131,12 +156,10 @@ impl SearchMatcher {
 
     /// Update the current match index based on the given offset.
     fn update_cursor_by_offset(&mut self, offset: usize) {
-        for (ix, range) in self.matched_ranges.iter().enumerate() {
-            self.current_match_ix = ix;
-            if range.contains(&offset) || range.end >= offset {
-                return;
-            }
-        }
+        self.current_match_ix = self
+            .matched_ranges
+            .partition_point(|range| range.end < offset)
+            .min(self.len().saturating_sub(1));
     }
 }
 
@@ -175,6 +198,15 @@ impl DoubleEndedIterator for SearchMatcher {
     }
 }
 
+struct SearchRequest {
+    text: Rope,
+    query: String,
+    case_insensitive: bool,
+    whole_word: bool,
+    offset: usize,
+    current_match_ix: Option<usize>,
+}
+
 pub(super) struct SearchPanel {
     editor: Entity<InputState>,
     search_input: Entity<InputState>,
@@ -186,6 +218,10 @@ pub(super) struct SearchPanel {
     input_width: Pixels,
 
     open: bool,
+    scan_running: bool,
+    pending_scan: Option<SearchRequest>,
+    cancellation: Arc<AtomicBool>,
+    searching: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -197,9 +233,13 @@ impl InputState {
         };
 
         let text = self.text.clone();
-        search_panel.update(cx, |this, _| {
+        let offset = self
+            .last_layout
+            .as_ref()
+            .map_or(0, |layout| layout.visible_range_offset.start);
+        search_panel.update(cx, |this, cx| {
             if this.open {
-                this.matcher.update(&text);
+                this.request_search(text, offset, cx);
             }
         });
     }
@@ -220,12 +260,16 @@ impl InputState {
         };
 
         let text = self.text.clone();
+        let offset = self
+            .last_layout
+            .as_ref()
+            .map_or(0, |layout| layout.visible_range_offset.start);
         let editor = cx.entity();
         let selected_text = Rope::from(self.selected_text());
         search_panel.update(cx, |this, cx| {
             this.editor = editor;
-            this.matcher.update(&text);
             this.show(&selected_text, window, cx);
+            this.request_search(text, offset, cx);
         });
         self.search_panel = Some(search_panel);
         cx.notify();
@@ -260,6 +304,10 @@ impl SearchPanel {
                 replace_mode: false,
                 matcher: SearchMatcher::new(),
                 open: true,
+                scan_running: false,
+                pending_scan: None,
+                cancellation: Arc::new(AtomicBool::new(false)),
+                searching: false,
                 input_width: Pixels::ZERO,
                 _subscriptions,
             }
@@ -285,26 +333,87 @@ impl SearchPanel {
     }
 
     fn update_search_query(&mut self, cx: &mut Context<Self>) {
-        let query = self.search_input.read(cx).value();
-        let visible_range_offset = self
-            .editor
-            .read(cx)
+        let editor = self.editor.read(cx);
+        let text = editor.text.clone();
+        let offset = editor
             .last_layout
             .as_ref()
-            .map(|l| l.visible_range_offset.clone());
+            .map_or(0, |layout| layout.visible_range_offset.start);
+        self.request_search(text, offset, cx);
+    }
 
-        self.matcher
-            .update_query(query.as_str(), self.case_insensitive, self.whole_word);
-
-        if let Some(visible_range_offset) = visible_range_offset {
-            self.matcher
-                .update_cursor_by_offset(visible_range_offset.start);
-        }
+    fn request_search(&mut self, text: Rope, offset: usize, cx: &mut Context<Self>) {
+        self.cancellation.store(true, Ordering::Relaxed);
+        self.pending_scan = Some(SearchRequest {
+            text,
+            query: self.search_input.read(cx).value().to_string(),
+            case_insensitive: self.case_insensitive,
+            whole_word: self.whole_word,
+            offset,
+            current_match_ix: self
+                .matcher
+                .replacing
+                .then_some(self.matcher.current_match_ix),
+        });
+        self.matcher.matched_ranges = Arc::new(Vec::new());
+        self.matcher.replacing = false;
+        self.searching = true;
+        self.start_search(cx);
         cx.notify();
+    }
+
+    fn start_search(&mut self, cx: &mut Context<Self>) {
+        if self.scan_running {
+            return;
+        }
+        let Some(request) = self.pending_scan.take() else {
+            return;
+        };
+        self.scan_running = true;
+        let cancellation = Arc::new(AtomicBool::new(false));
+        self.cancellation = cancellation.clone();
+        let task = cx.background_spawn(async move {
+            let mut matcher = SearchMatcher::new();
+            matcher.text = request.text;
+            matcher.cancellation = Some(cancellation.clone());
+            matcher.update_query(&request.query, request.case_insensitive, request.whole_word);
+            if cancellation.load(Ordering::Relaxed) {
+                return None;
+            }
+            if let Some(index) = request.current_match_ix {
+                matcher.current_match_ix = index.min(matcher.len().saturating_sub(1));
+            } else {
+                matcher.update_cursor_by_offset(request.offset);
+            }
+            matcher.cancellation = None;
+            Some(matcher)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            _ = this.update(cx, |this, cx| {
+                this.scan_running = false;
+                if this.open
+                    && this.pending_scan.is_none()
+                    && !this.cancellation.load(Ordering::Relaxed)
+                {
+                    if let Some(matcher) = result {
+                        this.matcher = matcher;
+                        this.searching = false;
+                    }
+                }
+                this.start_search(cx);
+                this.editor.update(cx, |_, cx| cx.notify());
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub(super) fn hide(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open = false;
+        self.cancellation.store(true, Ordering::Relaxed);
+        self.pending_scan = None;
+        self.searching = false;
         if let Some(range) = self
             .matcher
             .matched_ranges
@@ -413,29 +522,42 @@ impl SearchPanel {
 
         let editor = self.editor.clone();
         let original = editor.read(cx).text.clone();
+        let cancellation = self.cancellation.clone();
+        let worker_cancel = cancellation.clone();
+        let worker_original = original.clone();
+        self.searching = true;
+        self.matcher.matched_ranges = Arc::new(Vec::new());
+        let task = cx.background_spawn(async move {
+            let text = worker_original.to_string();
+            let mut output = String::new();
+            let mut offset = 0;
+            for (index, range) in ranges.iter().enumerate() {
+                if index % 1024 == 0 && worker_cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
+                output.push_str(&text[offset..range.start]);
+                output.push_str(new_text.as_str());
+                offset = range.end;
+            }
+            output.push_str(&text[offset..]);
+            (!worker_cancel.load(Ordering::Relaxed)).then_some(output)
+        });
         cx.spawn_in(window, async move |_, cx| {
-            cx.update(|window, cx| {
+            let Some(replaced) = task.await else {
+                return;
+            };
+            _ = cx.update(|window, cx| {
                 editor.update(cx, |state, cx| {
-                    if state.text != original {
+                    if cancellation.load(Ordering::Relaxed) || state.text != original {
                         return;
-                    }
-                    // Replace from the end to avoid messing up the ranges.
-                    let mut rope = state.text.clone();
-                    for range in ranges.iter().rev() {
-                        rope.replace(range.clone(), new_text.as_str());
                     }
                     let full_range = state.range_to_utf16(&(0..state.text.len()));
                     state.history.new_group();
-                    state.replace_text_in_range_silent(
-                        Some(full_range),
-                        &rope.to_string(),
-                        window,
-                        cx,
-                    );
+                    state.replace_text_in_range_silent(Some(full_range), &replaced, window, cx);
                     state.history.new_group();
                     state.scroll_to(0, Some(MoveDirection::Down), cx);
                 });
-            })
+            });
         })
         .detach();
     }
@@ -454,6 +576,11 @@ impl Render for SearchPanel {
         }
 
         let has_matches = self.matcher.len() > 0;
+        let match_label = if self.searching {
+            "Searching…".into()
+        } else {
+            self.matcher.label()
+        };
 
         v_flex()
             .id("search-panel")
@@ -570,14 +697,16 @@ impl Render for SearchPanel {
                                 this.next(window, cx);
                             })),
                     )
-                    .child(
-                        Label::new(self.matcher.label())
+                    .child(crate::semantic_text::text(
+                        "match-count",
+                        match_label.clone().into(),
+                        Label::new(match_label)
                             .when(!has_matches, |this| {
                                 this.text_color(cx.theme().muted_foreground)
                             })
                             .text_left()
                             .min_w_16(),
-                    )
+                    ))
                     .child(div().w_7())
                     .child(
                         Button::new("close")
@@ -681,6 +810,22 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_dense_search_never_publishes_partial_matches() {
+        let mut matcher = SearchMatcher::new();
+        matcher.text = Rope::from("🙂 café ".repeat(100_000));
+        let cancel = Arc::new(AtomicBool::new(true));
+        matcher.cancellation = Some(cancel.clone());
+        matcher.update_query("café", true, false);
+        assert!(matcher.matched_ranges.is_empty());
+        cancel.store(false, Ordering::Relaxed);
+        matcher.update_query("café", true, false);
+        assert_eq!(matcher.len(), 100_000);
+        assert_eq!(matcher.matched_ranges.first(), Some(&(5..10)));
+        matcher.update_cursor_by_offset(1_099_999);
+        assert_eq!(matcher.current_match_ix, 99_999);
+    }
+
+    #[test]
     fn test_search_label() {
         let mut matcher = SearchMatcher::new();
         matcher.update(&Rope::from("Hello 世界 this is a Is test string."));
@@ -700,7 +845,7 @@ mod tests {
     #[test]
     fn test_select_range_start() {
         let mut matcher = SearchMatcher::new();
-        matcher.matched_ranges = Rc::new(vec![5..10, 15..20, 25..30]);
+        matcher.matched_ranges = Arc::new(vec![5..10, 15..20, 25..30]);
         matcher.update_cursor_by_offset(0);
         assert_eq!(matcher.current_match_ix, 0);
 

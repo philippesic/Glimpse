@@ -398,7 +398,14 @@ impl TextElement {
         };
 
         let mut paths = Vec::new();
-        for (index, range) in ranges.as_ref().iter().enumerate() {
+        let first =
+            ranges.partition_point(|range| range.end < last_layout.visible_range_offset.start);
+        for (index, range) in ranges
+            .iter()
+            .enumerate()
+            .skip(first)
+            .take_while(|(_, range)| range.start <= last_layout.visible_range_offset.end)
+        {
             if let Some(path) = Self::layout_match_range(range.clone(), last_layout, bounds) {
                 paths.push((path, current_match_ix == index));
             }
