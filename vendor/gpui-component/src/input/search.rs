@@ -41,13 +41,103 @@ pub(super) fn init(cx: &mut App) {
     )]);
 }
 
+#[derive(Debug)]
+pub(super) enum MatchRanges {
+    Uniform { starts: Vec<u32>, length: u32 },
+    Variable { starts: Vec<u32>, lengths: Vec<u32> },
+    Wide(Vec<Range<usize>>),
+}
+
+impl MatchRanges {
+    pub(super) fn new(text_bytes: usize) -> Self {
+        if text_bytes <= u32::MAX as usize {
+            Self::Uniform {
+                starts: Vec::new(),
+                length: 0,
+            }
+        } else {
+            Self::Wide(Vec::new())
+        }
+    }
+
+    pub(super) fn push(&mut self, range: Range<usize>) {
+        match self {
+            Self::Uniform { starts, length } => {
+                let match_length = range.len() as u32;
+                if starts.is_empty() {
+                    *length = match_length;
+                }
+                if match_length == *length {
+                    starts.push(range.start as u32);
+                } else {
+                    let mut lengths = vec![*length; starts.len()];
+                    lengths.push(match_length);
+                    starts.push(range.start as u32);
+                    *self = Self::Variable {
+                        starts: std::mem::take(starts),
+                        lengths,
+                    };
+                }
+            }
+            Self::Variable { starts, lengths } => {
+                starts.push(range.start as u32);
+                lengths.push(range.len() as u32);
+            }
+            Self::Wide(ranges) => ranges.push(range),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Uniform { starts, .. } | Self::Variable { starts, .. } => starts.len(),
+            Self::Wide(ranges) => ranges.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub(super) fn get(&self, index: usize) -> Option<Range<usize>> {
+        let (start, length) = match self {
+            Self::Uniform { starts, length } => (*starts.get(index)?, *length),
+            Self::Variable { starts, lengths } => (*starts.get(index)?, lengths[index]),
+            Self::Wide(ranges) => return ranges.get(index).cloned(),
+        };
+        Some(start as usize..start as usize + length as usize)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = Range<usize>> + '_ {
+        (0..self.len()).map(|index| self.get(index).unwrap())
+    }
+
+    fn partition_point(&self, mut predicate: impl FnMut(Range<usize>) -> bool) -> usize {
+        let mut low = 0;
+        let mut high = self.len();
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if predicate(self.get(middle).unwrap()) {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        low
+    }
+
+    pub(super) fn intersecting(&self, visible: &Range<usize>) -> Range<usize> {
+        self.partition_point(|range| range.end <= visible.start)
+            ..self.partition_point(|range| range.start < visible.end)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SearchMatcher {
     text: Rope,
     pub query: Option<Regex>,
     query_error: bool,
 
-    pub(super) matched_ranges: Arc<Vec<Range<usize>>>,
+    pub(super) matched_ranges: Arc<MatchRanges>,
     pub(super) current_match_ix: usize,
     /// Is in replacing mode, if true, the next update will not reset the current match index.
     replacing: bool,
@@ -60,7 +150,7 @@ impl SearchMatcher {
             text: "".into(),
             query: None,
             query_error: false,
-            matched_ranges: Arc::new(Vec::new()),
+            matched_ranges: Arc::new(MatchRanges::new(0)),
             current_match_ix: 0,
             replacing: false,
             cancellation: None,
@@ -86,7 +176,7 @@ impl SearchMatcher {
         {
             return;
         }
-        let mut new_ranges = Vec::new();
+        let mut new_ranges = MatchRanges::new(self.text.len());
         if let Some(query) = &self.query {
             let text = self.text.to_string();
             for found in query.find_iter(&text) {
@@ -143,7 +233,7 @@ impl SearchMatcher {
     }
 
     fn peek(&self) -> Option<Range<usize>> {
-        self.matched_ranges.get(self.current_match_ix + 1).cloned()
+        self.matched_ranges.get(self.current_match_ix + 1)
     }
 
     fn label(&self) -> String {
@@ -179,7 +269,7 @@ impl Iterator for SearchMatcher {
             self.current_match_ix = 0;
         }
 
-        self.matched_ranges.get(self.current_match_ix).cloned()
+        self.matched_ranges.get(self.current_match_ix)
     }
 }
 
@@ -194,9 +284,7 @@ impl DoubleEndedIterator for SearchMatcher {
         }
 
         self.current_match_ix -= 1;
-        let item = self.matched_ranges[self.current_match_ix].clone();
-
-        Some(item)
+        self.matched_ranges.get(self.current_match_ix)
     }
 }
 
@@ -355,7 +443,7 @@ impl SearchPanel {
                 .replacing
                 .then_some(self.matcher.current_match_ix),
         });
-        self.matcher.matched_ranges = Arc::new(Vec::new());
+        self.matcher.matched_ranges = Arc::new(MatchRanges::new(0));
         self.matcher.replacing = false;
         self.searching = true;
         self.start_search(cx);
@@ -494,7 +582,6 @@ impl SearchPanel {
             .matcher
             .matched_ranges
             .get(self.matcher.current_match_ix)
-            .cloned()
         {
             let Some(editor) = self.editor.upgrade() else {
                 return;
@@ -547,7 +634,7 @@ impl SearchPanel {
         let worker_original = original.clone();
         let text_system = cx.text_system().clone();
         self.searching = true;
-        self.matcher.matched_ranges = Arc::new(Vec::new());
+        self.matcher.matched_ranges = Arc::new(MatchRanges::new(0));
         let task = cx.background_spawn(async move {
             let text = value.unwrap_or_else(|| worker_original.to_string().into());
             let mut output = String::new();
@@ -956,7 +1043,7 @@ mod tests {
         let matches: Vec<_> = matcher
             .matched_ranges
             .iter()
-            .map(|r| &text[r.clone()])
+            .map(|range| &text[range])
             .collect();
         assert_eq!(matches, ["CAFÉ", "café", "café"]);
         matcher.update_query("café", false, false);
@@ -970,6 +1057,38 @@ mod tests {
     }
 
     #[test]
+    fn different_length_unicode_matches_keep_exact_offsets() {
+        let mut matcher = SearchMatcher::new();
+        matcher.update(&Rope::from("K k K"));
+        matcher.update_query("k", true, false);
+        assert!(matches!(
+            &*matcher.matched_ranges,
+            MatchRanges::Uniform { length: 1, .. }
+        ));
+        matcher.update(&Rope::from("K K k"));
+        assert!(matches!(
+            &*matcher.matched_ranges,
+            MatchRanges::Variable { .. }
+        ));
+        assert_eq!(
+            matcher.matched_ranges.iter().collect::<Vec<_>>(),
+            [0..1, 2..5, 6..7]
+        );
+        assert_eq!(matcher.matched_ranges.intersecting(&(4..6)), 1..2);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn large_offsets_use_wide_ranges() {
+        let offset = u32::MAX as usize + 10;
+        let mut matches = MatchRanges::new(offset + 10);
+        matches.push(offset..offset + 2);
+        matches.push(offset + 5..offset + 8);
+        assert_eq!(matches.get(1), Some(offset + 5..offset + 8));
+        assert_eq!(matches.intersecting(&(offset + 1..offset + 3)), 0..1);
+    }
+
+    #[test]
     fn cancelled_dense_search_never_publishes_partial_matches() {
         let mut matcher = SearchMatcher::new();
         matcher.text = Rope::from("🙂 café ".repeat(100_000));
@@ -980,7 +1099,7 @@ mod tests {
         cancel.store(false, Ordering::Relaxed);
         matcher.update_query("café", true, false);
         assert_eq!(matcher.len(), 100_000);
-        assert_eq!(matcher.matched_ranges.first(), Some(&(5..10)));
+        assert_eq!(matcher.matched_ranges.get(0), Some(5..10));
         matcher.update_cursor_by_offset(1_099_999);
         assert_eq!(matcher.current_match_ix, 99_999);
     }
@@ -1005,7 +1124,11 @@ mod tests {
     #[test]
     fn test_select_range_start() {
         let mut matcher = SearchMatcher::new();
-        matcher.matched_ranges = Arc::new(vec![5..10, 15..20, 25..30]);
+        let mut ranges = MatchRanges::new(30);
+        for range in [5..10, 15..20, 25..30] {
+            ranges.push(range);
+        }
+        matcher.matched_ranges = Arc::new(ranges);
         matcher.update_cursor_by_offset(0);
         assert_eq!(matcher.current_match_ix, 0);
 

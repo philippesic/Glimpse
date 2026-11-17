@@ -18,7 +18,7 @@ use crate::{
     },
 };
 
-use super::{InputEvent, InputState, LastLayout, mode::InputMode};
+use super::{InputEvent, InputState, LastLayout, mode::InputMode, search::MatchRanges};
 
 const BOTTOM_MARGIN_ROWS: usize = 3;
 pub(super) const RIGHT_MARGIN: Pixels = px(10.);
@@ -409,7 +409,9 @@ impl TextElement {
         }
         let mut paths = Vec::new();
         for index in matching_indices(&ranges, &visible) {
-            if let Some(path) = Self::layout_search_range(&ranges[index], last_layout, bounds) {
+            if let Some(path) =
+                Self::layout_search_range(&ranges.get(index).unwrap(), last_layout, bounds)
+            {
                 paths.push((path, current_match_ix == index));
             }
         }
@@ -1611,20 +1613,13 @@ impl Element for TextElement {
     }
 }
 
-fn matching_indices(ranges: &[Range<usize>], visible: &[Range<usize>]) -> Vec<usize> {
+fn matching_indices(ranges: &MatchRanges, visible: &[Range<usize>]) -> Vec<usize> {
     let mut indices = Vec::new();
     for interval in visible {
         if interval.is_empty() {
             continue;
         }
-        let first = ranges.partition_point(|range| range.end <= interval.start);
-        indices.extend(
-            ranges[first..]
-                .iter()
-                .take_while(|range| range.start < interval.end)
-                .enumerate()
-                .map(|(index, _)| first + index),
-        );
+        indices.extend(ranges.intersecting(interval));
     }
     indices.sort_unstable();
     indices.dedup();
@@ -1766,13 +1761,15 @@ mod tests {
                 })
                 .map(|(index, _)| index)
                 .collect::<Vec<_>>();
-            assert_eq!(matching_indices(&ranges, &visible), expected, "{seed}");
+            let mut compact = MatchRanges::new(cursor);
+            ranges.into_iter().for_each(|range| compact.push(range));
+            assert_eq!(matching_indices(&compact, &visible), expected, "{seed}");
         }
+        let mut ranges = MatchRanges::new(100_100);
+        ranges.push(0..100_000);
+        ranges.push(100_001..100_100);
         assert_eq!(
-            matching_indices(
-                &[0..100_000, 100_001..100_100],
-                &[10..20, 50..60, 100_010..100_020]
-            ),
+            matching_indices(&ranges, &[10..20, 50..60, 100_010..100_020]),
             vec![0, 1]
         );
     }
