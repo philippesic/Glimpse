@@ -45,24 +45,32 @@ impl LineWrapper {
         wrap_width: Pixels,
         continuation_indent: Option<u32>,
     ) -> impl Iterator<Item = Boundary> + 'a {
-        let mut width =
-            continuation_indent.map_or(px(0.), |indent| self.width_for_char(' ') * indent as f32);
-        let mut first_non_whitespace_ix = continuation_indent.map(|_| 0);
-        let mut indent = continuation_indent;
-        let mut last_candidate_ix = 0;
-        let mut last_candidate_width = px(0.);
-        let mut last_wrap_ix = 0;
-        let mut prev_c = '\0';
-        let mut index = 0;
+        let state = LineWrapState {
+            width: continuation_indent
+                .map_or(px(0.), |indent| self.width_for_char(' ') * indent as f32),
+            first_non_whitespace_ix: continuation_indent.map(|_| 0),
+            indent: continuation_indent,
+            ..LineWrapState::default()
+        };
+        self.resume_line(fragments, wrap_width, state)
+            .map(|(boundary, _)| boundary)
+    }
+
+    /// Continue with the unconsumed fragments and an exact state from this font and wrap width.
+    pub fn resume_line<'a>(
+        &'a mut self,
+        fragments: &'a [LineFragment],
+        wrap_width: Pixels,
+        mut state: LineWrapState,
+    ) -> impl Iterator<Item = (Boundary, LineWrapState)> + 'a {
         let mut candidates = fragments
             .iter()
-            .flat_map(move |fragment| fragment.wrap_boundary_candidates())
-            .peekable();
+            .flat_map(move |fragment| fragment.wrap_boundary_candidates());
         iter::from_fn(move || {
             for candidate in candidates.by_ref() {
-                let ix = index;
-                index += candidate.len_utf8();
-                let mut new_prev_c = prev_c;
+                let ix = state.index;
+                state.index += candidate.len_utf8();
+                let mut new_prev_c = state.prev_c;
                 let item_width = match candidate {
                     WrapBoundaryCandidate::Char { character: c } => {
                         if c == '\n' {
@@ -70,20 +78,23 @@ impl LineWrapper {
                         }
 
                         if Self::is_word_char(c) {
-                            if prev_c == ' ' && c != ' ' && first_non_whitespace_ix.is_some() {
-                                last_candidate_ix = ix;
-                                last_candidate_width = width;
+                            if state.prev_c == ' '
+                                && c != ' '
+                                && state.first_non_whitespace_ix.is_some()
+                            {
+                                state.last_candidate_ix = ix;
+                                state.last_candidate_width = state.width;
                             }
                         } else {
                             // CJK may not be space separated, e.g.: `Hello world你好世界`
-                            if c != ' ' && first_non_whitespace_ix.is_some() {
-                                last_candidate_ix = ix;
-                                last_candidate_width = width;
+                            if c != ' ' && state.first_non_whitespace_ix.is_some() {
+                                state.last_candidate_ix = ix;
+                                state.last_candidate_width = state.width;
                             }
                         }
 
-                        if c != ' ' && first_non_whitespace_ix.is_none() {
-                            first_non_whitespace_ix = Some(ix);
+                        if c != ' ' && state.first_non_whitespace_ix.is_none() {
+                            state.first_non_whitespace_ix = Some(ix);
                         }
 
                         new_prev_c = c;
@@ -94,45 +105,50 @@ impl LineWrapper {
                         width: element_width,
                         ..
                     } => {
-                        if prev_c == ' ' && first_non_whitespace_ix.is_some() {
-                            last_candidate_ix = ix;
-                            last_candidate_width = width;
+                        if state.prev_c == ' ' && state.first_non_whitespace_ix.is_some() {
+                            state.last_candidate_ix = ix;
+                            state.last_candidate_width = state.width;
                         }
 
-                        if first_non_whitespace_ix.is_none() {
-                            first_non_whitespace_ix = Some(ix);
+                        if state.first_non_whitespace_ix.is_none() {
+                            state.first_non_whitespace_ix = Some(ix);
                         }
 
                         element_width
                     }
                 };
 
-                width += item_width;
-                if width > wrap_width && ix > last_wrap_ix {
-                    if let (None, Some(first_non_whitespace_ix)) = (indent, first_non_whitespace_ix)
+                state.width += item_width;
+                if state.width > wrap_width && ix > state.last_wrap_ix {
+                    if let (None, Some(first_non_whitespace_ix)) =
+                        (state.indent, state.first_non_whitespace_ix)
                     {
-                        indent = Some(
-                            Self::MAX_INDENT.min((first_non_whitespace_ix - last_wrap_ix) as u32),
+                        state.indent = Some(
+                            Self::MAX_INDENT
+                                .min((first_non_whitespace_ix - state.last_wrap_ix) as u32),
                         );
                     }
 
-                    if last_candidate_ix > 0 {
-                        last_wrap_ix = last_candidate_ix;
-                        width -= last_candidate_width;
-                        last_candidate_ix = 0;
+                    if state.last_candidate_ix > 0 {
+                        state.last_wrap_ix = state.last_candidate_ix;
+                        state.width -= state.last_candidate_width;
+                        state.last_candidate_ix = 0;
                     } else {
-                        last_wrap_ix = ix;
-                        width = item_width;
+                        state.last_wrap_ix = ix;
+                        state.width = item_width;
                     }
 
-                    if let Some(indent) = indent {
-                        width += self.width_for_char(' ') * indent as f32;
+                    if let Some(indent) = state.indent {
+                        state.width += self.width_for_char(' ') * indent as f32;
                     }
 
-                    return Some(Boundary::new(last_wrap_ix, indent.unwrap_or(0)));
+                    return Some((
+                        Boundary::new(state.last_wrap_ix, state.indent.unwrap_or(0)),
+                        state,
+                    ));
                 }
 
-                prev_c = new_prev_c;
+                state.prev_c = new_prev_c;
             }
 
             None
@@ -261,6 +277,58 @@ fn update_runs_after_truncation(result: &str, ellipsis: &str, runs: &mut Vec<Tex
             runs.truncate(run_index + 1);
             break;
         }
+    }
+}
+
+/// Complete wrapping state after an emitted boundary, including consumed lookahead.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LineWrapState {
+    width: Pixels,
+    first_non_whitespace_ix: Option<usize>,
+    indent: Option<u32>,
+    last_candidate_ix: usize,
+    last_candidate_width: Pixels,
+    last_wrap_ix: usize,
+    prev_c: char,
+    index: usize,
+}
+
+impl LineWrapState {
+    /// Byte position after the consumed candidate, which may follow the emitted boundary.
+    pub fn consumed_bytes(&self) -> usize {
+        self.index
+    }
+
+    /// Indent used for subsequent wrapped rows.
+    pub fn continuation_indent(&self) -> u32 {
+        self.indent.unwrap_or(0)
+    }
+
+    /// Byte position of the last emitted boundary.
+    pub fn boundary(&self) -> usize {
+        self.last_wrap_ix
+    }
+
+    /// Map stored positions through an edit, refusing positions within replaced text.
+    pub fn after_edit(mut self, range: std::ops::Range<usize>, inserted: usize) -> Option<Self> {
+        let shift = |index: usize| {
+            if index >= range.end {
+                Some(index - range.len() + inserted)
+            } else if index <= range.start {
+                Some(index)
+            } else {
+                None
+            }
+        };
+        self.index = shift(self.index)?;
+        self.last_wrap_ix = shift(self.last_wrap_ix)?;
+        if self.last_candidate_ix != 0 {
+            self.last_candidate_ix = shift(self.last_candidate_ix)?;
+        }
+        if let Some(index) = self.first_non_whitespace_ix {
+            self.first_non_whitespace_ix = Some(shift(index)?);
+        }
+        Some(self)
     }
 }
 

@@ -62,7 +62,14 @@ pub(super) struct TextWrapper {
     /// The lines by split \n
     pub(super) lines: Vec<LineItem>,
 
+    checkpoints: std::collections::BTreeMap<usize, Vec<WrapCheckpoint>>,
     _initialized: bool,
+}
+
+#[derive(Clone)]
+struct WrapCheckpoint {
+    state: gpui::LineWrapState,
+    rows: usize,
 }
 
 #[allow(unused)]
@@ -76,6 +83,7 @@ impl TextWrapper {
             soft_lines: 0,
             longest_row: LongestRow::default(),
             lines: Vec::new(),
+            checkpoints: std::collections::BTreeMap::new(),
             _initialized: false,
         }
     }
@@ -148,6 +156,7 @@ impl TextWrapper {
             .text_system()
             .line_wrapper(self.font.clone(), self.font_size);
         if self.edit_uniform_word(changed_text, range, new_text, &mut line_wrapper)
+            || self.resume_edit(changed_text, range, new_text, &mut line_wrapper)
             || self.append(changed_text, range, new_text, &mut line_wrapper)
         {
             return;
@@ -157,9 +166,24 @@ impl TextWrapper {
             range,
             new_text,
             &mut |line_str, wrap_width| {
-                line_wrapper
-                    .wrap_line(&[LineFragment::text(line_str)], wrap_width)
-                    .collect()
+                let mut boundaries = Vec::new();
+                let mut checkpoints = Vec::new();
+                let mut next_checkpoint = 1024;
+                for (boundary, state) in line_wrapper.resume_line(
+                    &[LineFragment::text(line_str)],
+                    wrap_width,
+                    gpui::LineWrapState::default(),
+                ) {
+                    boundaries.push(boundary);
+                    if state.consumed_bytes() >= next_checkpoint {
+                        checkpoints.push(WrapCheckpoint {
+                            state,
+                            rows: boundaries.len(),
+                        });
+                        next_checkpoint = state.consumed_bytes() + 1024;
+                    }
+                }
+                (boundaries, checkpoints)
             },
         );
         if self.wrap_width.is_some() {
@@ -182,6 +206,155 @@ impl TextWrapper {
                 }
             }
         }
+    }
+
+    fn resume_edit(
+        &mut self,
+        changed_text: &Rope,
+        range: &Range<usize>,
+        new_text: &Rope,
+        wrapper: &mut gpui::LineWrapper,
+    ) -> bool {
+        let Some(width) = self.wrap_width else {
+            return false;
+        };
+        if !self._initialized || new_text.lines_len() != 1 {
+            return false;
+        }
+        let row = self.text.offset_to_point(range.start).row;
+        if self.text.offset_to_point(range.end).row != row
+            || range.end > self.text.line_end_offset(row)
+        {
+            return false;
+        }
+        let Some(checkpoints) = self
+            .checkpoints
+            .get(&row)
+            .filter(|points| !points.is_empty())
+        else {
+            return false;
+        };
+        let origin = self.text.line_start_offset(row);
+        let local = range.start - origin..range.end - origin;
+        let before =
+            checkpoints.partition_point(|point| point.state.consumed_bytes() <= local.start);
+        let start = before.checked_sub(1).map(|index| &checkpoints[index]);
+        let state = start.map_or_else(gpui::LineWrapState::default, |point| point.state);
+        let rows = start.map_or(0, |point| point.rows);
+        let line = &self.lines[row];
+        let length = line.length - range.len() + new_text.len();
+        let tail = changed_text.slice(origin + state.consumed_bytes()..origin + length);
+        let fragments: Vec<_> = tail.chunks().map(LineFragment::text).collect();
+        let mut wrapped = Vec::new();
+        let mut updated = checkpoints[..before].to_vec();
+        let mut previous = state.boundary();
+        let mut next_checkpoint = updated
+            .last()
+            .map_or(1024, |point| point.state.consumed_bytes() + 1024);
+        let mut old_index =
+            checkpoints.partition_point(|point| point.state.consumed_bytes() < local.end);
+        let mut reused = false;
+        let mut indent = start.map_or(0, |point| point.state.continuation_indent());
+        for (boundary, state) in wrapper.resume_line(&fragments, width, state) {
+            indent = boundary.next_indent;
+            wrapped.push(previous..boundary.ix);
+            previous = boundary.ix;
+            if state.consumed_bytes() >= local.start + new_text.len() {
+                while old_index < checkpoints.len() {
+                    let point = &checkpoints[old_index];
+                    let shifted = point.state.after_edit(local.clone(), new_text.len());
+                    let Some(shifted) = shifted else {
+                        old_index += 1;
+                        continue;
+                    };
+                    if shifted.consumed_bytes() < state.consumed_bytes() {
+                        old_index += 1;
+                        continue;
+                    }
+                    if shifted == state && point.state.boundary() >= local.end {
+                        let shift = |offset: usize| offset - range.len() + new_text.len();
+                        let row_delta = (rows + wrapped.len()) as isize - point.rows as isize;
+                        wrapped.extend(
+                            line.wrapped_lines[point.rows..]
+                                .iter()
+                                .map(|range| shift(range.start)..shift(range.end)),
+                        );
+                        for point in &checkpoints[old_index..] {
+                            if let Some(state) =
+                                point.state.after_edit(local.clone(), new_text.len())
+                            {
+                                updated.push(WrapCheckpoint {
+                                    state,
+                                    rows: point.rows.checked_add_signed(row_delta).unwrap(),
+                                });
+                            }
+                        }
+                        reused = true;
+                    }
+                    break;
+                }
+            }
+            if reused {
+                break;
+            }
+            if state.consumed_bytes() >= next_checkpoint {
+                updated.push(WrapCheckpoint {
+                    state,
+                    rows: rows + wrapped.len(),
+                });
+                next_checkpoint = state.consumed_bytes() + 1024;
+            }
+        }
+        if !reused && (previous < length || (rows == 0 && wrapped.is_empty())) {
+            wrapped.push(previous..length);
+        }
+        let line = &mut self.lines[row];
+        self.soft_lines = self.soft_lines - line.lines_len() + rows + wrapped.len();
+        line.wrapped_lines.truncate(rows);
+        line.wrapped_lines.extend(wrapped);
+        line.length = length;
+        line.word_columns = 0;
+        line.word_width = px(0.);
+        line.indent = (changed_text
+            .slice(origin..origin + length)
+            .bytes()
+            .take_while(|&byte| byte == b' ')
+            .count()
+            < line.wrapped_lines.first().map_or(0, |range| range.end))
+        .then_some(indent);
+        if length >= 1024 && line.wrapped_lines.len() > 1 && changed_text.byte(origin).is_ascii() {
+            if let Some(advance) =
+                wrapper.uniform_word_width(&changed_text.slice(origin..origin + length).to_string())
+            {
+                line.word_width = advance;
+                line.word_columns = line.wrapped_lines[0].len() as u32;
+            }
+        }
+        let mut next_checkpoint = 1024;
+        updated.retain(|point| {
+            if point.state.consumed_bytes() < next_checkpoint {
+                return false;
+            }
+            next_checkpoint = point.state.consumed_bytes() + 1024;
+            true
+        });
+        if updated.is_empty() {
+            self.checkpoints.remove(&row);
+        } else {
+            self.checkpoints.insert(row, updated);
+        }
+        self.longest_row = self
+            .lines
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, line)| line.length)
+            .map(|(row, line)| LongestRow {
+                row,
+                len: line.length,
+            })
+            .unwrap_or_default();
+        self.text = changed_text.clone();
+        true
     }
 
     fn edit_uniform_word(
@@ -217,6 +390,7 @@ impl TextWrapper {
         for (row, range) in line.wrapped_lines.iter_mut().enumerate() {
             *range = row * columns..((row + 1) * columns).min(length);
         }
+        self.checkpoints.remove(&row);
         line.length = length;
         if length == 0 {
             line.indent = None;
@@ -265,6 +439,7 @@ impl TextWrapper {
         let Some(continuation_indent) = line.indent else {
             return false;
         };
+        self.checkpoints.remove(&row);
         let prefix = line.wrapped_lines.len().saturating_sub(2);
         let start = line.wrapped_lines[prefix].start;
         let classify = line.length < 1024;
@@ -316,7 +491,7 @@ impl TextWrapper {
         new_text: &Rope,
         wrap_line: &mut F,
     ) where
-        F: FnMut(&str, Pixels) -> Vec<gpui::Boundary>,
+        F: FnMut(&str, Pixels) -> (Vec<gpui::Boundary>, Vec<WrapCheckpoint>),
     {
         // Remove the old changed lines.
         let start_row = self.text.offset_to_point(range.start).row;
@@ -342,6 +517,7 @@ impl TextWrapper {
         let new_range = new_start_offset..new_end_offset;
 
         let mut new_lines = vec![];
+        let mut new_checkpoints = std::collections::BTreeMap::new();
         let wrap_width = self.wrap_width;
 
         // line not contains `\n`.
@@ -362,7 +538,11 @@ impl TextWrapper {
             // If wrap_width is Pixels::MAX, skip wrapping to disable word wrap
             if let Some(wrap_width) = wrap_width {
                 // Here only have wrapped line, if there is no wrap meet, the `line_wraps` result will empty.
-                for boundary in wrap_line(&line_str, wrap_width) {
+                let (boundaries, checkpoints) = wrap_line(&line_str, wrap_width);
+                if !checkpoints.is_empty() {
+                    new_checkpoints.insert(new_start_row + ix, checkpoints);
+                }
+                for boundary in boundaries {
                     indent = boundary.next_indent;
                     wrapped_lines.push(prev_boundary_ix..boundary.ix);
                     prev_boundary_ix = boundary.ix;
@@ -387,7 +567,17 @@ impl TextWrapper {
 
         if self.lines.len() == 0 {
             self.lines = new_lines;
+            self.checkpoints = new_checkpoints;
         } else {
+            self.checkpoints.retain(|row, _| !rows_range.contains(row));
+            let suffix = self.checkpoints.split_off(&(end_row + 1));
+            let delta = new_lines.len() as isize - rows_range.clone().count() as isize;
+            self.checkpoints.extend(
+                suffix
+                    .into_iter()
+                    .map(|(row, points)| (row.checked_add_signed(delta).unwrap(), points)),
+            );
+            self.checkpoints.extend(new_checkpoints);
             self.lines.splice(rows_range, new_lines);
         }
 
@@ -422,14 +612,15 @@ impl TextWrapper {
             .sum::<usize>();
 
         let local_offset = offset.saturating_sub(start);
-        for (ix, range) in line.wrapped_lines.iter().enumerate() {
-            if range.contains(&local_offset) {
-                return DisplayPoint::new(
-                    wrapped_row + ix,
-                    ix,
-                    local_offset.saturating_sub(range.start),
-                );
-            }
+        let ix = line
+            .wrapped_lines
+            .partition_point(|range| range.end <= local_offset);
+        if let Some(range) = line
+            .wrapped_lines
+            .get(ix)
+            .filter(|range| range.contains(&local_offset))
+        {
+            return DisplayPoint::new(wrapped_row + ix, ix, local_offset - range.start);
         }
 
         // Otherwise return the eof of the line.
@@ -741,6 +932,210 @@ mod tests {
     }
 
     #[gpui::test]
+    fn original_gpui_wrapping_contract(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+        let _entity = cx.new(|cx: &mut gpui::Context<()>| {
+            let mut wrapper = cx
+                .text_system()
+                .line_wrapper(gpui::font(".ZedMono"), px(16.));
+
+            assert_eq!(
+                wrapper
+                    .wrap_line(&[LineFragment::text("aa bbb cccc ddddd eeee")], px(72.))
+                    .map(|boundary| (boundary.ix, boundary.next_indent))
+                    .collect::<Vec<_>>(),
+                &[(7, 0), (12, 0), (18, 0)],
+            );
+            assert_eq!(
+                wrapper
+                    .wrap_line(&[LineFragment::text("aaa aaaaaaaaaaaaaaaaaa")], px(72.0))
+                    .map(|boundary| (boundary.ix, boundary.next_indent))
+                    .collect::<Vec<_>>(),
+                &[(4, 0), (11, 0), (18, 0)],
+            );
+            assert_eq!(
+                wrapper
+                    .wrap_line(&[LineFragment::text("     aaaaaaa")], px(72.))
+                    .map(|boundary| (boundary.ix, boundary.next_indent))
+                    .collect::<Vec<_>>(),
+                &[(7, 5), (9, 5), (11, 5),]
+            );
+            assert_eq!(
+                wrapper
+                    .wrap_line(
+                        &[LineFragment::text("                            ")],
+                        px(72.)
+                    )
+                    .map(|boundary| (boundary.ix, boundary.next_indent))
+                    .collect::<Vec<_>>(),
+                &[(7, 0), (14, 0), (21, 0)]
+            );
+            assert_eq!(
+                wrapper
+                    .wrap_line(&[LineFragment::text("          aaaaaaaaaaaaaa")], px(72.))
+                    .map(|boundary| (boundary.ix, boundary.next_indent))
+                    .collect::<Vec<_>>(),
+                &[(7, 0), (14, 3), (18, 3), (22, 3),]
+            );
+
+            assert_eq!(
+                wrapper
+                    .wrap_line(
+                        &[
+                            LineFragment::text("aa bbb "),
+                            LineFragment::text("cccc ddddd eeee")
+                        ],
+                        px(72.)
+                    )
+                    .map(|boundary| (boundary.ix, boundary.next_indent))
+                    .collect::<Vec<_>>(),
+                &[(7, 0), (12, 0), (18, 0)],
+            );
+
+            assert_eq!(
+                wrapper
+                    .wrap_line(
+                        &[
+                            LineFragment::text("aa "),
+                            LineFragment::element(px(20.), 1),
+                            LineFragment::text(" bbb "),
+                            LineFragment::element(px(30.), 1),
+                            LineFragment::text(" cccc")
+                        ],
+                        px(72.)
+                    )
+                    .map(|boundary| (boundary.ix, boundary.next_indent))
+                    .collect::<Vec<_>>(),
+                &[(5, 0), (9, 0), (11, 0)],
+            );
+
+            assert_eq!(
+                wrapper
+                    .wrap_line(
+                        &[
+                            LineFragment::element(px(50.), 1),
+                            LineFragment::text(" aaaa bbbb cccc dddd")
+                        ],
+                        px(72.)
+                    )
+                    .map(|boundary| (boundary.ix, boundary.next_indent))
+                    .collect::<Vec<_>>(),
+                &[(2, 0), (7, 0), (12, 0), (17, 0)],
+            );
+
+            assert_eq!(
+                wrapper
+                    .wrap_line(
+                        &[
+                            LineFragment::text("short text "),
+                            LineFragment::element(px(100.), 1),
+                            LineFragment::text(" more text")
+                        ],
+                        px(72.)
+                    )
+                    .map(|boundary| (boundary.ix, boundary.next_indent))
+                    .collect::<Vec<_>>(),
+                &[(6, 0), (11, 0), (12, 0), (18, 0)],
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn exact_states_resume_across_consumed_lookahead(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+        let _entity = cx.new(|cx: &mut gpui::Context<()>| {
+            for family in [".ZedMono", "Arial"] {
+                for width in [25., 75., 120., 311.] {
+                    let font = gpui::font(family);
+                    let mut wrapper = cx.text_system().line_wrapper(font, px(16.));
+                    for text in [
+                        "a b longer_word.with-punctuation 中文🙂é ".repeat(80),
+                        format!("{}firstword {}", " ".repeat(400), "abcdef ".repeat(200)),
+                        "אבג 👩‍👩‍👧‍👦 日本語\t café\r ".repeat(80),
+                    ] {
+                        let fragments = [LineFragment::text(&text)];
+                        let complete: Vec<_> = wrapper
+                            .resume_line(&fragments, px(width), gpui::LineWrapState::default())
+                            .collect();
+                        for (index, (_, state)) in complete.iter().enumerate() {
+                            let tail = &text[state.consumed_bytes()..];
+                            let fragments: Vec<_> = tail
+                                .char_indices()
+                                .map(|(byte, character)| {
+                                    LineFragment::text(&tail[byte..byte + character.len_utf8()])
+                                })
+                                .collect();
+                            let resumed: Vec<_> =
+                                wrapper.resume_line(&fragments, px(width), *state).collect();
+                            assert_eq!(resumed, complete[index + 1..], "{family} {width} {index}");
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn checkpoint_edits_preserve_all_rows_and_positions(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+        let _entity = cx.new(|cx: &mut gpui::Context<()>| {
+            for family in [".ZedMono", "Arial"] {
+                for width in [75., 311.] {
+                    let font = gpui::font(family);
+                    let mut text = Rope::from(
+                        format!(
+                            "{}{}",
+                            " ".repeat(350),
+                            "a café 日本語 👩‍👩‍👧‍👦 é\t words ".repeat(500)
+                        )
+                        .as_str(),
+                    );
+                    let mut incremental = TextWrapper::new(font.clone(), px(16.), Some(px(width)));
+                    incremental.prepare(&text, font.clone(), px(16.), Some(px(width)), cx);
+                    let mut random = 7331u64;
+                    for step in 0..200 {
+                        random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+                        let start = text
+                            .clip_offset(random as usize % (text.len() + 1), sum_tree::Bias::Left);
+                        let end = text.clip_offset(
+                            (start + (random >> 32) as usize % 103).min(text.len()),
+                            sum_tree::Bias::Right,
+                        );
+                        let inserted =
+                            ["🙂x", "", " ", "é", "日本語 ", "long_word.with-punctuation"]
+                                [step % 6];
+                        text.replace(start..end, inserted);
+                        let mut wrapper = cx.text_system().line_wrapper(font.clone(), px(16.));
+                        assert!(incremental.resume_edit(
+                            &text,
+                            &(start..end),
+                            &Rope::from(inserted),
+                            &mut wrapper
+                        ));
+                        let mut complete = TextWrapper::new(font.clone(), px(16.), Some(px(width)));
+                        complete.prepare(&text, font.clone(), px(16.), Some(px(width)), cx);
+                        assert_eq!(incremental.lines, complete.lines, "{family} {width} {step}");
+                        assert_eq!(incremental.len(), complete.len());
+                        for range in &incremental.lines[0].wrapped_lines {
+                            for offset in [range.start, range.end] {
+                                assert_eq!(
+                                    incremental.offset_to_display_point(offset),
+                                    complete.offset_to_display_point(offset)
+                                );
+                            }
+                        }
+                        let points = &incremental.checkpoints[&0];
+                        assert!(points.len() <= text.len() / 1024 + 2);
+                        assert!(points.windows(2).all(|pair| pair[0].state.consumed_bytes()
+                            < pair[1].state.consumed_bytes()
+                            && pair[0].rows < pair[1].rows));
+                    }
+                }
+            }
+        });
+    }
+
+    #[gpui::test]
     fn repeated_unicode_middle_edits_match_full_layout(cx: &mut gpui::TestAppContext) {
         use gpui::AppContext;
         let _entity = cx.new(|cx: &mut gpui::Context<()>| {
@@ -884,8 +1279,11 @@ mod tests {
             "Hello, 世界!\r\nThis is second line.\nThis is third line.\n这里是第 4 行。",
         );
 
-        fn fake_wrap_line(_line: &str, _wrap_width: Pixels) -> Vec<Boundary> {
-            vec![]
+        fn fake_wrap_line(
+            _line: &str,
+            _wrap_width: Pixels,
+        ) -> (Vec<Boundary>, Vec<WrapCheckpoint>) {
+            (vec![], vec![])
         }
 
         #[track_caller]
