@@ -526,6 +526,35 @@ impl Shell {
         }
         this
     }
+    fn report_startup_ready(&mut self, source_visible: bool, window: &mut Window, cx: &App) {
+        if !self.ready
+            && self.listing_done
+            && self.opening.is_empty()
+            && self.startup_recovery.is_none()
+            && (!source_visible
+                || !self.documents.iter().any(|doc| {
+                    Some(doc.id) == self.active && doc.input.read(cx).initial_layout_pending()
+                }))
+        {
+            self.ready = true;
+            let failed = self.startup_failed;
+            let timing = std::env::var_os("GLIMPSE_TIMING").is_some();
+            window.on_next_frame(move |window, _| {
+                if timing && !failed {
+                    eprintln!("GLIMPSE_EDITABLE_FRAME");
+                }
+                window.on_next_frame(move |_, _| {
+                    let _ = lifecycle::notify(if failed { b'2' } else { b'0' });
+                    if failed {
+                        eprintln!("GLIMPSE_STARTUP_FAILED");
+                    } else {
+                        eprintln!("GLIMPSE_READY");
+                    }
+                })
+            });
+        }
+    }
+
     fn open_preferences(
         &mut self,
         settings: storage::Settings,
@@ -1016,8 +1045,11 @@ impl Shell {
             input.set_auto_indent(self.settings.auto_indent, cx);
             input
         });
-        let subscription = cx.subscribe_in(&input, window, move |this, _, event, _, cx| {
+        let subscription = cx.subscribe_in(&input, window, move |this, _, event, window, cx| {
             if matches!(event, InputEvent::InitialLayoutReady) {
+                let source_visible =
+                    !this.reading && (!this.narrow(window) || !this.navigation_only);
+                this.report_startup_ready(source_visible, window, cx);
                 cx.notify();
                 return;
             }
@@ -3067,33 +3099,7 @@ impl Render for Shell {
         }
         let narrow = self.narrow(window);
         let source_visible = !self.reading && (!narrow || !self.navigation_only);
-        if !self.ready
-            && self.listing_done
-            && self.opening.is_empty()
-            && self.startup_recovery.is_none()
-            && (!source_visible
-                || !self.documents.iter().any(|doc| {
-                    Some(doc.id) == self.active && doc.input.read(cx).initial_layout_pending()
-                }))
-        {
-            self.ready = true;
-            let failed = self.startup_failed;
-            let timing = std::env::var_os("GLIMPSE_TIMING").is_some();
-            window.on_next_frame(move |window, _| {
-                if timing && !failed {
-                    eprintln!("GLIMPSE_EDITABLE_FRAME");
-                }
-                window.on_next_frame(move |_, _| {
-                    let _ = lifecycle::notify(if failed { b'2' } else { b'0' });
-                    if failed {
-                        eprintln!("GLIMPSE_STARTUP_FAILED");
-                    } else {
-                        eprintln!("GLIMPSE_READY");
-                    }
-                })
-            });
-            window.request_animation_frame();
-        }
+        self.report_startup_ready(source_visible, window, cx);
         if !self.listing_done && self.listing_waiter.is_none() {
             let id = self.listing_id;
             self.listing_waiter = Some(cx.spawn(async move |this, cx| {

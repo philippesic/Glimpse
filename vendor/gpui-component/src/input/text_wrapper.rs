@@ -2,7 +2,8 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use gpui::{
-    App, Font, LineFragment, Pixels, Point, ShapedLine, Size, TextSystem, Window, point, px, size,
+    App, BackgroundExecutor, Font, LineFragment, Pixels, Point, ShapedLine, Size, TextSystem,
+    Window, point, px, size,
 };
 use ropey::{LineType, Rope, RopeSlice};
 use smallvec::SmallVec;
@@ -161,6 +162,76 @@ impl TextWrapper {
         let mut layout = Self::new(config.font, config.font_size, config.wrap_width);
         layout._initialized = true;
         layout.prepare_replacement(text, text_system);
+        layout
+    }
+
+    pub(super) async fn prepare_initial_on_worker(
+        config: LayoutConfig,
+        text: Rope,
+        text_system: Arc<TextSystem>,
+        executor: BackgroundExecutor,
+    ) -> Self {
+        let rows = text.lines_len();
+        let workers = executor.num_cpus().min(4);
+        if workers < 2
+            || text.len() < 2 * 1024 * 1024
+            || rows > 8 * 1024 * 1024 / std::mem::size_of::<LineItem>()
+        {
+            return Self::prepare_initial(config, &text, &text_system);
+        }
+
+        let mut boundaries = vec![0];
+        for part in 1..workers {
+            let row = text.byte_to_line_idx(text.len() / workers * part, LineType::LF);
+            if boundaries.last() != Some(&row) {
+                boundaries.push(row);
+            }
+        }
+        if boundaries.len() == 1 {
+            return Self::prepare_initial(config, &text, &text_system);
+        }
+        boundaries.push(rows);
+
+        let tasks: Vec<_> = boundaries
+            .windows(2)
+            .map(|range| {
+                let (start, end) = (range[0], range[1]);
+                let slice = text.slice(text.line_start_offset(start)..text.line_start_offset(end));
+                let part = ropey::extra::esoterica::disconnect_slice(slice)
+                    .unwrap_or_else(|| Rope::from(slice));
+                let config = config.clone();
+                let text_system = text_system.clone();
+                executor.spawn(async move {
+                    let mut layout = Self::prepare_initial(config, &part, &text_system);
+                    if end < rows {
+                        layout.lines.pop();
+                        layout.soft_lines -= 1;
+                    }
+                    (start, layout)
+                })
+            })
+            .collect();
+
+        let mut layout = Self::new(config.font, config.font_size, config.wrap_width);
+        layout._initialized = true;
+        layout.text = text;
+        layout.lines.reserve_exact(rows);
+        for task in tasks {
+            let (start, mut part) = task.await;
+            if part.longest_row.len > layout.longest_row.len {
+                layout.longest_row = LongestRow {
+                    row: start + part.longest_row.row,
+                    len: part.longest_row.len,
+                };
+            }
+            layout.soft_lines += part.soft_lines;
+            layout.lines.append(&mut part.lines);
+            layout.checkpoints.extend(
+                part.checkpoints
+                    .into_iter()
+                    .map(|(row, points)| (row + start, points)),
+            );
+        }
         layout
     }
 
@@ -916,6 +987,53 @@ impl LineLayout {
 mod tests {
     use super::*;
     use gpui::{Boundary, FontFeatures, FontStyle, FontWeight, px};
+
+    #[gpui::test]
+    fn partitioned_initial_layout_matches_full_layout(cx: &mut gpui::TestAppContext) {
+        let (system, executor) =
+            cx.update(|cx| (cx.text_system().clone(), cx.background_executor().clone()));
+        let mut text = String::new();
+        for index in 0..22_000 {
+            use std::fmt::Write;
+            let length = if index % 1_013 == 0 {
+                410
+            } else {
+                12 + index % 4
+            };
+            write!(text, "{index:05} 日本語 é {}\r\n", "a café ".repeat(length)).unwrap();
+            if index % 13 == 0 {
+                text.push('\n');
+            }
+        }
+        text.push_str("Unterminated final line");
+        let text = Rope::from(text.as_str());
+        let config = LayoutConfig {
+            font: gpui::font(".ZedMono"),
+            font_size: px(16.),
+            wrap_width: Some(px(319.)),
+        };
+        let exact = TextWrapper::prepare_initial(config.clone(), &text, &system);
+        let actual = executor.block_test(TextWrapper::prepare_initial_on_worker(
+            config,
+            text,
+            system,
+            executor.clone(),
+        ));
+        assert_eq!(actual.lines, exact.lines);
+        assert_eq!(actual.len(), exact.len());
+        assert_eq!(actual.longest_row.row, exact.longest_row.row);
+        assert_eq!(actual.longest_row.len, exact.longest_row.len);
+        let checkpoint_states = |layout: &TextWrapper| {
+            layout
+                .checkpoints
+                .iter()
+                .flat_map(|(row, points)| {
+                    points.iter().map(|point| (*row, point.rows, point.state))
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(checkpoint_states(&actual), checkpoint_states(&exact));
+    }
 
     #[gpui::test]
     fn wrapping_rope_chunks_matches_contiguous_text(cx: &mut gpui::TestAppContext) {

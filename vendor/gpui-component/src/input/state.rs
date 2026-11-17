@@ -436,12 +436,14 @@ impl InputState {
         if self.initial_layout_task.is_none() {
             let text = self.text.clone();
             let text_system = cx.text_system().clone();
+            let executor = cx.background_executor().clone();
             let task = cx.background_spawn({
                 let text = text.clone();
                 let config = config.clone();
                 async move {
                     let _wrap = gpui::work_trace::Span::new("editor_wrap_worker");
-                    TextWrapper::prepare_initial(config, &text, &text_system)
+                    TextWrapper::prepare_initial_on_worker(config, text, text_system, executor)
+                        .await
                 }
             });
             self.initial_layout_task = Some(cx.spawn(async move |this, cx| {
