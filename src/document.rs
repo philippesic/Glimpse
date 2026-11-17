@@ -118,11 +118,8 @@ fn identity(meta: &Metadata) -> (u64, u64) {
     (meta.dev(), meta.ino())
 }
 
-fn read_regular(path: &Path) -> Result<(Vec<u8>, Metadata)> {
-    read_cancellable(path, &|| false)
-}
-fn read_cancellable(path: &Path, cancelled: &dyn Fn() -> bool) -> Result<(Vec<u8>, Metadata)> {
-    let mut file = OpenOptions::new()
+fn open_regular(path: &Path) -> Result<(fs::File, Metadata)> {
+    let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
         .open(path)
@@ -134,25 +131,52 @@ fn read_cancellable(path: &Path, cancelled: &dyn Fn() -> bool) -> Result<(Vec<u8
     if meta.len() > MAX_BYTES {
         return Err("Files larger than 10 MiB are not supported yet.".into());
     }
-    let mut bytes = Vec::with_capacity(meta.len() as usize + 1);
-    let mut chunk = [0u8; 65536];
+    Ok((file, meta))
+}
+
+fn read_chunks(
+    mut file: fs::File,
+    cancelled: &dyn Fn() -> bool,
+    mut consume: impl FnMut(usize, &[u8]),
+) -> Result<usize> {
+    let mut length = 0;
+    let mut chunk = [0u8; 64 * 1024];
     loop {
         if cancelled() {
             return Err("Cancelled".into());
         }
         let read = file.read(&mut chunk).map_err(|e| e.to_string())?;
         if read == 0 {
-            break;
+            return Ok(length);
         }
-        bytes.extend_from_slice(&chunk[..read]);
-        if bytes.len() as u64 > MAX_BYTES {
-            break;
+        if (length + read) as u64 > MAX_BYTES {
+            return Err("File grew beyond 10 MiB while reading.".into());
         }
+        consume(length, &chunk[..read]);
+        length += read;
     }
-    if bytes.len() as u64 > MAX_BYTES {
-        return Err("File grew beyond 10 MiB while reading.".into());
-    }
+}
+
+fn read_cancellable(path: &Path, cancelled: &dyn Fn() -> bool) -> Result<(Vec<u8>, Metadata)> {
+    let (file, meta) = open_regular(path)?;
+    let mut bytes = Vec::with_capacity(meta.len() as usize + 1);
+    read_chunks(file, cancelled, |_, chunk| bytes.extend_from_slice(chunk))?;
     Ok((bytes, meta))
+}
+
+fn compare_regular(path: &Path, expected: &FileBytes) -> Result<(bool, Metadata)> {
+    let (file, meta) = open_regular(path)?;
+    let (header, body) = expected.parts();
+    let mut equal = true;
+    let length = read_chunks(file, &|| false, |offset, chunk| {
+        let prefix = header.get(offset..).unwrap_or_default();
+        let prefix_len = prefix.len().min(chunk.len());
+        let rest = &chunk[prefix_len..];
+        let start = offset.saturating_sub(header.len());
+        equal &= prefix[..prefix_len] == chunk[..prefix_len]
+            && body.get(start..start + rest.len()) == Some(rest);
+    })?;
+    Ok((equal && length == expected.len(), meta))
 }
 
 impl DiskFile {
@@ -275,8 +299,8 @@ impl DiskFile {
         if fs::canonicalize(&path).map_err(|_| message.clone())? != target {
             return Err(message);
         }
-        let (observed, meta) = read_regular(&target).map_err(|_| message.clone())?;
-        if identity(&meta) != expected_identity || !bytes.matches(&observed) {
+        let (equal, meta) = compare_regular(&target, &bytes).map_err(|_| message.clone())?;
+        if identity(&meta) != expected_identity || !equal {
             return Err(message);
         }
         Ok(Self {
@@ -297,8 +321,8 @@ impl DiskFile {
                 ));
             }
         }
-        let (bytes, _) = read_regular(&self.target)?;
-        if !self.bytes.matches(&bytes) {
+        let (equal, _) = compare_regular(&self.target, &self.bytes)?;
+        if !equal {
             return Err(
                 "Requested destination bytes changed after the last observed version".into(),
             );
@@ -309,8 +333,8 @@ impl DiskFile {
         if fs::canonicalize(&self.path).map_err(|e| e.to_string())? != self.target {
             return Err("The file's destination changed. Your text is still in this tab.".into());
         }
-        let (bytes, meta) = read_regular(&self.target)?;
-        if identity(&meta) != self.identity || !self.bytes.matches(&bytes) {
+        let (equal, meta) = compare_regular(&self.target, &self.bytes)?;
+        if identity(&meta) != self.identity || !equal {
             return Err(
                 "The file changed on disk. Saving was stopped; your text is still in this tab."
                     .into(),
@@ -503,6 +527,25 @@ mod tests {
         fs::remove_file(&path).unwrap();
         fs::write(&path, b"base").unwrap();
         assert!(disk.save("mine").is_err());
+    }
+
+    #[test]
+    fn streamed_comparison_checks_bom_and_later_file_chunks() {
+        let original = "\u{feff}".to_owned() + &"abcé\r\n".repeat(30_000);
+        let (_dir, path) = fixture(original.as_bytes());
+        let (disk, source) = DiskFile::open(path.clone()).unwrap();
+        assert!(disk.save(&source).is_ok());
+        let mut external = original.into_bytes();
+        let changed_byte = external
+            .iter_mut()
+            .skip(64 * 1024)
+            .find(|byte| **byte == b'a')
+            .unwrap();
+        *changed_byte = b'z';
+        fs::write(&path, &external).unwrap();
+        assert!(disk.revalidate_paths(std::slice::from_ref(&path)).is_err());
+        assert!(disk.save("unsaved").is_err());
+        assert_eq!(fs::read(&path).unwrap(), external);
     }
     #[test]
     fn symlink_is_preserved_and_retargeting_is_rejected() {
