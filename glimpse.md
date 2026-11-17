@@ -292,9 +292,9 @@ Extensions begin with stable internal commands and declarative preferences, not 
 
 ### Validate the intended experience
 
-Use the owner's actual manual-editing work to evaluate the design. Existing tools provide interaction references and performance baselines; comparison guides implementation rather than deciding whether Glimpse is original enough to build. Record concrete friction, setup effort, visual preferences, and desired customization. Compare a navigation prototype only on interactions it implements; compare editing and recovery when the vertical slice exists. Performance comparisons use equivalent warm/cold conditions and recorded versions/configurations.
+Use the owner's actual manual-editing work to evaluate the design. Judge core workflows against platform interface guidelines, WCAG 2.2 contrast and keyboard access, consistent spacing and typography, visible focus and states, readable text, and reachable controls at supported window sizes. Record concrete friction, context loss and recovery steps. Existing applications are optional interaction references; a comparison is not a release requirement. Any performance comparison must use equivalent cache conditions and recorded versions/configurations.
 
-Use the same tasks and files:
+Use repeatable tasks and files:
 
 1. Open a pasted absolute path outside the current repository; edit and save one paragraph.
 2. Inspect several similarly named files without accumulating unwanted tabs or losing the starting location.
@@ -312,7 +312,7 @@ Reuse maintained libraries or components when they meet the design and reduce ma
 
 The current user aspirations are app opening below 100 ms, folder and file opening within 100 ms, total RAM below 100 MB and idle CPU at most 0.1% of one core. During active use, CPU work stays proportional to the interaction and returns to idle promptly; report active and idle CPU separately. These supersede the earlier launch/RAM aspirations for current acceptance; the baseline table below remains historical engineering context. Report actual failures, cache conditions and instrumentation limits.
 
-Measure optimized release builds on a named reference machine, OS, display refresh rate, and storage configuration. Establish the initial reference on an ordinary Apple Silicon laptop with local SSD storage; record the actual model and memory before collecting results. Repeat on representative Windows and Linux machines before claiming support. Report p50/p95/p99 where meaningful, sample counts, and cache state.
+Measure optimized release builds on a named reference machine, OS, display refresh rate, memory and storage configuration. Linux is the current qualification target; macOS and Windows require their own build and desktop evidence before claiming support. Keep shared behavior and design platform-neutral. Report p50/p95/p99 where meaningful, sample counts, cache state and instrumentation limits.
 
 | Workload | Initial target |
 | --- | --- |
