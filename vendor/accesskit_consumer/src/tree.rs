@@ -126,7 +126,10 @@ impl TreeState {
         let map_id = |id: NodeId| FullNodeId::new(id, tree_index);
 
         let mut unchanged_ids = HashSet::new();
-        if update.tree.is_none()
+        if update
+            .tree
+            .as_ref()
+            .is_none_or(|info| update.tree_id == TreeId::ROOT && *info == self.info)
             && update.nodes.iter().all(|(id, _)| unchanged_ids.insert(*id))
             && self.subtrees.contains_key(&update.tree_id)
             && update.nodes.iter().all(|(id, data)| {
@@ -3248,7 +3251,7 @@ mod tests {
         assert_eq!(None, state.toolkit_version());
     }
     #[test]
-    fn property_updates_match_the_full_topology_path() {
+    fn property_updates_match_forced_metadata_refresh() {
         let children: Vec<_> = (1..=64).map(NodeId).collect();
         let mut root = Node::new(Role::Window);
         root.set_children(children.clone());
@@ -3275,14 +3278,16 @@ mod tests {
             }
             let change = TreeUpdate {
                 nodes: vec![(id, node)],
-                tree: None,
+                tree: Some(TreeInfo::new(NodeId(0))),
                 tree_id: TreeId::ROOT,
                 focus: id,
             };
             sparse.update_and_process_changes(change.clone(), &mut NoOpHandler);
+            let mut changed_metadata = TreeInfo::new(NodeId(0));
+            changed_metadata.toolkit_version = Some(alloc::format!("{step}"));
             full.update_and_process_changes(
                 TreeUpdate {
-                    tree: Some(TreeInfo::new(NodeId(0))),
+                    tree: Some(changed_metadata),
                     ..change
                 },
                 &mut NoOpHandler,
