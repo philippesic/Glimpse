@@ -69,11 +69,12 @@ pub fn prepare(source: String, path: &Path) -> Prepared {
             notes.push("Additional images omitted: at most 32 local images per document.".into());
             break;
         }
+        let resource: &str = &dest_url;
         let result = match resolve_link(path, &dest_url) {
             Link::Local(path) => raster(&path),
             _ => {
                 notes.push(format!(
-                    "Remote or unsupported image omitted: {dest_url}; no network request was made."
+                    "Remote or unsupported image omitted: {resource:?}; no network request was made."
                 ));
                 continue;
             }
@@ -84,9 +85,9 @@ pub fn prepare(source: String, path: &Path) -> Prepared {
                 images.insert(dest_url.to_string(), image);
             }
             Ok(_) => notes.push(format!(
-                "Local image omitted: {dest_url}. The document image cache is limited to 32 MiB."
+                "Local image omitted: {resource:?}. The document image cache is limited to 32 MiB."
             )),
-            Err(error) => notes.push(format!("Local image unavailable: {dest_url}. {error}")),
+            Err(error) => notes.push(format!("Local image unavailable: {resource:?}. {error}")),
         }
     }
     notes.sort();
