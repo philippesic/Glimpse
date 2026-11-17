@@ -5,16 +5,111 @@ use std::{
     io::{Read, Write},
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 pub const MAX_BYTES: u64 = 10 * 1024 * 1024;
+pub(crate) const BOM: &[u8] = b"\xef\xbb\xbf";
 type Result<T> = std::result::Result<T, String>;
+
+#[derive(Clone, Debug)]
+pub enum FileBytes {
+    Raw(Arc<[u8]>),
+    WithBom(Arc<str>),
+}
+
+impl FileBytes {
+    fn from_text(text: Arc<str>, bom: bool) -> Self {
+        if bom {
+            Self::WithBom(text)
+        } else {
+            Self::Raw(text.into())
+        }
+    }
+
+    pub fn parts(&self) -> (&[u8], &[u8]) {
+        match self {
+            Self::Raw(bytes) => (&[], bytes),
+            Self::WithBom(text) => (BOM, text.as_bytes()),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        let (prefix, bytes) = self.parts();
+        prefix.len() + bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Self::Raw(bytes) if bytes.is_empty())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn as_bytes(&self) -> std::borrow::Cow<'_, [u8]> {
+        match self {
+            Self::Raw(bytes) => std::borrow::Cow::Borrowed(bytes),
+            Self::WithBom(text) => std::borrow::Cow::Owned([BOM, text.as_bytes()].concat()),
+        }
+    }
+
+    pub(crate) fn has_bom(&self) -> bool {
+        match self {
+            Self::Raw(bytes) => bytes.starts_with(BOM),
+            Self::WithBom(_) => true,
+        }
+    }
+
+    pub(crate) fn content_bytes(&self, bom: bool) -> &[u8] {
+        match self {
+            Self::Raw(bytes) if bom => bytes.strip_prefix(BOM).unwrap_or(bytes),
+            Self::Raw(bytes) => bytes,
+            Self::WithBom(text) => text.as_bytes(),
+        }
+    }
+
+    fn matches(&self, other: &[u8]) -> bool {
+        let (prefix, body) = self.parts();
+        other.strip_prefix(prefix) == Some(body)
+    }
+
+    fn write_to(&self, mut writer: impl Write) -> std::io::Result<()> {
+        let (prefix, body) = self.parts();
+        writer.write_all(prefix)?;
+        writer.write_all(body)
+    }
+}
+
+impl Default for FileBytes {
+    fn default() -> Self {
+        Self::Raw(Arc::default())
+    }
+}
+
+impl From<Vec<u8>> for FileBytes {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::Raw(bytes.into())
+    }
+}
+
+impl From<&[u8]> for FileBytes {
+    fn from(bytes: &[u8]) -> Self {
+        Self::Raw(bytes.into())
+    }
+}
+
+impl PartialEq for FileBytes {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Raw(bytes), other) | (other, Self::Raw(bytes)) => other.matches(bytes),
+            (Self::WithBom(left), Self::WithBom(right)) => left == right,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct DiskFile {
     pub path: PathBuf,
     pub target: PathBuf,
-    pub bytes: std::sync::Arc<[u8]>,
+    pub bytes: FileBytes,
     pub bom: bool,
     identity: (u64, u64),
 }
@@ -62,13 +157,7 @@ fn read_cancellable(path: &Path, cancelled: &dyn Fn() -> bool) -> Result<(Vec<u8
 
 impl DiskFile {
     pub fn content_bytes(&self) -> &[u8] {
-        if self.bom {
-            self.bytes
-                .strip_prefix(&[0xef, 0xbb, 0xbf])
-                .unwrap_or(&self.bytes)
-        } else {
-            &self.bytes
-        }
+        self.bytes.content_bytes(self.bom)
     }
 
     pub fn draft() -> Self {
@@ -95,7 +184,7 @@ impl DiskFile {
         };
         disk.path = draft.path.clone();
         disk.bytes = draft.base.clone();
-        disk.bom = draft.base.starts_with(&[0xef, 0xbb, 0xbf]);
+        disk.bom = draft.base.has_bom();
         disk.target = draft.target.clone().unwrap_or_default();
         disk
     }
@@ -104,31 +193,34 @@ impl DiskFile {
             || (self.identity != (0, 0) && self.identity == other.identity)
     }
 
-    pub fn open(path: PathBuf) -> Result<(Self, String)> {
+    pub fn open(path: PathBuf) -> Result<(Self, Arc<str>)> {
         Self::open_cancellable(path, &|| false)
     }
-    pub fn open_cancellable(path: PathBuf, cancelled: &dyn Fn() -> bool) -> Result<(Self, String)> {
+    pub fn open_cancellable(
+        path: PathBuf,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(Self, Arc<str>)> {
         if cancelled() {
             return Err("Cancelled".into());
         }
         let target = fs::canonicalize(&path).map_err(|e| e.to_string())?;
         let (bytes, meta) = read_cancellable(&target, cancelled)?;
-        let bom = bytes.starts_with(&[0xef, 0xbb, 0xbf]);
+        let bom = bytes.starts_with(BOM);
         let content = if bom { &bytes[3..] } else { &bytes };
         let text = std::str::from_utf8(content)
-            .map_err(|_| "Only UTF-8 text is supported; the file was not changed.")?
-            .to_owned();
+            .map_err(|_| "Only UTF-8 text is supported; the file was not changed.")?;
         if text
             .chars()
             .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
         {
             return Err("This file contains binary/control data and cannot be edited.".into());
         }
+        let text: Arc<str> = text.into();
         Ok((
             Self {
                 path,
                 target,
-                bytes: bytes.into(),
+                bytes: FileBytes::from_text(text.clone(), bom),
                 bom,
                 identity: identity(&meta),
             },
@@ -151,18 +243,14 @@ impl DiskFile {
             .unwrap_or(Path::new("."));
         let directory = fs::canonicalize(parent).map_err(|error| error.to_string())?;
         let target = directory.join(path.file_name().ok_or("Choose a filename")?);
-        let mut bytes = Vec::with_capacity(text.len() + 3);
-        if bom {
-            bytes.extend_from_slice(&[0xef, 0xbb, 0xbf]);
-        }
-        bytes.extend_from_slice(text.as_bytes());
+        let bytes = FileBytes::from_text(text.into(), bom);
         if bytes.len() as u64 > MAX_BYTES {
             return Err("The new file exceeds the 10 MiB editing limit".into());
         }
         let mut staged =
             tempfile::NamedTempFile::new_in(&directory).map_err(|error| error.to_string())?;
-        staged
-            .write_all(&bytes)
+        bytes
+            .write_to(&mut staged)
             .and_then(|_| staged.as_file().sync_all())
             .map_err(|error| error.to_string())?;
         let expected_identity = identity(
@@ -188,13 +276,13 @@ impl DiskFile {
             return Err(message);
         }
         let (observed, meta) = read_regular(&target).map_err(|_| message.clone())?;
-        if identity(&meta) != expected_identity || observed != bytes {
+        if identity(&meta) != expected_identity || !bytes.matches(&observed) {
             return Err(message);
         }
         Ok(Self {
             path,
             target,
-            bytes: bytes.into(),
+            bytes,
             bom,
             identity: expected_identity,
         })
@@ -210,7 +298,7 @@ impl DiskFile {
             }
         }
         let (bytes, _) = read_regular(&self.target)?;
-        if bytes.as_slice() != self.bytes.as_ref() {
+        if !self.bytes.matches(&bytes) {
             return Err(
                 "Requested destination bytes changed after the last observed version".into(),
             );
@@ -222,7 +310,7 @@ impl DiskFile {
             return Err("The file's destination changed. Your text is still in this tab.".into());
         }
         let (bytes, meta) = read_regular(&self.target)?;
-        if identity(&meta) != self.identity || bytes.as_slice() != self.bytes.as_ref() {
+        if identity(&meta) != self.identity || !self.bytes.matches(&bytes) {
             return Err(
                 "The file changed on disk. Saving was stopped; your text is still in this tab."
                     .into(),
@@ -242,17 +330,21 @@ impl DiskFile {
     pub fn save(&self, text: &str) -> Result<Self> {
         self.save_with_bom(text, self.bom)
     }
+
+    pub fn save_snapshot(&self, text: Arc<str>) -> Result<Self> {
+        self.save_bytes(FileBytes::from_text(text, self.bom), self.bom)
+    }
+
     pub fn save_with_bom(&self, text: &str, bom: bool) -> Result<Self> {
+        self.save_bytes(FileBytes::from_text(text.into(), bom), bom)
+    }
+
+    fn save_bytes(&self, bytes: FileBytes, bom: bool) -> Result<Self> {
         let meta = self.validate()?;
-        let mut bytes = Vec::with_capacity(text.len() + 3);
-        if bom {
-            bytes.extend_from_slice(&[0xef, 0xbb, 0xbf]);
-        }
-        bytes.extend_from_slice(text.as_bytes());
         if bytes.len() as u64 > MAX_BYTES {
             return Err("The edited file exceeds the 10 MiB limit.".into());
         }
-        if bytes.as_slice() == self.bytes.as_ref() {
+        if bytes == self.bytes {
             return Ok(self.clone());
         }
         if meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o7000 != 0 {
@@ -315,7 +407,7 @@ impl DiskFile {
                     .map_err(|e| e.to_string())?;
             }
         }
-        staged.write_all(&bytes).map_err(|e| e.to_string())?;
+        bytes.write_to(&mut staged).map_err(|e| e.to_string())?;
         staged.as_file().sync_all().map_err(|e| e.to_string())?;
         self.validate()?;
         staged
@@ -323,7 +415,7 @@ impl DiskFile {
             .map_err(|e| e.error.to_string())?;
         let saved_meta = fs::symlink_metadata(&self.target).map_err(|e| e.to_string())?;
         Ok(Self {
-            bytes: bytes.into(),
+            bytes,
             bom,
             identity: identity(&saved_meta),
             ..self.clone()
@@ -372,10 +464,16 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("new.txt");
         let disk = DiskFile::create(path.clone(), "local β\r\n", true).unwrap();
-        assert_eq!(disk.bytes.as_ref(), "\u{feff}local β\r\n".as_bytes());
+        assert_eq!(
+            disk.bytes.as_bytes().as_ref(),
+            "\u{feff}local β\r\n".as_bytes()
+        );
         disk.revalidate_paths(std::slice::from_ref(&path)).unwrap();
         assert!(DiskFile::create(path.clone(), "replacement", false).is_err());
-        assert_eq!(fs::read(path).unwrap().as_slice(), disk.bytes.as_ref());
+        assert_eq!(
+            fs::read(path).unwrap().as_slice(),
+            disk.bytes.as_bytes().as_ref()
+        );
     }
 
     #[test]
@@ -388,9 +486,10 @@ mod tests {
         ] {
             let (_dir, path) = fixture(bytes);
             let (disk, text) = DiskFile::open(path.clone()).unwrap();
+            assert!(std::ptr::eq(disk.content_bytes(), text.as_bytes()));
             disk.save(&text).unwrap();
             assert_eq!(fs::read(&path).unwrap(), bytes);
-            disk.save(&(text + "!")).unwrap();
+            disk.save(&format!("{text}!")).unwrap();
             assert_eq!(fs::read(path).unwrap(), [bytes, b"!"].concat());
         }
     }

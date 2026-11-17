@@ -109,7 +109,7 @@ pub struct Highlight {
 struct Request {
     id: u64,
     generation: u64,
-    text: String,
+    text: Arc<str>,
     extension: &'static str,
     dark: bool,
     token: u64,
@@ -193,7 +193,7 @@ impl Syntax {
                 let mut offset = 0;
                 let started = Instant::now();
                 let mut state = syntax.name.clone();
-                for line in LinesWithEndings::from(&request.text) {
+                for line in LinesWithEndings::from(request.text.as_ref()) {
                     if current.load(Ordering::Relaxed) != request.token {
                         break;
                     }
@@ -257,12 +257,13 @@ impl Syntax {
         &self,
         id: u64,
         generation: u64,
-        text: &str,
+        text: impl Into<Arc<str>>,
         path: &std::path::Path,
         dark: bool,
     ) {
         let token = self.token.fetch_add(1, Ordering::Relaxed) + 1;
-        let Some(extension) = grammar_extension(path, text) else {
+        let text = text.into();
+        let Some(extension) = grammar_extension(path, &text) else {
             self.pending.lock().unwrap().take();
             *self.ready.lock().unwrap() = Some(Highlight {
                 id,
@@ -276,7 +277,7 @@ impl Syntax {
         *self.pending.lock().unwrap() = Some(Request {
             id,
             generation,
-            text: text.into(),
+            text,
             extension,
             dark,
             token,

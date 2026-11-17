@@ -61,8 +61,15 @@ pub struct Search {
     pub replies: mpsc::Receiver<ResultSet>,
 }
 pub fn fingerprint(bytes: &[u8]) -> u64 {
+    match bytes.strip_prefix(crate::document::BOM) {
+        Some(body) => fingerprint_body(body, true),
+        None => fingerprint_body(bytes, false),
+    }
+}
+pub fn fingerprint_body(body: &[u8], bom: bool) -> u64 {
     let mut hash = DefaultHasher::new();
-    bytes.hash(&mut hash);
+    bom.hash(&mut hash);
+    body.hash(&mut hash);
     hash.finish()
 }
 pub fn highlight_ranges(value: &str, query: &str) -> Vec<std::ops::Range<usize>> {

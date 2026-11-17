@@ -10,7 +10,7 @@ pub(super) struct Snapshot {
     generation: u64,
     local: String,
     disk: DiskFile,
-    text: String,
+    text: std::sync::Arc<str>,
     resolution: Resolution,
 }
 impl Shell {

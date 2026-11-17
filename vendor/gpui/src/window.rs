@@ -972,6 +972,7 @@ impl Window {
         let bounds = window_bounds
             .map(|bounds| bounds.get_bounds())
             .unwrap_or_else(|| default_bounds(display_id, cx));
+        let platform_open = crate::work_trace::Span::new("platform_window");
         let mut platform_window = cx.platform.open_window(
             handle,
             WindowParams {
@@ -989,6 +990,7 @@ impl Window {
                 tabbing_identifier,
             },
         )?;
+        drop(platform_open);
 
         let tab_bar_visible = platform_window.tab_bar_visible();
         SystemWindowTabController::init_visible(cx, tab_bar_visible);

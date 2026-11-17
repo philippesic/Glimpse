@@ -1023,6 +1023,7 @@ impl Element for TextElement {
             None
         };
         self.state.update(cx, |state, cx| {
+            let _wrap = gpui::work_trace::Span::new("editor_wrap");
             state
                 .text_wrapper
                 .prepare(&state.text, font, text_size, wrap_width, cx);
@@ -1150,6 +1151,7 @@ impl Element for TextElement {
         let document_colors = state
             .lsp
             .document_colors_for_range(&text, &last_layout.visible_range);
+        let layout = gpui::work_trace::Span::new("editor_shape");
         let lines = Self::layout_lines(
             &state,
             &display_text,
@@ -1159,6 +1161,7 @@ impl Element for TextElement {
             &document_colors,
             window,
         );
+        drop(layout);
 
         let mut longest_line_width = wrap_width.unwrap_or(px(0.));
         // 1. Single line

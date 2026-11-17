@@ -50,7 +50,8 @@ mod text_system;
 mod util;
 mod view;
 mod window;
-mod work_trace;
+#[doc(hidden)]
+pub mod work_trace;
 
 #[cfg(doc)]
 pub mod _ownership_and_data_flow;

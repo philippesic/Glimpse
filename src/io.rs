@@ -58,7 +58,7 @@ pub struct Reload {
     pub original: DiskFile,
     pub local: String,
     pub disk: DiskFile,
-    pub text: String,
+    pub text: Arc<str>,
 }
 #[derive(Clone)]
 pub struct SaveDestination {
@@ -95,9 +95,9 @@ pub enum Reply {
     Done(Result<(), String>),
     Visit(PathBuf, bool),
     SavedTo(Box<SaveDestination>, Result<DiskFile, String>),
-    Checked(u64, u64, Result<(DiskFile, String), String>),
+    Checked(u64, u64, Result<(DiskFile, Arc<str>), String>),
     CheckDeferred(u64, u64),
-    Open(PathBuf, u64, Result<(DiskFile, String), String>),
+    Open(PathBuf, u64, Result<(DiskFile, Arc<str>), String>),
     Save(u64, u64, Arc<str>, Result<DiskFile, String>),
 }
 
@@ -542,7 +542,7 @@ impl IoWorker {
                             #[cfg(feature = "test-support")]
                             crate::metrics::delay("SAVE");
                             let result = if without_recovery {
-                                disk.save(&text)
+                                disk.save_snapshot(text.clone())
                             } else {
                                 recovery
                                     .as_ref()
@@ -563,7 +563,7 @@ impl IoWorker {
                                             .map_err(|e| format!("Recovery unavailable: {e}"))?;
                                         let _ =
                                             results.send(Reply::Recovered(id, generation, Ok(())));
-                                        let saved = disk.save(&text)?;
+                                        let saved = disk.save_snapshot(text.clone())?;
                                         if let Err(error) = r.saved(id, generation) {
                                             let _ = results.send(Reply::HistoryWarning(format!(
                                                 "Saved {}. Recovery maintenance failed: {error}",
@@ -969,7 +969,10 @@ mod tests {
         candidate.recovery_copy = true;
         let saved =
             save_destination(&candidate, Err("storage unavailable".into()), &results).unwrap();
-        assert_eq!(saved.bytes.as_ref(), "\u{feff}local β\r\n".as_bytes());
+        assert_eq!(
+            saved.bytes.as_bytes().as_ref(),
+            "\u{feff}local β\r\n".as_bytes()
+        );
         candidate.expected = Some(saved.clone());
         assert!(save_destination(&candidate, Err("storage unavailable".into()), &results).is_err());
         candidate.expected = None;
@@ -977,7 +980,7 @@ mod tests {
         assert!(save_destination(&candidate, Err("storage unavailable".into()), &results).is_err());
         assert_eq!(
             std::fs::read(&path).unwrap().as_slice(),
-            saved.bytes.as_ref()
+            saved.bytes.as_bytes().as_ref()
         );
         candidate.path = root.path().join("not-created.txt");
         candidate.copy = false;
@@ -1051,7 +1054,7 @@ mod tests {
         let path = record(&recovery_root, 7);
         let read =
             || serde_json::from_slice::<storage::Draft>(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(read().base.as_ref(), b"saved snapshot\n");
+        assert_eq!(read().base.as_bytes().as_ref(), b"saved snapshot\n");
         assert_eq!(read().text.as_ref(), "newer local λ\n");
         let (started, paused) = mpsc::channel();
         let (release, hold) = mpsc::channel();
@@ -1064,7 +1067,7 @@ mod tests {
         io.send(Job::Recover(7, draft(12, "edit after a later reload\n")));
         release.send(()).unwrap();
         barrier(&io);
-        assert_eq!(read().base.as_ref(), b"original bytes\n");
+        assert_eq!(read().base.as_bytes().as_ref(), b"original bytes\n");
         assert_eq!(read().text.as_ref(), "edit after a later reload\n");
         assert_eq!(std::fs::read(&original).unwrap(), b"saved snapshot\n");
     }
@@ -1117,14 +1120,14 @@ mod tests {
         assert_eq!(restored.path, target);
         assert_eq!(restored.target, Some(target.clone()));
         assert_eq!(restored.text.as_ref(), "newer local λ\n");
-        assert_eq!(restored.base.as_ref(), b"saved snapshot\n");
+        assert_eq!(restored.base.as_bytes().as_ref(), b"saved snapshot\n");
         io.send(Job::Recover(7, draft(10, "late old-binding edit β\n")));
         io.send(Job::BindingApplied(7, 8, 11));
         barrier(&io);
         let restored = read();
         assert_eq!(restored.path, target);
         assert_eq!(restored.text.as_ref(), "late old-binding edit β\n");
-        assert_eq!(restored.base.as_ref(), b"saved snapshot\n");
+        assert_eq!(restored.base.as_bytes().as_ref(), b"saved snapshot\n");
         io.send(Job::Recover(
             7,
             storage::Draft {
@@ -1136,7 +1139,7 @@ mod tests {
             },
         ));
         barrier(&io);
-        assert_eq!(read().base.as_ref(), b"fresh observed base\n");
+        assert_eq!(read().base.as_bytes().as_ref(), b"fresh observed base\n");
         assert_eq!(std::fs::read(&original).unwrap(), b"original bytes\n");
         assert_eq!(std::fs::read(&target).unwrap(), b"saved snapshot\n");
     }
@@ -1178,7 +1181,7 @@ mod tests {
             reload.local.as_str()
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "later version\n");
-        std::fs::write(&path, &reload.disk.bytes).unwrap();
+        std::fs::write(&path, reload.disk.bytes.as_bytes()).unwrap();
         recovery.write(4, &draft(9, "newer local edit\n")).unwrap();
         reload_document(&reload, Ok(&recovery), &results).unwrap();
         let retained: storage::Draft =
@@ -1187,7 +1190,7 @@ mod tests {
         assert_eq!(retained.text.as_ref(), "newer local edit\n");
         assert_eq!(
             std::fs::read(&path).unwrap().as_slice(),
-            reload.disk.bytes.as_ref()
+            reload.disk.bytes.as_bytes().as_ref()
         );
         assert!(
             storage::inventory(&root.path().join("recovery"))
@@ -1255,7 +1258,7 @@ mod tests {
         }
         assert_eq!(
             std::fs::read(&original).unwrap().as_slice(),
-            draft.base.as_ref()
+            draft.base.as_bytes().as_ref()
         );
     }
 
@@ -1542,7 +1545,7 @@ mod tests {
         let reply = io.replies.recv_timeout(std::time::Duration::from_secs(2));
         release.send(()).unwrap();
         match reply.unwrap() {
-            Reply::Open(_, _, Ok((_, text))) => assert_eq!(text, "available"),
+            Reply::Open(_, _, Ok((_, text))) => assert_eq!(text.as_ref(), "available"),
             _ => panic!("document worker did not run independently"),
         }
     }
@@ -1584,7 +1587,7 @@ mod tests {
                 panic!("Expected checked file");
             };
             assert_eq!(id, token);
-            assert_eq!(result.unwrap().1, "disk bytes");
+            assert_eq!(result.unwrap().1.as_ref(), "disk bytes");
             completed.insert(id);
         }
         assert_eq!(completed.len(), 32);

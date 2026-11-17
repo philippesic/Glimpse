@@ -111,7 +111,7 @@ mod tests {
         create(&path, false, "\u{feff}text\r\n").unwrap();
         let (disk, text) = crate::document::DiskFile::open(path.clone()).unwrap();
         assert!(disk.bom);
-        assert_eq!(text, "text\r\n");
+        assert_eq!(text.as_ref(), "text\r\n");
         assert_eq!(fs::read(path).unwrap(), b"\xef\xbb\xbftext\r\n");
         let large = dir.path().join("large");
         assert!(

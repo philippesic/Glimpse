@@ -218,12 +218,21 @@ impl LineWrapper {
 
     /// Return the shared advance of an ASCII word, when every character has equal width.
     pub fn uniform_word_width(&mut self, text: &str) -> Option<Pixels> {
-        let first = text.bytes().next()?;
+        self.uniform_word_width_for_bytes(text.bytes())
+    }
+
+    /// Return the shared advance of an ASCII word from contiguous or chunked bytes.
+    pub fn uniform_word_width_for_bytes(
+        &mut self,
+        bytes: impl IntoIterator<Item = u8>,
+    ) -> Option<Pixels> {
+        let mut bytes = bytes.into_iter();
+        let first = bytes.next()?;
         if !first.is_ascii() || !Self::is_word_char(first as char) {
             return None;
         }
         let width = self.width_for_char(first as char);
-        text.bytes()
+        bytes
             .all(|byte| {
                 byte.is_ascii()
                     && Self::is_word_char(byte as char)

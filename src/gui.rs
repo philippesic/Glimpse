@@ -104,8 +104,8 @@ struct Document {
     failure_action: FailureAction,
     failed_destination: Option<(PathBuf, DestinationKind)>,
     unrecovered_save: Option<u64>,
-    external: Option<(DiskFile, String)>,
-    deferred_external: Option<(DiskFile, String)>,
+    external: Option<(DiskFile, std::sync::Arc<str>)>,
+    deferred_external: Option<(DiskFile, std::sync::Arc<str>)>,
     passive_refresh: bool,
     tab_focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
@@ -1061,7 +1061,7 @@ impl Shell {
                 this.syntax.request(
                     id,
                     doc.generation,
-                    &doc.input.read(cx).value(),
+                    std::sync::Arc::<str>::from(doc.input.read(cx).value()),
                     &doc.disk.path,
                     cx.theme().is_dark(),
                 );
@@ -1116,7 +1116,7 @@ impl Shell {
         self.syntax.request(
             id,
             0,
-            &input.read(cx).value(),
+            std::sync::Arc::<str>::from(input.read(cx).value()),
             &disk_path(&self.documents, id),
             cx.theme().is_dark(),
         );
@@ -1194,7 +1194,7 @@ impl Shell {
             self.syntax.request(
                 doc.id,
                 doc.generation,
-                &doc.input.read(cx).value(),
+                std::sync::Arc::<str>::from(doc.input.read(cx).value()),
                 &doc.disk.path,
                 cx.theme().is_dark(),
             );
@@ -1428,7 +1428,8 @@ impl Shell {
                                     continue;
                                 }
                                 if let Some((expected, search_generation)) = expected
-                                    && (expected != search::fingerprint(&disk.bytes)
+                                    && (expected
+                                        != search::fingerprint_body(disk.content_bytes(), disk.bom)
                                         || self
                                             .documents
                                             .iter()
@@ -1777,7 +1778,10 @@ impl Shell {
                             Ok((disk, text)) if disk.bytes != doc.disk.bytes => {
                                 doc.deferred_external = Some((disk, text));
                             }
-                            Ok((disk, _)) => {
+                            Ok((mut disk, _)) => {
+                                if doc.disk.bom == disk.bom {
+                                    disk.bytes = doc.disk.bytes.clone();
+                                }
                                 doc.deferred_external = None;
                                 doc.external = None;
                                 doc.set_disk(disk);

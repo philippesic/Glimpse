@@ -350,7 +350,7 @@ pub struct Draft {
     pub path: PathBuf,
     pub text: std::sync::Arc<str>,
     #[serde(with = "encoded_bytes")]
-    pub base: std::sync::Arc<[u8]>,
+    pub base: crate::document::FileBytes,
     #[serde(
         default,
         serialize_with = "native_path::serialize_optional",
@@ -542,20 +542,15 @@ pub fn restore_snapshot(path: &Path, observed: bool) -> Result<Draft, String> {
     };
     let mut draft = read_draft(path)?;
     if observed {
-        let bom = draft.base.starts_with(&[0xef, 0xbb, 0xbf]);
-        let base = draft
-            .base
-            .strip_prefix(&[0xef, 0xbb, 0xbf])
-            .unwrap_or(&draft.base);
-        draft.text = std::str::from_utf8(base)
+        let bom = draft.base.has_bom();
+        draft.text = std::str::from_utf8(draft.base.content_bytes(bom))
             .map_err(|_| "Observed disk version is not UTF-8")?
             .into();
         draft.base = if bom {
-            vec![0xef, 0xbb, 0xbf]
+            crate::document::BOM.into()
         } else {
-            Vec::new()
-        }
-        .into();
+            Default::default()
+        };
         draft.target = None;
         draft.generation = 1;
     }
@@ -868,10 +863,13 @@ mod tests {
         let record = r#"{"path":"original","text":"local β\r\n","base":[239,187,191,98,97,115,101,13,10],"target":null,"generation":4}"#;
         let draft: Draft = serde_json::from_str(record).unwrap();
         assert_eq!(draft.text.as_ref(), "local β\r\n");
-        assert_eq!(draft.base.as_ref(), b"\xef\xbb\xbfbase\r\n");
+        assert_eq!(draft.base.as_bytes().as_ref(), b"\xef\xbb\xbfbase\r\n");
         let disk = crate::document::DiskFile::restore(&draft);
-        assert!(std::sync::Arc::ptr_eq(&draft.base, &disk.bytes));
-        assert!(std::sync::Arc::ptr_eq(&disk.bytes, &disk.clone().bytes));
+        assert!(std::ptr::eq(draft.base.parts().1, disk.bytes.parts().1));
+        assert!(std::ptr::eq(
+            disk.content_bytes(),
+            disk.clone().content_bytes()
+        ));
         let serialized = serde_json::to_value(&draft).unwrap();
         assert_eq!(serialized["text"], "local β\r\n");
         assert_eq!(serialized["base"], "77u/YmFzZQ0K");
@@ -899,9 +897,27 @@ mod tests {
                 base64::engine::general_purpose::STANDARD.encode(&bytes)
             );
             let restored: Draft = serde_json::from_value(stored).unwrap();
-            assert_eq!(restored.base.as_ref(), bytes);
+            assert_eq!(restored.base.as_bytes().as_ref(), bytes);
             assert_eq!(restored.text, draft.text);
         }
+        let source = root.path().join("source.txt");
+        let text = "\u{feff}β\r\nx\ry\n".repeat(1025);
+        let bytes = [crate::document::BOM, text.as_bytes()].concat();
+        fs::write(&source, &bytes).unwrap();
+        let (disk, value) = crate::document::DiskFile::open(source).unwrap();
+        let draft = Draft {
+            base: disk.bytes,
+            ..draft(8)
+        };
+        assert!(std::ptr::eq(draft.base.parts().1, value.as_bytes()));
+        atomic_json(&path, &draft).unwrap();
+        let stored: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            stored["base"],
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        );
+        let restored: Draft = serde_json::from_value(stored).unwrap();
+        assert_eq!(restored.base, draft.base);
     }
 
     #[test]
@@ -994,7 +1010,7 @@ mod tests {
         let path = &summary.records.iter().find(|r| r.history).unwrap().path;
         let observed = restore_snapshot(path, true).unwrap();
         assert_eq!(observed.text.as_ref(), "observed\r\n");
-        assert_eq!(observed.base.as_ref(), [0xef, 0xbb, 0xbf]);
+        assert_eq!(observed.base.as_bytes().as_ref(), [0xef, 0xbb, 0xbf]);
         assert!(observed.target.is_none());
         assert_eq!(
             restore_snapshot(path, false).unwrap().text.as_ref(),
@@ -1299,15 +1315,21 @@ mod native_path {
 mod encoded_bytes {
     use super::*;
     use base64::Engine;
-    pub fn serialize<S: serde::Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_str(&base64::display::Base64Display::new(
-            bytes,
-            &base64::engine::general_purpose::STANDARD,
+    pub fn serialize<S: serde::Serializer>(
+        bytes: &crate::document::FileBytes,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let (prefix, body) = bytes.parts();
+        let engine = &base64::engine::general_purpose::STANDARD;
+        serializer.collect_str(&format_args!(
+            "{}{}",
+            base64::display::Base64Display::new(prefix, engine),
+            base64::display::Base64Display::new(body, engine),
         ))
     }
     pub fn deserialize<'de, D: serde::Deserializer<'de>>(
         deserializer: D,
-    ) -> Result<std::sync::Arc<[u8]>, D::Error> {
+    ) -> Result<crate::document::FileBytes, D::Error> {
         #[derive(Deserialize)]
         #[serde(untagged)]
         enum Value {

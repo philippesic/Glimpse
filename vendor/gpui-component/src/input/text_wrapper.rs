@@ -4,7 +4,7 @@ use std::sync::Arc;
 use gpui::{
     App, Font, LineFragment, Pixels, Point, ShapedLine, Size, TextSystem, Window, point, px, size,
 };
-use ropey::Rope;
+use ropey::{LineType, Rope, RopeSlice};
 use smallvec::SmallVec;
 
 use crate::input::RopeExt;
@@ -214,31 +214,26 @@ impl TextWrapper {
         {
             return;
         }
-        self._update(
-            changed_text,
-            range,
-            new_text,
-            &mut |line_str, wrap_width| {
-                let mut boundaries = Vec::new();
-                let mut checkpoints = Vec::new();
-                let mut next_checkpoint = 1024;
-                for (boundary, state) in line_wrapper.resume_line(
-                    &[LineFragment::text(line_str)],
-                    wrap_width,
-                    gpui::LineWrapState::default(),
-                ) {
-                    boundaries.push(boundary);
-                    if state.consumed_bytes() >= next_checkpoint {
-                        checkpoints.push(WrapCheckpoint {
-                            state,
-                            rows: boundaries.len(),
-                        });
-                        next_checkpoint = state.consumed_bytes() + 1024;
-                    }
+        self._update(changed_text, range, new_text, &mut |line, wrap_width| {
+            let mut boundaries = Vec::new();
+            let mut checkpoints = Vec::new();
+            let mut next_checkpoint = 1024;
+            let fragments: SmallVec<[LineFragment<'_>; 4]> =
+                line.chunks().map(LineFragment::text).collect();
+            for (boundary, state) in
+                line_wrapper.resume_line(&fragments, wrap_width, gpui::LineWrapState::default())
+            {
+                boundaries.push(boundary);
+                if state.consumed_bytes() >= next_checkpoint {
+                    checkpoints.push(WrapCheckpoint {
+                        state,
+                        rows: boundaries.len(),
+                    });
+                    next_checkpoint = state.consumed_bytes() + 1024;
                 }
-                (boundaries, checkpoints)
-            },
-        );
+            }
+            (boundaries, checkpoints)
+        });
         if self.wrap_width.is_some() {
             let start = changed_text.offset_to_point(range.start).row;
             let end = changed_text
@@ -249,8 +244,8 @@ impl TextWrapper {
                     continue;
                 };
                 if line.length >= 1024 && line.wrapped_lines.len() > 1 {
-                    if let Some(width) =
-                        line_wrapper.uniform_word_width(&changed_text.slice_line(row).to_string())
+                    if let Some(width) = line_wrapper
+                        .uniform_word_width_for_bytes(changed_text.slice_line(row).bytes())
                     {
                         line.word_width = width;
                         line.word_columns =
@@ -376,8 +371,8 @@ impl TextWrapper {
             < line.wrapped_lines.first().map_or(0, |range| range.end))
         .then_some(indent);
         if length >= 1024 && line.wrapped_lines.len() > 1 && changed_text.byte(origin).is_ascii() {
-            if let Some(advance) =
-                wrapper.uniform_word_width(&changed_text.slice(origin..origin + length).to_string())
+            if let Some(advance) = wrapper
+                .uniform_word_width_for_bytes(changed_text.slice(origin..origin + length).bytes())
             {
                 line.word_width = advance;
                 line.word_columns = line.wrapped_lines[0].len() as u32;
@@ -431,7 +426,7 @@ impl TextWrapper {
         };
         if line.word_columns == 0
             || (new_text.len() != 0
-                && wrapper.uniform_word_width(&new_text.to_string()) != Some(line.word_width))
+                && wrapper.uniform_word_width_for_bytes(new_text.bytes()) != Some(line.word_width))
         {
             return false;
         }
@@ -521,8 +516,8 @@ impl TextWrapper {
         line.word_columns = 0;
         line.word_width = px(0.);
         if classify && length >= 1024 {
-            if let Some(advance) =
-                wrapper.uniform_word_width(&changed_text.slice(origin..origin + length).to_string())
+            if let Some(advance) = wrapper
+                .uniform_word_width_for_bytes(changed_text.slice(origin..origin + length).bytes())
             {
                 line.word_width = advance;
                 line.word_columns =
@@ -544,7 +539,7 @@ impl TextWrapper {
         new_text: &Rope,
         wrap_line: &mut F,
     ) where
-        F: FnMut(&str, Pixels) -> (Vec<gpui::Boundary>, Vec<WrapCheckpoint>),
+        F: FnMut(RopeSlice<'_>, Pixels) -> (Vec<gpui::Boundary>, Vec<WrapCheckpoint>),
     {
         // Remove the old changed lines.
         let start_row = self.text.offset_to_point(range.start).row;
@@ -569,29 +564,34 @@ impl TextWrapper {
         let new_end_offset = changed_text.line_end_offset(new_end_row);
         let new_range = new_start_offset..new_end_offset;
 
-        let mut new_lines = vec![];
+        let mut new_lines = Vec::with_capacity(new_end_row - new_start_row + 1);
         let mut new_checkpoints = std::collections::BTreeMap::new();
         let wrap_width = self.wrap_width;
 
         // line not contains `\n`.
-        for (ix, line) in Rope::from(changed_text.slice(new_range))
-            .iter_lines()
+        for (ix, line) in changed_text
+            .slice(new_range)
+            .lines(LineType::LF)
             .enumerate()
         {
-            let line_str = line.to_string();
+            let line = if line.len() != 0 && line.byte(line.len() - 1) == b'\n' {
+                line.slice(..line.len() - 1)
+            } else {
+                line
+            };
             let mut wrapped_lines: SmallVec<[Range<usize>; 1]> = SmallVec::new();
             let mut prev_boundary_ix = 0;
             let mut indent = 0;
 
-            if line_str.len() > longest_row_len {
+            if line.len() > longest_row_len {
                 longest_row_ix = new_start_row + ix;
-                longest_row_len = line_str.len();
+                longest_row_len = line.len();
             }
 
             // If wrap_width is Pixels::MAX, skip wrapping to disable word wrap
             if let Some(wrap_width) = wrap_width {
                 // Here only have wrapped line, if there is no wrap meet, the `line_wraps` result will empty.
-                let (boundaries, checkpoints) = wrap_line(&line_str, wrap_width);
+                let (boundaries, checkpoints) = wrap_line(line, wrap_width);
                 if !checkpoints.is_empty() {
                     new_checkpoints.insert(new_start_row + ix, checkpoints);
                 }
@@ -603,13 +603,13 @@ impl TextWrapper {
             }
 
             // Reset of the line
-            if !line_str[prev_boundary_ix..].is_empty() || prev_boundary_ix == 0 {
+            if prev_boundary_ix < line.len() || prev_boundary_ix == 0 {
                 wrapped_lines.push(prev_boundary_ix..line.len());
             }
 
             new_lines.push(LineItem {
                 length: line.len(),
-                indent: (line_str.bytes().take_while(|&byte| byte == b' ').count()
+                indent: (line.bytes().take_while(|&byte| byte == b' ').count()
                     < wrapped_lines.first().map_or(0, |range| range.end))
                 .then_some(indent),
                 word_columns: 0,
@@ -891,6 +891,33 @@ impl LineLayout {
 mod tests {
     use super::*;
     use gpui::{Boundary, FontFeatures, FontStyle, FontWeight, px};
+
+    #[gpui::test]
+    fn wrapping_rope_chunks_matches_contiguous_text(cx: &mut gpui::TestAppContext) {
+        let cx = cx.add_empty_window();
+        cx.update(|_, cx| {
+            let text = "    a café 日本語 👩‍👩‍👧‍👦 é\t words and an unbroken-word ".repeat(2_000);
+            let rope = Rope::from(text.as_str());
+            let chunks: Vec<_> = rope.chunks().map(LineFragment::text).collect();
+            assert!(chunks.len() > 20);
+            let mut wrapper = cx
+                .text_system()
+                .line_wrapper(gpui::font(".ZedMono"), px(16.));
+            for width in [px(75.), px(311.), px(880.)] {
+                let contiguous = wrapper
+                    .resume_line(
+                        &[LineFragment::text(&text)],
+                        width,
+                        gpui::LineWrapState::default(),
+                    )
+                    .collect::<Vec<_>>();
+                let streamed = wrapper
+                    .resume_line(&chunks, width, gpui::LineWrapState::default())
+                    .collect::<Vec<_>>();
+                assert_eq!(streamed, contiguous);
+            }
+        });
+    }
 
     #[test]
     fn sparse_layout_retains_offscreen_geometry_and_byte_offsets() {
@@ -1333,7 +1360,7 @@ mod tests {
         );
 
         fn fake_wrap_line(
-            _line: &str,
+            _line: RopeSlice<'_>,
             _wrap_width: Pixels,
         ) -> (Vec<Boundary>, Vec<WrapCheckpoint>) {
             (vec![], vec![])

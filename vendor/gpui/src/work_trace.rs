@@ -1,6 +1,7 @@
 use std::{sync::OnceLock, time::Instant};
 
-pub(crate) struct Span {
+/// Records elapsed work when GPUI tracing is enabled.
+pub struct Span {
     started: Option<(Instant, &'static str)>,
 }
 
@@ -10,7 +11,8 @@ fn origin() -> Option<Instant> {
 }
 
 impl Span {
-    pub(crate) fn new(name: &'static str) -> Self {
+    /// Begin a span on the current thread.
+    pub fn new(name: &'static str) -> Self {
         Self {
             started: origin().map(|_| (Instant::now(), name)),
         }
