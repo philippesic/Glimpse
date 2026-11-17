@@ -13,27 +13,36 @@ pub(super) struct Mapping {
 }
 struct Run {
     id: NodeId,
-    boundaries: Vec<usize>,
+    range: Range<usize>,
 }
 impl Mapping {
     fn offset(&self, position: &TextPosition) -> Option<usize> {
-        self.runs
-            .iter()
-            .find(|run| run.id == position.node)?
-            .boundaries
-            .get(position.character_index)
-            .copied()
+        let index = self.runs.iter().position(|run| run.id == position.node)?;
+        let lengths = self.nodes[index].1.character_lengths();
+        (position.character_index <= lengths.len()).then(|| {
+            self.runs[index].range.start
+                + lengths[..position.character_index]
+                    .iter()
+                    .map(|&length| usize::from(length))
+                    .sum::<usize>()
+        })
     }
     fn position(&self, offset: usize) -> TextPosition {
-        let run = self
+        let index = self
             .runs
+            .partition_point(|run| run.range.end <= offset)
+            .min(self.runs.len() - 1);
+        let run = &self.runs[index];
+        let mut byte = run.range.start;
+        let character_index = self.nodes[index]
+            .1
+            .character_lengths()
             .iter()
-            .find(|run| offset < *run.boundaries.last().unwrap())
-            .unwrap_or_else(|| self.runs.last().unwrap());
-        let character_index = run
-            .boundaries
-            .partition_point(|&byte| byte <= offset)
-            .saturating_sub(1);
+            .take_while(|&&length| {
+                byte += usize::from(length);
+                byte <= offset
+            })
+            .count();
         TextPosition {
             node: run.id,
             character_index,
@@ -102,7 +111,7 @@ impl InputState {
                 .enumerate()
                 .map(|(index, segment)| Run {
                     id: ids[index],
-                    boundaries: segment.boundaries,
+                    range: segment.range,
                 })
                 .collect();
             mapping.nodes = nodes.into();
@@ -189,6 +198,67 @@ impl InputState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn compact_positions_match_grapheme_boundaries_and_reject_invalid_actions() {
+        for text in [
+            String::new(),
+            "α é 👨‍👩‍👧\r\nnext\n".into(),
+            "🙂 café 中文 ".repeat(1000),
+            format!("a{}", "́".repeat(400)),
+        ] {
+            let segments = segments(&text);
+            let mut mapping = Mapping::default();
+            let mut nodes = vec![];
+            for (index, segment) in segments.iter().enumerate() {
+                let id = NodeId((segments.len() - index) as u64 + 10);
+                let mut node = Node::new(Role::TextRun);
+                node.set_character_lengths(
+                    segment
+                        .boundaries
+                        .windows(2)
+                        .map(|pair| (pair[1] - pair[0]) as u8)
+                        .collect::<Vec<_>>(),
+                );
+                nodes.push((id, node));
+                mapping.runs.push(Run {
+                    id,
+                    range: segment.range.clone(),
+                });
+            }
+            mapping.nodes = nodes.into();
+            for offset in 0..=text.len() {
+                let index = segments
+                    .iter()
+                    .position(|run| offset < run.range.end)
+                    .unwrap_or(segments.len() - 1);
+                let character = segments[index]
+                    .boundaries
+                    .partition_point(|&byte| byte <= offset)
+                    .saturating_sub(1);
+                let position = mapping.position(offset);
+                assert_eq!(position.node, mapping.runs[index].id);
+                assert_eq!(position.character_index, character);
+                assert_eq!(
+                    mapping.offset(&position),
+                    Some(segments[index].boundaries[character])
+                );
+            }
+            assert_eq!(
+                mapping.offset(&TextPosition {
+                    node: mapping.runs[0].id,
+                    character_index: segments[0].boundaries.len(),
+                }),
+                None
+            );
+            assert_eq!(
+                mapping.offset(&TextPosition {
+                    node: NodeId(0),
+                    character_index: 0
+                }),
+                None
+            );
+        }
+    }
     #[test]
     fn runs_preserve_every_byte_and_cluster_across_hard_lines() {
         let text = format!("α é 👨‍👩‍👧\r\n{}\n", "long ".repeat(200));
