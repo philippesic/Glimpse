@@ -89,11 +89,6 @@ impl TextSystem {
     /// Get a list of all available font names from the operating system.
     pub fn all_font_names(&self) -> Vec<String> {
         let mut names = self.platform_text_system.all_font_names();
-        names.extend(
-            self.fallback_font_stack
-                .iter()
-                .map(|font| font.family.to_string()),
-        );
         names.push(".SystemUIFont".to_string());
         names.sort();
         names.dedup();
@@ -152,7 +147,11 @@ impl TextSystem {
             return font_id;
         }
         for fallback in &self.fallback_font_stack {
-            if let Ok(font_id) = self.font_id(fallback) {
+            let fallback = Font {
+                family: fallback.family.clone(),
+                ..font.clone()
+            };
+            if let Ok(font_id) = self.font_id(&fallback) {
                 return font_id;
             }
         }

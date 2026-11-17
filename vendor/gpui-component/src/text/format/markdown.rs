@@ -78,31 +78,39 @@ fn parse_paragraph(paragraph: &mut Paragraph, node: &mdast::Node) -> String {
         }
         Node::Emphasis(val) => {
             let mut child_paragraph = Paragraph::default();
-            for child in val.children.iter() {
-                text.push_str(&parse_paragraph(&mut child_paragraph, &child));
+            for child in &val.children {
+                text.push_str(&parse_paragraph(&mut child_paragraph, child));
             }
-            paragraph.push(
-                InlineNode::new(&text).marks(vec![(0..text.len(), TextMark::default().italic())]),
-            );
+            for child in &mut child_paragraph.children {
+                child
+                    .marks
+                    .push((0..child.text.len(), TextMark::default().italic()));
+            }
+            paragraph.merge(child_paragraph);
         }
         Node::Strong(val) => {
             let mut child_paragraph = Paragraph::default();
-            for child in val.children.iter() {
-                text.push_str(&parse_paragraph(&mut child_paragraph, &child));
+            for child in &val.children {
+                text.push_str(&parse_paragraph(&mut child_paragraph, child));
             }
-            paragraph.push(
-                InlineNode::new(&text).marks(vec![(0..text.len(), TextMark::default().bold())]),
-            );
+            for child in &mut child_paragraph.children {
+                child
+                    .marks
+                    .push((0..child.text.len(), TextMark::default().bold()));
+            }
+            paragraph.merge(child_paragraph);
         }
         Node::Delete(val) => {
             let mut child_paragraph = Paragraph::default();
-            for child in val.children.iter() {
-                text.push_str(&parse_paragraph(&mut child_paragraph, &child));
+            for child in &val.children {
+                text.push_str(&parse_paragraph(&mut child_paragraph, child));
             }
-            paragraph.push(
-                InlineNode::new(&text)
-                    .marks(vec![(0..text.len(), TextMark::default().strikethrough())]),
-            );
+            for child in &mut child_paragraph.children {
+                child
+                    .marks
+                    .push((0..child.text.len(), TextMark::default().strikethrough()));
+            }
+            paragraph.merge(child_paragraph);
         }
         Node::InlineCode(val) => {
             text = val.value.clone();
@@ -175,24 +183,27 @@ fn parse_paragraph(paragraph: &mut Paragraph, node: &mdast::Node) -> String {
         }
         Node::LinkReference(link) => {
             let mut child_paragraph = Paragraph::default();
-            let mut child_text = String::new();
-            for child in link.children.iter() {
-                child_text.push_str(&parse_paragraph(&mut child_paragraph, child));
+            for child in &link.children {
+                text.push_str(&parse_paragraph(&mut child_paragraph, child));
             }
-
             let link_mark = LinkMark {
                 url: "".into(),
                 title: link.label.clone().map(Into::into),
                 identifier: Some(link.identifier.clone().into()),
             };
-
-            paragraph.push(InlineNode::new(&child_text).marks(vec![(
-                0..child_text.len(),
-                TextMark {
-                    link: Some(link_mark),
-                    ..Default::default()
-                },
-            )]));
+            for child in &mut child_paragraph.children {
+                if let Some(image) = &mut child.image {
+                    image.link = Some(link_mark.clone());
+                }
+                child.marks.push((
+                    0..child.text.len(),
+                    TextMark {
+                        link: Some(link_mark.clone()),
+                        ..Default::default()
+                    },
+                ));
+            }
+            paragraph.merge(child_paragraph);
         }
         _ => {
             if cfg!(debug_assertions) {
@@ -378,6 +389,80 @@ fn ast_to_node(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn nested_inline_marks_keep_links_code_and_images() {
+        let ast = markdown::to_mdast(
+            "**outer *inner [link](next.md)* `code` ![alt](local.png)**",
+            &ParseOptions::gfm(),
+        )
+        .unwrap();
+        let Node::Root(root) = ast else {
+            panic!("expected root")
+        };
+        let mut paragraph = Paragraph::default();
+        parse_paragraph(&mut paragraph, &root.children[0]);
+        let link = paragraph
+            .children
+            .iter()
+            .find(|child| child.text.as_str() == "link")
+            .unwrap();
+        assert!(link.marks.iter().any(|(_, mark)| mark.bold));
+        assert!(link.marks.iter().any(|(_, mark)| mark.italic));
+        assert!(link.marks.iter().any(|(_, mark)| mark
+            .link
+            .as_ref()
+            .is_some_and(|link| link.url.as_str() == "next.md")));
+        let code = paragraph
+            .children
+            .iter()
+            .find(|child| child.text.as_str() == "code")
+            .unwrap();
+        assert!(code.marks.iter().any(|(_, mark)| mark.bold));
+        assert!(code.marks.iter().any(|(_, mark)| mark.code));
+        assert!(paragraph.children.iter().any(|child| child
+            .image
+            .as_ref()
+            .is_some_and(|image| image.url.as_str() == "local.png")));
+    }
+
+    #[test]
+    fn reference_links_keep_nested_formatting_and_linked_images() {
+        let ast = markdown::to_mdast(
+            "[*nested **bold** ![alt](local.png)*][target]\n\n[target]: next.md",
+            &ParseOptions::gfm(),
+        )
+        .unwrap();
+        let Node::Root(root) = ast else {
+            panic!("expected root")
+        };
+        let mut paragraph = Paragraph::default();
+        parse_paragraph(&mut paragraph, &root.children[0]);
+        let bold = paragraph
+            .children
+            .iter()
+            .find(|child| child.text.as_str() == "bold")
+            .unwrap();
+        assert!(bold.marks.iter().any(|(_, mark)| mark.bold));
+        assert!(bold.marks.iter().any(|(_, mark)| mark.italic));
+        assert!(bold
+            .marks
+            .iter()
+            .any(|(_, mark)| mark.link.as_ref().is_some_and(|link| link
+                .identifier
+                .as_ref()
+                .is_some_and(|identifier| identifier.as_str() == "target"))));
+        assert!(paragraph
+            .children
+            .iter()
+            .any(|child| child.image.as_ref().is_some_and(|image| image
+                .link
+                .as_ref()
+                .is_some_and(|link| link
+                    .identifier
+                    .as_ref()
+                    .is_some_and(|identifier| identifier.as_str() == "target")))));
+    }
+
     #[test]
     fn declared_dialect_keeps_html_literal() {
         let style = TextViewStyle::default();

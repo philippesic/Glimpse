@@ -635,21 +635,30 @@ impl Paragraph {
                         .object_fit(ObjectFit::Contain)
                         .max_w(relative(1.))
                         .when_some(image.width, |this, width| this.w(width))
-                        .when_some(image.link.clone(), |this, link| {
-                            let title = image.title();
-                            this.cursor_pointer()
-                                .tooltip(move |window, cx| {
-                                    Tooltip::new(title.clone()).build(window, cx)
-                                })
-                                .on_click(move |_, window, cx| {
-                                    cx.stop_propagation();
-                                    if let Some(on_link) = &on_link {
-                                        on_link(&link.url, window, cx);
-                                    } else {
-                                        cx.open_url(&link.url);
-                                    }
-                                })
-                        });
+                        .when_some(
+                            image.link.as_ref().map(|link| {
+                                link.identifier
+                                    .as_ref()
+                                    .and_then(|id| node_cx.link_refs.get(id))
+                                    .unwrap_or(link)
+                                    .clone()
+                            }),
+                            |this, link| {
+                                let title = image.title();
+                                this.cursor_pointer()
+                                    .tooltip(move |window, cx| {
+                                        Tooltip::new(title.clone()).build(window, cx)
+                                    })
+                                    .on_click(move |_, window, cx| {
+                                        cx.stop_propagation();
+                                        if let Some(on_link) = &on_link {
+                                            on_link(&link.url, window, cx);
+                                        } else {
+                                            cx.open_url(&link.url);
+                                        }
+                                    })
+                            },
+                        );
                     child_nodes.push(
                         gpui::accessible(("image", ix), rendered, move |_, _, _| {
                             let mut node = gpui::accesskit::Node::new(gpui::accesskit::Role::Image);
@@ -816,7 +825,14 @@ impl Node {
                 }
                 if let Some(image) = &child.image {
                     if let Some(link) = &image.link {
-                        links.push((image.title().into(), link.url.clone()));
+                        let link = link
+                            .identifier
+                            .as_ref()
+                            .and_then(|id| context.link_refs.get(id))
+                            .unwrap_or(link);
+                        if !link.url.is_empty() {
+                            links.push((image.title().into(), link.url.clone()));
+                        }
                     }
                 }
             }
@@ -1195,6 +1211,7 @@ impl Node {
                                                             |this| this.justify_end(),
                                                         )
                                                         .flex_shrink_0()
+                                                        .flex_grow()
                                                         .w(rems(len as f32 * 0.6 + 1.))
                                                         .px_2()
                                                         .py_1()
@@ -1203,8 +1220,7 @@ impl Node {
                                                                 .border_color(cx.theme().border)
                                                         })
                                                         .child(
-                                                            cell.children
-                                                                .render(node_cx, window, cx),
+                                                            cell.children.render(node_cx, window, cx),
                                                         )
                                                         .map(|rendered| {
                                                             gpui::accessible(
