@@ -714,11 +714,15 @@ impl Recovery {
         let warning=fs::File::open(&destination).and_then(|f|f.sync_all()).err().map(|e|format!("Draft restored into this session, but its sync failed: {e}. Save a copy elsewhere."));
         Ok((draft, warning))
     }
-    pub fn checkpoint(&self, id: u64, draft: &Draft) -> Result<PathBuf, String> {
+    pub fn checkpoint(&self, id: u64, draft: &Draft<impl Serialize>) -> Result<PathBuf, String> {
         self.write(id, draft)?;
         self.checkpoint_version(id, draft)
     }
-    pub fn checkpoint_version(&self, id: u64, draft: &Draft) -> Result<PathBuf, String> {
+    pub fn checkpoint_version(
+        &self,
+        id: u64,
+        draft: &Draft<impl Serialize>,
+    ) -> Result<PathBuf, String> {
         let path = self.directory.join(format!(
             "candidate-{id}-{}-{}.json",
             draft.generation,

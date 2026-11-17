@@ -16,6 +16,7 @@ type Result<T> = std::result::Result<T, String>;
 pub enum FileBytes {
     Raw(Arc<[u8]>),
     WithBom(Arc<str>),
+    OwnedText { text: Arc<String>, bom: bool },
 }
 
 impl FileBytes {
@@ -31,6 +32,7 @@ impl FileBytes {
         match self {
             Self::Raw(bytes) => (&[], bytes),
             Self::WithBom(text) => (BOM, text.as_bytes()),
+            Self::OwnedText { text, bom } => (if *bom { BOM } else { &[] }, text.as_bytes()),
         }
     }
 
@@ -40,35 +42,32 @@ impl FileBytes {
     }
 
     pub fn is_empty(&self) -> bool {
-        matches!(self, Self::Raw(bytes) if bytes.is_empty())
+        let (prefix, bytes) = self.parts();
+        prefix.is_empty() && bytes.is_empty()
     }
 
     #[cfg(test)]
     pub(crate) fn as_bytes(&self) -> std::borrow::Cow<'_, [u8]> {
-        match self {
-            Self::Raw(bytes) => std::borrow::Cow::Borrowed(bytes),
-            Self::WithBom(text) => std::borrow::Cow::Owned([BOM, text.as_bytes()].concat()),
+        let (prefix, bytes) = self.parts();
+        if prefix.is_empty() {
+            std::borrow::Cow::Borrowed(bytes)
+        } else {
+            std::borrow::Cow::Owned([prefix, bytes].concat())
         }
     }
 
     pub(crate) fn has_bom(&self) -> bool {
-        match self {
-            Self::Raw(bytes) => bytes.starts_with(BOM),
-            Self::WithBom(_) => true,
-        }
+        let (prefix, bytes) = self.parts();
+        !prefix.is_empty() || bytes.starts_with(BOM)
     }
 
     pub(crate) fn content_bytes(&self, bom: bool) -> &[u8] {
-        match self {
-            Self::Raw(bytes) if bom => bytes.strip_prefix(BOM).unwrap_or(bytes),
-            Self::Raw(bytes) => bytes,
-            Self::WithBom(text) => text.as_bytes(),
+        let (prefix, bytes) = self.parts();
+        if prefix.is_empty() && bom {
+            bytes.strip_prefix(BOM).unwrap_or(bytes)
+        } else {
+            bytes
         }
-    }
-
-    fn matches(&self, other: &[u8]) -> bool {
-        let (prefix, body) = self.parts();
-        other.strip_prefix(prefix) == Some(body)
     }
 
     fn write_to(&self, mut writer: impl Write) -> std::io::Result<()> {
@@ -98,9 +97,14 @@ impl From<&[u8]> for FileBytes {
 
 impl PartialEq for FileBytes {
     fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Raw(bytes), other) | (other, Self::Raw(bytes)) => other.matches(bytes),
-            (Self::WithBom(left), Self::WithBom(right)) => left == right,
+        let (left_prefix, left) = self.parts();
+        let (right_prefix, right) = other.parts();
+        if left_prefix == right_prefix {
+            left == right
+        } else if left_prefix.is_empty() {
+            left.strip_prefix(right_prefix) == Some(right)
+        } else {
+            right.strip_prefix(left_prefix) == Some(left)
         }
     }
 }
@@ -359,6 +363,16 @@ impl DiskFile {
         self.save_bytes(FileBytes::from_text(text, self.bom), self.bom)
     }
 
+    pub(crate) fn save_owned_snapshot(&self, text: String) -> Result<Self> {
+        self.save_bytes(
+            FileBytes::OwnedText {
+                text: Arc::new(text),
+                bom: self.bom,
+            },
+            self.bom,
+        )
+    }
+
     pub fn save_with_bom(&self, text: &str, bom: bool) -> Result<Self> {
         self.save_bytes(FileBytes::from_text(text.into(), bom), bom)
     }
@@ -497,6 +511,29 @@ mod tests {
         assert_eq!(
             fs::read(path).unwrap().as_slice(),
             disk.bytes.as_bytes().as_ref()
+        );
+    }
+
+    #[test]
+    fn save_shares_the_worker_snapshot_and_compares_exact_bytes() {
+        let before = "\u{feff}original\n";
+        let text = "local 🦀\r\nsecond\rthird\n";
+        let (_dir, path) = fixture(before.as_bytes());
+        let (disk, _) = DiskFile::open(path.clone()).unwrap();
+        let snapshot = text.to_owned();
+        let allocation = snapshot.as_ptr();
+        let saved = disk.save_owned_snapshot(snapshot).unwrap();
+        assert_eq!(saved.content_bytes().as_ptr(), allocation);
+        let full_text = format!("\u{feff}{text}");
+        assert_eq!(fs::read(path).unwrap(), full_text.as_bytes());
+        assert_eq!(saved.bytes, FileBytes::from(full_text.as_bytes()));
+        assert_eq!(saved.bytes, FileBytes::from_text(text.into(), true));
+        assert_eq!(
+            saved.bytes,
+            FileBytes::OwnedText {
+                text: Arc::new(full_text),
+                bom: false
+            }
         );
     }
 

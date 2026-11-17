@@ -531,7 +531,7 @@ impl InputState {
             .then(|| self.text_wrapper.replacement_layout())
     }
 
-    pub(super) fn cached_value(&self) -> Option<SharedString> {
+    pub fn cached_value(&self) -> Option<SharedString> {
         self.value_cache.borrow().clone()
     }
 

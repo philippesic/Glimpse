@@ -125,7 +125,7 @@ impl Shell {
                 id: doc.id,
                 generation: snapshot.generation,
                 disk: snapshot.disk,
-                text: snapshot.local.into(),
+                text: glimpse::io::TextSnapshot::Flat(snapshot.local.into()),
                 without_recovery: false,
             }),
         }

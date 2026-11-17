@@ -1596,7 +1596,7 @@ impl Shell {
                         glimpse::closing::Outcome::Ignored => {}
                     }
                 }
-                Reply::Save(id, generation, _, result) => {
+                Reply::Save(id, generation, result) => {
                     glimpse::metrics::event("save-reply", id, generation);
                     let succeeded = result.is_ok();
                     if let Some(doc) = self.documents.iter_mut().find(|d| d.id == id) {
@@ -1616,16 +1616,16 @@ impl Shell {
                                 doc.external = None;
                                 doc.generation += 1;
                                 if doc.dirty(cx) {
-                                    self.io.send(Job::Recover(
+                                    self.io.recover_edit(
                                         id,
                                         storage::Draft {
                                             path: doc.disk.path.clone(),
                                             target: Some(doc.disk.target.clone()),
-                                            text: doc.input.read(cx).value().into(),
+                                            text: doc.input.read(cx).text().clone(),
                                             base: doc.disk.bytes.clone(),
                                             generation: doc.generation,
                                         },
-                                    ));
+                                    );
                                 } else {
                                     self.io.send(Job::ClearThrough(id, doc.generation));
                                 }
@@ -2240,10 +2240,15 @@ impl Shell {
             self.checks.invalidate(doc.id);
             doc.deferred_external = None;
             doc.saving = true;
+            let input = doc.input.read(cx);
+            let text = match input.cached_value() {
+                Some(value) => glimpse::io::TextSnapshot::Flat(value.into()),
+                None => glimpse::io::TextSnapshot::Revision(input.text().clone()),
+            };
             self.io.send(Job::Save {
                 id: doc.id,
                 disk: doc.disk.clone(),
-                text: doc.input.read(cx).value().into(),
+                text,
                 generation: doc.generation,
                 without_recovery: false,
             });

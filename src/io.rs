@@ -48,7 +48,7 @@ pub enum Job {
     Save {
         id: u64,
         disk: DiskFile,
-        text: Arc<str>,
+        text: TextSnapshot,
         generation: u64,
         without_recovery: bool,
     },
@@ -99,7 +99,7 @@ pub enum Reply {
     Checked(u64, u64, Result<(DiskFile, Arc<str>), String>),
     CheckDeferred(u64, u64),
     Open(PathBuf, u64, Result<(DiskFile, PreparedInput), String>),
-    Save(u64, u64, Arc<str>, Result<DiskFile, String>),
+    Save(u64, u64, Result<DiskFile, String>),
 }
 
 struct Rebinding {
@@ -132,7 +132,7 @@ pub struct IoWorker {
     maintenance: Option<mpsc::SyncSender<Job>>,
     pub replies: mpsc::Receiver<Reply>,
     errors: mpsc::Sender<Reply>,
-    drafts: Arc<Mutex<HashMap<u64, storage::Draft<RecoveryText>>>>,
+    drafts: Arc<Mutex<HashMap<u64, storage::Draft<TextSnapshot>>>>,
     handles: Vec<thread::JoinHandle<()>>,
     clears: Arc<Mutex<HashMap<u64, u64>>>,
     cleared_through: Arc<Mutex<HashMap<u64, u64>>>,
@@ -142,12 +142,12 @@ pub struct IoWorker {
     rebindings: Arc<Rebindings>,
 }
 
-enum RecoveryText {
+pub enum TextSnapshot {
     Flat(Arc<str>),
     Revision(Rope),
 }
 
-impl serde::Serialize for RecoveryText {
+impl serde::Serialize for TextSnapshot {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
             Self::Flat(text) => serializer.serialize_str(text),
@@ -207,7 +207,7 @@ impl IoWorker {
         let (results, replies) = mpsc::channel();
         let errors = results.clone();
         let drafts = Arc::new(Mutex::new(
-            HashMap::<u64, storage::Draft<RecoveryText>>::new(),
+            HashMap::<u64, storage::Draft<TextSnapshot>>::new(),
         ));
         let preview = Arc::new(AtomicU64::new(0));
         let rebindings = Arc::new(Rebindings::default());
@@ -559,8 +559,14 @@ impl IoWorker {
                             crate::metrics::event("save-worker", id, generation);
                             #[cfg(feature = "test-support")]
                             crate::metrics::delay("SAVE");
+                            let save = || match &text {
+                                TextSnapshot::Flat(text) => disk.save_snapshot(text.clone()),
+                                TextSnapshot::Revision(text) => {
+                                    disk.save_owned_snapshot(text.to_string())
+                                }
+                            };
                             let result = if without_recovery {
-                                disk.save_snapshot(text.clone())
+                                save()
                             } else {
                                 recovery
                                     .as_ref()
@@ -572,7 +578,7 @@ impl IoWorker {
                                                 id,
                                                 &storage::Draft {
                                                     path: disk.path.clone(),
-                                                    text: text.clone(),
+                                                    text: &text,
                                                     base: disk.bytes.clone(),
                                                     target: Some(disk.target.clone()),
                                                     generation,
@@ -581,7 +587,7 @@ impl IoWorker {
                                             .map_err(|e| format!("Recovery unavailable: {e}"))?;
                                         let _ =
                                             results.send(Reply::Recovered(id, generation, Ok(())));
-                                        let saved = disk.save_snapshot(text.clone())?;
+                                        let saved = save()?;
                                         if let Err(error) = r.saved(id, generation) {
                                             let _ = results.send(Reply::HistoryWarning(format!(
                                                 "Saved {}. Recovery maintenance failed: {error}",
@@ -613,7 +619,7 @@ impl IoWorker {
                                 )
                             });
                             crate::metrics::event("save-worker-done", id, generation);
-                            Reply::Save(id, generation, text, result)
+                            Reply::Save(id, generation, result)
                         }
                     };
                     if was_tracked {
@@ -707,7 +713,7 @@ impl IoWorker {
             return;
         }
         let job = if let Job::Recover(id, draft) = job {
-            self.queue_recovery(id, draft.map_text(RecoveryText::Flat));
+            self.queue_recovery(id, draft.map_text(TextSnapshot::Flat));
             return;
         } else {
             job
@@ -764,12 +770,7 @@ impl IoWorker {
                     Job::RecentLocation(_) => Reply::RecentLocation(None),
                     Job::Volumes => Reply::Volumes(Err(message)),
                     Job::Settings(_) => Reply::SettingsSaved(Err(message)),
-                    Job::Save {
-                        id,
-                        generation,
-                        text,
-                        ..
-                    } => Reply::Save(id, generation, text, Err(message)),
+                    Job::Save { id, generation, .. } => Reply::Save(id, generation, Err(message)),
                     Job::SaveTo(d) | Job::Prepare(d) => Reply::SavedTo(Box::new(d), Err(message)),
                     Job::Choose(path, _) => Reply::Chosen(path, Err(message)),
                     Job::Finish(id, generation, attempt, disk, _) => {
@@ -791,10 +792,10 @@ impl IoWorker {
     }
 
     pub fn recover_edit(&self, id: u64, draft: storage::Draft<Rope>) {
-        self.queue_recovery(id, draft.map_text(RecoveryText::Revision));
+        self.queue_recovery(id, draft.map_text(TextSnapshot::Revision));
     }
 
-    fn queue_recovery(&self, id: u64, draft: storage::Draft<RecoveryText>) {
+    fn queue_recovery(&self, id: u64, draft: storage::Draft<TextSnapshot>) {
         if self
             .cleared_through
             .lock()
@@ -856,7 +857,7 @@ fn reload_document(
             &storage::Draft {
                 path: reload.original.path.clone(),
                 target: Some(reload.original.target.clone()),
-                text: reload.local.clone().into(),
+                text: reload.local.as_str(),
                 base: reload.original.bytes.clone(),
                 generation: reload.generation,
             },
@@ -919,7 +920,7 @@ fn save_destination(
                 destination.id,
                 &storage::Draft {
                     path: destination.path.clone(),
-                    text: destination.text.clone().into(),
+                    text: destination.text.as_str(),
                     base: destination
                         .expected
                         .as_ref()
@@ -989,7 +990,7 @@ mod tests {
         let revision = Rope::from(text.as_str());
         assert!(revision.chunks().count() > 1);
         assert_eq!(
-            serde_json::to_vec(&RecoveryText::Revision(revision)).unwrap(),
+            serde_json::to_vec(&TextSnapshot::Revision(revision)).unwrap(),
             serde_json::to_vec(&text).unwrap()
         );
     }
@@ -1073,7 +1074,7 @@ mod tests {
         io.send(Job::Save {
             id: 7,
             disk: disk.clone(),
-            text: "saved snapshot\n".into(),
+            text: TextSnapshot::Revision(Rope::from("saved snapshot\n")),
             generation: 8,
             without_recovery: false,
         });
@@ -1083,8 +1084,8 @@ mod tests {
                 .recv_timeout(std::time::Duration::from_secs(5))
                 .unwrap()
             {
-                Reply::Save(7, 8, _, Ok(_)) => break,
-                Reply::Save(_, _, _, Err(error)) => panic!("{error}"),
+                Reply::Save(7, 8, Ok(_)) => break,
+                Reply::Save(_, _, Err(error)) => panic!("{error}"),
                 _ => {}
             }
         }
