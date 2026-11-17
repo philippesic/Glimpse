@@ -6,7 +6,7 @@
 
 The GPUI shell owns document IDs, tabs, focus, navigation history, search scope and user decisions. Disk files, save validation, recovery, search, directory enumeration, CLI parsing and lifecycle remain ordinary Rust modules. Worker completion uses a small renderer-independent callback, connected to a bounded GPUI wake channel. The domain modules are exposed through the library target and can be tested without opening a window. The runtime does not use egui. Retained egui presentation regression tests are test-only; they do not qualify the new interface.
 
-Document reads use two bounded workers, mutations one, and maintenance one. Directory listings use two workers and stream bounded batches. Recursive search and syntax each use a latest-request mailbox. Notifications trigger full document validation; they are not authoritative versions. No periodic scan or repaint loop is intended.
+Document reads use two bounded workers, mutations one, and maintenance one. Directory listings use two workers and stream bounded batches. Recursive search and syntax each use a latest-request mailbox. Relevant notifications trigger document validation; they are not authoritative versions. No periodic scan or repaint loop is intended.
 
 ## Editor choice
 
@@ -21,6 +21,8 @@ Cursor movement, selection and deletion use extended grapheme boundaries across 
 DiskFile retains observed identity, symlink binding and bytes. Save stages beside the target, preserves supported metadata, syncs, validates and atomically replaces. Hard links, unsupported ownership/metadata and changed destinations stop saving. Atomic replacement is not compare-and-swap against unrelated writers. External observation retains the existing binding when a symlink target changes, even when both targets have identical bytes; ordinary Save stays blocked until an explicit resolution.
 
 Document observations allow two outstanding reads. Repeated notifications coalesce into one follow-up per document, and a local edit during a read schedules a fresh observation without needing another filesystem event. Invalidated reads retain their slot until completion. A full read queue returns a typed deferral with a short retry. Watches include the chosen path, resolved target and pending observed target parents; rebinding refreshes them.
+
+Content notifications affect matching documents; entry changes refresh the displayed folder. Unknown events, overflow and monitoring errors retain a full rescan. Registration is followed by validation, and Refresh Folder rearms monitoring after a directory is replaced. Watch directories resolve on the worker, share registrations across aliases and map events back to chosen paths. Monitoring failures remain in Warnings until acknowledged.
 
 Failed opens retain the existing document and show a persistent, named explanation with details, retry and an explicit external-open action. Unsupported encodings, binary data and over-limit files never become editable buffers.
 
