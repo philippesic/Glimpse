@@ -1058,13 +1058,63 @@ impl Clone for PropertyValue {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(transparent)]
-struct PropertyIndices([u8; PropertyId::Unset as usize]);
+const UNSET_PROPERTY: u8 = PropertyId::Unset as u8;
+const INLINE_PROPERTIES: usize = 6;
+
+#[derive(Clone, Debug)]
+enum PropertyIndices {
+    Inline([u8; INLINE_PROPERTIES]),
+    Dense(Box<[u8; UNSET_PROPERTY as usize]>),
+}
 
 impl Default for PropertyIndices {
     fn default() -> Self {
-        Self([PropertyId::Unset as u8; PropertyId::Unset as usize])
+        Self::Inline([UNSET_PROPERTY; INLINE_PROPERTIES])
+    }
+}
+
+impl PropertyIndices {
+    fn index(&self, id: u8) -> u8 {
+        match self {
+            Self::Inline(ids) => ids
+                .iter()
+                .position(|&stored| stored == id)
+                .map_or(UNSET_PROPERTY, |index| index as u8),
+            Self::Dense(indices) => indices[id as usize],
+        }
+    }
+
+    fn insert(&mut self, id: PropertyId, index: u8) {
+        match self {
+            Self::Inline(ids) if (index as usize) < ids.len() => ids[index as usize] = id as u8,
+            Self::Inline(ids) => {
+                let mut indices = Box::new([UNSET_PROPERTY; UNSET_PROPERTY as usize]);
+                for (position, &property) in ids.iter().enumerate() {
+                    indices[property as usize] = position as u8;
+                }
+                indices[id as usize] = index;
+                *self = Self::Dense(indices);
+            }
+            Self::Dense(indices) => indices[id as usize] = index,
+        }
+    }
+
+    fn entries(&self) -> impl Iterator<Item = (u8, u8)> + '_ {
+        let (inline, dense): (&[u8], &[u8]) = match self {
+            Self::Inline(ids) => (ids, &[]),
+            Self::Dense(indices) => (&[], indices.as_slice()),
+        };
+        let inline = inline
+            .iter()
+            .take_while(|&&id| id != UNSET_PROPERTY)
+            .enumerate()
+            .map(|(index, &id)| (id, index as u8));
+        let dense = dense
+            .iter()
+            .enumerate()
+            .filter(|&(_, &index)| index != UNSET_PROPERTY)
+            .map(|(id, &index)| (id as u8, index));
+        inline.chain(dense)
     }
 }
 
@@ -1075,7 +1125,7 @@ struct Properties {
 }
 
 fn value_at(values: &[PropertyValue], index: u8) -> &PropertyValue {
-    if index == PropertyId::Unset as u8 {
+    if index == UNSET_PROPERTY {
         &PropertyValue::None
     } else {
         &values[index as usize]
@@ -1084,13 +1134,23 @@ fn value_at(values: &[PropertyValue], index: u8) -> &PropertyValue {
 
 impl PartialEq for Properties {
     fn eq(&self, other: &Self) -> bool {
-        self.indices
-            .0
-            .iter()
-            .zip(other.indices.0.iter())
-            .all(|(&own, &other_index)| {
-                value_at(&self.values, own) == value_at(&other.values, other_index)
-            })
+        let mut matched = 0;
+        for (id, index) in self.indices.entries() {
+            let value = value_at(&self.values, index);
+            if matches!(value, PropertyValue::None) {
+                continue;
+            }
+            if value != value_at(&other.values, other.indices.index(id)) {
+                return false;
+            }
+            matched += 1;
+        }
+        matched
+            == other
+                .values
+                .iter()
+                .filter(|v| !matches!(v, PropertyValue::None))
+                .count()
     }
 }
 
@@ -1115,17 +1175,17 @@ pub struct Node {
 
 impl PropertyIndices {
     fn get<'a>(&self, values: &'a [PropertyValue], id: PropertyId) -> &'a PropertyValue {
-        value_at(values, self.0[id as usize])
+        value_at(values, self.index(id as u8))
     }
 }
 
 impl Properties {
     fn get_mut(&mut self, id: PropertyId, default: PropertyValue) -> &mut PropertyValue {
-        let index = self.indices.0[id as usize] as usize;
-        if index == PropertyId::Unset as usize {
+        let index = self.indices.index(id as u8) as usize;
+        if index == UNSET_PROPERTY as usize {
             self.values.push(default);
             let index = self.values.len() - 1;
-            self.indices.0[id as usize] = index as u8;
+            self.indices.insert(id, index as u8);
             &mut self.values[index]
         } else {
             let value = &mut self.values[index];
@@ -1137,18 +1197,18 @@ impl Properties {
     }
 
     fn set(&mut self, id: PropertyId, value: PropertyValue) {
-        let index = self.indices.0[id as usize];
-        if index == PropertyId::Unset as u8 {
+        let index = self.indices.index(id as u8);
+        if index == UNSET_PROPERTY {
             self.values.push(value);
-            self.indices.0[id as usize] = (self.values.len() - 1) as u8;
+            self.indices.insert(id, (self.values.len() - 1) as u8);
         } else {
             self.values[index as usize] = value;
         }
     }
 
     fn clear(&mut self, id: PropertyId) {
-        let index = self.indices.0[id as usize];
-        if index != PropertyId::Unset as u8 {
+        let index = self.indices.index(id as u8);
+        if index != UNSET_PROPERTY {
             self.values[index as usize] = PropertyValue::None;
         }
     }
@@ -1157,15 +1217,40 @@ impl Properties {
 impl Clone for Properties {
     fn clone(&self) -> Self {
         Self {
-            indices: self.indices,
+            indices: self.indices.clone(),
             values: self.values.clone(),
         }
     }
 
     fn clone_from(&mut self, source: &Self) {
-        self.indices = source.indices;
+        self.indices.clone_from(&source.indices);
         source.values.clone_into(&mut self.values);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn property_lookup_survives_dense_promotion_and_clearing() {
+    let mut sparse = Node::new(Role::TextRun);
+    sparse.set_value("text");
+    sparse.set_character_lengths([1, 1, 1, 1]);
+    sparse.set_word_starts([0]);
+    let mut dense = sparse.clone();
+    dense.set_label("label");
+    dense.set_description("description");
+    dense.set_next_on_line(NodeId(12));
+    dense.set_previous_on_line(NodeId(11));
+    assert_eq!(dense.previous_on_line(), Some(NodeId(11)));
+    assert_eq!(dense.next_on_line(), Some(NodeId(12)));
+    assert_ne!(dense, sparse);
+    dense.clear_label();
+    dense.clear_description();
+    dense.clear_next_on_line();
+    dense.clear_previous_on_line();
+    assert_eq!(dense, sparse);
+    dense.set_label("new label");
+    assert_eq!(dense.label(), Some("new label"));
+    assert_eq!(sparse.label(), None);
 }
 
 macro_rules! flag_methods {
@@ -2849,8 +2934,9 @@ impl Serialize for Properties {
             }
         }
         let mut map = serializer.serialize_map(Some(len))?;
-        for (id, index) in self.indices.0.iter().copied().enumerate() {
-            if index == PropertyId::Unset as u8 {
+        for id in 0..UNSET_PROPERTY {
+            let index = self.indices.index(id);
+            if index == UNSET_PROPERTY {
                 continue;
             }
             let id = PropertyId::n(id as _).unwrap();

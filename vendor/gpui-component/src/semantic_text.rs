@@ -18,14 +18,15 @@ impl Segment {
             .collect()
     }
 }
-pub(crate) fn segments(text: &str) -> Vec<Segment> {
-    let mut segments = vec![];
+pub(crate) fn visit_segments(text: &str, mut visit: impl FnMut(Segment)) {
     let mut offset = 0;
+    let mut had_line = false;
     for (line_index, line) in text
         .split_inclusive('\n')
         .chain(text.ends_with('\n').then_some(""))
         .enumerate()
     {
+        had_line = true;
         let mut words = line
             .unicode_word_indices()
             .map(|(byte, _)| offset + byte)
@@ -53,7 +54,7 @@ pub(crate) fn segments(text: &str) -> Vec<Segment> {
             let ascii_end = byte + safe_ascii;
             while byte < ascii_end {
                 if lengths.len() == 255 {
-                    segments.push(Segment {
+                    visit(Segment {
                         range: start..byte,
                         lengths,
                         words: starts,
@@ -88,7 +89,7 @@ pub(crate) fn segments(text: &str) -> Vec<Segment> {
             };
             for length in pieces {
                 if lengths.len() == 255 {
-                    segments.push(Segment {
+                    visit(Segment {
                         range: start..byte,
                         lengths,
                         words: starts,
@@ -115,7 +116,7 @@ pub(crate) fn segments(text: &str) -> Vec<Segment> {
                 byte += usize::from(length);
             }
         }
-        segments.push(Segment {
+        visit(Segment {
             range: start..end,
             lengths,
             words: starts,
@@ -123,14 +124,19 @@ pub(crate) fn segments(text: &str) -> Vec<Segment> {
         });
         offset = end;
     }
-    if segments.is_empty() {
-        segments.push(Segment {
+    if !had_line {
+        visit(Segment {
             range: 0..0,
             lengths: vec![],
             words: vec![],
             line: 0,
         });
     }
+}
+
+pub(crate) fn segments(text: &str) -> Vec<Segment> {
+    let mut segments = Vec::new();
+    visit_segments(text, |part| segments.push(part));
     segments
 }
 pub(crate) fn text(

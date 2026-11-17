@@ -1,5 +1,5 @@
 use super::*;
-use crate::semantic_text::segments;
+use crate::semantic_text::visit_segments;
 use gpui::accesskit::{
     Action, ActionData, ActionRequest, Node, NodeId, Role, TextDirection, TextPosition,
     TextSelection,
@@ -62,50 +62,40 @@ impl TextRuns {
         } else {
             self.runs.partition_point(|run| run.range.start < old.end)
         };
-        let mut parts = segments(&text[new.clone()]);
-        if new.end < text.len() && parts.last().is_some_and(|part| part.range.is_empty()) {
-            parts.pop();
-        }
-        let ids: Vec<_> = (0..parts.len())
-            .map(|index| {
-                if let Some(run) = self
-                    .runs
-                    .get(prefix + index)
-                    .filter(|_| prefix + index < suffix)
-                {
-                    run.id
-                } else {
-                    let key = self.next_key;
-                    self.next_key += 1;
-                    node_id(key)
-                }
-            })
-            .collect();
-        let mut nodes = Vec::with_capacity(prefix + parts.len() + self.nodes.len() - suffix);
-        let mut runs = Vec::with_capacity(nodes.capacity());
+        let mut nodes = Vec::with_capacity(self.nodes.len());
+        let mut runs = Vec::with_capacity(self.runs.len());
         nodes.extend(self.nodes[..prefix].iter().cloned());
         runs.extend(self.runs[..prefix].iter().cloned());
-        let mut parts = parts.into_iter().enumerate().peekable();
-        let mut previous_line = None;
-        while let Some((index, part)) = parts.next() {
+        let mut previous: Option<(usize, NodeId, Node)> = None;
+        visit_segments(&text[new.clone()], |part| {
+            if part.range.is_empty() && new.end < text.len() {
+                return;
+            }
+            let id = if runs.len() < suffix {
+                self.runs[runs.len()].id
+            } else {
+                let key = self.next_key;
+                self.next_key += 1;
+                node_id(key)
+            };
             let mut run = Node::new(Role::TextRun);
             let range = new.start + part.range.start..new.start + part.range.end;
             run.set_value(text[range.clone()].to_owned());
             run.set_character_lengths(part.lengths);
             run.set_word_starts(part.words);
             run.set_text_direction(TextDirection::LeftToRight);
-            if previous_line == Some(part.line) {
-                run.set_previous_on_line(ids[index - 1]);
+            if let Some((line, previous_id, mut previous)) = previous.take() {
+                if line == part.line {
+                    previous.set_next_on_line(id);
+                    run.set_previous_on_line(previous_id);
+                }
+                nodes.push((previous_id, previous));
             }
-            if parts.peek().is_some_and(|(_, next)| next.line == part.line) {
-                run.set_next_on_line(ids[index + 1]);
-            }
-            previous_line = Some(part.line);
-            nodes.push((ids[index], run));
-            runs.push(Run {
-                id: ids[index],
-                range,
-            });
+            previous = Some((part.line, id, run));
+            runs.push(Run { id, range });
+        });
+        if let Some((_, id, node)) = previous {
+            nodes.push((id, node));
         }
         nodes.extend(self.nodes[suffix..].iter().cloned());
         runs.extend(self.runs[suffix..].iter().map(|run| Run {
@@ -386,6 +376,7 @@ impl InputState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::semantic_text::segments;
 
     #[gpui::test]
     fn large_accessible_updates_reject_stale_text_and_owners(cx: &mut gpui::TestAppContext) {
