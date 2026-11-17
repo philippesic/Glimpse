@@ -1,6 +1,6 @@
 //! Semantic colors, system typography and static native UI components.
 
-use eframe::egui::{self, Color32, CornerRadius, FontId, Stroke, TextStyle, Theme};
+use egui::{self, Color32, CornerRadius, FontId, Stroke, TextStyle, Theme};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Density {

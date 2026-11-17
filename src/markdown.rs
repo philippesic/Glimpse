@@ -1,5 +1,5 @@
 //! Markdown keeps authoritative source separate from its bounded reading presentation.
-use eframe::egui::{
+use egui::{
     self,
     load::{ImageLoadResult, ImageLoader, ImagePoll, LoadError, SizeHint},
 };

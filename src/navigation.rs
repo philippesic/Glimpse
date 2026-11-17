@@ -1,5 +1,5 @@
 mod ui;
-use eframe::egui::{self, Vec2};
+use egui::{self, Vec2};
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
@@ -9,12 +9,7 @@ use std::{
 const ROW_HEIGHT: f32 = 28.0;
 const GESTURE_DISTANCE: f32 = 65.0;
 
-#[derive(Clone)]
-pub struct Entry {
-    pub path: PathBuf,
-    pub directory: bool,
-    pub symlink: bool,
-}
+pub use crate::directory::Entry;
 
 enum Listing {
     Loading,

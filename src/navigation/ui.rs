@@ -1,6 +1,6 @@
 use super::*;
 use crate::appearance;
-use eframe::egui::RichText;
+use egui::RichText;
 
 // Resample precise 60 Hz wheel updates across intervening display frames.
 #[derive(Clone, Default)]

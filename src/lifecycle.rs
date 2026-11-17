@@ -42,7 +42,12 @@ pub fn launch(args: &[std::ffi::OsString], wait: bool, picker: bool) -> ! {
         .env("GLIMPSE_GUI", "1")
         .stdin(std::process::Stdio::null());
     if !picker {
-        command.env("GLIMPSE_CHANNEL", &socket);
+        command
+            .env("GLIMPSE_CHANNEL", &socket)
+            .stdout(std::process::Stdio::null());
+        if std::env::var_os("GLIMPSE_TRACE").is_none() {
+            command.stderr(std::process::Stdio::null());
+        }
     }
     let mut child = command
         .spawn()
@@ -78,7 +83,7 @@ pub fn launch(args: &[std::ffi::OsString], wait: bool, picker: bool) -> ! {
         fail(&format!("GUI did not acknowledge a usable frame: {e}"));
     }
     if message[0] != b'0' {
-        std::process::exit(2);
+        fail("GUI could not open the requested files or folder; see its error message");
     }
     if !wait {
         std::process::exit(0);

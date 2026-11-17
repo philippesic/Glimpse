@@ -1,6 +1,6 @@
 # Glimpse
 
-**Product and design source of truth · Core development baseline · Updated 30 October 2026**
+**Product and design source of truth · Core development baseline · Updated 16 November 2026**
 
 Glimpse is a small desktop file navigator and text editor for people whose main work happens in terminals and agent harnesses. Its primary workflow is **find a file, inspect it, make a small edit, and return to the task that brought you there**.
 
@@ -10,7 +10,7 @@ This document governs product scope, interaction, visual language, and implement
 
 ### Current implementation stage
 
-The macOS development build implements single-list directory navigation, previews, native AppKit source editing, syntax and line numbers, validated Save/As/Copy, no-clobber creation/rename, OS Trash, recovery/history, external-change handling, scoped streaming search, native Markdown reading, functional preferences/keymaps and CLI open/pick/wait. [README.md](README.md) describes actual behavior; [qualification results](docs/qualification.md) separate implemented functionality from release evidence. The 10 MiB long-line case and memory aspiration fail their performance gates. Physical 120 Hz delivery, full VoiceOver and real IME composition remain unverified; no other desktop platform is qualified. These limits do not relax the product targets.
+The development build uses GPUI, with Linux as the current verification target. [README.md](README.md) describes the current interface and [core design](docs/core-design.md) records gaps. Historical [qualification results](docs/qualification.md) apply to the retired prototype. macOS compilation and interaction are unverified for the GPUI port. These limits do not relax the product targets.
 
 ## 1. Purpose and position
 
@@ -280,11 +280,11 @@ The initial implementation should use one Cargo package with ordinary Rust modul
 
 The domain modules must compile and be testable without opening a window. Prefer concrete types and explicit ownership; use traits when an actual alternative implementation or necessary test boundary requires one. Keep public interfaces small. Extract another crate when a demonstrated dependency, reuse, or build-time need justifies it. A possible future TUI or plugin system alone is not that need. Rust modules already provide encapsulation within a crate. [Rust module privacy](https://doc.rust-lang.org/book/ch07-02-defining-modules-to-control-scope-and-privacy.html).
 
-### Toolkit selection remains an engineering gate
+### GPUI implementation
 
-Prototype **egui/eframe and one editor-capable alternative** against the same workload. Floem is a relevant alternative because it exposes a text editor used by Lapce; GPUI and Iced remain candidates if their current APIs and component availability fit. Choose the second candidate after a short component and license assessment, rather than implementing four parallel prototypes. [egui](https://github.com/emilk/egui), [Floem editor](https://lapce.dev/floem/floem/views/text_editor/index.html), [GPUI](https://gpui.rs/), [Iced](https://github.com/iced-rs/iced).
+The GUI uses GPUI with a native Rust text component. Linux is the first port target; macOS remains a target requiring separate compilation and desktop verification. The egui/eframe and embedded AppKit application layer is retired. No WebView application frontend or Markdown renderer is permitted.
 
-A framework's renderer or text-input demo is insufficient evidence. The spike must demonstrate long-document layout, selection, undo, IME/dead keys, emoji/graphemes, font fallback, native clipboard, screen-reader editing, virtualized tree rows, startup, and idle behavior. Evaluate upstream maintenance and licensing of any editor code separately from the toolkit. Choose a toolkit only after this evidence; if no candidate meets the essentials, revise the implementation strategy before constructing the full application around it.
+The editor choice and its patches are recorded in [core design](docs/core-design.md). Availability of a component is not qualification: long-document layout, long lines, selection, undo, IME/dead keys, emoji/graphemes, font fallback, native clipboard, accessibility, virtualized rows, startup and idle behavior require direct evidence. Remaining gaps must stay visible rather than weakening the editing or safety contracts.
 
 Extensions begin with stable internal commands and declarative preferences, not a public plugin ABI. Add a runtime only after concrete optional features demonstrate a repeated need. Any later extension system must make activation, capabilities, resource cost, isolation, compatibility, and disablement explicit. Core navigation, editing, and recovery stay available with all extensions disabled.
 
@@ -292,9 +292,9 @@ Extensions begin with stable internal commands and declarative preferences, not 
 
 ### Validate the intended experience
 
-Use the owner's actual manual-editing work to evaluate the design. Existing tools provide interaction references and performance baselines; comparison guides implementation rather than deciding whether Glimpse is original enough to build. Record concrete friction, setup effort, visual preferences, and desired customization. Compare a navigation prototype only on interactions it implements; compare editing and recovery when the vertical slice exists. Performance comparisons use equivalent warm/cold conditions and recorded versions/configurations.
+Use the owner's actual manual-editing work to evaluate the design. Judge core workflows against platform interface guidelines, WCAG 2.2 contrast and keyboard access, consistent spacing and typography, visible focus and states, readable text, and reachable controls at supported window sizes. Record concrete friction, context loss and recovery steps. Existing applications are optional interaction references; a comparison is not a release requirement. Any performance comparison must use equivalent cache conditions and recorded versions/configurations.
 
-Use the same tasks and files:
+Use repeatable tasks and files:
 
 1. Open a pasted absolute path outside the current repository; edit and save one paragraph.
 2. Inspect several similarly named files without accumulating unwanted tabs or losing the starting location.
@@ -312,7 +312,7 @@ Reuse maintained libraries or components when they meet the design and reduce ma
 
 The current user aspirations are app opening below 100 ms, folder and file opening within 100 ms, total RAM below 100 MB and idle CPU at most 0.1% of one core. During active use, CPU work stays proportional to the interaction and returns to idle promptly; report active and idle CPU separately. These supersede the earlier launch/RAM aspirations for current acceptance; the baseline table below remains historical engineering context. Report actual failures, cache conditions and instrumentation limits.
 
-Measure optimized release builds on a named reference machine, OS, display refresh rate, and storage configuration. Establish the initial reference on an ordinary Apple Silicon laptop with local SSD storage; record the actual model and memory before collecting results. Repeat on representative Windows and Linux machines before claiming support. Report p50/p95/p99 where meaningful, sample counts, and cache state.
+Measure optimized release builds on a named reference machine, OS, display refresh rate, memory and storage configuration. Linux is the current qualification target; macOS and Windows require their own build and desktop evidence before claiming support. Keep shared behavior and design platform-neutral. Report p50/p95/p99 where meaningful, sample counts, cache state and instrumentation limits.
 
 | Workload | Initial target |
 | --- | --- |
@@ -361,7 +361,7 @@ UX refinement is expected. Keep visual tokens, typography, focus, and spacing co
 
 **Give features and abstractions a cost.** Before adding either, state the current task it improves, the simpler alternative, and its startup, memory, UI, dependency, and maintenance cost. Defer extras without implementing their infrastructure. Remove abandoned code and dependencies as part of the change that replaces them. Refactor a concrete source of difficulty in a bounded change; avoid mixing a broad architectural rewrite with a new interaction. A new framework, event bus, plugin host, or service is not a substitute for a clear state model.
 
-**Keep verification proportional and continuous.** Once code exists, establish formatting, linting, and focused automated tests in CI. Test document/state transitions and filesystem failure paths directly; use a small number of integration scenarios for complete flows. Avoid brittle screenshot suites and tests that merely repeat implementation details. Reserve separate review for consequential uncertainties such as save correctness, text handling, or a toolkit limitation. Track startup, typing, memory, and package-size budgets as features land. Check platform-sensitive behavior on the other target systems early, even while macOS remains the primary development platform; full platform qualification still occurs before claiming support.
+**Keep verification proportional and continuous.** Once code exists, establish formatting, linting, and focused automated tests in CI. Test document/state transitions and filesystem failure paths directly; use a small number of integration scenarios for complete flows. Avoid brittle screenshot suites and tests that merely repeat implementation details. Reserve separate review for consequential uncertainties such as save correctness, text handling, or a toolkit limitation. Track startup, typing, memory, and package-size budgets as features land. Check platform-sensitive behavior on the other target systems early, while Linux is the current GPUI port target; full platform qualification still occurs before claiming support.
 
 **Keep agent work integrated.** One implementation owner carries a slice through coding, verification, and cleanup. Parallel work should have independent boundaries; unresolved interactions and shared state are poor candidates for simultaneous implementation. Handoffs explain the user-visible result, evidence, limitations, and next step. The owner's use of the running application supplies the judgment about feel and appearance that automated checks cannot supply.
 

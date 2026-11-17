@@ -1,4 +1,49 @@
-use eframe::egui::{self, Key, Modifiers};
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Modifiers {
+    pub command: bool,
+    pub shift: bool,
+    pub alt: bool,
+    pub ctrl: bool,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct Key(String);
+impl Key {
+    fn from_name(name: &str) -> Option<Self> {
+        ((name.len() == 1 && name.chars().all(|c| c.is_ascii_alphanumeric()))
+            || matches!(
+                name,
+                "ArrowLeft"
+                    | "ArrowRight"
+                    | "ArrowUp"
+                    | "ArrowDown"
+                    | "Enter"
+                    | "Comma"
+                    | "Escape"
+                    | "Tab"
+                    | "Space"
+                    | "Backspace"
+                    | "Delete"
+                    | "Home"
+                    | "End"
+                    | "PageUp"
+                    | "PageDown"
+            )
+            || name
+                .strip_prefix('F')
+                .and_then(|n| n.parse::<u8>().ok())
+                .is_some_and(|n| (1..=24).contains(&n)))
+        .then(|| {
+            Self(if name.len() == 1 {
+                name.to_ascii_uppercase()
+            } else {
+                name.to_owned()
+            })
+        })
+    }
+    pub fn name(&self) -> &str {
+        &self.0
+    }
+}
 use std::collections::{BTreeMap, HashSet};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Action {
@@ -26,6 +71,12 @@ pub enum Action {
     Pin,
     Scope,
     GoScope,
+    SearchHere,
+    IndexFolder,
+    RemoveIndex,
+    SearchDetails,
+    StopSearch,
+    FocusResults,
     CopyPath,
     CopyRelative,
     Reveal,
@@ -44,7 +95,12 @@ pub enum Action {
     Cancel,
     RetryCleanup,
     CancelClosing,
-    RetainCleanup,
+    Navigator,
+    ToggleNavigator,
+    Line,
+    Filter,
+    KeepPreview,
+    RefreshVolumes,
 }
 pub struct Command {
     pub action: Action,
@@ -71,18 +127,50 @@ commands![
     (Text, "find-text", "Find Text in Saved Files", "Cmd+Shift+F"),
     (Find, "find", "Find / Replace in Document", "Cmd+F"),
     (Read, "read", "Read / Edit Markdown", ""),
-    (Settings, "settings", "Settings", "Cmd+Comma"),
+    (Settings, "settings", "Preferences", "Cmd+Comma"),
     (Recovery, "recovery", "Recovery and Saved Versions", ""),
     (Palette, "commands", "Commands", "Cmd+Shift+P"),
     (Path, "path", "Enter Path", "Cmd+L"),
+    (Navigator, "navigator", "Focus Navigator", "Cmd+Shift+E"),
+    (
+        ToggleNavigator,
+        "toggle-navigator",
+        "Show / Hide Navigator",
+        "Cmd+Alt+E"
+    ),
+    (Line, "line", "Go to Line…", "Cmd+G"),
+    (Filter, "filter", "Filter This Folder", ""),
+    (KeepPreview, "keep-tab", "Keep Preview Tab", ""),
+    (
+        RefreshVolumes,
+        "refresh-volumes",
+        "Refresh Mounted Locations",
+        ""
+    ),
     (Pin, "pin", "Pin / Unpin Current Folder", ""),
     (Scope, "scope", "Pin / Unpin Search Scope Here", ""),
     (GoScope, "go-scope", "Go to Search Folder", ""),
+    (SearchHere, "search-here", "Search This Folder", ""),
+    (
+        IndexFolder,
+        "index-folder",
+        "Index / Rebuild Search Folder",
+        ""
+    ),
+    (RemoveIndex, "remove-index", "Remove Filename Index", ""),
+    (
+        SearchDetails,
+        "search-details",
+        "Search Scope and Coverage",
+        ""
+    ),
+    (StopSearch, "stop-search", "Stop Recursive Search", ""),
+    (FocusResults, "focus-results", "Focus Search Results", ""),
     (CopyPath, "copy-path", "Copy Absolute Path", ""),
     (CopyRelative, "copy-relative", "Copy Relative Path", ""),
     (Reveal, "reveal", "Reveal Document in Navigator", ""),
     (External, "external", "Open Selected Externally", ""),
-    (Finder, "finder", "Reveal Selected in Finder", ""),
+    (Finder, "finder", "Reveal Selected in File Manager", ""),
     (NewFolder, "new-folder", "New Folder…", "Cmd+Shift+N"),
     (NamedFile, "named-file", "New Named File…", ""),
     (Rename, "rename", "Rename Selected…", ""),
@@ -106,12 +194,6 @@ commands![
         "Cancel Closing Documents",
         ""
     ),
-    (
-        RetainCleanup,
-        "retain-cleanup",
-        "Close Retaining Recovery Records",
-        ""
-    ),
 ];
 #[derive(Clone, PartialEq)]
 pub struct Binding {
@@ -120,7 +202,7 @@ pub struct Binding {
     pub modifiers: Modifiers,
 }
 pub fn parse(value: &str) -> Result<(Modifiers, Key), String> {
-    let mut modifiers = Modifiers::NONE;
+    let mut modifiers = Modifiers::default();
     let mut key = None;
     for part in value.split('+') {
         match part {
@@ -139,6 +221,9 @@ pub fn parse(value: &str) -> Result<(Modifiers, Key), String> {
             }
         }
     }
+    if !cfg!(target_os = "macos") {
+        modifiers.ctrl = false;
+    }
     let key = key.ok_or_else(|| format!("Missing key: {value}"))?;
     if ["Copy", "Cut", "Paste", "BrowserBack"].contains(&key.name()) {
         return Err("Use a keyboard key name for an app shortcut.".into());
@@ -148,7 +233,10 @@ pub fn parse(value: &str) -> Result<(Modifiers, Key), String> {
     }
     if !modifiers.alt
         && !modifiers.ctrl
-        && matches!(key, Key::A | Key::C | Key::V | Key::X | Key::Z)
+        && matches!(
+            key.name().to_ascii_uppercase().as_str(),
+            "A" | "C" | "V" | "X" | "Z"
+        )
     {
         return Err(
             "Select All, clipboard and Undo/Redo shortcuts are reserved for text editing.".into(),
@@ -185,18 +273,21 @@ pub fn bindings(overrides: &BTreeMap<String, String>) -> Result<Vec<Binding>, St
     }
     Ok(result)
 }
-pub fn consume(ctx: &egui::Context, bindings: &[Binding]) -> Vec<Action> {
-    ctx.input_mut(|i| {
-        bindings
-            .iter()
-            .filter(|b| i.consume_key(b.modifiers, b.key))
-            .map(|b| b.action)
-            .collect()
-    })
-}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn effective_shortcuts_cannot_collide_through_case_or_primary_control_aliases() {
+        let mut overrides = BTreeMap::new();
+        overrides.insert("new".into(), "Cmd+s".into());
+        assert!(bindings(&overrides).is_err());
+        if !cfg!(target_os = "macos") {
+            overrides.insert("new".into(), "Cmd+Ctrl+S".into());
+            assert!(bindings(&overrides).is_err());
+            assert!(parse("Cmd+Ctrl+A").is_err());
+        }
+    }
+
     #[test]
     fn defaults_and_overrides_preserve_editing_keys() {
         assert!(bindings(&BTreeMap::new()).is_ok());

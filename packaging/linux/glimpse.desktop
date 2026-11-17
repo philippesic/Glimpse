@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Glimpse
+GenericName=Text Editor
+Comment=Browse files, read Markdown and edit text
+Exec=glimpse %F
+TryExec=glimpse
+Icon=glimpse
+Terminal=false
+StartupNotify=true
+StartupWMClass=glimpse
+Categories=Utility;TextEditor;
+MimeType=text/plain;text/markdown;
+Keywords=files;editor;markdown;

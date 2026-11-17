@@ -1,5 +1,5 @@
 //! Highlighting runs outside the event loop; obsolete documents never recolor a newer edit.
-use eframe::egui;
+use crate::wake;
 use std::{
     sync::{
         Arc, Mutex,
@@ -109,12 +109,12 @@ pub struct Highlight {
 struct Request {
     id: u64,
     generation: u64,
-    text: String,
+    text: Arc<str>,
     extension: &'static str,
     dark: bool,
     token: u64,
 }
-fn grammar_extension(path: &std::path::Path, text: &str) -> Option<&'static str> {
+pub fn grammar_extension(path: &std::path::Path, text: &str) -> Option<&'static str> {
     let extension = path.extension().and_then(|s| s.to_str()).unwrap_or("");
     let extension = match extension.to_ascii_lowercase().as_str() {
         "md" | "markdown" | "mdown" => "md",
@@ -171,7 +171,7 @@ pub struct Syntax {
     token: Arc<AtomicU64>,
 }
 impl Syntax {
-    pub fn new(ctx: egui::Context) -> Self {
+    pub fn new(ctx: wake::Context) -> Self {
         let pending = Arc::new(Mutex::new(None::<Request>));
         let ready = Arc::new(Mutex::new(None));
         let token = Arc::new(AtomicU64::new(0));
@@ -193,7 +193,7 @@ impl Syntax {
                 let mut offset = 0;
                 let started = Instant::now();
                 let mut state = syntax.name.clone();
-                for line in LinesWithEndings::from(&request.text) {
+                for line in LinesWithEndings::from(request.text.as_ref()) {
                     if current.load(Ordering::Relaxed) != request.token {
                         break;
                     }
@@ -211,7 +211,7 @@ impl Syntax {
                                     state.push_str(" · partial highlighting (span limit)");
                                     break;
                                 }
-                                let length = part.encode_utf16().count();
+                                let length = part.len();
                                 spans.push(Span {
                                     start: offset,
                                     length,
@@ -257,12 +257,13 @@ impl Syntax {
         &self,
         id: u64,
         generation: u64,
-        text: &str,
+        text: impl Into<Arc<str>>,
         path: &std::path::Path,
         dark: bool,
     ) {
         let token = self.token.fetch_add(1, Ordering::Relaxed) + 1;
-        let Some(extension) = grammar_extension(path, text) else {
+        let text = text.into();
+        let Some(extension) = grammar_extension(path, &text) else {
             self.pending.lock().unwrap().take();
             *self.ready.lock().unwrap() = Some(Highlight {
                 id,
@@ -276,7 +277,7 @@ impl Syntax {
         *self.pending.lock().unwrap() = Some(Request {
             id,
             generation,
-            text: text.into(),
+            text,
             extension,
             dark,
             token,
@@ -300,7 +301,7 @@ mod tests {
     use super::*;
     #[test]
     fn plain_text_is_immediate_and_invalidates_pending_grammar_work() {
-        let syntax = Syntax::new(egui::Context::default());
+        let syntax = Syntax::new(wake::Context::default());
         syntax.request(1, 1, "fn old() {}", std::path::Path::new("x.rs"), true);
         syntax.request(1, 2, "plain 🦀", std::path::Path::new("x.txt"), false);
         let result = syntax.take().unwrap();
@@ -347,16 +348,23 @@ mod tests {
         }
     }
     #[test]
-    fn latest_generation_has_matching_utf16_ranges() {
-        let syntax = Syntax::new(egui::Context::default());
+    fn latest_generation_has_matching_byte_ranges() {
+        let syntax = Syntax::new(wake::Context::default());
         syntax.request(1, 1, "obsolete", std::path::Path::new("x.rs"), true);
-        syntax.request(1, 2, "let 🦀 = 3;\n", std::path::Path::new("x.rs"), true);
+        let text = "let 🦀 = \"café 中文 é\";\r\n";
+        syntax.request(1, 2, text, std::path::Path::new("x.rs"), true);
         let until = Instant::now() + Duration::from_secs(5);
         loop {
             if let Some(result) = syntax.take() {
                 assert_eq!(result.generation, 2);
-                assert_eq!(result.spans.iter().map(|s| s.length).sum::<usize>(), 12);
-                assert_eq!(result.spans.first().unwrap().start, 0);
+                let mut covered = 0;
+                for span in &result.spans {
+                    assert_eq!(span.start, covered);
+                    covered += span.length;
+                    assert!(text.is_char_boundary(span.start));
+                    assert!(text.is_char_boundary(covered));
+                }
+                assert_eq!(covered, text.len());
                 break;
             }
             assert!(Instant::now() < until);

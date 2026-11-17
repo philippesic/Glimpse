@@ -21,7 +21,20 @@ pub fn rename(source: &Path, destination: &Path) -> Result<(), String> {
         std::ffi::CString::new(source.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
     let destination =
         std::ffi::CString::new(destination.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
-    if unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) } != 0 {
+    #[cfg(target_os = "macos")]
+    let result =
+        unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) };
+    #[cfg(target_os = "linux")]
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result != 0 {
         return Err(std::io::Error::last_os_error().to_string());
     }
     Ok(())
@@ -29,6 +42,7 @@ pub fn rename(source: &Path, destination: &Path) -> Result<(), String> {
 pub fn trash(path: &Path) -> Result<(), String> {
     trash_location(path).map(|_| ())
 }
+#[cfg(target_os = "macos")]
 fn trash_location(path: &Path) -> Result<Option<std::path::PathBuf>, String> {
     use objc2_foundation::{NSFileManager, NSURL};
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -57,9 +71,16 @@ fn trash_location(path: &Path) -> Result<Option<std::path::PathBuf>, String> {
     }))
 }
 
+#[cfg(target_os = "linux")]
+fn trash_location(path: &Path) -> Result<Option<std::path::PathBuf>, String> {
+    trash::delete(path).map_err(|error| error.to_string())?;
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
     #[test]
     fn trash_is_recoverable_and_does_not_follow_symlinks() {
         let dir = tempfile::tempdir().unwrap();
@@ -90,7 +111,7 @@ mod tests {
         create(&path, false, "\u{feff}text\r\n").unwrap();
         let (disk, text) = crate::document::DiskFile::open(path.clone()).unwrap();
         assert!(disk.bom);
-        assert_eq!(text, "text\r\n");
+        assert_eq!(text.as_ref(), "text\r\n");
         assert_eq!(fs::read(path).unwrap(), b"\xef\xbb\xbftext\r\n");
         let large = dir.path().join("large");
         assert!(

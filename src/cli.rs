@@ -24,6 +24,7 @@ pub struct Request {
 }
 pub fn parse(args: Vec<OsString>, cwd: PathBuf) -> Result<Request, String> {
     let mut request = Request {
+        desktop: args.is_empty(),
         line: 1,
         column: 1,
         ..Default::default()
@@ -103,7 +104,10 @@ pub fn parse(args: Vec<OsString>, cwd: PathBuf) -> Result<Request, String> {
     if request.pick && !request.files.is_empty() {
         return Err("Picker start must be a directory".into());
     }
-    if request.folder.is_none() && request.files.is_empty() {
+    if open && request.files.is_empty() {
+        return Err("open requires at least one file".into());
+    }
+    if !request.desktop && request.folder.is_none() && request.files.is_empty() {
         request.folder = Some(cwd);
     }
     if request.wait && request.files.is_empty() {
@@ -128,6 +132,23 @@ pub fn selection_json(path: &std::path::Path, directory: bool) -> serde_json::Va
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_a_plain_desktop_launch_restores_abandoned_work() {
+        let root = tempfile::tempdir().unwrap();
+        let desktop = parse(vec![], root.path().into()).unwrap();
+        assert!(desktop.desktop);
+        assert!(desktop.folder.is_none());
+        let explicit = parse(vec![".".into()], root.path().into()).unwrap();
+        assert!(!explicit.desktop);
+        assert_eq!(explicit.folder, Some(root.path().join(".")));
+        assert!(
+            !parse(vec!["pick".into()], root.path().into())
+                .unwrap()
+                .desktop
+        );
+        assert!(parse(vec!["open".into()], root.path().into()).is_err());
+        assert!(parse(vec!["--wait".into()], root.path().into()).is_err());
+    }
     #[test]
     fn literal_option_names_are_paths_not_information_requests() {
         let root = tempfile::tempdir().unwrap();

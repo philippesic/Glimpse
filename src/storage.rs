@@ -7,13 +7,22 @@ use std::{
 };
 
 pub fn data_dir() -> PathBuf {
-    std::env::var_os("GLIMPSE_DATA_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::home_dir()
-                .unwrap()
-                .join("Library/Application Support/Glimpse")
-        })
+    if let Some(path) = std::env::var_os("GLIMPSE_DATA_DIR") {
+        return path.into();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::home_dir().unwrap().join(".local/share"))
+            .join("glimpse")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::env::home_dir()
+            .unwrap()
+            .join("Library/Application Support/Glimpse")
+    }
 }
 pub fn private_dir(path: &Path) -> Result<(), String> {
     fs::DirBuilder::new()
@@ -23,16 +32,32 @@ pub fn private_dir(path: &Path) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 pub fn atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    atomic_write(path, |file| {
+        file.write_all(bytes).map_err(|error| error.to_string())
+    })
+}
+fn atomic_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
+    atomic_write(path, |file| {
+        let mut writer = std::io::BufWriter::with_capacity(65536, file);
+        serde_json::to_writer(&mut writer, value).map_err(|error| error.to_string())?;
+        writer.flush().map_err(|error| error.to_string())
+    })
+}
+fn atomic_write(
+    path: &Path,
+    write: impl FnOnce(&mut fs::File) -> Result<(), String>,
+) -> Result<(), String> {
     private_dir(path.parent().ok_or("Missing parent")?)?;
-    let mut temp =
-        tempfile::NamedTempFile::new_in(path.parent().unwrap()).map_err(|e| e.to_string())?;
+    let mut temp = tempfile::NamedTempFile::new_in(path.parent().unwrap())
+        .map_err(|error| error.to_string())?;
     temp.as_file()
         .set_permissions(fs::Permissions::from_mode(0o600))
-        .map_err(|e| e.to_string())?;
-    temp.write_all(bytes)
-        .and_then(|_| temp.as_file().sync_all())
-        .map_err(|e| e.to_string())?;
-    temp.persist(path).map_err(|e| e.to_string())?;
+        .map_err(|error| error.to_string())?;
+    write(temp.as_file_mut())?;
+    temp.as_file()
+        .sync_all()
+        .map_err(|error| error.to_string())?;
+    temp.persist(path).map_err(|error| error.to_string())?;
     Ok(())
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -194,6 +219,16 @@ impl Settings {
                 "Unsupported or invalid settings; the last valid values are retained.".into(),
             );
         }
+        if self.font_family.len() > 512 || self.search_exclude.len() > 32768 {
+            return Err("Font family or search exclusions exceed the settings size limit.".into());
+        }
+        if serde_json::to_vec_pretty(self)
+            .map_err(|error| error.to_string())?
+            .len()
+            > 65536
+        {
+            return Err("Settings exceed 64 KiB; the saved settings are retained.".into());
+        }
         crate::commands::bindings(&self.keymaps)?;
         let mut globs = ignore::overrides::OverrideBuilder::new("/");
         for line in self.search_exclude.lines().filter(|s| !s.trim().is_empty()) {
@@ -204,7 +239,7 @@ impl Settings {
     pub fn load() -> Result<Self, String> {
         Self::load_in(&data_dir())
     }
-    fn load_in(root: &Path) -> Result<Self, String> {
+    pub(crate) fn load_in(root: &Path) -> Result<Self, String> {
         use std::io::Read;
         let path = root.join("settings.json");
         let bytes = match fs::File::open(&path) {
@@ -229,11 +264,22 @@ impl Settings {
         let mut value = match parse(&bytes) {
             Ok(value) => value,
             Err(error) => {
-                let previous =
-                    fs::read(root.join("settings.previous.json")).map_err(|_| error.clone())?;
-                let mut value = parse(&previous)?;
+                let previous = fs::File::open(root.join("settings.previous.json"))
+                    .ok()
+                    .and_then(|file| {
+                        let mut bytes = Vec::new();
+                        file.take(65537).read_to_end(&mut bytes).ok()?;
+                        (bytes.len() <= 65536).then_some(bytes)
+                    })
+                    .and_then(|bytes| parse(&bytes).ok());
+                let source = if previous.is_some() {
+                    "previous valid settings"
+                } else {
+                    "defaults"
+                };
+                let mut value = previous.unwrap_or_default();
                 value.warning = Some(format!(
-                    "Settings are invalid ({error}); previous valid settings loaded. Apply Settings explicitly to replace the invalid file."
+                    "Settings are invalid ({error}); {source} loaded. Apply Preferences explicitly to replace the invalid file."
                 ));
                 value
             }
@@ -302,9 +348,9 @@ impl Settings {
 pub struct Draft {
     #[serde(with = "native_path")]
     pub path: PathBuf,
-    pub text: String,
+    pub text: std::sync::Arc<str>,
     #[serde(with = "encoded_bytes")]
-    pub base: Vec<u8>,
+    pub base: crate::document::FileBytes,
     #[serde(
         default,
         serialize_with = "native_path::serialize_optional",
@@ -459,30 +505,89 @@ pub fn inventory(root: &Path) -> Result<Inventory, String> {
     });
     Ok(result)
 }
-fn read_draft(path: &Path) -> Result<Draft, String> {
-    use std::{io::Read, os::unix::fs::OpenOptionsExt};
+const MAX_RECOVERY_RECORD_BYTES: u64 = 70 * 1024 * 1024;
+
+fn read_recovery_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::{
+        io::{Error, ErrorKind, Read},
+        os::unix::fs::OpenOptionsExt,
+    };
     let file = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|e| e.to_string())?;
-    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
-        return Err("Recovery record is not a regular file".into());
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "Recovery record is not a regular file",
+        ));
     }
-    let mut bytes = Vec::new();
-    file.take(70 * 1024 * 1024 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
-    if bytes.len() > 70 * 1024 * 1024 {
-        return Err("Recovery record exceeds the supported size".into());
+    if metadata.len() > MAX_RECOVERY_RECORD_BYTES {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "Recovery record exceeds the supported size",
+        ));
     }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_RECOVERY_RECORD_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_RECOVERY_RECORD_BYTES {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "Recovery record exceeds the supported size",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn read_draft(path: &Path) -> Result<Draft, String> {
+    let bytes = read_recovery_bytes(path).map_err(|e| e.to_string())?;
     let draft: Draft = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    if draft.text.len() > crate::document::MAX_BYTES as usize
-        || draft.base.len() > crate::document::MAX_BYTES as usize
-    {
+    validate_record_limits(draft.generation, draft.text.len(), draft.base.len())?;
+    Ok(draft)
+}
+
+fn validate_record_limits(
+    generation: u64,
+    text_bytes: usize,
+    base_bytes: usize,
+) -> Result<(), String> {
+    if generation > i64::MAX as u64 {
+        return Err("Recovery generation is invalid".into());
+    }
+    let limit = crate::document::MAX_BYTES as usize;
+    if text_bytes > limit || base_bytes > limit {
         return Err("Recovery text exceeds the editing limit".into());
     }
-    Ok(draft)
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct RecoveryHeader<'a> {
+    #[serde(rename = "path", with = "native_path")]
+    _path: PathBuf,
+    #[serde(borrow)]
+    text: std::borrow::Cow<'a, str>,
+    #[serde(deserialize_with = "encoded_bytes::decoded_len", rename = "base")]
+    base_bytes: usize,
+    #[serde(
+        default,
+        deserialize_with = "native_path::deserialize_optional",
+        rename = "target"
+    )]
+    _target: Option<PathBuf>,
+    generation: u64,
+}
+
+fn read_recovery_header(path: &Path, validate_limits: bool) -> std::io::Result<u64> {
+    let bytes = read_recovery_bytes(path)?;
+    let header: RecoveryHeader<'_> = serde_json::from_slice(&bytes)?;
+    if validate_limits {
+        validate_record_limits(header.generation, header.text.len(), header.base_bytes)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    }
+    Ok(header.generation)
 }
 pub fn restore_snapshot(path: &Path, observed: bool) -> Result<Draft, String> {
     let parent = path.parent().ok_or("Invalid recovery record")?;
@@ -493,18 +598,14 @@ pub fn restore_snapshot(path: &Path, observed: bool) -> Result<Draft, String> {
     };
     let mut draft = read_draft(path)?;
     if observed {
-        let bom = draft.base.starts_with(&[0xef, 0xbb, 0xbf]);
-        let base = draft
-            .base
-            .strip_prefix(&[0xef, 0xbb, 0xbf])
-            .unwrap_or(&draft.base);
-        draft.text = std::str::from_utf8(base)
+        let bom = draft.base.has_bom();
+        draft.text = std::str::from_utf8(draft.base.content_bytes(bom))
             .map_err(|_| "Observed disk version is not UTF-8")?
             .into();
         draft.base = if bom {
-            vec![0xef, 0xbb, 0xbf]
+            crate::document::BOM.into()
         } else {
-            Vec::new()
+            Default::default()
         };
         draft.target = None;
         draft.generation = 1;
@@ -562,16 +663,22 @@ impl Recovery {
             return Ok(());
         }
         let path = self.directory.join(format!("{id}.json"));
-        if let Ok(bytes) = fs::read(&path)
-            && let Ok(existing) = serde_json::from_slice::<Draft>(&bytes)
-            && existing.generation > draft.generation
-        {
-            return Ok(());
+        #[derive(Deserialize)]
+        struct Generation {
+            generation: u64,
         }
-        atomic(
-            &self.directory.join(format!("{id}.json")),
-            &serde_json::to_vec(draft).map_err(|e| e.to_string())?,
-        )
+        match read_recovery_bytes(&path) {
+            Ok(bytes) => {
+                let existing: Generation = serde_json::from_slice(&bytes)
+                    .map_err(|error| format!("Previous recovery record was retained: {error}"))?;
+                if existing.generation > draft.generation {
+                    return Ok(());
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("Previous recovery record was retained: {error}")),
+        }
+        atomic_json(&path, draft)
     }
     pub fn claim(&self, source: &Path, id: u64) -> Result<(Draft, Option<String>), String> {
         let parent = source.parent().ok_or("Invalid recovery record")?;
@@ -597,21 +704,18 @@ impl Recovery {
     }
     pub fn checkpoint(&self, id: u64, draft: &Draft) -> Result<PathBuf, String> {
         self.write(id, draft)?;
-        self.checkpoint_version(draft)
+        self.checkpoint_version(id, draft)
     }
-    pub fn checkpoint_version(&self, draft: &Draft) -> Result<PathBuf, String> {
+    pub fn checkpoint_version(&self, id: u64, draft: &Draft) -> Result<PathBuf, String> {
         let path = self.directory.join(format!(
-            "candidate-{}-{}.json",
+            "candidate-{id}-{}-{}.json",
             draft.generation,
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        atomic(
-            &path,
-            &serde_json::to_vec(draft).map_err(|e| e.to_string())?,
-        )?;
+        atomic_json(&path, draft)?;
         Ok(path)
     }
     pub fn resolved(&self, candidate: &Path) -> Result<(), String> {
@@ -622,7 +726,13 @@ impl Recovery {
             self.directory.file_name().unwrap().to_string_lossy(),
             candidate.file_name().unwrap().to_string_lossy()
         ));
-        fs::rename(candidate, destination).map_err(|e| e.to_string())?;
+        match fs::rename(candidate, &destination) {
+            Ok(()) => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && fs::symlink_metadata(&destination).is_ok_and(|meta| meta.is_file()) => {}
+            Err(error) => return Err(error.to_string()),
+        }
         self.prune_history()
     }
     pub fn prune_history(&self) -> Result<(), String> {
@@ -654,6 +764,33 @@ impl Recovery {
         }
         Ok(())
     }
+    pub fn rebind(
+        &self,
+        id: u64,
+        generation: u64,
+        from: &crate::document::DiskFile,
+        to: &crate::document::DiskFile,
+    ) -> Result<(), String> {
+        let _finished = self.io.lock().unwrap();
+        let path = self.directory.join(format!("{id}.json"));
+        let mut draft = match read_draft(&path) {
+            Ok(draft) => draft,
+            Err(_) if !path.try_exists().map_err(|error| error.to_string())? => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if draft.generation > generation {
+            if draft.path != from.path
+                || draft.target.as_deref().unwrap_or(std::path::Path::new("")) != from.target
+            {
+                return Err("Newer recovery text has a different binding; it was retained".into());
+            }
+            draft.path = to.path.clone();
+            draft.target = Some(to.target.clone());
+            draft.base = to.bytes.clone();
+            atomic_json(&path, &draft)?;
+        }
+        Ok(())
+    }
     pub fn saved(&self, id: u64, generation: u64) -> Result<(), String> {
         let mut finished = self.io.lock().unwrap();
         finished
@@ -661,15 +798,41 @@ impl Recovery {
             .and_modify(|g| *g = (*g).max(generation))
             .or_insert(generation);
         let path = self.directory.join(format!("{id}.json"));
-        match fs::read(&path) {
-            Ok(bytes) => {
-                let value: Draft = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-                if value.generation <= generation {
+        match read_recovery_header(&path, false) {
+            Ok(recovered_generation) => {
+                if recovered_generation <= generation {
                     fs::remove_file(path).map_err(|e| e.to_string())?;
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.to_string()),
+        }
+        for (index, entry) in fs::read_dir(&self.directory)
+            .map_err(|error| error.to_string())?
+            .enumerate()
+        {
+            if index >= 100_000 {
+                return Err("Recovery cleanup exceeded its scan limit; records retained".into());
+            }
+            let entry = entry.map_err(|error| error.to_string())?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(candidate) = name
+                .strip_prefix("candidate-")
+                .and_then(|name| name.strip_suffix(".json"))
+            else {
+                continue;
+            };
+            let parts: Vec<_> = candidate.split('-').collect();
+            if parts.len() != 3 || parts[0].parse::<u64>().ok() != Some(id) {
+                continue;
+            }
+            let path = entry.path();
+            if read_recovery_header(&path, true).map_err(|error| error.to_string())? <= generation {
+                self.resolved(&path)?;
+            }
         }
         Ok(())
     }
@@ -732,6 +895,151 @@ impl Drop for Recovery {
 mod tests {
     use super::*;
     #[test]
+    fn interrupted_atomic_writes_leave_original_and_no_partial_record() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("record.json");
+        fs::write(&path, b"original bytes").unwrap();
+        let result = atomic_write(&path, |file| {
+            file.write_all(b"partial replacement").unwrap();
+            Err("injected interrupted write".into())
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"original bytes");
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+        let draft = draft(9);
+        atomic_json(&path, &draft).unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            serde_json::to_vec(&draft).unwrap()
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn shared_snapshots_preserve_legacy_recovery_contents() {
+        let record = r#"{"path":"original","text":"local β\r\n","base":[239,187,191,98,97,115,101,13,10],"target":null,"generation":4}"#;
+        let draft: Draft = serde_json::from_str(record).unwrap();
+        assert_eq!(draft.text.as_ref(), "local β\r\n");
+        assert_eq!(draft.base.as_bytes().as_ref(), b"\xef\xbb\xbfbase\r\n");
+        let disk = crate::document::DiskFile::restore(&draft);
+        assert!(std::ptr::eq(draft.base.parts().1, disk.bytes.parts().1));
+        assert!(std::ptr::eq(
+            disk.content_bytes(),
+            disk.clone().content_bytes()
+        ));
+        let serialized = serde_json::to_value(&draft).unwrap();
+        assert_eq!(serialized["text"], "local β\r\n");
+        assert_eq!(serialized["base"], "77u/YmFzZQ0K");
+        let restored: Draft = serde_json::from_value(serialized).unwrap();
+        assert_eq!(restored.text, draft.text);
+        assert_eq!(restored.base, draft.base);
+    }
+
+    #[test]
+    fn streamed_recovery_bases_preserve_chunk_boundaries_and_wire_format() {
+        use base64::Engine;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("record.json");
+        for size in [0, 1, 2, 3, 1023, 1024, 1025, 4097, 1024 * 1024] {
+            let bytes: Vec<_> = (0..size).map(|index| index as u8).collect();
+            let draft = Draft {
+                base: bytes.clone().into(),
+                ..draft(8)
+            };
+            atomic_json(&path, &draft).unwrap();
+            let stored: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(
+                stored["base"],
+                base64::engine::general_purpose::STANDARD.encode(&bytes)
+            );
+            let restored: Draft = serde_json::from_value(stored).unwrap();
+            assert_eq!(restored.base.as_bytes().as_ref(), bytes);
+            assert_eq!(restored.text, draft.text);
+        }
+        let source = root.path().join("source.txt");
+        let text = "\u{feff}β\r\nx\ry\n".repeat(1025);
+        let bytes = [crate::document::BOM, text.as_bytes()].concat();
+        fs::write(&source, &bytes).unwrap();
+        let (disk, value) = crate::document::DiskFile::open(source).unwrap();
+        let draft = Draft {
+            base: disk.bytes,
+            ..draft(8)
+        };
+        assert!(std::ptr::eq(draft.base.parts().1, value.as_bytes()));
+        atomic_json(&path, &draft).unwrap();
+        let stored: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            stored["base"],
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        );
+        let restored: Draft = serde_json::from_value(stored).unwrap();
+        assert_eq!(restored.base, draft.base);
+    }
+
+    #[test]
+    fn malformed_recovery_generations_are_rejected_without_removing_records() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("record.json");
+        for generation in [u64::MAX, u64::MAX - 1] {
+            let draft = Draft {
+                path: "original".into(),
+                text: "local β".into(),
+                base: Default::default(),
+                target: None,
+                generation,
+            };
+            let bytes = serde_json::to_vec(&draft).unwrap();
+            fs::write(&path, &bytes).unwrap();
+            assert!(read_draft(&path).is_err());
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn recovery_cleanup_validates_large_and_legacy_base_data() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("record.json");
+        let mut valid = draft(4);
+        valid.base = vec![91; 35_773].into();
+        atomic_json(&path, &valid).unwrap();
+        assert_eq!(read_recovery_header(&path, true).unwrap(), valid.generation);
+        assert_eq!(read_draft(&path).unwrap().base, valid.base);
+
+        let mut wire = serde_json::to_value(&valid).unwrap();
+        wire["base"] = serde_json::json!([255, 254, 0, 13, 10]);
+        atomic_json(&path, &wire).unwrap();
+        assert_eq!(read_recovery_header(&path, true).unwrap(), valid.generation);
+        assert_eq!(
+            read_draft(&path).unwrap().base.as_bytes().as_ref(),
+            [255, 254, 0, 13, 10]
+        );
+    }
+
+    #[test]
+    fn active_recovery_keeps_records_with_unreadable_metadata_or_content() {
+        let root = tempfile::tempdir().unwrap();
+        let recovery = Recovery::new(root.path()).unwrap();
+        let path = recovery.directory.join("1.json");
+        let missing_generation = br#"{"text":"prior local text"}"#;
+        fs::write(&path, missing_generation).unwrap();
+        assert!(recovery.write(1, &draft(2)).is_err());
+        assert_eq!(fs::read(&path).unwrap(), missing_generation);
+
+        let mut encoded = "AAAA".repeat(9000);
+        encoded.replace_range(17_000..17_004, "AA==");
+        let mut malformed = serde_json::to_value(draft(4)).unwrap();
+        malformed["base"] = encoded.into();
+        let original = serde_json::to_vec(&malformed).unwrap();
+        fs::write(&path, &original).unwrap();
+        assert!(recovery.saved(1, 4).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
     fn frequent_locations_coalesce_visits_and_decay_old_usage() {
         let mut settings = Settings::default();
         let a = Path::new("/projects/a");
@@ -756,7 +1064,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let session = Recovery::new(root.path()).unwrap();
         session.write(1, &draft(2)).unwrap();
-        let candidate = session.checkpoint_version(&draft(3)).unwrap();
+        let candidate = session.checkpoint_version(1, &draft(3)).unwrap();
         let summary = inventory(root.path()).unwrap();
         assert!(summary.records.is_empty());
         assert_eq!(summary.usage.files, 3);
@@ -795,27 +1103,55 @@ mod tests {
         let session = Recovery::new(root.path()).unwrap();
         let mut value = draft(7);
         value.text = "candidate\n".into();
-        value.base = b"\xef\xbb\xbfobserved\r\n".to_vec();
-        let path = session.checkpoint_version(&value).unwrap();
+        value.base = b"\xef\xbb\xbfobserved\r\n".as_slice().into();
+        let path = session.checkpoint_version(1, &value).unwrap();
         session.resolved(&path).unwrap();
         let summary = inventory(root.path()).unwrap();
         let path = &summary.records.iter().find(|r| r.history).unwrap().path;
         let observed = restore_snapshot(path, true).unwrap();
-        assert_eq!(observed.text, "observed\r\n");
-        assert_eq!(observed.base, [0xef, 0xbb, 0xbf]);
+        assert_eq!(observed.text.as_ref(), "observed\r\n");
+        assert_eq!(observed.base.as_bytes().as_ref(), [0xef, 0xbb, 0xbf]);
         assert!(observed.target.is_none());
-        assert_eq!(restore_snapshot(path, false).unwrap().text, "candidate\n");
+        assert_eq!(
+            restore_snapshot(path, false).unwrap().text.as_ref(),
+            "candidate\n"
+        );
         assert!(path.exists());
     }
     fn draft(generation: u64) -> Draft {
         Draft {
             path: "missing".into(),
             text: "local 🦀".into(),
-            base: b"disk".to_vec(),
+            base: b"disk".as_slice().into(),
             target: None,
             generation,
         }
     }
+    #[test]
+    fn resolving_a_document_archives_only_its_owned_candidates_through_the_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let recovery = Recovery::new(root.path()).unwrap();
+        let old = recovery.checkpoint(7, &draft(3)).unwrap();
+        let newer = recovery.checkpoint_version(7, &draft(4)).unwrap();
+        let other = recovery.checkpoint_version(8, &draft(2)).unwrap();
+        let legacy = recovery.directory.join("candidate-7-123456789.json");
+        fs::write(&legacy, serde_json::to_vec(&draft(1)).unwrap()).unwrap();
+        recovery.saved(7, 3).unwrap();
+        assert!(!old.exists());
+        assert!(newer.exists());
+        assert!(other.exists());
+        assert!(legacy.exists());
+        recovery.resolved(&old).unwrap();
+        let history = inventory(root.path())
+            .unwrap()
+            .records
+            .into_iter()
+            .find(|record| record.history)
+            .unwrap();
+        assert_eq!(read_draft(&history.path).unwrap().text, draft(3).text);
+        assert_eq!(read_draft(&history.path).unwrap().base, draft(3).base);
+    }
+
     #[test]
     fn saved_generation_cannot_recur_or_remove_a_newer_edit() {
         let root = tempfile::tempdir().unwrap();
@@ -874,6 +1210,35 @@ mod tests {
         );
     }
     #[test]
+    fn invalid_first_settings_require_explicit_replacement_and_keep_original_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let original = b"{invalid settings";
+        fs::write(root.path().join("settings.json"), original).unwrap();
+        fs::write(root.path().join("settings.previous.json"), b"also invalid").unwrap();
+        let mut settings = Settings::load_in(root.path()).unwrap();
+        assert!(
+            settings
+                .warning
+                .as_ref()
+                .unwrap()
+                .contains("defaults loaded")
+        );
+        let mut base = settings.disk_base.clone();
+        assert!(settings.save_checked(root.path(), &mut base).is_err());
+        assert_eq!(
+            fs::read(root.path().join("settings.json")).unwrap(),
+            original
+        );
+        settings.warning = None;
+        settings.save_checked(root.path(), &mut base).unwrap();
+        assert_eq!(
+            fs::read(root.path().join("settings.rejected.json")).unwrap(),
+            original
+        );
+        assert!(Settings::load_in(root.path()).unwrap().warning.is_none());
+    }
+
+    #[test]
     fn recovery_preserves_native_non_unicode_paths() {
         use std::os::unix::ffi::OsStringExt;
         let mut value = draft(9);
@@ -884,6 +1249,42 @@ mod tests {
         assert_eq!(restored.path, value.path);
         assert_eq!(restored.target, value.target);
     }
+    #[test]
+    fn oversized_settings_never_replace_a_readable_file() {
+        let root = tempfile::tempdir().unwrap();
+        let mut expected = None;
+        let valid = Settings::default();
+        valid.save_checked(root.path(), &mut expected).unwrap();
+        let original = fs::read(root.path().join("settings.json")).unwrap();
+        let mut large = valid.clone();
+        large.search_exclude = "x".repeat(65536);
+        assert!(large.save_checked(root.path(), &mut expected).is_err());
+        assert_eq!(
+            fs::read(root.path().join("settings.json")).unwrap(),
+            original
+        );
+        assert!(Settings::load_in(root.path()).is_ok());
+        large = valid;
+        large.pins = (0..128)
+            .map(|i| PathBuf::from(format!("/{i}/{}", "x".repeat(1024))))
+            .collect();
+        assert!(large.save_checked(root.path(), &mut expected).is_err());
+        assert_eq!(
+            fs::read(root.path().join("settings.json")).unwrap(),
+            original
+        );
+        large.pins = vec![PathBuf::from("x".repeat(1024))];
+        while serde_json::to_vec_pretty(&large).unwrap().len() <= 65536 {
+            large.pins[0].as_mut_os_string().push("xxxxxxxxxxxxxxxx");
+        }
+        assert!(serde_json::to_vec(&large).unwrap().len() <= 65536);
+        assert!(large.save_checked(root.path(), &mut expected).is_err());
+        assert_eq!(
+            fs::read(root.path().join("settings.json")).unwrap(),
+            original
+        );
+    }
+
     #[test]
     fn settings_persist_atomically_with_private_permissions() {
         let dir = tempfile::tempdir().unwrap();
@@ -915,7 +1316,7 @@ mod tests {
         let drafts = Recovery::abandoned(root.path());
         assert_eq!(drafts.len(), 1);
         assert_eq!(drafts[0].1.generation, 42);
-        assert_eq!(drafts[0].1.text, "local 🦀");
+        assert_eq!(drafts[0].1.text.as_ref(), "local 🦀");
     }
     #[test]
     fn import_transfers_once_and_preserves_live_ownership() {
@@ -1014,14 +1415,21 @@ mod native_path {
 mod encoded_bytes {
     use super::*;
     use base64::Engine;
-    pub fn serialize<S: serde::Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
-        base64::engine::general_purpose::STANDARD
-            .encode(bytes)
-            .serialize(serializer)
+    pub fn serialize<S: serde::Serializer>(
+        bytes: &crate::document::FileBytes,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let (prefix, body) = bytes.parts();
+        let engine = &base64::engine::general_purpose::STANDARD;
+        serializer.collect_str(&format_args!(
+            "{}{}",
+            base64::display::Base64Display::new(prefix, engine),
+            base64::display::Base64Display::new(body, engine),
+        ))
     }
     pub fn deserialize<'de, D: serde::Deserializer<'de>>(
         deserializer: D,
-    ) -> Result<Vec<u8>, D::Error> {
+    ) -> Result<crate::document::FileBytes, D::Error> {
         #[derive(Deserialize)]
         #[serde(untagged)]
         enum Value {
@@ -1029,10 +1437,54 @@ mod encoded_bytes {
             Legacy(Vec<u8>),
         }
         match Value::deserialize(deserializer)? {
-            Value::Legacy(bytes) => Ok(bytes),
+            Value::Legacy(bytes) => Ok(bytes.into()),
             Value::Encoded(value) => base64::engine::general_purpose::STANDARD
                 .decode(value)
+                .map(Into::into)
                 .map_err(serde::de::Error::custom),
         }
+    }
+
+    pub fn decoded_len<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<usize, D::Error> {
+        struct DecodedLength;
+
+        impl<'de> serde::de::Visitor<'de> for DecodedLength {
+            type Value = usize;
+
+            fn expecting(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                fmt.write_str("a base64 string or an array of bytes")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<usize, E> {
+                let engine = &base64::engine::general_purpose::STANDARD;
+                let mut decoded = [0; 12 * 1024];
+                let mut chunks = value.as_bytes().chunks(16 * 1024).peekable();
+                let mut length = 0;
+                while let Some(chunk) = chunks.next() {
+                    if chunks.peek().is_some() && chunk.contains(&b'=') {
+                        return Err(E::custom("Padding before the end of the recovery base"));
+                    }
+                    length += engine
+                        .decode_slice(chunk, &mut decoded)
+                        .map_err(E::custom)?;
+                }
+                Ok(length)
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<usize, A::Error> {
+                let mut length = 0;
+                while seq.next_element::<u8>()?.is_some() {
+                    length += 1;
+                }
+                Ok(length)
+            }
+        }
+
+        deserializer.deserialize_any(DecodedLength)
     }
 }
