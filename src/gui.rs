@@ -146,16 +146,11 @@ impl Document {
             return !clean;
         }
         let text = input.text();
-        let mut disk = self.disk.content_bytes();
-        let clean = text.len() == disk.len()
-            && text.chunks().all(|chunk| {
-                if let Some(remaining) = disk.strip_prefix(chunk.as_bytes()) {
-                    disk = remaining;
-                    true
-                } else {
-                    false
-                }
-            });
+        let clean = self
+            .disk
+            .text_revision()
+            .is_some_and(|revision| input.has_text_revision(revision))
+            || self.disk.matches_revision(text);
         *comparison = Some((text.clone(), clean));
         !clean
     }
@@ -169,9 +164,9 @@ impl Document {
         if self.restored {
             return glimpse::syntax::grammar_for_text(&self.disk.path, self.input.read(cx).text());
         }
-        let content = self.disk.content_bytes();
+        let content = self.disk.content_prefix(256);
         let first_line = if content.starts_with(b"#!") {
-            String::from_utf8_lossy(&content[..content.len().min(256)])
+            String::from_utf8_lossy(&content)
         } else {
             "".into()
         };
@@ -1034,6 +1029,9 @@ impl Shell {
                 .soft_wrap(self.settings.wrap)
                 .defer_large_wrapped_layout()
                 .default_prepared_value(text);
+            if disk.text_revision().is_some() {
+                input.release_value_cache(cx);
+            }
             input.set_external_highlights(Vec::new(), cx);
             input.set_cursor_blink(false, cx);
             input.set_accessibility_label(format!("Source: {}", paths::display(&disk.path)), cx);
@@ -1185,17 +1183,22 @@ impl Shell {
         else {
             return;
         };
-        let text = input.read(cx).value();
-        let (position, clamped) = glimpse::editor::position(&text, line, column);
-        let byte = text
-            .char_indices()
-            .nth(position)
-            .map_or(text.len(), |(byte, _)| byte);
-        let prefix = &text[..byte];
-        let row = prefix.bytes().filter(|&byte| byte == b'\n').count() as u32;
-        let column = prefix.rsplit('\n').next().unwrap_or("").chars().count() as u32;
+        let (position, clamped) = if line <= 1 && column <= 1 {
+            (Position::new(0, 0), false)
+        } else {
+            let text = input.read(cx).value();
+            let (position, clamped) = glimpse::editor::position(&text, line, column);
+            let byte = text
+                .char_indices()
+                .nth(position)
+                .map_or(text.len(), |(byte, _)| byte);
+            let prefix = &text[..byte];
+            let row = prefix.bytes().filter(|&byte| byte == b'\n').count() as u32;
+            let column = prefix.rsplit('\n').next().unwrap_or("").chars().count() as u32;
+            (Position::new(row, column), clamped)
+        };
         input.update(cx, |input, cx| {
-            input.set_cursor_position_unfocused(Position::new(row, column), cx);
+            input.set_cursor_position_unfocused(position, cx);
             if focus {
                 input.focus(window, cx);
             }
@@ -1467,7 +1470,10 @@ impl Shell {
                                 }
                                 if let Some((expected, search_generation)) = expected
                                     && (expected
-                                        != search::fingerprint_body(disk.content_bytes(), disk.bom)
+                                        != search::fingerprint_body(
+                                            text.value().as_bytes(),
+                                            disk.bom,
+                                        )
                                         || self
                                             .documents
                                             .iter()
@@ -1608,6 +1614,10 @@ impl Shell {
                                     doc.recovery_error = None;
                                 }
                                 doc.set_disk(disk);
+                                if doc.disk.text_revision().is_some() {
+                                    doc.input
+                                        .update(cx, |input, cx| input.release_value_cache(cx));
+                                }
                                 doc.restored = false;
                                 doc.external = None;
                                 doc.generation += 1;
@@ -2243,11 +2253,7 @@ impl Shell {
             self.checks.invalidate(doc.id);
             doc.deferred_external = None;
             doc.saving = true;
-            let input = doc.input.read(cx);
-            let text = match input.cached_value() {
-                Some(value) => glimpse::io::TextSnapshot::Flat(value.into()),
-                None => glimpse::io::TextSnapshot::Revision(input.text().clone()),
-            };
+            let text = glimpse::io::TextSnapshot::Revision(doc.input.read(cx).text().clone());
             self.io.send(Job::Save {
                 id: doc.id,
                 disk: doc.disk.clone(),

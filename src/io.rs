@@ -21,7 +21,7 @@ pub enum Job {
     HoldMaintenance(mpsc::Sender<()>, mpsc::Receiver<()>),
     #[cfg(test)]
     HoldRead(mpsc::Sender<()>, mpsc::Receiver<()>),
-    ReadMarkdown(u64, u64, Arc<str>, PathBuf),
+    ReadMarkdown(u64, u64, Rope, PathBuf),
     CompletePath(u64, String, PathBuf),
     Visit(PathBuf),
     RecentLocation(Vec<PathBuf>),
@@ -416,7 +416,7 @@ impl IoWorker {
                             id,
                             generation,
                             path.clone(),
-                            Ok(crate::reading::prepare(source, &path)),
+                            Ok(crate::reading::prepare(String::from(source).into(), &path)),
                         ),
                         Job::Check(id, disk, generation) => {
                             crate::metrics::event("check-worker", id, generation);
@@ -530,7 +530,10 @@ impl IoWorker {
                             DiskFile::open_cancellable(path, &|| {
                                 transient && preview.load(Ordering::Relaxed) != token
                             })
-                            .map(|(disk, text)| (disk, PreparedInput::new(text))),
+                            .map(|(disk, text)| {
+                                let input = PreparedInput::new(text);
+                                (disk.share_revision(input.text_revision().clone()), input)
+                            }),
                         ),
                         Job::Reload(reload) => {
                             crate::metrics::event("reload-worker", reload.id, reload.generation);
@@ -564,9 +567,7 @@ impl IoWorker {
                             crate::metrics::delay("SAVE");
                             let save = || match &text {
                                 TextSnapshot::Flat(text) => disk.save_snapshot(text.clone()),
-                                TextSnapshot::Revision(text) => {
-                                    disk.save_owned_snapshot(text.to_string())
-                                }
+                                TextSnapshot::Revision(text) => disk.save_revision(text.clone()),
                             };
                             let result = if without_recovery {
                                 save()

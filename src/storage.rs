@@ -611,7 +611,7 @@ pub fn restore_snapshot(path: &Path, observed: bool) -> Result<Draft, String> {
     let mut draft = read_draft(path)?;
     if observed {
         let bom = draft.base.has_bom();
-        draft.text = std::str::from_utf8(draft.base.content_bytes(bom))
+        draft.text = std::str::from_utf8(&draft.base.content_bytes(bom))
             .map_err(|_| "Observed disk version is not UTF-8")?
             .into();
         draft.base = if bom {
@@ -941,10 +941,13 @@ mod tests {
         assert_eq!(draft.text.as_ref(), "local β\r\n");
         assert_eq!(draft.base.as_bytes().as_ref(), b"\xef\xbb\xbfbase\r\n");
         let disk = crate::document::DiskFile::restore(&draft);
-        assert!(std::ptr::eq(draft.base.parts().1, disk.bytes.parts().1));
         assert!(std::ptr::eq(
-            disk.content_bytes(),
-            disk.clone().content_bytes()
+            draft.base.as_bytes().as_ref(),
+            disk.bytes.as_bytes().as_ref()
+        ));
+        assert!(std::ptr::eq(
+            disk.content_bytes().as_ref(),
+            disk.clone().content_bytes().as_ref()
         ));
         let serialized = serde_json::to_value(&draft).unwrap();
         assert_eq!(serialized["text"], "local β\r\n");
@@ -981,19 +984,23 @@ mod tests {
         let bytes = [crate::document::BOM, text.as_bytes()].concat();
         fs::write(&source, &bytes).unwrap();
         let (disk, value) = crate::document::DiskFile::open(source).unwrap();
-        let draft = Draft {
-            base: disk.bytes,
-            ..draft(8)
-        };
-        assert!(std::ptr::eq(draft.base.parts().1, value.as_bytes()));
-        atomic_json(&path, &draft).unwrap();
-        let stored: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(
-            stored["base"],
-            base64::engine::general_purpose::STANDARD.encode(bytes)
-        );
-        let restored: Draft = serde_json::from_value(stored).unwrap();
-        assert_eq!(restored.base, draft.base);
+        assert!(std::ptr::eq(
+            disk.content_bytes().as_ref(),
+            value.as_bytes()
+        ));
+        let revision = gpui_component::input::Rope::from(value.as_ref());
+        for base in [disk.bytes.clone(), disk.share_revision(revision).bytes] {
+            let draft = Draft { base, ..draft(8) };
+            atomic_json(&path, &draft).unwrap();
+            let stored: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(
+                stored["base"],
+                base64::engine::general_purpose::STANDARD.encode(&bytes)
+            );
+            let restored: Draft = serde_json::from_value(stored).unwrap();
+            assert_eq!(restored.base, draft.base);
+        }
     }
 
     #[test]
@@ -1431,17 +1438,41 @@ mod native_path {
 mod encoded_bytes {
     use super::*;
     use base64::Engine;
+    use std::{fmt, io};
+
+    struct FormatWriter<'a, 'b>(&'a mut fmt::Formatter<'b>);
+
+    impl io::Write for FormatWriter<'_, '_> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let encoded = std::str::from_utf8(bytes).map_err(io::Error::other)?;
+            self.0.write_str(encoded).map_err(io::Error::other)?;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct EncodedBytes<'a>(&'a crate::document::FileBytes);
+
+    impl fmt::Display for EncodedBytes<'_> {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            let mut encoder = base64::write::EncoderWriter::new(
+                FormatWriter(formatter),
+                &base64::engine::general_purpose::STANDARD,
+            );
+            self.0.write_to(&mut encoder).map_err(|_| fmt::Error)?;
+            encoder.finish().map_err(|_| fmt::Error)?;
+            Ok(())
+        }
+    }
+
     pub fn serialize<S: serde::Serializer>(
         bytes: &crate::document::FileBytes,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
-        let (prefix, body) = bytes.parts();
-        let engine = &base64::engine::general_purpose::STANDARD;
-        serializer.collect_str(&format_args!(
-            "{}{}",
-            base64::display::Base64Display::new(prefix, engine),
-            base64::display::Base64Display::new(body, engine),
-        ))
+        serializer.collect_str(&EncodedBytes(bytes))
     }
     pub fn deserialize<'de, D: serde::Deserializer<'de>>(
         deserializer: D,

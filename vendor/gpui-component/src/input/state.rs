@@ -383,6 +383,10 @@ impl PreparedInput {
     pub fn value(&self) -> &str {
         &self.value
     }
+
+    pub fn text_revision(&self) -> &Rope {
+        &self.revision.text
+    }
 }
 
 pub(super) struct PreparedReplacement {
@@ -529,10 +533,6 @@ impl InputState {
     pub(super) fn replacement_layout(&self) -> Option<TextWrapper> {
         self.can_install_revision()
             .then(|| self.text_wrapper.replacement_layout())
-    }
-
-    pub fn cached_value(&self) -> Option<SharedString> {
-        self.value_cache.borrow().clone()
     }
 
     pub(super) fn apply_prepared_replacement(
@@ -1086,8 +1086,16 @@ impl InputState {
     pub fn value(&self) -> SharedString {
         self.value_cache
             .borrow_mut()
-            .get_or_insert_with(|| SharedString::new(self.text.to_string()))
+            .get_or_insert_with(|| SharedString::new(String::from(&self.text)))
             .clone()
+    }
+
+    pub fn release_value_cache(&mut self, cx: &mut Context<Self>) {
+        if let Some(value) = self.value_cache.get_mut().take()
+            && value.len() >= 512 * 1024
+        {
+            cx.background_spawn(async move { drop(value) }).detach();
+        }
     }
 
     pub fn line_endings(&self) -> &'static str {

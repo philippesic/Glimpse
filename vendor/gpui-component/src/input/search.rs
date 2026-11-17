@@ -13,7 +13,7 @@ use gpui::{
     InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Render, Styled,
     Subscription, WeakEntity, Window, actions, prelude::FluentBuilder as _, rems,
 };
-use ropey::Rope;
+use ropey::{Rope, extra::esoterica::ropes_are_instances};
 
 use crate::{
     ActiveTheme, Disableable, IconName, Selectable, Sizable,
@@ -132,6 +132,51 @@ impl MatchRanges {
     }
 }
 
+fn advance_source<'a>(
+    chunks: &mut impl Iterator<Item = &'a str>,
+    remaining: &mut &'a str,
+    mut length: usize,
+    mut visit: impl FnMut(&str),
+) {
+    while length != 0 {
+        if remaining.is_empty() {
+            *remaining = chunks.next().expect("Match ranges fit the source revision");
+        }
+        let count = length.min(remaining.len());
+        let (source, rest) = remaining.split_at(count);
+        visit(source);
+        *remaining = rest;
+        length -= count;
+    }
+}
+
+fn replace_matches(
+    source: &Rope,
+    ranges: &MatchRanges,
+    replacement: &str,
+    cancel: &AtomicBool,
+) -> Option<String> {
+    let mut chunks = source.chunks();
+    let mut remaining = "";
+    let mut output = String::new();
+    let mut offset = 0;
+    for (index, range) in ranges.iter().enumerate() {
+        if index % 1024 == 0 && cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        advance_source(&mut chunks, &mut remaining, range.start - offset, |text| {
+            output.push_str(text);
+        });
+        advance_source(&mut chunks, &mut remaining, range.len(), |_| {});
+        output.push_str(replacement);
+        offset = range.end;
+    }
+    advance_source(&mut chunks, &mut remaining, source.len() - offset, |text| {
+        output.push_str(text);
+    });
+    (!cancel.load(Ordering::Relaxed)).then_some(output)
+}
+
 #[derive(Debug, Clone)]
 pub struct SearchMatcher {
     text: Rope,
@@ -179,7 +224,7 @@ impl SearchMatcher {
         }
         let mut new_ranges = MatchRanges::new(self.text.len());
         if let Some(query) = &self.query {
-            let text = self.text.to_string();
+            let text = String::from(&self.text);
             for found in query.find_iter(&text) {
                 if new_ranges.len() % 1024 == 0
                     && self
@@ -699,7 +744,6 @@ impl SearchPanel {
 
     fn replace_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let new_text = self.replace_input.read(cx).value();
-        self.matcher.replacing = true;
         let ranges = self.matcher.matched_ranges.clone();
         if ranges.is_empty() {
             return;
@@ -709,33 +753,23 @@ impl SearchPanel {
             return;
         };
         let state = editor.read(cx);
+        if !ropes_are_instances(&state.text, &self.matcher.text) {
+            return;
+        }
         let original = state.text.clone();
         let layout = state.replacement_layout();
-        let value = state.cached_value();
         let editor = self.editor.clone();
         let cancellation = self.cancellation.clone();
         let worker_cancel = cancellation.clone();
         let worker_original = original.clone();
         let text_system = cx.text_system().clone();
+        self.matcher.replacing = true;
         self.searching = true;
         self.matcher.matched_ranges = Arc::new(MatchRanges::new(0));
         let task = cx.background_spawn(async move {
-            let text = value.unwrap_or_else(|| worker_original.to_string().into());
-            let mut output = String::new();
-            let mut offset = 0;
-            for (index, range) in ranges.iter().enumerate() {
-                if index % 1024 == 0 && worker_cancel.load(Ordering::Relaxed) {
-                    return None;
-                }
-                output.push_str(&text[offset..range.start]);
-                output.push_str(new_text.as_str());
-                offset = range.end;
-            }
-            output.push_str(&text[offset..]);
-            if worker_cancel.load(Ordering::Relaxed) {
-                return None;
-            }
-            let output: gpui::SharedString = output.into();
+            let output: gpui::SharedString =
+                replace_matches(&worker_original, &ranges, new_text.as_str(), &worker_cancel)?
+                    .into();
             let prepared =
                 layout.map(|layout| PreparedReplacement::new(output.clone(), layout, &text_system));
             (!worker_cancel.load(Ordering::Relaxed)).then_some((output, prepared))
@@ -972,6 +1006,31 @@ impl Render for SearchPanel {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn streamed_replacement_keeps_precise_unicode_and_line_endings() {
+        use super::{AtomicBool, MatchRanges, Regex, Rope, replace_matches};
+
+        let text = format!(
+            "{}\r\n{}",
+            "🐋a".repeat(209),
+            "K café\r\nk CAFÉ\nplain\r".repeat(1200)
+        );
+        let source = Rope::from(text.as_str());
+        let pattern = Regex::new("(?i)k café").unwrap();
+        let mut ranges = MatchRanges::new(text.len());
+        for found in pattern.find_iter(&text) {
+            ranges.push(found.range());
+        }
+        for replacement in ["", "🦀$5\r\n"] {
+            let expected = pattern.replace_all(&text, regex::NoExpand(replacement));
+            assert_eq!(
+                replace_matches(&source, &ranges, replacement, &AtomicBool::new(false)).unwrap(),
+                expected
+            );
+        }
+        assert!(replace_matches(&source, &ranges, "ignored", &AtomicBool::new(true)).is_none());
+    }
+
     struct SearchFixture {
         editor: gpui::Entity<super::InputState>,
     }

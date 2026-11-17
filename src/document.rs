@@ -1,8 +1,10 @@
+use gpui_component::input::Rope;
 #[cfg(target_os = "macos")]
 use std::os::fd::AsRawFd;
 use std::{
+    borrow::Cow,
     fs::{self, Metadata, OpenOptions},
-    io::{Read, Write},
+    io::{BufWriter, Read, Write},
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     sync::Arc,
@@ -16,7 +18,7 @@ type Result<T> = std::result::Result<T, String>;
 pub enum FileBytes {
     Raw(Arc<[u8]>),
     WithBom(Arc<str>),
-    OwnedText { text: Arc<String>, bom: bool },
+    Revision { text: Rope, bom: bool },
 }
 
 impl FileBytes {
@@ -28,52 +30,134 @@ impl FileBytes {
         }
     }
 
-    pub fn parts(&self) -> (&[u8], &[u8]) {
-        match self {
-            Self::Raw(bytes) => (&[], bytes),
-            Self::WithBom(text) => (BOM, text.as_bytes()),
-            Self::OwnedText { text, bom } => (if *bom { BOM } else { &[] }, text.as_bytes()),
-        }
+    fn explicit_bom(&self) -> bool {
+        matches!(self, Self::WithBom(_) | Self::Revision { bom: true, .. })
+    }
+
+    pub(crate) fn chunks(&self) -> impl Iterator<Item = &[u8]> {
+        self.explicit_bom()
+            .then_some(BOM)
+            .into_iter()
+            .chain(self.content_chunks(false))
+    }
+
+    fn content_chunks(&self, bom: bool) -> impl Iterator<Item = &[u8]> {
+        let (flat, revision) = match self {
+            Self::Raw(bytes) => (Some(bytes.as_ref()), None),
+            Self::WithBom(text) => (Some(text.as_bytes()), None),
+            Self::Revision { text, .. } => (None, Some(text.chunks())),
+        };
+        let strip_bom = bom && !self.explicit_bom();
+        flat.into_iter()
+            .chain(revision.into_iter().flatten().map(str::as_bytes))
+            .enumerate()
+            .map(move |(index, chunk)| {
+                if strip_bom && index == 0 {
+                    chunk.strip_prefix(BOM).unwrap_or(chunk)
+                } else {
+                    chunk
+                }
+            })
     }
 
     pub fn len(&self) -> usize {
-        let (prefix, bytes) = self.parts();
-        prefix.len() + bytes.len()
+        let bytes = match self {
+            Self::Raw(bytes) => bytes.len(),
+            Self::WithBom(text) => text.len(),
+            Self::Revision { text, .. } => text.len(),
+        };
+        bytes + if self.explicit_bom() { BOM.len() } else { 0 }
     }
 
     pub fn is_empty(&self) -> bool {
-        let (prefix, bytes) = self.parts();
-        prefix.is_empty() && bytes.is_empty()
+        self.len() == 0
     }
 
     #[cfg(test)]
-    pub(crate) fn as_bytes(&self) -> std::borrow::Cow<'_, [u8]> {
-        let (prefix, bytes) = self.parts();
-        if prefix.is_empty() {
-            std::borrow::Cow::Borrowed(bytes)
-        } else {
-            std::borrow::Cow::Owned([prefix, bytes].concat())
-        }
+    pub(crate) fn as_bytes(&self) -> Cow<'_, [u8]> {
+        collect_prefix(self.chunks(), self.len())
     }
 
     pub(crate) fn has_bom(&self) -> bool {
-        let (prefix, bytes) = self.parts();
-        !prefix.is_empty() || bytes.starts_with(BOM)
+        self.chunks()
+            .next()
+            .is_some_and(|chunk| chunk.starts_with(BOM))
     }
 
-    pub(crate) fn content_bytes(&self, bom: bool) -> &[u8] {
-        let (prefix, bytes) = self.parts();
-        if prefix.is_empty() && bom {
-            bytes.strip_prefix(BOM).unwrap_or(bytes)
-        } else {
-            bytes
+    pub(crate) fn content_bytes(&self, bom: bool) -> Cow<'_, [u8]> {
+        collect_prefix(self.content_chunks(bom), self.content_len(bom))
+    }
+
+    fn content_len(&self, bom: bool) -> usize {
+        let has_prefix = self.explicit_bom() || (bom && self.has_bom());
+        self.len() - if has_prefix { BOM.len() } else { 0 }
+    }
+
+    fn validate_text(&self, bom: bool) -> Result<()> {
+        for chunk in self.content_chunks(bom) {
+            supported_text(chunk)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn write_to(&self, writer: impl Write) -> std::io::Result<()> {
+        let mut writer = BufWriter::new(writer);
+        for chunk in self.chunks() {
+            writer.write_all(chunk)?;
+        }
+        writer.flush()
+    }
+}
+
+fn collect_prefix<'a>(mut chunks: impl Iterator<Item = &'a [u8]>, limit: usize) -> Cow<'a, [u8]> {
+    let first = chunks.next().unwrap_or_default();
+    if first.len() >= limit {
+        return Cow::Borrowed(&first[..limit]);
+    }
+    let Some(second) = chunks.next() else {
+        return Cow::Borrowed(first);
+    };
+    let mut bytes = Vec::with_capacity(limit);
+    bytes.extend_from_slice(first);
+    for chunk in std::iter::once(second).chain(chunks) {
+        let count = chunk.len().min(limit - bytes.len());
+        bytes.extend_from_slice(&chunk[..count]);
+        if bytes.len() == limit {
+            break;
+        }
+    }
+    Cow::Owned(bytes)
+}
+
+struct ByteMatcher<'a, I> {
+    chunks: I,
+    remaining: &'a [u8],
+}
+
+impl<'a, I: Iterator<Item = &'a [u8]>> ByteMatcher<'a, I> {
+    fn new(chunks: I) -> Self {
+        Self {
+            chunks,
+            remaining: &[],
         }
     }
 
-    fn write_to(&self, mut writer: impl Write) -> std::io::Result<()> {
-        let (prefix, body) = self.parts();
-        writer.write_all(prefix)?;
-        writer.write_all(body)
+    fn consume(&mut self, mut bytes: &[u8]) -> bool {
+        while !bytes.is_empty() {
+            if self.remaining.is_empty() {
+                let Some(chunk) = self.chunks.find(|chunk| !chunk.is_empty()) else {
+                    return false;
+                };
+                self.remaining = chunk;
+            }
+            let count = bytes.len().min(self.remaining.len());
+            if self.remaining[..count] != bytes[..count] {
+                return false;
+            }
+            self.remaining = &self.remaining[count..];
+            bytes = &bytes[count..];
+        }
+        true
     }
 }
 
@@ -97,15 +181,11 @@ impl From<&[u8]> for FileBytes {
 
 impl PartialEq for FileBytes {
     fn eq(&self, other: &Self) -> bool {
-        let (left_prefix, left) = self.parts();
-        let (right_prefix, right) = other.parts();
-        if left_prefix == right_prefix {
-            left == right
-        } else if left_prefix.is_empty() {
-            left.strip_prefix(right_prefix) == Some(right)
-        } else {
-            right.strip_prefix(left_prefix) == Some(left)
+        if self.len() != other.len() {
+            return false;
         }
+        let mut cursor = ByteMatcher::new(self.chunks());
+        other.chunks().all(|chunk| cursor.consume(chunk))
     }
 }
 
@@ -146,7 +226,7 @@ fn open_regular(path: &Path) -> Result<(fs::File, Metadata)> {
 fn read_chunks(
     mut file: fs::File,
     cancelled: &dyn Fn() -> bool,
-    mut consume: impl FnMut(usize, &[u8]),
+    mut consume: impl FnMut(&[u8]),
 ) -> Result<usize> {
     let mut length = 0;
     let mut chunk = [0u8; 64 * 1024];
@@ -161,7 +241,7 @@ fn read_chunks(
         if (length + read) as u64 > MAX_BYTES {
             return Err("File grew beyond 10 MiB while reading.".into());
         }
-        consume(length, &chunk[..read]);
+        consume(&chunk[..read]);
         length += read;
     }
 }
@@ -169,21 +249,16 @@ fn read_chunks(
 fn read_cancellable(path: &Path, cancelled: &dyn Fn() -> bool) -> Result<(Vec<u8>, Metadata)> {
     let (file, meta) = open_regular(path)?;
     let mut bytes = Vec::with_capacity(meta.len() as usize + 1);
-    read_chunks(file, cancelled, |_, chunk| bytes.extend_from_slice(chunk))?;
+    read_chunks(file, cancelled, |chunk| bytes.extend_from_slice(chunk))?;
     Ok((bytes, meta))
 }
 
 fn compare_regular(path: &Path, expected: &FileBytes) -> Result<(bool, Metadata)> {
     let (file, meta) = open_regular(path)?;
-    let (header, body) = expected.parts();
+    let mut cursor = ByteMatcher::new(expected.chunks());
     let mut equal = true;
-    let length = read_chunks(file, &|| false, |offset, chunk| {
-        let prefix = header.get(offset..).unwrap_or_default();
-        let prefix_len = prefix.len().min(chunk.len());
-        let rest = &chunk[prefix_len..];
-        let start = offset.saturating_sub(header.len());
-        equal &= prefix[..prefix_len] == chunk[..prefix_len]
-            && body.get(start..start + rest.len()) == Some(rest);
+    let length = read_chunks(file, &|| false, |chunk| {
+        equal = equal && cursor.consume(chunk);
     })?;
     Ok((equal && length == expected.len(), meta))
 }
@@ -201,8 +276,37 @@ fn supported_text(bytes: &[u8]) -> Result<&str> {
 }
 
 impl DiskFile {
-    pub fn content_bytes(&self) -> &[u8] {
+    #[cfg(test)]
+    pub(crate) fn content_bytes(&self) -> Cow<'_, [u8]> {
         self.bytes.content_bytes(self.bom)
+    }
+
+    pub fn content_prefix(&self, limit: usize) -> Cow<'_, [u8]> {
+        collect_prefix(self.bytes.content_chunks(self.bom), limit)
+    }
+
+    pub fn text_revision(&self) -> Option<&Rope> {
+        match &self.bytes {
+            FileBytes::Revision { text, .. } => Some(text),
+            _ => None,
+        }
+    }
+
+    pub fn matches_revision(&self, text: &Rope) -> bool {
+        if text.len() != self.bytes.content_len(self.bom) {
+            return false;
+        }
+        let mut cursor = ByteMatcher::new(self.bytes.content_chunks(self.bom));
+        text.chunks().all(|chunk| cursor.consume(chunk.as_bytes()))
+    }
+
+    pub(crate) fn share_revision(mut self, text: Rope) -> Self {
+        debug_assert!(self.matches_revision(&text));
+        self.bytes = FileBytes::Revision {
+            text,
+            bom: self.bom,
+        };
+        self
     }
 
     pub fn draft() -> Self {
@@ -271,7 +375,7 @@ impl DiskFile {
         if target == self.target {
             let (equal, metadata) = compare_regular(&target, &self.bytes)?;
             if equal && self.bom == self.bytes.has_bom() {
-                supported_text(self.content_bytes())?;
+                self.bytes.validate_text(self.bom)?;
                 self.identity = identity(&metadata);
                 return Ok(Observation::Unchanged(self));
             }
@@ -387,10 +491,10 @@ impl DiskFile {
         self.save_bytes(FileBytes::from_text(text, self.bom), self.bom)
     }
 
-    pub(crate) fn save_owned_snapshot(&self, text: String) -> Result<Self> {
+    pub(crate) fn save_revision(&self, text: Rope) -> Result<Self> {
         self.save_bytes(
-            FileBytes::OwnedText {
-                text: Arc::new(text),
+            FileBytes::Revision {
+                text,
                 bom: self.bom,
             },
             self.bom,
@@ -541,24 +645,42 @@ mod tests {
     #[test]
     fn save_shares_the_worker_snapshot_and_compares_exact_bytes() {
         let before = "\u{feff}original\n";
-        let text = "local 🦀\r\nsecond\rthird\n";
+        let text = "local 🦀\r\nsecond\rthird\n".repeat(6000);
         let (_dir, path) = fixture(before.as_bytes());
         let (disk, _) = DiskFile::open(path.clone()).unwrap();
-        let snapshot = text.to_owned();
-        let allocation = snapshot.as_ptr();
-        let saved = disk.save_owned_snapshot(snapshot).unwrap();
-        assert_eq!(saved.content_bytes().as_ptr(), allocation);
+        let snapshot = Rope::from(text.as_str());
+        let saved = disk.save_revision(snapshot.clone()).unwrap();
+        assert!(
+            snapshot
+                .chunks()
+                .zip(saved.text_revision().unwrap().chunks())
+                .all(|(original, saved)| std::ptr::eq(original, saved))
+        );
+        assert!(saved.matches_revision(&snapshot));
+        assert_eq!(saved.content_prefix(256).as_ref(), &text.as_bytes()[..256]);
         let full_text = format!("\u{feff}{text}");
-        assert_eq!(fs::read(path).unwrap(), full_text.as_bytes());
+        assert_eq!(fs::read(&path).unwrap(), full_text.as_bytes());
         assert_eq!(saved.bytes, FileBytes::from(full_text.as_bytes()));
-        assert_eq!(saved.bytes, FileBytes::from_text(text.into(), true));
         assert_eq!(
             saved.bytes,
-            FileBytes::OwnedText {
-                text: Arc::new(full_text),
+            FileBytes::from_text(text.as_str().into(), true)
+        );
+        assert_eq!(
+            saved.bytes,
+            FileBytes::Revision {
+                text: Rope::from(full_text.as_str()),
                 bom: false
             }
         );
+        assert!(matches!(
+            saved.clone().observe().unwrap(),
+            Observation::Unchanged(_)
+        ));
+        let mut externally_changed = full_text.into_bytes();
+        externally_changed[65_536] ^= 1;
+        fs::write(&path, &externally_changed).unwrap();
+        assert!(saved.save_revision(snapshot).is_err());
+        assert_eq!(fs::read(path).unwrap(), externally_changed);
     }
 
     #[test]
@@ -571,7 +693,7 @@ mod tests {
         ] {
             let (_dir, path) = fixture(bytes);
             let (disk, text) = DiskFile::open(path.clone()).unwrap();
-            assert!(std::ptr::eq(disk.content_bytes(), text.as_bytes()));
+            assert!(std::ptr::eq(disk.content_bytes().as_ref(), text.as_bytes()));
             disk.save(&text).unwrap();
             assert_eq!(fs::read(&path).unwrap(), bytes);
             disk.save(&format!("{text}!")).unwrap();
@@ -620,15 +742,13 @@ mod tests {
     fn unchanged_observation_preserves_file_decoding_rules() {
         let (_dir, path) = fixture(b"original");
         let (disk, _) = DiskFile::open(path.clone()).unwrap();
-        let saved = disk
-            .save_owned_snapshot("\u{feff}different".to_owned())
-            .unwrap();
+        let saved = disk.save_revision(Rope::from("\u{feff}different")).unwrap();
         let Observation::Changed(decoded, body) = saved.observe().unwrap() else {
             panic!("A leading BOM changes the decoded document");
         };
         assert!(decoded.bom);
         assert_eq!(body.as_ref(), "different");
-        let unsupported = decoded.save_owned_snapshot("nul\0".to_owned()).unwrap();
+        let unsupported = decoded.save_revision(Rope::from("nul\0")).unwrap();
         assert_eq!(unsupported.observe().err(), DiskFile::open(path).err(),);
     }
 
