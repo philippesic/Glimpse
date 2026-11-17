@@ -51,9 +51,8 @@ pub(crate) enum Event {
 pub(crate) struct State {
     active: Arc<AtomicBool>,
     initialized: bool,
-    next_id: u64,
+    next_id: u32,
     ids: HashMap<Vec<ElementId>, NodeId>,
-    child_ids: HashMap<(NodeId, ElementId), NodeId>,
     visible: HashSet<NodeId>,
     text_groups: HashMap<NodeId, Arc<[(NodeId, Node)]>>,
     pub(crate) parents: Vec<NodeId>,
@@ -83,6 +82,18 @@ pub struct AccessibilityInfo {
     pub focused: bool,
     /// Whether assistive access is contained within this element.
     pub modal: bool,
+}
+
+/// The text-run ID namespace of one rendered accessible element.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct TextRunIds(u32);
+
+impl TextRunIds {
+    /// A stable ID for a run key supplied by the text owner.
+    pub fn get(self, key: usize) -> NodeId {
+        let key = u32::try_from(key).expect("accessibility text run key exhausted");
+        NodeId((u64::from(self.0) << 32) | u64::from(key))
+    }
 }
 impl AccessibilityInfo {
     /// Describe an element without additional text runs.
@@ -279,13 +290,19 @@ impl State {
             nodes.insert(record.id, record.info.node.clone());
         }
         nodes.insert(NodeId(1), root);
+        let mut rendered_children: HashMap<NodeId, Vec<NodeId>> = HashMap::default();
         for record in records {
             if let Some(parent) = nodes.get_mut(&record.parent) {
                 parent.push_child(record.id);
+                rendered_children
+                    .entry(record.parent)
+                    .or_default()
+                    .push(record.id);
             }
         }
         if let Some(modal) = modal {
             nodes.get_mut(&NodeId(1)).unwrap().set_children(vec![modal]);
+            rendered_children.insert(NodeId(1), vec![modal]);
         }
         let mut pending = vec![NodeId(1)];
         let mut visible = HashSet::default();
@@ -293,8 +310,8 @@ impl State {
             if !visible.insert(id) {
                 continue;
             }
-            if let Some(node) = nodes.get(&id) {
-                pending.extend_from_slice(node.children());
+            if let Some(children) = rendered_children.get(&id) {
+                pending.extend_from_slice(children);
             }
         }
         let focus = records
@@ -306,17 +323,7 @@ impl State {
         let mut tree = TreeInfo::new(NodeId(1));
         tree.toolkit_name = Some("GPUI".into());
         tree.toolkit_version = Some(env!("CARGO_PKG_VERSION").into());
-        let collect_profile = crate::work_trace::Span::new("a11y_collect");
-        let current_ids: HashSet<_> = nodes
-            .keys()
-            .copied()
-            .chain(
-                records
-                    .iter()
-                    .flat_map(|record| record.info.text.iter().map(|(id, _)| *id)),
-            )
-            .collect();
-        drop(collect_profile);
+        self.ids.retain(|_, id| nodes.contains_key(id));
         let diff_profile = crate::work_trace::Span::new("a11y_diff");
         let mut text_groups = HashMap::default();
         let mut changed_text = Vec::new();
@@ -361,8 +368,6 @@ impl State {
             tree_id: TreeId::ROOT,
             focus,
         };
-        self.ids.retain(|_, id| current_ids.contains(id));
-        self.child_ids.retain(|_, id| current_ids.contains(id));
         self.visible = visible;
         #[cfg(target_os = "linux")]
         if let Some(adapter) = &mut self.adapter {
@@ -401,25 +406,18 @@ impl Window {
         if let Some(id) = self.accessibility.ids.get(global_id.0.as_slice()) {
             return *id;
         }
-        self.accessibility.next_id = self.accessibility.next_id.max(1) + 1;
-        let id = NodeId(self.accessibility.next_id);
+        self.accessibility.next_id = self
+            .accessibility
+            .next_id
+            .max(1)
+            .checked_add(1)
+            .expect("accessibility element ID exhausted");
+        let id = NodeId(u64::from(self.accessibility.next_id));
         self.accessibility.ids.insert(global_id.0.to_vec(), id);
         id
     }
-    /// Allocate a stable text-run identifier below a semantic element.
-    pub fn accessibility_child_id(
-        &mut self,
-        parent: &GlobalElementId,
-        id: impl Into<ElementId>,
-    ) -> NodeId {
-        let parent = self.accessibility_id(parent);
-        *self
-            .accessibility
-            .child_ids
-            .entry((parent, id.into()))
-            .or_insert_with(|| {
-                self.accessibility.next_id = self.accessibility.next_id.max(1) + 1;
-                NodeId(self.accessibility.next_id)
-            })
+    /// Reserve the text-run namespace for a semantic element.
+    pub fn accessibility_text_run_ids(&mut self, parent: &GlobalElementId) -> TextRunIds {
+        TextRunIds(self.accessibility_id(parent).0 as u32)
     }
 }

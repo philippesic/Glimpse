@@ -141,27 +141,32 @@ pub(crate) fn text(
     gpui::accessible(id, child, move |id, window, _| {
         use gpui::accesskit::{Node, Role, TextDirection};
         let parts = segments(&text);
-        let ids: Vec<_> = (0..parts.len())
-            .map(|index| window.accessibility_child_id(id, ("run", index)))
-            .collect();
+        let owner = window.accessibility_text_run_ids(id);
         let mut node = Node::new(Role::Label);
         node.set_read_only();
-        node.set_children(ids.clone());
+        node.set_children(
+            (0..parts.len())
+                .map(|index| owner.get(index))
+                .collect::<Vec<_>>(),
+        );
         let mut info = gpui::AccessibilityInfo::new(node);
-        let mut text_nodes = Vec::new();
-        for (index, part) in parts.iter().enumerate() {
+        let mut text_nodes = Vec::with_capacity(parts.len());
+        let mut parts = parts.into_iter().enumerate().peekable();
+        let mut previous_line = None;
+        while let Some((index, part)) = parts.next() {
             let mut run = Node::new(Role::TextRun);
-            run.set_value(text[part.range.clone()].to_owned());
-            run.set_character_lengths(part.lengths.clone());
-            run.set_word_starts(part.words.clone());
+            run.set_value(text[part.range].to_owned());
+            run.set_character_lengths(part.lengths);
+            run.set_word_starts(part.words);
             run.set_text_direction(TextDirection::LeftToRight);
-            if index > 0 && parts[index - 1].line == part.line {
-                run.set_previous_on_line(ids[index - 1]);
+            if previous_line == Some(part.line) {
+                run.set_previous_on_line(owner.get(index - 1));
             }
-            if index + 1 < parts.len() && parts[index + 1].line == part.line {
-                run.set_next_on_line(ids[index + 1]);
+            if parts.peek().is_some_and(|(_, next)| next.line == part.line) {
+                run.set_next_on_line(owner.get(index + 1));
             }
-            text_nodes.push((ids[index], run));
+            previous_line = Some(part.line);
+            text_nodes.push((owner.get(index), run));
         }
         info.text = text_nodes.into();
         info
@@ -181,11 +186,13 @@ mod tests {
             let mut second = gpui::GlobalElementId::default();
             second.push("second".into());
             let mut ids = std::collections::HashSet::new();
+            let first_ids = window.accessibility_text_run_ids(&first);
+            let second_ids = window.accessibility_text_run_ids(&second);
             for index in 0..10_000usize {
-                let id = window.accessibility_child_id(&first, ("run", index));
-                assert_eq!(id, window.accessibility_child_id(&first, ("run", index)));
+                let id = first_ids.get(index);
+                assert_eq!(id, window.accessibility_text_run_ids(&first).get(index));
                 assert!(ids.insert(id));
-                assert!(ids.insert(window.accessibility_child_id(&second, ("run", index))));
+                assert!(ids.insert(second_ids.get(index)));
             }
         });
     }

@@ -7,6 +7,7 @@ use gpui::accesskit::{
 
 #[derive(Default)]
 pub(super) struct Mapping {
+    owner: Option<gpui::accessibility::TextRunIds>,
     text: SharedString,
     runs: Vec<Run>,
     nodes: std::sync::Arc<[(NodeId, Node)]>,
@@ -51,19 +52,22 @@ impl Mapping {
         let mut runs = Vec::with_capacity(nodes.capacity());
         nodes.extend(self.nodes[..prefix].iter().cloned());
         runs.extend(self.runs[..prefix].iter().cloned());
-        for (index, part) in parts.iter().enumerate() {
+        let mut parts = parts.into_iter().enumerate().peekable();
+        let mut previous_line = None;
+        while let Some((index, part)) = parts.next() {
             let mut run = Node::new(Role::TextRun);
             let range = new.start + part.range.start..new.start + part.range.end;
             run.set_value(text[range.clone()].to_owned());
-            run.set_character_lengths(part.lengths.clone());
-            run.set_word_starts(part.words.clone());
+            run.set_character_lengths(part.lengths);
+            run.set_word_starts(part.words);
             run.set_text_direction(TextDirection::LeftToRight);
-            if index > 0 && parts[index - 1].line == part.line {
+            if previous_line == Some(part.line) {
                 run.set_previous_on_line(ids[index - 1]);
             }
-            if index + 1 < parts.len() && parts[index + 1].line == part.line {
+            if parts.peek().is_some_and(|(_, next)| next.line == part.line) {
                 run.set_next_on_line(ids[index + 1]);
             }
+            previous_line = Some(part.line);
             nodes.push((ids[index], run));
             runs.push(Run {
                 id: ids[index],
@@ -203,17 +207,18 @@ impl InputState {
             info.focused = self.focus_handle.is_focused(window);
             return info;
         }
-        let first = window.accessibility_child_id(id, ("text-run", 0usize));
-        if mapping.nodes.first().map(|(id, _)| *id) != Some(first) {
-            *mapping = Mapping::default();
+        let owner = window.accessibility_text_run_ids(id);
+        if mapping.owner != Some(owner) {
+            *mapping = Mapping {
+                owner: Some(owner),
+                ..Mapping::default()
+            };
         }
         if mapping.nodes.is_empty()
             || mapping.text.as_ptr() != text.as_ptr()
             || mapping.text.len() != text.len()
         {
-            mapping.update(text.clone(), |index| {
-                window.accessibility_child_id(id, ("text-run", index))
-            });
+            mapping.update(text.clone(), |index| owner.get(index));
         }
         let mut node = Node::new(if self.mode.is_multi_line() {
             Role::MultilineTextInput
