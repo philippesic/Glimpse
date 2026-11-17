@@ -166,6 +166,38 @@ pub struct Position<'a> {
     pub(crate) inner: InnerPosition<'a>,
 }
 
+enum WordStarts<'a> {
+    Narrow(&'a [u8]),
+    Wide(&'a [u16]),
+}
+
+impl WordStarts<'_> {
+    fn get(&self, index: usize) -> Option<usize> {
+        match self {
+            Self::Narrow(starts) => starts.get(index).map(|&start| usize::from(start)),
+            Self::Wide(starts) => starts.get(index).map(|&start| usize::from(start)),
+        }
+    }
+
+    fn last(&self) -> Option<usize> {
+        match self {
+            Self::Narrow(starts) => starts.last().map(|&start| usize::from(start)),
+            Self::Wide(starts) => starts.last().map(|&start| usize::from(start)),
+        }
+    }
+
+    fn search(&self, character: usize) -> Result<usize, usize> {
+        match self {
+            Self::Narrow(starts) => {
+                starts.binary_search_by_key(&character, |&start| usize::from(start))
+            }
+            Self::Wide(starts) => {
+                starts.binary_search_by_key(&character, |&start| usize::from(start))
+            }
+        }
+    }
+}
+
 impl<'a> Position<'a> {
     pub fn to_raw(self) -> WeakPosition {
         self.inner.downgrade()
@@ -175,11 +207,15 @@ impl<'a> Position<'a> {
         &self.inner.node
     }
 
-    fn word_starts(&self, node: &NodeRef<'a>) -> &'a [u8] {
+    fn word_starts(&self, node: &NodeRef<'a>) -> WordStarts<'a> {
         if self.root_node.is_password_input() {
-            &[]
+            return WordStarts::Narrow(&[]);
+        }
+        let wide = node.data().wide_word_starts();
+        if wide.is_empty() {
+            WordStarts::Narrow(node.data().word_starts())
         } else {
-            node.data().word_starts()
+            WordStarts::Wide(wide)
         }
     }
 
@@ -200,7 +236,7 @@ impl<'a> Position<'a> {
         self.is_paragraph_start()
             || self
                 .word_starts(&self.inner.node)
-                .binary_search(&(self.inner.character_index as u8))
+                .search(self.inner.character_index)
                 .is_ok()
     }
 
@@ -419,7 +455,7 @@ impl<'a> Position<'a> {
         // `word_starts` local later.
         {
             let word_starts = self.word_starts(&pos.node);
-            let index = match word_starts.binary_search(&(pos.character_index as u8)) {
+            let index = match word_starts.search(pos.character_index) {
                 Ok(index) => index + 1,
                 Err(index) => index,
             };
@@ -428,7 +464,7 @@ impl<'a> Position<'a> {
                     root_node: self.root_node,
                     inner: InnerPosition {
                         node: pos.node,
-                        character_index: *start as usize,
+                        character_index: start,
                     },
                 };
             }
@@ -444,12 +480,12 @@ impl<'a> Position<'a> {
             if start_pos.is_paragraph_start() {
                 return start_pos;
             }
-            if let Some(start) = self.word_starts(&node).first() {
+            if let Some(start) = self.word_starts(&node).get(0) {
                 return Self {
                     root_node: self.root_node,
                     inner: InnerPosition {
                         node,
-                        character_index: *start as usize,
+                        character_index: start,
                     },
                 };
             }
@@ -466,16 +502,18 @@ impl<'a> Position<'a> {
         // `word_starts` local later.
         {
             let word_starts = self.word_starts(&self.inner.node);
-            let index = match word_starts.binary_search(&(self.inner.character_index as u8)) {
-                Ok(index) => index,
-                Err(index) => index,
-            };
-            if let Some(index) = index.checked_sub(1) {
+            let index = word_starts
+                .search(self.inner.character_index)
+                .unwrap_or_else(|index| index);
+            if let Some(start) = index
+                .checked_sub(1)
+                .and_then(|index| word_starts.get(index))
+            {
                 return Self {
                     root_node: self.root_node,
                     inner: InnerPosition {
                         node: self.inner.node,
-                        character_index: word_starts[index] as usize,
+                        character_index: start,
                     },
                 };
             }
@@ -498,7 +536,7 @@ impl<'a> Position<'a> {
                     root_node: self.root_node,
                     inner: InnerPosition {
                         node,
-                        character_index: *start as usize,
+                        character_index: start,
                     },
                 };
             }
@@ -2931,9 +2969,10 @@ mod tests {
         let _ = node.text_selection().unwrap();
     }
 
-    fn word_starts_tree(role: Role) -> crate::Tree {
+    fn word_starts_tree(role: Role, wide: bool) -> crate::Tree {
         use accesskit::{Node, TextPosition, TreeId, TreeInfo, TreeUpdate};
 
+        let word = if wide { 301 } else { 3 };
         let update = TreeUpdate {
             nodes: vec![
                 (NodeId(0), {
@@ -2947,20 +2986,26 @@ mod tests {
                     node.set_text_selection(TextSelection {
                         anchor: TextPosition {
                             node: NodeId(2),
-                            character_index: 3,
+                            character_index: word,
                         },
                         focus: TextPosition {
                             node: NodeId(2),
-                            character_index: 3,
+                            character_index: word,
                         },
                     });
                     node
                 }),
                 (NodeId(2), {
                     let mut node = Node::new(Role::TextRun);
-                    node.set_value("ab cd");
-                    node.set_character_lengths([1, 1, 1, 1, 1]);
-                    node.set_word_starts([3]);
+                    if wide {
+                        node.set_value("a".repeat(300) + " cd");
+                        node.set_character_lengths(vec![1; 303]);
+                        node.set_wide_word_starts([301]);
+                    } else {
+                        node.set_value("ab cd");
+                        node.set_character_lengths([1, 1, 1, 1, 1]);
+                        node.set_word_starts([3]);
+                    }
                     node.set_next_on_line(NodeId(3));
                     node
                 }),
@@ -2983,24 +3028,27 @@ mod tests {
 
     #[test]
     fn word_starts_are_exposed_on_text_input() {
-        let tree = word_starts_tree(Role::TextInput);
-        let state = tree.state();
-        let node = state.node_by_id(nid(NodeId(1))).unwrap();
-        let pos = node.text_selection().unwrap().start();
-        assert!(pos.is_word_start());
-        let range = node.document_range();
-        let next = range.start().forward_to_word_start();
-        assert_eq!(next, pos);
-        assert_eq!(pos.backward_to_word_start(), range.start());
-        let next = next.forward_to_word_start();
-        assert_eq!(next.inner.node.id(), nid(NodeId(3)));
-        assert_eq!(next.inner.character_index, 1);
-        assert_eq!(range.end().backward_to_word_start(), next);
+        for wide in [false, true] {
+            let tree = word_starts_tree(Role::TextInput, wide);
+            let state = tree.state();
+            let node = state.node_by_id(nid(NodeId(1))).unwrap();
+            let pos = node.text_selection().unwrap().start();
+            assert!(pos.is_word_start());
+            let range = node.document_range();
+            let next = range.start().forward_to_word_start();
+            assert_eq!(next, pos);
+            assert_eq!(pos.backward_to_word_start(), range.start());
+            let next = next.forward_to_word_start();
+            assert_eq!(next.inner.node.id(), nid(NodeId(3)));
+            assert_eq!(next.inner.character_index, 1);
+            assert_eq!(range.end().backward_to_word_start(), next);
+            assert_eq!(next.backward_to_word_start(), pos);
+        }
     }
 
     #[test]
     fn word_starts_are_ignored_on_password_input() {
-        let tree = word_starts_tree(Role::PasswordInput);
+        let tree = word_starts_tree(Role::PasswordInput, false);
         let state = tree.state();
         let node = state.node_by_id(nid(NodeId(1))).unwrap();
         let pos = node.text_selection().unwrap().start();

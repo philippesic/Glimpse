@@ -864,6 +864,7 @@ enum PropertyValue {
     Color(Color),
     TextDecoration(TextDecoration),
     LengthVec(Vec<u8>),
+    WordIndexVec(Vec<u16>),
     CoordVec(Vec<f32>),
     Bool(bool),
     Invalid(Invalid),
@@ -1004,6 +1005,7 @@ enum PropertyId {
     TextSelection,
     CustomActions,
     TreeId,
+    WideWordStarts,
 
     // This MUST be last.
     Unset,
@@ -1022,6 +1024,7 @@ impl Clone for PropertyValue {
             Self::Color(v) => Self::Color(*v),
             Self::TextDecoration(v) => Self::TextDecoration(*v),
             Self::LengthVec(v) => Self::LengthVec(v.clone()),
+            Self::WordIndexVec(v) => Self::WordIndexVec(v.clone()),
             Self::CoordVec(v) => Self::CoordVec(v.clone()),
             Self::Bool(v) => Self::Bool(*v),
             Self::Invalid(v) => Self::Invalid(*v),
@@ -1049,6 +1052,7 @@ impl Clone for PropertyValue {
             (Self::NodeIdVec(dest), Self::NodeIdVec(source)) => dest.clone_from(source),
             (Self::String(dest), Self::String(source)) => dest.clone_from(source),
             (Self::LengthVec(dest), Self::LengthVec(source)) => dest.clone_from(source),
+            (Self::WordIndexVec(dest), Self::WordIndexVec(source)) => dest.clone_from(source),
             (Self::CoordVec(dest), Self::CoordVec(source)) => dest.clone_from(source),
             (Self::CustomActionVec(dest), Self::CustomActionVec(source)) => dest.clone_from(source),
             (Self::Affine(dest), Self::Affine(source)) => dest.clone_from(source),
@@ -2080,7 +2084,8 @@ option_ref_type_getters! {
 }
 
 slice_type_getters! {
-    (get_length_vec_property, u8, LengthVec)
+    (get_length_vec_property, u8, LengthVec),
+    (get_word_index_vec_property, u16, WordIndexVec)
 }
 
 copy_type_getters! {
@@ -2099,6 +2104,7 @@ owned_type_setters! {
     (set_affine_property, Box<Affine>, Affine),
     (set_string_property, String, String),
     (set_length_vec_property, Vec<u8>, LengthVec),
+    (set_word_index_vec_property, Vec<u16>, WordIndexVec),
     (set_coord_vec_property, Vec<f32>, CoordVec),
     (set_text_selection_property, Box<TextSelection>, TextSelection)
 }
@@ -2486,6 +2492,12 @@ length_vec_property_methods! {
     ///
     /// [`character_lengths`]: Node::character_lengths
     (WordStarts, word_starts, set_word_starts, clear_word_starts)
+}
+
+property_methods! {
+    /// Word boundaries for a run with more than 255 characters.
+    /// A nonempty wide list takes precedence over [`Node::word_starts`].
+    (WideWordStarts, wide_word_starts, get_word_index_vec_property, &[u16], set_wide_word_starts, set_word_index_vec_property, impl Into<Vec<u16>>, clear_wide_word_starts)
 }
 
 coord_vec_property_methods! {
@@ -2880,6 +2892,9 @@ impl fmt::Debug for Node {
         self.debug_color_properties(&mut fmt);
         self.debug_text_decoration_properties(&mut fmt);
         self.debug_length_vec_properties(&mut fmt);
+        if !self.wide_word_starts().is_empty() {
+            fmt.field("wide_word_starts", &self.wide_word_starts());
+        }
         self.debug_coord_vec_properties(&mut fmt);
         self.debug_bool_properties(&mut fmt);
         self.debug_unique_enum_properties(&mut fmt);
@@ -2950,6 +2965,7 @@ impl Serialize for Properties {
                 Color,
                 TextDecoration,
                 LengthVec,
+                WordIndexVec,
                 CoordVec,
                 Bool,
                 Invalid,
@@ -3079,6 +3095,7 @@ impl<'de> Visitor<'de> for PropertiesVisitor {
                     CharacterLengths,
                     WordStarts
                 },
+                WordIndexVec { WideWordStarts },
                 CoordVec {
                     CharacterPositions,
                     CharacterWidths
@@ -3233,6 +3250,7 @@ impl JsonSchema for Properties {
                 CharacterLengths,
                 WordStarts
             },
+            Vec<u16> { WideWordStarts },
             Vec<f32> {
                 CharacterPositions,
                 CharacterWidths
@@ -3581,6 +3599,25 @@ mod tests {
         assert_eq!(serde_json::to_value(node.clone()).unwrap(), wire);
         restored.clear_value();
         assert_eq!(node.value(), Some("café 🙂"));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn wide_and_narrow_word_indices_use_distinct_wire_properties() {
+        let mut node = Node::new(Role::TextRun);
+        node.set_word_starts([2, 5]);
+        node.set_wide_word_starts([2, 300]);
+        let wire = serde_json::to_value(&node).unwrap();
+        assert_eq!(wire["properties"]["wordStarts"], serde_json::json!([2, 5]));
+        assert_eq!(
+            wire["properties"]["wideWordStarts"],
+            serde_json::json!([2, 300])
+        );
+        let mut decoded: Node = serde_json::from_value(wire).unwrap();
+        assert_eq!(decoded, node);
+        decoded.clear_wide_word_starts();
+        assert_eq!(decoded.word_starts(), [2, 5]);
+        assert!(decoded.wide_word_starts().is_empty());
     }
 
     #[test]

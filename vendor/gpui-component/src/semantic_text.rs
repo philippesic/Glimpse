@@ -1,10 +1,14 @@
+use gpui::accesskit::{Node, Role, TextDirection};
 use std::ops::Range;
+use std::sync::OnceLock;
 use unicode_segmentation::UnicodeSegmentation;
+
+pub(crate) const MAX_RUN_CHARACTERS: usize = 2048;
 
 pub(crate) struct Segment {
     pub(crate) range: Range<usize>,
     pub(crate) lengths: Vec<u8>,
-    pub(crate) words: Vec<u8>,
+    pub(crate) words: Vec<u16>,
     pub(crate) line: usize,
 }
 impl Segment {
@@ -53,7 +57,7 @@ pub(crate) fn visit_segments(text: &str, mut visit: impl FnMut(Segment)) {
             };
             let ascii_end = byte + safe_ascii;
             while byte < ascii_end {
-                if lengths.len() == 255 {
+                if lengths.len() == MAX_RUN_CHARACTERS {
                     visit(Segment {
                         range: start..byte,
                         lengths,
@@ -64,12 +68,12 @@ pub(crate) fn visit_segments(text: &str, mut visit: impl FnMut(Segment)) {
                     lengths = Vec::new();
                     starts = Vec::new();
                 }
-                let count = (255 - lengths.len()).min(ascii_end - byte);
+                let count = (MAX_RUN_CHARACTERS - lengths.len()).min(ascii_end - byte);
                 while words.peek().is_some_and(|&word| word < byte) {
                     words.next();
                 }
                 while let Some(&word) = words.peek().filter(|&&word| word < byte + count) {
-                    starts.push((lengths.len() + word - byte) as u8);
+                    starts.push((lengths.len() + word - byte) as u16);
                     words.next();
                 }
                 lengths.resize(lengths.len() + count, 1);
@@ -88,7 +92,7 @@ pub(crate) fn visit_segments(text: &str, mut visit: impl FnMut(Segment)) {
                     .collect()
             };
             for length in pieces {
-                if lengths.len() == 255 {
+                if lengths.len() == MAX_RUN_CHARACTERS {
                     visit(Segment {
                         range: start..byte,
                         lengths,
@@ -106,7 +110,7 @@ pub(crate) fn visit_segments(text: &str, mut visit: impl FnMut(Segment)) {
                     .peek()
                     .is_some_and(|&word| word < byte + usize::from(length))
                 {
-                    let index = lengths.len() as u8;
+                    let index = lengths.len() as u16;
                     if starts.last() != Some(&index) {
                         starts.push(index);
                     }
@@ -139,13 +143,41 @@ pub(crate) fn segments(text: &str) -> Vec<Segment> {
     visit_segments(text, |part| segments.push(part));
     segments
 }
+
+pub(crate) fn text_run(value: &str, lengths: Vec<u8>, words: Vec<u16>) -> Node {
+    static EMPTY: OnceLock<Node> = OnceLock::new();
+    static LF: OnceLock<Node> = OnceLock::new();
+    static CRLF: OnceLock<Node> = OnceLock::new();
+    let shared = match value {
+        "" => Some(&EMPTY),
+        "\n" => Some(&LF),
+        "\r\n" => Some(&CRLF),
+        _ => None,
+    };
+    let build = || {
+        let mut run = Node::new(Role::TextRun);
+        run.set_value(value);
+        run.set_character_lengths(lengths);
+        if words.last().is_none_or(|&word| word <= u8::MAX.into()) {
+            run.set_word_starts(words.into_iter().map(|word| word as u8).collect::<Vec<_>>());
+        } else {
+            run.set_wide_word_starts(words);
+        }
+        run.set_text_direction(TextDirection::LeftToRight);
+        run
+    };
+    match shared {
+        Some(shared) => shared.get_or_init(build).clone(),
+        None => build(),
+    }
+}
+
 pub(crate) fn text(
     id: impl Into<gpui::ElementId>,
     text: gpui::SharedString,
     child: impl gpui::IntoElement,
 ) -> gpui::Accessible {
     gpui::accessible(id, child, move |id, window, _| {
-        use gpui::accesskit::{Node, Role, TextDirection};
         let parts = segments(&text);
         let owner = window.accessibility_text_run_ids(id);
         let mut node = Node::new(Role::Label);
@@ -160,11 +192,7 @@ pub(crate) fn text(
         let mut parts = parts.into_iter().enumerate().peekable();
         let mut previous_line = None;
         while let Some((index, part)) = parts.next() {
-            let mut run = Node::new(Role::TextRun);
-            run.set_value(text[part.range].to_owned());
-            run.set_character_lengths(part.lengths);
-            run.set_word_starts(part.words);
-            run.set_text_direction(TextDirection::LeftToRight);
+            let mut run = text_run(&text[part.range], part.lengths, part.words);
             if previous_line == Some(part.line) {
                 run.set_previous_on_line(owner.get(index - 1));
             }
@@ -182,6 +210,20 @@ pub(crate) fn text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn equal_blank_runs_share_their_properties_without_sharing_links() {
+        for (text, length) in [("\n", 1), ("\r\n", 2)] {
+            let normal = text_run(text, vec![length], vec![]);
+            let mut linked = text_run(text, vec![length], vec![]);
+            assert!(normal.shares_data_with(&linked));
+            linked.set_previous_on_line(gpui::accesskit::NodeId(7));
+            assert!(normal.previous_on_line().is_none());
+            assert!(!normal.shares_data_with(&linked));
+            assert_eq!(linked.value(), Some(text));
+            assert_eq!(linked.character_lengths(), [length]);
+        }
+    }
 
     #[gpui::test]
     fn text_run_ids_are_stable_and_distinct_between_parents(cx: &mut gpui::TestAppContext) {
@@ -303,7 +345,9 @@ mod tests {
                     .map(|(byte, _)| byte)
                     .collect::<Vec<_>>()
             );
-            assert!(parts.iter().all(|part| part.lengths.len() <= 255));
+            assert!(parts
+                .iter()
+                .all(|part| part.lengths.len() <= MAX_RUN_CHARACTERS));
             assert_eq!(
                 parts
                     .iter()
@@ -320,7 +364,7 @@ mod tests {
             "A", " ", "\r", "\n", "\t", "\0", "é", "́", "🙂", "\u{200d}", "\u{600}", "🇨🇳", "🇺", "🇸",
             "क", "्", "ष", "ा", "ᄀ", "ᅡ", "ᆨ", "👩🏽", "🏻", "\u{200c}",
         ];
-        let padding = [0, 1, 254, 255, 256, 511];
+        let padding = [0, 1, 254, 255, 256, 511, 2047, 2048, 2049];
         for (a, first) in pieces.iter().enumerate() {
             for (b, second) in pieces.iter().enumerate() {
                 for (c, third) in pieces.iter().enumerate() {
@@ -404,6 +448,7 @@ mod tests {
         );
         assert!(segments
             .iter()
-            .all(|segment| segment.boundaries().len() <= 256));
+            .all(|segment| segment.lengths.len() <= MAX_RUN_CHARACTERS));
+        assert!(segments.iter().any(|segment| segment.lengths.len() > 255));
     }
 }

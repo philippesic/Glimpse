@@ -1,8 +1,7 @@
 use super::*;
-use crate::semantic_text::visit_segments;
+use crate::semantic_text::{text_run, visit_segments};
 use gpui::accesskit::{
-    Action, ActionData, ActionRequest, Node, NodeId, Role, TextDirection, TextPosition,
-    TextSelection,
+    Action, ActionData, ActionRequest, Node, NodeId, Role, TextPosition, TextSelection,
 };
 use gpui::accessibility::TextRunIds;
 use gpui::WeakEntity;
@@ -78,12 +77,8 @@ impl TextRuns {
                 self.next_key += 1;
                 node_id(key)
             };
-            let mut run = Node::new(Role::TextRun);
             let range = new.start + part.range.start..new.start + part.range.end;
-            run.set_value(text[range.clone()].to_owned());
-            run.set_character_lengths(part.lengths);
-            run.set_word_starts(part.words);
-            run.set_text_direction(TextDirection::LeftToRight);
+            let mut run = text_run(&text[range.clone()], part.lengths, part.words);
             if let Some((line, previous_id, mut previous)) = previous.take() {
                 if line == part.line {
                     previous.set_next_on_line(id);
@@ -422,7 +417,16 @@ mod tests {
             assert_eq!(mapping.runs[index].range, part.range);
             assert_eq!(node.value(), Some(&text[part.range.clone()]));
             assert_eq!(node.character_lengths(), part.lengths.clone());
-            assert_eq!(node.word_starts(), part.words);
+            let words = if node.wide_word_starts().is_empty() {
+                node.word_starts()
+                    .iter()
+                    .copied()
+                    .map(u16::from)
+                    .collect::<Vec<_>>()
+            } else {
+                node.wide_word_starts().to_vec()
+            };
+            assert_eq!(words, part.words);
             assert_eq!(
                 node.previous_on_line(),
                 (index > 0 && parts[index - 1].line == part.line)
@@ -549,7 +553,10 @@ mod tests {
                 .collect::<String>(),
             text
         );
-        assert!(runs.iter().all(|run| run.boundaries().len() <= 256));
+        assert!(runs
+            .iter()
+            .all(|run| run.lengths.len() <= crate::semantic_text::MAX_RUN_CHARACTERS));
+        assert!(runs.iter().any(|run| run.lengths.len() > 255));
         assert_eq!(&text[runs[0].boundaries()[2]..runs[0].boundaries()[3]], "é");
         assert_eq!(
             &text[runs[0].boundaries()[runs[0].boundaries().len() - 2]..runs[0].range.end],
