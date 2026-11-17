@@ -1,5 +1,8 @@
 use crate::wake;
-use crate::{document::DiskFile, fileops, storage};
+use crate::{
+    document::{DiskFile, Observation},
+    fileops, storage,
+};
 use gpui_component::input::{PreparedInput, Rope};
 use std::{
     collections::HashMap,
@@ -41,7 +44,7 @@ pub enum Job {
     ClearThrough(u64, u64),
     Settings(storage::Settings),
     LoadSettings,
-    Check(u64, PathBuf, u64),
+    Check(u64, DiskFile, u64),
     Finish(u64, u64, u64, DiskFile, Vec<PathBuf>),
     Choose(PathBuf, bool),
     Open(PathBuf, u64, bool),
@@ -96,7 +99,7 @@ pub enum Reply {
     Done(Result<(), String>),
     Visit(PathBuf, bool),
     SavedTo(Box<SaveDestination>, Result<DiskFile, String>),
-    Checked(u64, u64, Result<(DiskFile, Arc<str>), String>),
+    Checked(u64, u64, Result<Observation, String>),
     CheckDeferred(u64, u64),
     Open(PathBuf, u64, Result<(DiskFile, PreparedInput), String>),
     Save(u64, u64, Result<DiskFile, String>),
@@ -415,11 +418,11 @@ impl IoWorker {
                             path.clone(),
                             Ok(crate::reading::prepare(source, &path)),
                         ),
-                        Job::Check(id, path, generation) => {
+                        Job::Check(id, disk, generation) => {
                             crate::metrics::event("check-worker", id, generation);
                             #[cfg(feature = "test-support")]
                             crate::metrics::delay("CHECK");
-                            let result = DiskFile::open(path);
+                            let result = disk.observe();
                             crate::metrics::event("check-worker-done", id, generation);
                             Reply::Checked(id, generation, result)
                         }
@@ -1591,6 +1594,8 @@ mod tests {
     fn full_read_queue_returns_a_typed_deferred_check_without_losing_queued_reads() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("source.txt");
+        std::fs::write(&path, "original bytes").unwrap();
+        let (disk, _) = DiskFile::open(path.clone()).unwrap();
         std::fs::write(&path, "disk bytes").unwrap();
         let io = IoWorker::new_in(wake::Context::default(), root.path().join("recovery"));
         let (entered, seen) = mpsc::channel();
@@ -1605,9 +1610,9 @@ mod tests {
                 .unwrap();
         }
         for id in 0..32 {
-            io.send(Job::Check(id, path.clone(), id));
+            io.send(Job::Check(id, disk.clone(), id));
         }
-        io.send(Job::Check(99, path, 500));
+        io.send(Job::Check(99, disk, 500));
         assert!(matches!(
             io.replies
                 .recv_timeout(std::time::Duration::from_secs(2))
@@ -1625,7 +1630,10 @@ mod tests {
                 panic!("Expected checked file");
             };
             assert_eq!(id, token);
-            assert_eq!(result.unwrap().1.as_ref(), "disk bytes");
+            let Observation::Changed(_, text) = result.unwrap() else {
+                panic!("Expected changed bytes");
+            };
+            assert_eq!(text.as_ref(), "disk bytes");
             completed.insert(id);
         }
         assert_eq!(completed.len(), 32);

@@ -19,7 +19,7 @@ mod theme;
 use glimpse::directory::Entry;
 use glimpse::{
     cli, directory,
-    document::DiskFile,
+    document::{DiskFile, Observation},
     io::{IoWorker, Job, Reply, SaveDestination},
     lifecycle, observe, paths, search, storage, wake,
 };
@@ -859,7 +859,7 @@ impl Shell {
             };
             let doc = self.documents.iter().find(|doc| doc.id == id).unwrap();
             glimpse::metrics::event("check-request", id, token);
-            self.io.send(Job::Check(id, doc.disk.path.clone(), token));
+            self.io.send(Job::Check(id, doc.disk.clone(), token));
         }
     }
     fn visible_rows(&mut self) -> std::sync::Arc<Vec<usize>> {
@@ -1808,7 +1808,9 @@ impl Shell {
                             self.status = "File access restored".into();
                         }
                         match result {
-                            Ok((disk, text)) if disk.target != doc.disk.target => {
+                            Ok(Observation::Changed(disk, text))
+                                if disk.target != doc.disk.target =>
+                            {
                                 doc.deferred_external = None;
                                 self.status = format!(
                                     "Destination changed from {} to {}. Local text retained; use Save Copy or explicitly Reload disk.",
@@ -1817,10 +1819,15 @@ impl Shell {
                                 );
                                 doc.external = Some((disk, text));
                             }
-                            Ok((disk, text)) if disk.bytes != doc.disk.bytes => {
+                            Ok(Observation::Changed(disk, text))
+                                if disk.bytes != doc.disk.bytes =>
+                            {
                                 doc.deferred_external = Some((disk, text));
                             }
-                            Ok((mut disk, _)) => {
+                            Ok(
+                                Observation::Unchanged(mut disk)
+                                | Observation::Changed(mut disk, _),
+                            ) => {
                                 if doc.disk.bom == disk.bom {
                                     disk.bytes = doc.disk.bytes.clone();
                                 }

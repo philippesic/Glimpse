@@ -118,6 +118,11 @@ pub struct DiskFile {
     identity: (u64, u64),
 }
 
+pub enum Observation {
+    Unchanged(DiskFile),
+    Changed(DiskFile, Arc<str>),
+}
+
 fn identity(meta: &Metadata) -> (u64, u64) {
     (meta.dev(), meta.ino())
 }
@@ -183,6 +188,18 @@ fn compare_regular(path: &Path, expected: &FileBytes) -> Result<(bool, Metadata)
     Ok((equal && length == expected.len(), meta))
 }
 
+fn supported_text(bytes: &[u8]) -> Result<&str> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| "Only UTF-8 text is supported; the file was not changed.")?;
+    if text
+        .chars()
+        .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+    {
+        return Err("This file contains binary/control data and cannot be edited.".into());
+    }
+    Ok(text)
+}
+
 impl DiskFile {
     pub fn content_bytes(&self) -> &[u8] {
         self.bytes.content_bytes(self.bom)
@@ -235,14 +252,7 @@ impl DiskFile {
         let (bytes, meta) = read_cancellable(&target, cancelled)?;
         let bom = bytes.starts_with(BOM);
         let content = if bom { &bytes[3..] } else { &bytes };
-        let text = std::str::from_utf8(content)
-            .map_err(|_| "Only UTF-8 text is supported; the file was not changed.")?;
-        if text
-            .chars()
-            .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
-        {
-            return Err("This file contains binary/control data and cannot be edited.".into());
-        }
+        let text = supported_text(content)?;
         let text: Arc<str> = text.into();
         Ok((
             Self {
@@ -254,6 +264,20 @@ impl DiskFile {
             },
             text,
         ))
+    }
+
+    pub(crate) fn observe(mut self) -> Result<Observation> {
+        let target = fs::canonicalize(&self.path).map_err(|e| e.to_string())?;
+        if target == self.target {
+            let (equal, metadata) = compare_regular(&target, &self.bytes)?;
+            if equal && self.bom == self.bytes.has_bom() {
+                supported_text(self.content_bytes())?;
+                self.identity = identity(&metadata);
+                return Ok(Observation::Unchanged(self));
+            }
+        }
+        let (disk, text) = Self::open(self.path)?;
+        Ok(Observation::Changed(disk, text))
     }
 
     pub fn create(path: PathBuf, text: &str, bom: bool) -> Result<Self> {
@@ -554,6 +578,60 @@ mod tests {
             assert_eq!(fs::read(path).unwrap(), [bytes, b"!"].concat());
         }
     }
+    #[test]
+    fn observation_reuses_equal_bytes_and_checks_new_content_and_destinations() {
+        let text = "\u{feff}local 🦀\r\nsecond\rthird\n";
+        let (dir, path) = fixture(text.as_bytes());
+        let alias = dir.path().join("linked.txt");
+        symlink(&path, &alias).unwrap();
+        let (disk, _) = DiskFile::open(alias.clone()).unwrap();
+        let equal = dir.path().join("replacement.txt");
+        fs::write(&equal, text).unwrap();
+        fs::rename(&equal, &path).unwrap();
+        let Observation::Unchanged(matching) = disk.clone().observe().unwrap() else {
+            panic!("Identical bytes should reuse the saved base");
+        };
+        assert_ne!(matching.identity, disk.identity);
+        assert_eq!(
+            matching.content_bytes().as_ptr(),
+            disk.content_bytes().as_ptr()
+        );
+        matching.validate().unwrap();
+
+        let changed = "\u{feff}local 🦀\r\nsecond\rThird\n";
+        fs::write(&path, changed).unwrap();
+        let Observation::Changed(new_disk, new_text) = matching.clone().observe().unwrap() else {
+            panic!("Same-length changes must be observed");
+        };
+        assert_eq!(new_text.as_ref(), changed.trim_start_matches('\u{feff}'));
+        assert_eq!(new_disk.bytes.as_bytes().as_ref(), changed.as_bytes());
+
+        fs::write(&equal, text).unwrap();
+        fs::remove_file(&alias).unwrap();
+        symlink(&equal, &alias).unwrap();
+        let Observation::Changed(retargeted, _) = matching.observe().unwrap() else {
+            panic!("Retargeted paths must be observed even when their bytes match");
+        };
+        assert_eq!(retargeted.target, equal.canonicalize().unwrap());
+        assert_eq!(retargeted.bytes.as_bytes().as_ref(), text.as_bytes());
+    }
+
+    #[test]
+    fn unchanged_observation_preserves_file_decoding_rules() {
+        let (_dir, path) = fixture(b"original");
+        let (disk, _) = DiskFile::open(path.clone()).unwrap();
+        let saved = disk
+            .save_owned_snapshot("\u{feff}different".to_owned())
+            .unwrap();
+        let Observation::Changed(decoded, body) = saved.observe().unwrap() else {
+            panic!("A leading BOM changes the decoded document");
+        };
+        assert!(decoded.bom);
+        assert_eq!(body.as_ref(), "different");
+        let unsupported = decoded.save_owned_snapshot("nul\0".to_owned()).unwrap();
+        assert_eq!(unsupported.observe().err(), DiskFile::open(path).err(),);
+    }
+
     #[test]
     fn same_length_external_change_and_replacement_block_save() {
         let (_dir, path) = fixture(b"base");
