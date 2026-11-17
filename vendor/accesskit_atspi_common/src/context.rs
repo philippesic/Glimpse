@@ -14,6 +14,10 @@ use crate::WindowBounds;
 /// state transitions with minimal overhead.
 pub trait ActionHandlerNoMut {
     fn do_action(&self, request: ActionRequest);
+
+    fn do_text_action(&self, request: ActionRequest, _revision: Option<usize>) {
+        self.do_action(request)
+    }
 }
 
 /// This is an implementation detail of `accesskit_unix`, required for robust
@@ -29,6 +33,10 @@ impl<H: 'static + ActionHandler + Send> ActionHandlerWrapper<H> {
 impl<H: ActionHandler + Send> ActionHandlerNoMut for ActionHandlerWrapper<H> {
     fn do_action(&self, request: ActionRequest) {
         self.0.lock().unwrap().do_action(request)
+    }
+
+    fn do_text_action(&self, request: ActionRequest, revision: Option<usize>) {
+        self.0.lock().unwrap().do_text_action(request, revision)
     }
 }
 
@@ -75,6 +83,10 @@ impl Context {
 
     pub fn do_action(&self, request: ActionRequest) {
         self.action_handler.do_action(request);
+    }
+
+    pub fn do_text_action(&self, request: ActionRequest, revision: Option<usize>) {
+        self.action_handler.do_text_action(request, revision);
     }
 
     pub(crate) fn read_app_context(&self) -> RwLockReadGuard<'_, AppContext> {

@@ -960,6 +960,7 @@ enum PropertyId {
     Level,
     SizeOfSet,
     PositionInSet,
+    TextRevision,
 
     // Color
     ColorValue,
@@ -2326,7 +2327,9 @@ usize_property_methods! {
     ///
     /// [`size_of_set`]: Node::size_of_set
     /// [`aria-posinset`]: https://www.w3.org/TR/wai-aria-1.2/#aria-posinset
-    (PositionInSet, position_in_set, set_position_in_set, clear_position_in_set)
+    (PositionInSet, position_in_set, set_position_in_set, clear_position_in_set),
+    /// Application-defined revision of the text exposed by this node.
+    (TextRevision, text_revision, set_text_revision, clear_text_revision)
 }
 
 color_property_methods! {
@@ -2973,7 +2976,8 @@ impl<'de> Visitor<'de> for PropertiesVisitor {
                     ColumnSpan,
                     Level,
                     SizeOfSet,
-                    PositionInSet
+                    PositionInSet,
+                    TextRevision
                 },
                 Color {
                     ColorValue,
@@ -3126,7 +3130,8 @@ impl JsonSchema for Properties {
                 ColumnSpan,
                 Level,
                 SizeOfSet,
-                PositionInSet
+                PositionInSet,
+                TextRevision
             },
             Color {
                 ColorValue,
@@ -3386,6 +3391,11 @@ pub trait ActionHandler {
     /// This behavior is preferred over blocking, e.g. when dispatching
     /// the request to another thread.
     fn do_action(&mut self, request: ActionRequest);
+
+    /// Dispatch an action against the text revision used to interpret the request.
+    fn do_text_action(&mut self, request: ActionRequest, _revision: Option<usize>) {
+        self.do_action(request)
+    }
 }
 
 /// Handles deactivation of the application's accessibility implementation.

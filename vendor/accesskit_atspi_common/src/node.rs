@@ -1232,12 +1232,15 @@ impl PlatformNode {
             }
             let (target_node, target_tree) =
                 tree.state().locate_node(self.id).ok_or(Error::Defunct)?;
-            context.do_action(ActionRequest {
-                action: Action::SetValue,
-                target_tree,
-                target_node,
-                data: Some(ActionData::Value(value.into())),
-            });
+            context.do_text_action(
+                ActionRequest {
+                    action: Action::SetValue,
+                    target_tree,
+                    target_node,
+                    data: Some(ActionData::Value(value.into())),
+                },
+                node.data().text_revision(),
+            );
             Ok(true)
         })
     }
@@ -1469,17 +1472,23 @@ impl PlatformNode {
 
     pub fn set_caret_offset(&self, offset: i32) -> Result<bool> {
         self.resolve_for_text_with_context(|node, tree, context| {
+            if node.data().is_busy() {
+                return Ok(false);
+            }
             let offset = text_position_from_offset(&node, offset).ok_or(Error::IndexOutOfRange)?;
             let (target_node, target_tree) =
                 tree.state().locate_node(node.id()).ok_or(Error::Defunct)?;
-            context.do_action(ActionRequest {
-                action: Action::SetTextSelection,
-                target_tree,
-                target_node,
-                data: Some(ActionData::SetTextSelection(
-                    offset.to_degenerate_range().to_text_selection(),
-                )),
-            });
+            context.do_text_action(
+                ActionRequest {
+                    action: Action::SetTextSelection,
+                    target_tree,
+                    target_node,
+                    data: Some(ActionData::SetTextSelection(
+                        offset.to_degenerate_range().to_text_selection(),
+                    )),
+                },
+                node.data().text_revision(),
+            );
             Ok(true)
         })
     }
@@ -1591,6 +1600,9 @@ impl PlatformNode {
         }
 
         self.resolve_for_text_with_context(|node, tree, context| {
+            if node.data().is_busy() {
+                return Ok(false);
+            }
             // Simply collapse the selection to the position of the caret if a caret is
             // visible, otherwise set the selection to 0.
             let selection_end = node
@@ -1598,14 +1610,17 @@ impl PlatformNode {
                 .unwrap_or_else(|| node.document_range().start());
             let (target_node, target_tree) =
                 tree.state().locate_node(node.id()).ok_or(Error::Defunct)?;
-            context.do_action(ActionRequest {
-                action: Action::SetTextSelection,
-                target_tree,
-                target_node,
-                data: Some(ActionData::SetTextSelection(
-                    selection_end.to_degenerate_range().to_text_selection(),
-                )),
-            });
+            context.do_text_action(
+                ActionRequest {
+                    action: Action::SetTextSelection,
+                    target_tree,
+                    target_node,
+                    data: Some(ActionData::SetTextSelection(
+                        selection_end.to_degenerate_range().to_text_selection(),
+                    )),
+                },
+                node.data().text_revision(),
+            );
             Ok(true)
         })
     }
@@ -1621,16 +1636,22 @@ impl PlatformNode {
         }
 
         self.resolve_for_text_with_context(|node, tree, context| {
+            if node.data().is_busy() {
+                return Ok(false);
+            }
             let range = text_range_from_offsets(&node, start_offset, end_offset)
                 .ok_or(Error::IndexOutOfRange)?;
             let (target_node, target_tree) =
                 tree.state().locate_node(node.id()).ok_or(Error::Defunct)?;
-            context.do_action(ActionRequest {
-                action: Action::SetTextSelection,
-                target_tree,
-                target_node,
-                data: Some(ActionData::SetTextSelection(range.to_text_selection())),
-            });
+            context.do_text_action(
+                ActionRequest {
+                    action: Action::SetTextSelection,
+                    target_tree,
+                    target_node,
+                    data: Some(ActionData::SetTextSelection(range.to_text_selection())),
+                },
+                node.data().text_revision(),
+            );
             Ok(true)
         })
     }

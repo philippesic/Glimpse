@@ -210,6 +210,81 @@ mod tests {
     fn build(values: &[String]) -> (Adapter, Arc<Mutex<Vec<ObjectEvent>>>) {
         build_with_role(values, Role::MultilineTextInput)
     }
+
+    #[test]
+    fn native_text_actions_carry_the_revision_and_refuse_busy_positions() {
+        use accesskit::Action;
+
+        type TextAction = (Action, Option<usize>);
+        #[derive(Default)]
+        struct CaptureActions(Arc<Mutex<Vec<TextAction>>>);
+        impl ActionHandler for CaptureActions {
+            fn do_action(&mut self, request: ActionRequest) {
+                self.do_text_action(request, None);
+            }
+
+            fn do_text_action(&mut self, request: ActionRequest, revision: Option<usize>) {
+                self.0.lock().unwrap().push((request.action, revision));
+            }
+        }
+
+        let id = NodeId(1);
+        let run_id = NodeId(10);
+        let mut window = Node::new(Role::Window);
+        window.set_children(vec![id]);
+        let mut source = input(
+            &[run_id],
+            TextPosition {
+                node: run_id,
+                character_index: 0,
+            },
+        );
+        source.set_text_revision(5);
+        let actions = CaptureActions::default();
+        let captured = actions.0.clone();
+        let mut adapter = Adapter::new(
+            &AppContext::new(None),
+            Capture(Arc::default()),
+            TreeUpdate {
+                nodes: vec![
+                    (NodeId(0), window),
+                    (id, source.clone()),
+                    (run_id, run("a🦀")),
+                ],
+                tree: Some(TreeInfo::new(NodeId(0))),
+                ..update(vec![])
+            },
+            true,
+            WindowBounds::default(),
+            actions,
+        );
+        let native_id = adapter
+            .platform_node(adapter.root_id())
+            .child_at_index(0)
+            .unwrap()
+            .unwrap();
+        let native = adapter.platform_node(native_id);
+        assert!(native.set_caret_offset(1).unwrap());
+        assert!(native.set_text_contents("tea").unwrap());
+        source.set_busy();
+        source.set_read_only();
+        adapter.update(update(vec![(id, source.clone())]));
+        assert!(!native.set_selection(0, 0, 1).unwrap());
+        assert!(!native.set_text_contents("stale").unwrap());
+        source.clear_busy();
+        source.clear_read_only();
+        source.set_text_revision(6);
+        adapter.update(update(vec![(id, source)]));
+        assert!(native.set_selection(0, 0, 1).unwrap());
+        assert_eq!(
+            *captured.lock().unwrap(),
+            [
+                (Action::SetTextSelection, Some(5)),
+                (Action::SetValue, Some(5)),
+                (Action::SetTextSelection, Some(6)),
+            ]
+        );
+    }
     fn build_with_role(values: &[String], role: Role) -> (Adapter, Arc<Mutex<Vec<ObjectEvent>>>) {
         let ids: Vec<_> = (0..values.len()).map(|i| NodeId(i as u64 + 10)).collect();
         let mut window = Node::new(Role::Window);

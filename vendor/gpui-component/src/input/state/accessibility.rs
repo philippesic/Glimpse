@@ -7,6 +7,7 @@ use gpui::accesskit::{
 use gpui::accessibility::TextRunIds;
 use gpui::WeakEntity;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Default)]
 pub(super) struct Mapping {
@@ -17,6 +18,7 @@ pub(super) struct Mapping {
 
 #[derive(Clone, Default)]
 struct TextRuns {
+    revision: usize,
     text: SharedString,
     runs: Arc<[Run]>,
     nodes: Arc<[(NodeId, Node)]>,
@@ -113,6 +115,8 @@ impl TextRuns {
         self.text = text;
         self.nodes = nodes.into();
         self.runs = runs.into();
+        static NEXT_REVISION: AtomicUsize = AtomicUsize::new(1);
+        self.revision = NEXT_REVISION.fetch_add(1, Ordering::Relaxed);
     }
 
     fn offset(&self, position: &TextPosition) -> Option<usize> {
@@ -321,6 +325,7 @@ impl InputState {
         }
         node.add_action(Action::Focus);
         node.set_children(current.nodes.iter().map(|(id, _)| *id).collect::<Vec<_>>());
+        node.set_text_revision(current.revision);
         if ready {
             node.add_action(Action::SetTextSelection);
             let start = current.position(self.selected_range.start);

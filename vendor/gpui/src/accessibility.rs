@@ -29,7 +29,7 @@ use crate::{
     AnyElement, AnyWindowHandle, App, Bounds, Element, ElementId, GlobalElementId,
     InspectorElementId, IntoElement, LayoutId, Pixels, Task, Window,
 };
-use accesskit::{ActionRequest, Node, NodeId, Role, TreeId, TreeInfo, TreeUpdate};
+use accesskit::{ActionRequest, Node, NodeId, Role, TreeInfo};
 use collections::{HashMap, HashSet};
 use std::{
     rc::Rc,
@@ -44,7 +44,7 @@ type Handler = Rc<dyn Fn(ActionRequest, Bounds<Pixels>, &mut Window, &mut App)>;
 #[cfg(target_os = "linux")]
 pub(crate) enum Event {
     Refresh,
-    Action(ActionRequest),
+    Action(ActionRequest, Option<usize>),
 }
 
 #[derive(Default)]
@@ -54,12 +54,11 @@ pub(crate) struct State {
     next_id: u32,
     ids: HashMap<Vec<ElementId>, NodeId>,
     visible: HashSet<NodeId>,
-    text_groups: HashMap<NodeId, Arc<[(NodeId, Node)]>>,
     pub(crate) parents: Vec<NodeId>,
     pub(crate) title: String,
     _task: Option<Task<()>>,
     #[cfg(target_os = "linux")]
-    adapter: Option<accesskit_unix::Adapter>,
+    publisher: Option<linux::Publisher>,
 }
 
 #[derive(Clone)]
@@ -223,16 +222,13 @@ impl State {
         #[cfg(target_os = "linux")]
         {
             let (tx, rx) = async_channel::unbounded();
-            self.adapter = Some(linux::adapter(self.active.clone(), tx));
+            self.publisher = Some(linux::Publisher::new(self.active.clone(), tx, cx));
             self._task = Some(cx.spawn(async move |cx| {
                 while let Ok(event) = rx.recv().await {
                     if handle
                         .update(cx, |_, window, cx| match event {
-                            Event::Refresh => {
-                                window.accessibility.text_groups.clear();
-                                window.refresh();
-                            }
-                            Event::Action(request) => {
+                            Event::Refresh => window.refresh(),
+                            Event::Action(request, text_revision) => {
                                 if !window.accessibility.active.load(Ordering::Acquire) {
                                     return;
                                 }
@@ -244,6 +240,13 @@ impl State {
                                         record.id == request.target_node
                                             && window.accessibility.visible.contains(&record.id)
                                             && record.info.node.supports_action(request.action)
+                                            && (!matches!(
+                                                request.action,
+                                                accesskit::Action::SetValue
+                                                    | accesskit::Action::SetTextSelection
+                                                    | accesskit::Action::ReplaceSelectedText
+                                            ) || record.info.node.text_revision()
+                                                == text_revision)
                                     })
                                     .and_then(|record| {
                                         record
@@ -324,59 +327,26 @@ impl State {
         tree.toolkit_name = Some("GPUI".into());
         tree.toolkit_version = Some(env!("CARGO_PKG_VERSION").into());
         self.ids.retain(|_, id| nodes.contains_key(id));
-        let diff_profile = crate::work_trace::Span::new("a11y_diff");
-        let mut text_groups = HashMap::default();
-        let mut changed_text = Vec::new();
-        for record in records.iter().filter(|record| visible.contains(&record.id)) {
-            if !self
-                .text_groups
-                .get(&record.id)
-                .is_some_and(|previous| Arc::ptr_eq(previous, &record.info.text))
-            {
-                if let Some(previous) = self.text_groups.get(&record.id) {
-                    let previous: HashMap<_, _> =
-                        previous.iter().map(|(id, node)| (*id, node)).collect();
-                    changed_text.extend(
-                        record
-                            .info
-                            .text
-                            .iter()
-                            .filter(|(id, node)| {
-                                previous
-                                    .get(id)
-                                    .is_none_or(|old| !old.shares_data_with(node) && *old != node)
-                            })
-                            .cloned(),
-                    );
-                } else {
-                    changed_text.extend(record.info.text.iter().cloned());
-                }
-            }
-            if !record.info.text.is_empty() {
-                text_groups.insert(record.id, record.info.text.clone());
-            }
-        }
-        self.text_groups = text_groups;
-        drop(diff_profile);
-        let update = TreeUpdate {
-            nodes: nodes
-                .into_iter()
-                .filter(|(id, _)| visible.contains(id))
-                .chain(changed_text)
-                .collect(),
-            tree: Some(tree),
-            tree_id: TreeId::ROOT,
-            focus,
-        };
-        self.visible = visible;
         #[cfg(target_os = "linux")]
-        if let Some(adapter) = &mut self.adapter {
-            let _adapter_profile = crate::work_trace::Span::new("a11y_adapter");
-            adapter.update_window_focus_state(focused);
-            adapter.update_if_active(|| update);
+        if let Some(publisher) = &self.publisher {
+            publisher.submit(linux::Frame {
+                nodes: nodes
+                    .into_iter()
+                    .filter(|(id, _)| visible.contains(id))
+                    .collect(),
+                text: records
+                    .iter()
+                    .filter(|record| visible.contains(&record.id) && !record.info.text.is_empty())
+                    .map(|record| (record.id, record.info.text.clone()))
+                    .collect(),
+                tree,
+                focus,
+                focused,
+            });
         }
         #[cfg(not(target_os = "linux"))]
-        let _ = (focused, update);
+        let _ = (focused, focus, tree);
+        self.visible = visible;
     }
 }
 impl Window {
