@@ -223,6 +223,7 @@ struct Shell {
     navigator_visible: bool,
     scrolls: HashMap<PathBuf, UniformListScrollHandle>,
     selection: Option<PathBuf>,
+    reveal_pending: Option<PathBuf>,
     selections: HashMap<PathBuf, PathBuf>,
     entries: std::sync::Arc<Vec<Entry>>,
     entries_revision: u64,
@@ -396,6 +397,7 @@ impl Shell {
             navigator_visible: true,
             scrolls: HashMap::new(),
             selection: None,
+            reveal_pending: None,
             selections: HashMap::new(),
             entries: Default::default(),
             entries_revision: 0,
@@ -854,6 +856,7 @@ impl Shell {
             self.selections.insert(self.current.clone(), selection);
         }
         self.interaction += 1;
+        self.reveal_pending = None;
         self.path_completions = None;
         self.path_completion_token += 1;
         self.io.cancel_previews(self.open_token + 1);
@@ -2879,7 +2882,14 @@ impl Shell {
                     if let Some(parent) = path.parent() {
                         self.navigate(parent.to_owned());
                     }
+                    self.filter.clear();
+                    if self.panel == Some(Panel::Filter) {
+                        self.panel = None;
+                    }
+                    self.reveal_pending = Some(path.clone());
                     self.selection = Some(path);
+                    self.navigator_visible = true;
+                    self.navigation_only = true;
                     window.focus(&self.nav_focus);
                 }
             }
@@ -3304,6 +3314,14 @@ impl Render for Shell {
             .entry(self.current.clone())
             .or_default()
             .clone();
+        if self.listing_done
+            && let Some(path) = self.reveal_pending.take()
+            && let Some(index) = visible
+                .iter()
+                .position(|&index| entries[index].path == path)
+        {
+            scroll.scroll_to_item(index, ScrollStrategy::Top);
+        }
         let navigator = div()
             .id("navigator")
             .track_focus(&self.nav_focus)
