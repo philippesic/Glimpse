@@ -505,33 +505,89 @@ pub fn inventory(root: &Path) -> Result<Inventory, String> {
     });
     Ok(result)
 }
-fn read_draft(path: &Path) -> Result<Draft, String> {
-    use std::{io::Read, os::unix::fs::OpenOptionsExt};
+const MAX_RECOVERY_RECORD_BYTES: u64 = 70 * 1024 * 1024;
+
+fn read_recovery_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::{
+        io::{Error, ErrorKind, Read},
+        os::unix::fs::OpenOptionsExt,
+    };
     let file = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|e| e.to_string())?;
-    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
-        return Err("Recovery record is not a regular file".into());
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "Recovery record is not a regular file",
+        ));
     }
-    let mut bytes = Vec::new();
-    file.take(70 * 1024 * 1024 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
-    if bytes.len() > 70 * 1024 * 1024 {
-        return Err("Recovery record exceeds the supported size".into());
+    if metadata.len() > MAX_RECOVERY_RECORD_BYTES {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "Recovery record exceeds the supported size",
+        ));
     }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_RECOVERY_RECORD_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_RECOVERY_RECORD_BYTES {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "Recovery record exceeds the supported size",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn read_draft(path: &Path) -> Result<Draft, String> {
+    let bytes = read_recovery_bytes(path).map_err(|e| e.to_string())?;
     let draft: Draft = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    if draft.generation > i64::MAX as u64 {
+    validate_record_limits(draft.generation, draft.text.len(), draft.base.len())?;
+    Ok(draft)
+}
+
+fn validate_record_limits(
+    generation: u64,
+    text_bytes: usize,
+    base_bytes: usize,
+) -> Result<(), String> {
+    if generation > i64::MAX as u64 {
         return Err("Recovery generation is invalid".into());
     }
-    if draft.text.len() > crate::document::MAX_BYTES as usize
-        || draft.base.len() > crate::document::MAX_BYTES as usize
-    {
+    let limit = crate::document::MAX_BYTES as usize;
+    if text_bytes > limit || base_bytes > limit {
         return Err("Recovery text exceeds the editing limit".into());
     }
-    Ok(draft)
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct RecoveryHeader<'a> {
+    #[serde(rename = "path", with = "native_path")]
+    _path: PathBuf,
+    #[serde(borrow)]
+    text: std::borrow::Cow<'a, str>,
+    #[serde(deserialize_with = "encoded_bytes::decoded_len", rename = "base")]
+    base_bytes: usize,
+    #[serde(
+        default,
+        deserialize_with = "native_path::deserialize_optional",
+        rename = "target"
+    )]
+    _target: Option<PathBuf>,
+    generation: u64,
+}
+
+fn read_recovery_header(path: &Path, validate_limits: bool) -> std::io::Result<u64> {
+    let bytes = read_recovery_bytes(path)?;
+    let header: RecoveryHeader<'_> = serde_json::from_slice(&bytes)?;
+    if validate_limits {
+        validate_record_limits(header.generation, header.text.len(), header.base_bytes)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    }
+    Ok(header.generation)
 }
 pub fn restore_snapshot(path: &Path, observed: bool) -> Result<Draft, String> {
     let parent = path.parent().ok_or("Invalid recovery record")?;
@@ -611,11 +667,16 @@ impl Recovery {
         struct Generation {
             generation: u64,
         }
-        if let Ok(bytes) = fs::read(&path)
-            && let Ok(existing) = serde_json::from_slice::<Generation>(&bytes)
-            && existing.generation > draft.generation
-        {
-            return Ok(());
+        match read_recovery_bytes(&path) {
+            Ok(bytes) => {
+                let existing: Generation = serde_json::from_slice(&bytes)
+                    .map_err(|error| format!("Previous recovery record was retained: {error}"))?;
+                if existing.generation > draft.generation {
+                    return Ok(());
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("Previous recovery record was retained: {error}")),
         }
         atomic_json(&path, draft)
     }
@@ -737,10 +798,9 @@ impl Recovery {
             .and_modify(|g| *g = (*g).max(generation))
             .or_insert(generation);
         let path = self.directory.join(format!("{id}.json"));
-        match fs::read(&path) {
-            Ok(bytes) => {
-                let value: Draft = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-                if value.generation <= generation {
+        match read_recovery_header(&path, false) {
+            Ok(recovered_generation) => {
+                if recovered_generation <= generation {
                     fs::remove_file(path).map_err(|e| e.to_string())?;
                 }
             }
@@ -769,9 +829,9 @@ impl Recovery {
             if parts.len() != 3 || parts[0].parse::<u64>().ok() != Some(id) {
                 continue;
             }
-            let draft = read_draft(&entry.path())?;
-            if draft.generation <= generation {
-                self.resolved(&entry.path())?;
+            let path = entry.path();
+            if read_recovery_header(&path, true).map_err(|error| error.to_string())? <= generation {
+                self.resolved(&path)?;
             }
         }
         Ok(())
@@ -937,6 +997,46 @@ mod tests {
             assert!(read_draft(&path).is_err());
             assert_eq!(fs::read(&path).unwrap(), bytes);
         }
+    }
+
+    #[test]
+    fn recovery_cleanup_validates_large_and_legacy_base_data() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("record.json");
+        let mut valid = draft(4);
+        valid.base = vec![91; 35_773].into();
+        atomic_json(&path, &valid).unwrap();
+        assert_eq!(read_recovery_header(&path, true).unwrap(), valid.generation);
+        assert_eq!(read_draft(&path).unwrap().base, valid.base);
+
+        let mut wire = serde_json::to_value(&valid).unwrap();
+        wire["base"] = serde_json::json!([255, 254, 0, 13, 10]);
+        atomic_json(&path, &wire).unwrap();
+        assert_eq!(read_recovery_header(&path, true).unwrap(), valid.generation);
+        assert_eq!(
+            read_draft(&path).unwrap().base.as_bytes().as_ref(),
+            [255, 254, 0, 13, 10]
+        );
+    }
+
+    #[test]
+    fn active_recovery_keeps_records_with_unreadable_metadata_or_content() {
+        let root = tempfile::tempdir().unwrap();
+        let recovery = Recovery::new(root.path()).unwrap();
+        let path = recovery.directory.join("1.json");
+        let missing_generation = br#"{"text":"prior local text"}"#;
+        fs::write(&path, missing_generation).unwrap();
+        assert!(recovery.write(1, &draft(2)).is_err());
+        assert_eq!(fs::read(&path).unwrap(), missing_generation);
+
+        let mut encoded = "AAAA".repeat(9000);
+        encoded.replace_range(17_000..17_004, "AA==");
+        let mut malformed = serde_json::to_value(draft(4)).unwrap();
+        malformed["base"] = encoded.into();
+        let original = serde_json::to_vec(&malformed).unwrap();
+        fs::write(&path, &original).unwrap();
+        assert!(recovery.saved(1, 4).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
     }
 
     #[test]
@@ -1343,5 +1443,48 @@ mod encoded_bytes {
                 .map(Into::into)
                 .map_err(serde::de::Error::custom),
         }
+    }
+
+    pub fn decoded_len<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<usize, D::Error> {
+        struct DecodedLength;
+
+        impl<'de> serde::de::Visitor<'de> for DecodedLength {
+            type Value = usize;
+
+            fn expecting(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                fmt.write_str("a base64 string or an array of bytes")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<usize, E> {
+                let engine = &base64::engine::general_purpose::STANDARD;
+                let mut decoded = [0; 12 * 1024];
+                let mut chunks = value.as_bytes().chunks(16 * 1024).peekable();
+                let mut length = 0;
+                while let Some(chunk) = chunks.next() {
+                    if chunks.peek().is_some() && chunk.contains(&b'=') {
+                        return Err(E::custom("Padding before the end of the recovery base"));
+                    }
+                    length += engine
+                        .decode_slice(chunk, &mut decoded)
+                        .map_err(E::custom)?;
+                }
+                Ok(length)
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<usize, A::Error> {
+                let mut length = 0;
+                while seq.next_element::<u8>()?.is_some() {
+                    length += 1;
+                }
+                Ok(length)
+            }
+        }
+
+        deserializer.deserialize_any(DecodedLength)
     }
 }
