@@ -10,7 +10,7 @@ use gpui::{
     SharedString, SharedUri, StatefulInteractiveElement, Styled, StyledImage as _, Window, div,
     img, prelude::FluentBuilder as _, px, relative, rems,
 };
-use markdown::mdast;
+use pulldown_cmark::Alignment;
 use ropey::Rope;
 
 use crate::{
@@ -228,13 +228,13 @@ pub(crate) enum ColumnumnAlign {
     Right,
 }
 
-impl From<mdast::AlignKind> for ColumnumnAlign {
-    fn from(value: mdast::AlignKind) -> Self {
+impl From<Alignment> for ColumnumnAlign {
+    fn from(value: Alignment) -> Self {
         match value {
-            mdast::AlignKind::None => ColumnumnAlign::Left,
-            mdast::AlignKind::Left => ColumnumnAlign::Left,
-            mdast::AlignKind::Center => ColumnumnAlign::Center,
-            mdast::AlignKind::Right => ColumnumnAlign::Right,
+            Alignment::None => ColumnumnAlign::Left,
+            Alignment::Left => ColumnumnAlign::Left,
+            Alignment::Center => ColumnumnAlign::Center,
+            Alignment::Right => ColumnumnAlign::Right,
         }
     }
 }
@@ -462,12 +462,6 @@ pub(crate) enum Node {
         html: bool,
     },
     Divider,
-    /// Use for to_markdown get raw definition
-    Definition {
-        identifier: SharedString,
-        url: SharedString,
-        title: Option<SharedString>,
-    },
     Unknown,
 }
 
@@ -559,7 +553,7 @@ impl Node {
                     text.push('\n');
                 }
             }
-            Node::Definition { .. } | Node::Break { .. } | Node::Divider | Node::Unknown => {}
+            Node::Break { .. } | Node::Divider | Node::Unknown => {}
         }
 
         text
@@ -981,17 +975,6 @@ impl Node {
                 }
             }
             Node::Divider => "---".to_string(),
-            Node::Definition {
-                identifier,
-                url,
-                title,
-            } => {
-                if let Some(title) = title {
-                    format!("[{}]: {} \"{}\"", identifier, url, title)
-                } else {
-                    format!("[{}]: {}", identifier, url)
-                }
-            }
             Node::Unknown => "".to_string(),
         }
         .trim()
@@ -1430,7 +1413,7 @@ impl Node {
                 .child(div().id("divider").bg(cx.theme().border).h(px(2.)))
                 .into_any_element(),
             Node::Break { .. } => div().id("break").into_any_element(),
-            Node::Unknown | Node::Definition { .. } => div().into_any_element(),
+            Node::Unknown => div().into_any_element(),
             _ => {
                 if cfg!(debug_assertions) {
                     tracing::warn!("unknown implementation: {:?}", self);

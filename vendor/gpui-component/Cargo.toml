@@ -108,8 +108,12 @@ version = "0.13.0"
 version = "0.97.0"
 features = ["proposed"]
 
-[dependencies.markdown]
-version = "1.0.0"
+[dependencies.linkify]
+version = "0.11.0"
+
+[dependencies.pulldown-cmark]
+version = "0.13"
+default-features = false
 
 [dependencies.markup5ever_rcdom]
 version = "0.3.0"

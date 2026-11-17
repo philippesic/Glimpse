@@ -1,406 +1,384 @@
-use gpui::SharedString;
-use markdown::{
-    mdast::{self, Node},
-    ParseOptions,
-};
-
 use crate::{
     highlighter::HighlightTheme,
     text::{
+        TextViewStyle,
         node::{
             self, CodeBlock, ImageNode, InlineNode, LinkMark, NodeContext, Paragraph, Span, Table,
-            TableRow, TextMark,
+            TableCell, TableRow, TextMark,
         },
-        TextViewStyle,
     },
 };
+use gpui::SharedString;
+use linkify::{LinkFinder, LinkKind};
+use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
-/// Parse Markdown into a tree of nodes.
+enum Block {
+    Root,
+    Paragraph,
+    Heading(u8),
+    Quote,
+    List(bool),
+    Item,
+    Code(Option<SharedString>),
+    Html,
+    Table(Vec<pulldown_cmark::Alignment>),
+    Row,
+    Cell,
+}
+struct Frame {
+    kind: Block,
+    start: usize,
+    children: Vec<node::Node>,
+    paragraph: Paragraph,
+    buffer: String,
+    rows: Vec<TableRow>,
+    cells: Vec<TableCell>,
+    checked: Option<bool>,
+    spread: bool,
+}
+fn inline(text: String, marks: &[TextMark]) -> InlineNode {
+    let length = text.len();
+    InlineNode::new(text).marks(marks.iter().map(|mark| (0..length, mark.clone())).collect())
+}
+impl Frame {
+    fn new(kind: Block, start: usize) -> Self {
+        Self {
+            kind,
+            start,
+            children: vec![],
+            paragraph: Paragraph::default(),
+            buffer: String::new(),
+            rows: vec![],
+            cells: vec![],
+            checked: None,
+            spread: false,
+        }
+    }
+    fn flush(&mut self, marks: &[TextMark], finder: &LinkFinder) {
+        if self.buffer.is_empty() || matches!(self.kind, Block::Code(_) | Block::Html) {
+            return;
+        }
+        let text = std::mem::take(&mut self.buffer);
+        if marks.iter().any(|mark| mark.code || mark.link.is_some())
+            || !text.contains([':', '@']) && !text.contains("www.")
+        {
+            self.paragraph.push(inline(text, marks));
+            return;
+        }
+        let mut offset = 0;
+        for link in finder.links(&text) {
+            let url = match link.kind() {
+                LinkKind::Email => format!("mailto:{}", link.as_str()),
+                LinkKind::Url if link.as_str().starts_with("www.") => {
+                    format!("https://{}", link.as_str())
+                }
+                LinkKind::Url
+                    if link.as_str().starts_with("http://")
+                        || link.as_str().starts_with("https://") =>
+                {
+                    link.as_str().to_owned()
+                }
+                _ => continue,
+            };
+            if link.start() > offset {
+                self.paragraph
+                    .push(inline(text[offset..link.start()].to_owned(), marks));
+            }
+            let mut link_marks = marks.to_vec();
+            link_marks.push(TextMark::default().link(LinkMark {
+                url: url.into(),
+                ..Default::default()
+            }));
+            self.paragraph
+                .push(inline(link.as_str().to_owned(), &link_marks));
+            offset = link.end();
+        }
+        if offset < text.len() {
+            self.paragraph
+                .push(inline(text[offset..].to_owned(), marks));
+        }
+    }
+    fn finish_pending(&mut self, marks: &[TextMark], finder: &LinkFinder) {
+        self.flush(marks, finder);
+        if !self.paragraph.is_empty() {
+            self.children
+                .push(node::Node::Paragraph(self.paragraph.take()));
+        }
+    }
+    fn finish(
+        mut self,
+        end: usize,
+        marks: &[TextMark],
+        finder: &LinkFinder,
+        style: &TextViewStyle,
+        theme: &HighlightTheme,
+    ) -> node::Node {
+        self.flush(marks, finder);
+        self.paragraph.set_span(Span {
+            start: self.start,
+            end,
+        });
+        match self.kind {
+            Block::Paragraph | Block::Cell => node::Node::Paragraph(self.paragraph),
+            Block::Heading(level) => node::Node::Heading {
+                level,
+                children: self.paragraph,
+            },
+            Block::Code(lang) => {
+                node::Node::CodeBlock(CodeBlock::new(self.buffer.into(), lang, style, theme))
+            }
+            Block::Html => node::Node::Paragraph(Paragraph::new(
+                self.buffer.trim_end_matches(['\r', '\n']).to_owned(),
+            )),
+            Block::Table(alignments) => node::Node::Table(Table {
+                children: self.rows,
+                column_aligns: alignments.into_iter().map(Into::into).collect(),
+            }),
+            _ => {
+                self.finish_pending(marks, finder);
+                match self.kind {
+                    Block::Root => node::Node::Root {
+                        children: self.children.into(),
+                    },
+                    Block::Quote => node::Node::Blockquote {
+                        children: self.children,
+                    },
+                    Block::List(ordered) => node::Node::List {
+                        ordered,
+                        children: self.children,
+                    },
+                    Block::Item => node::Node::ListItem {
+                        children: self.children,
+                        spread: self.spread,
+                        checked: self.checked,
+                    },
+                    _ => node::Node::Unknown,
+                }
+            }
+        }
+    }
+}
+struct Image {
+    image: ImageNode,
+    alt: String,
+}
 pub(crate) fn parse(
     raw: &str,
     style: &TextViewStyle,
     cx: &mut NodeContext,
-    highlight_theme: &HighlightTheme,
+    theme: &HighlightTheme,
 ) -> Result<node::Node, SharedString> {
-    let mut options = ParseOptions::gfm();
-    options.constructs.gfm_footnote_definition = false;
-    options.constructs.gfm_label_start_footnote = false;
-    markdown::to_mdast(&raw, &options)
-        .map(|n| ast_to_node(n, style, cx, highlight_theme))
-        .map_err(|e| e.to_string().into())
-}
-
-fn parse_table_row(table: &mut Table, node: &mdast::TableRow) {
-    let mut row = TableRow::default();
-    node.children.iter().for_each(|c| {
-        match c {
-            Node::TableCell(cell) => {
-                parse_table_cell(&mut row, cell);
-            }
-            _ => {}
-        };
-    });
-    table.children.push(row);
-}
-
-fn parse_table_cell(row: &mut node::TableRow, node: &mdast::TableCell) {
-    let mut paragraph = Paragraph::default();
-    node.children.iter().for_each(|c| {
-        parse_paragraph(&mut paragraph, c);
-    });
-    let table_cell = node::TableCell {
-        children: paragraph,
-        ..Default::default()
-    };
-    row.children.push(table_cell);
-}
-
-fn parse_paragraph(paragraph: &mut Paragraph, node: &mdast::Node) -> String {
-    let span = node.position().map(|pos| Span {
-        start: pos.start.offset,
-        end: pos.end.offset,
-    });
-    if let Some(span) = span {
-        paragraph.set_span(span);
-    }
-
-    let mut text = String::new();
-
-    match node {
-        Node::Paragraph(val) => {
-            val.children.iter().for_each(|c| {
-                text.push_str(&parse_paragraph(paragraph, c));
-            });
-        }
-        Node::Text(val) => {
-            text = val.value.clone();
-            paragraph.push_str(&val.value)
-        }
-        Node::Emphasis(val) => {
-            let mut child_paragraph = Paragraph::default();
-            for child in &val.children {
-                text.push_str(&parse_paragraph(&mut child_paragraph, child));
-            }
-            for child in &mut child_paragraph.children {
-                child
-                    .marks
-                    .push((0..child.text.len(), TextMark::default().italic()));
-            }
-            paragraph.merge(child_paragraph);
-        }
-        Node::Strong(val) => {
-            let mut child_paragraph = Paragraph::default();
-            for child in &val.children {
-                text.push_str(&parse_paragraph(&mut child_paragraph, child));
-            }
-            for child in &mut child_paragraph.children {
-                child
-                    .marks
-                    .push((0..child.text.len(), TextMark::default().bold()));
-            }
-            paragraph.merge(child_paragraph);
-        }
-        Node::Delete(val) => {
-            let mut child_paragraph = Paragraph::default();
-            for child in &val.children {
-                text.push_str(&parse_paragraph(&mut child_paragraph, child));
-            }
-            for child in &mut child_paragraph.children {
-                child
-                    .marks
-                    .push((0..child.text.len(), TextMark::default().strikethrough()));
-            }
-            paragraph.merge(child_paragraph);
-        }
-        Node::InlineCode(val) => {
-            text = val.value.clone();
-            paragraph.push(
-                InlineNode::new(&text).marks(vec![(0..text.len(), TextMark::default().code())]),
-            );
-        }
-        Node::Link(val) => {
-            let link_mark = Some(LinkMark {
-                url: val.url.clone().into(),
-                title: val.title.clone().map(|s| s.into()),
-                ..Default::default()
-            });
-
-            let mut child_paragraph = Paragraph::default();
-            for child in val.children.iter() {
-                text.push_str(&parse_paragraph(&mut child_paragraph, &child));
-            }
-
-            // FIXME: GPUI InteractiveText does not support inline images yet.
-            // So here we push images to the paragraph directly.
-            for child in child_paragraph.children.iter_mut() {
-                if let Some(image) = child.image.as_mut() {
-                    image.link = link_mark.clone();
-                }
-
-                child.marks.push((
-                    0..child.text.len(),
-                    TextMark {
-                        link: link_mark.clone(),
+    let mut finder = LinkFinder::new();
+    finder.url_must_have_scheme(false);
+    let mut frames = vec![Frame::new(Block::Root, 0)];
+    let mut marks = Vec::new();
+    let mut images: Vec<Image> = Vec::new();
+    let options =
+        Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS | Options::ENABLE_STRIKETHROUGH;
+    for (event, range) in Parser::new_ext(raw, options).into_offset_iter() {
+        match event {
+            Event::Start(Tag::Image {
+                dest_url, title, ..
+            }) => {
+                frames.last_mut().unwrap().flush(&marks, &finder);
+                images.push(Image {
+                    image: ImageNode {
+                        url: dest_url.into_string().into(),
+                        title: (!title.is_empty()).then(|| title.into_string().into()),
+                        link: marks
+                            .iter()
+                            .rev()
+                            .find_map(|mark: &TextMark| mark.link.clone()),
                         ..Default::default()
                     },
-                ));
+                    alt: String::new(),
+                });
             }
-
-            paragraph.merge(child_paragraph);
-        }
-        Node::Image(raw) => {
-            paragraph.push_image(ImageNode {
-                url: raw.url.clone().into(),
-                title: raw.title.clone().map(|t| t.into()),
-                alt: Some(raw.alt.clone().into()),
-                ..Default::default()
-            });
-        }
-        Node::InlineMath(raw) => {
-            text = raw.value.clone();
-            paragraph.push(
-                InlineNode::new(&text).marks(vec![(0..text.len(), TextMark::default().code())]),
-            );
-        }
-        Node::MdxTextExpression(raw) => {
-            text = raw.value.clone();
-            paragraph
-                .push(InlineNode::new(&text).marks(vec![(0..text.len(), TextMark::default())]));
-        }
-        Node::Html(val) => {
-            text = val.value.clone();
-            paragraph.push_str(&text);
-        }
-        Node::FootnoteReference(foot) => {
-            let prefix = format!("[{}]", foot.identifier);
-            paragraph.push(InlineNode::new(&prefix).marks(vec![(
-                0..prefix.len(),
-                TextMark {
-                    italic: true,
-                    ..Default::default()
-                },
-            )]));
-        }
-        Node::LinkReference(link) => {
-            let mut child_paragraph = Paragraph::default();
-            for child in &link.children {
-                text.push_str(&parse_paragraph(&mut child_paragraph, child));
-            }
-            let link_mark = LinkMark {
-                url: "".into(),
-                title: link.label.clone().map(Into::into),
-                identifier: Some(link.identifier.clone().into()),
-            };
-            for child in &mut child_paragraph.children {
-                if let Some(image) = &mut child.image {
-                    image.link = Some(link_mark.clone());
+            Event::End(TagEnd::Image) => {
+                if let Some(mut image) = images.pop() {
+                    if let Some(parent) = images.last_mut() {
+                        parent.alt.push_str(&image.alt);
+                    } else {
+                        image.image.alt = Some(image.alt.into());
+                        frames.last_mut().unwrap().paragraph.push_image(image.image);
+                    }
                 }
-                child.marks.push((
-                    0..child.text.len(),
-                    TextMark {
-                        link: Some(link_mark.clone()),
-                        ..Default::default()
-                    },
-                ));
             }
-            paragraph.merge(child_paragraph);
-        }
-        _ => {
-            if cfg!(debug_assertions) {
-                tracing::warn!("unsupported inline node: {:#?}", node);
+            Event::Start(
+                tag @ (Tag::Emphasis | Tag::Strong | Tag::Strikethrough | Tag::Link { .. }),
+            ) => {
+                frames.last_mut().unwrap().flush(&marks, &finder);
+                let mark = match tag {
+                    Tag::Emphasis => TextMark::default().italic(),
+                    Tag::Strong => TextMark::default().bold(),
+                    Tag::Strikethrough => TextMark::default().strikethrough(),
+                    Tag::Link {
+                        dest_url,
+                        title,
+                        id,
+                        ..
+                    } => {
+                        let link = LinkMark {
+                            url: dest_url.into_string().into(),
+                            title: (!title.is_empty()).then(|| title.into_string().into()),
+                            identifier: (!id.is_empty()).then(|| id.into_string().into()),
+                        };
+                        if let Some(id) = &link.identifier {
+                            cx.add_ref(id.clone(), link.clone());
+                        }
+                        TextMark::default().link(link)
+                    }
+                    _ => unreachable!(),
+                };
+                marks.push(mark);
             }
+            Event::End(
+                TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link,
+            ) => {
+                frames.last_mut().unwrap().flush(&marks, &finder);
+                marks.pop();
+            }
+            Event::Start(tag) => {
+                frames.last_mut().unwrap().finish_pending(&marks, &finder);
+                let kind = match tag {
+                    Tag::Paragraph => {
+                        if matches!(frames.last().unwrap().kind, Block::Item) {
+                            frames.last_mut().unwrap().spread = true;
+                        }
+                        Block::Paragraph
+                    }
+                    Tag::Heading { level, .. } => Block::Heading(level as u8),
+                    Tag::BlockQuote(_) => Block::Quote,
+                    Tag::List(start) => Block::List(start.is_some()),
+                    Tag::Item => Block::Item,
+                    Tag::CodeBlock(code) => Block::Code(match code {
+                        CodeBlockKind::Indented => None,
+                        CodeBlockKind::Fenced(info) => info
+                            .split_whitespace()
+                            .next()
+                            .map(|language| SharedString::from(language.to_owned())),
+                    }),
+                    Tag::HtmlBlock => Block::Html,
+                    Tag::Table(alignments) => Block::Table(alignments),
+                    Tag::TableHead | Tag::TableRow => Block::Row,
+                    Tag::TableCell => Block::Cell,
+                    _ => return Err("Unsupported Markdown block; source text is unchanged.".into()),
+                };
+                frames.push(Frame::new(kind, range.start));
+            }
+            Event::End(tag) => {
+                let mut frame = frames.pop().unwrap();
+                if matches!(tag, TagEnd::TableHead | TagEnd::TableRow) {
+                    frames.last_mut().unwrap().rows.push(TableRow {
+                        children: frame.cells,
+                    });
+                } else if tag == TagEnd::TableCell {
+                    frame.flush(&marks, &finder);
+                    frame.paragraph.set_span(Span {
+                        start: frame.start,
+                        end: range.end,
+                    });
+                    frames.last_mut().unwrap().cells.push(TableCell {
+                        children: frame.paragraph,
+                        width: None,
+                    });
+                } else {
+                    frames
+                        .last_mut()
+                        .unwrap()
+                        .children
+                        .push(frame.finish(range.end, &marks, &finder, style, theme));
+                }
+            }
+            Event::Text(text) => {
+                if let Some(image) = images.last_mut() {
+                    image.alt.push_str(&text);
+                } else {
+                    frames.last_mut().unwrap().buffer.push_str(&text);
+                }
+            }
+            Event::Code(text) | Event::InlineMath(text) => {
+                if let Some(image) = images.last_mut() {
+                    image.alt.push_str(&text);
+                } else {
+                    let frame = frames.last_mut().unwrap();
+                    frame.flush(&marks, &finder);
+                    let mut code_marks = marks.clone();
+                    code_marks.push(TextMark::default().code());
+                    frame
+                        .paragraph
+                        .push(inline(text.into_string(), &code_marks));
+                }
+            }
+            Event::Html(text) => frames.last_mut().unwrap().buffer.push_str(&text),
+            Event::InlineHtml(text) => {
+                if let Some(image) = images.last_mut() {
+                    image.alt.push_str(&text);
+                    continue;
+                }
+                let frame = frames.last_mut().unwrap();
+                frame.flush(&marks, &finder);
+                frame.paragraph.push(inline(text.into_string(), &marks));
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                let text = if matches!(event, Event::SoftBreak) {
+                    " "
+                } else {
+                    "\n"
+                };
+                if let Some(image) = images.last_mut() {
+                    image.alt.push_str(text);
+                } else {
+                    frames.last_mut().unwrap().buffer.push_str(text);
+                }
+            }
+            Event::TaskListMarker(checked) => {
+                if let Some(frame) = frames
+                    .iter_mut()
+                    .rev()
+                    .find(|frame| matches!(frame.kind, Block::Item))
+                {
+                    frame.checked = Some(checked);
+                }
+            }
+            Event::Rule => {
+                let frame = frames.last_mut().unwrap();
+                frame.finish_pending(&marks, &finder);
+                frame.children.push(node::Node::Divider);
+            }
+            Event::FootnoteReference(label) => frames
+                .last_mut()
+                .unwrap()
+                .buffer
+                .push_str(&format!("[^{label}]")),
+            Event::DisplayMath(text) => frames.last_mut().unwrap().buffer.push_str(&text),
         }
     }
-
-    text
-}
-
-fn ast_to_node(
-    value: mdast::Node,
-    style: &TextViewStyle,
-    cx: &mut NodeContext,
-    highlight_theme: &HighlightTheme,
-) -> node::Node {
-    match value {
-        Node::Root(val) => {
-            let children: Vec<_> = val
-                .children
-                .into_iter()
-                .map(|c| ast_to_node(c, style, cx, highlight_theme))
-                .collect();
-            node::Node::Root {
-                children: children.into(),
-            }
-        }
-        Node::Paragraph(val) => {
-            let mut paragraph = Paragraph::default();
-            val.children.iter().for_each(|c| {
-                parse_paragraph(&mut paragraph, c);
-            });
-
-            node::Node::Paragraph(paragraph)
-        }
-        Node::Blockquote(val) => {
-            let children = val
-                .children
-                .into_iter()
-                .map(|c| ast_to_node(c, style, cx, highlight_theme))
-                .collect();
-            node::Node::Blockquote { children }
-        }
-        Node::List(list) => {
-            let children = list
-                .children
-                .into_iter()
-                .map(|c| ast_to_node(c, style, cx, highlight_theme))
-                .collect();
-            node::Node::List {
-                ordered: list.ordered,
-                children,
-            }
-        }
-        Node::ListItem(val) => {
-            let children = val
-                .children
-                .into_iter()
-                .map(|c| ast_to_node(c, style, cx, highlight_theme))
-                .collect();
-            node::Node::ListItem {
-                children,
-                spread: val.spread,
-                checked: val.checked,
-            }
-        }
-        Node::Break(_) => node::Node::Break { html: false },
-        Node::Code(raw) => node::Node::CodeBlock(CodeBlock::new(
-            raw.value.into(),
-            raw.lang.map(|s| s.into()),
-            style,
-            highlight_theme,
-        )),
-        Node::Heading(val) => {
-            let mut paragraph = Paragraph::default();
-            val.children.iter().for_each(|c| {
-                parse_paragraph(&mut paragraph, c);
-            });
-
-            node::Node::Heading {
-                level: val.depth,
-                children: paragraph,
-            }
-        }
-        Node::Math(val) => node::Node::CodeBlock(CodeBlock::new(
-            val.value.into(),
-            None,
-            style,
-            highlight_theme,
-        )),
-        Node::Html(val) => node::Node::Paragraph(Paragraph::new(val.value)),
-        Node::MdxFlowExpression(val) => node::Node::CodeBlock(CodeBlock::new(
-            val.value.into(),
-            Some("mdx".into()),
-            style,
-            highlight_theme,
-        )),
-        Node::Yaml(val) => node::Node::CodeBlock(CodeBlock::new(
-            val.value.into(),
-            Some("yml".into()),
-            style,
-            highlight_theme,
-        )),
-        Node::Toml(val) => node::Node::CodeBlock(CodeBlock::new(
-            val.value.into(),
-            Some("toml".into()),
-            style,
-            highlight_theme,
-        )),
-        Node::MdxJsxTextElement(val) => {
-            let mut paragraph = Paragraph::default();
-            val.children.iter().for_each(|c| {
-                parse_paragraph(&mut paragraph, c);
-            });
-            node::Node::Paragraph(paragraph)
-        }
-        Node::MdxJsxFlowElement(val) => {
-            let mut paragraph = Paragraph::default();
-            val.children.iter().for_each(|c| {
-                parse_paragraph(&mut paragraph, c);
-            });
-            node::Node::Paragraph(paragraph)
-        }
-        Node::ThematicBreak(_) => node::Node::Divider,
-        Node::Table(val) => {
-            let mut table = Table::default();
-            table.column_aligns = val
-                .align
-                .clone()
-                .into_iter()
-                .map(|align| align.into())
-                .collect();
-            val.children.iter().for_each(|c| {
-                if let Node::TableRow(row) = c {
-                    parse_table_row(&mut table, row);
-                }
-            });
-
-            node::Node::Table(table)
-        }
-        Node::FootnoteDefinition(def) => {
-            let mut paragraph = Paragraph::default();
-            let prefix = format!("[{}]: ", def.identifier);
-            paragraph.push(InlineNode::new(&prefix).marks(vec![(
-                0..prefix.len(),
-                TextMark {
-                    italic: true,
-                    ..Default::default()
-                },
-            )]));
-
-            def.children.iter().for_each(|c| {
-                parse_paragraph(&mut paragraph, c);
-            });
-            node::Node::Paragraph(paragraph)
-        }
-        Node::Definition(def) => {
-            cx.add_ref(
-                def.identifier.clone().into(),
-                LinkMark {
-                    url: def.url.clone().into(),
-                    identifier: Some(def.identifier.clone().into()),
-                    title: def.title.clone().map(Into::into),
-                },
-            );
-
-            node::Node::Definition {
-                identifier: def.identifier.clone().into(),
-                url: def.url.clone().into(),
-                title: def.title.clone().map(|s| s.into()),
-            }
-        }
-        _ => {
-            if cfg!(debug_assertions) {
-                tracing::warn!("unsupported node: {:#?}", value);
-            }
-            node::Node::Unknown
-        }
-    }
+    Ok(frames
+        .pop()
+        .unwrap()
+        .finish(raw.len(), &marks, &finder, style, theme))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn nested_inline_marks_keep_links_code_and_images() {
-        let ast = markdown::to_mdast(
-            "**outer *inner [link](next.md)* `code` ![alt](local.png)**",
-            &ParseOptions::gfm(),
-        )
-        .unwrap();
-        let Node::Root(root) = ast else {
+    fn paragraph(source: &str) -> Paragraph {
+        let style = TextViewStyle::default();
+        let mut context = NodeContext::default();
+        let node::Node::Root { children } =
+            parse(source, &style, &mut context, &style.highlight_theme).unwrap()
+        else {
             panic!("expected root")
         };
-        let mut paragraph = Paragraph::default();
-        parse_paragraph(&mut paragraph, &root.children[0]);
+        let node::Node::Paragraph(paragraph) = &children[0] else {
+            panic!("expected paragraph")
+        };
+        paragraph.clone()
+    }
+    #[test]
+    fn nested_inline_marks_keep_links_code_and_images() {
+        let paragraph = paragraph("**outer *inner [link](next.md)* `code` ![alt](local.png)**");
         let link = paragraph
             .children
             .iter()
@@ -427,16 +405,8 @@ mod tests {
 
     #[test]
     fn reference_links_keep_nested_formatting_and_linked_images() {
-        let ast = markdown::to_mdast(
-            "[*nested **bold** ![alt](local.png)*][target]\n\n[target]: next.md",
-            &ParseOptions::gfm(),
-        )
-        .unwrap();
-        let Node::Root(root) = ast else {
-            panic!("expected root")
-        };
-        let mut paragraph = Paragraph::default();
-        parse_paragraph(&mut paragraph, &root.children[0]);
+        let paragraph =
+            paragraph("[*nested **bold** ![alt](local.png)*][target]\n\n[target]: next.md");
         let bold = paragraph
             .children
             .iter()
@@ -482,5 +452,155 @@ mod tests {
             .iter()
             .any(|node| matches!(node, node::Node::List { .. })));
         assert!(context.link_refs.is_empty());
+    }
+    #[test]
+    fn autolinks_preserve_punctuation_and_exclude_inline_code() {
+        let source = "Visit http://example.test/a_(b). www.example.test a@example.test and `https://code.example.test`.";
+        let style = TextViewStyle::default();
+        let mut context = NodeContext::default();
+        let root = parse(source, &style, &mut context, &style.highlight_theme).unwrap();
+        let mut links = vec![];
+        root.links(&context, &mut links);
+        assert_eq!(
+            links
+                .iter()
+                .map(|(_, url)| url.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "http://example.test/a_(b)",
+                "https://www.example.test",
+                "mailto:a@example.test"
+            ]
+        );
+        let text = paragraph(source);
+        let code = text
+            .children
+            .iter()
+            .find(|node| node.text.as_str() == "https://code.example.test")
+            .unwrap();
+        assert!(code.marks.iter().any(|(_, mark)| mark.code));
+        assert!(code.marks.iter().all(|(_, mark)| mark.link.is_none()));
+        assert_eq!(text.children.iter().map(|node| node.text.as_str()).collect::<String>(), "Visit http://example.test/a_(b). www.example.test a@example.test and https://code.example.test.");
+    }
+    #[test]
+    fn nested_blocks_keep_tasks_code_and_table_alignment() {
+        let source = "# Title\n\n> quote **strong**\n>\n> 3. nested\n\n- [x] done\n\n```text\n<raw>&code\n```\n\n|a|b|c|\n|:---|:---:|---:|\n|left|middle|right|";
+        let style = TextViewStyle::default();
+        let mut context = NodeContext::default();
+        let node::Node::Root { children } =
+            parse(source, &style, &mut context, &style.highlight_theme).unwrap()
+        else {
+            panic!("expected blocks")
+        };
+        assert!(matches!(children[0], node::Node::Heading { level: 1, .. }));
+        let node::Node::Blockquote { children: quote } = &children[1] else {
+            panic!("expected quote")
+        };
+        assert!(quote
+            .iter()
+            .any(|node| matches!(node, node::Node::List { ordered: true, .. })));
+        let node::Node::List {
+            children: tasks, ..
+        } = &children[2]
+        else {
+            panic!("expected tasks")
+        };
+        assert!(matches!(
+            tasks[0],
+            node::Node::ListItem {
+                checked: Some(true),
+                ..
+            }
+        ));
+        let node::Node::CodeBlock(code) = &children[3] else {
+            panic!("expected code")
+        };
+        assert_eq!(code.code().as_str(), "<raw>&code\n");
+        let node::Node::Table(table) = &children[4] else {
+            panic!("expected table")
+        };
+        assert_eq!(
+            table.column_aligns,
+            vec![
+                node::ColumnumnAlign::Left,
+                node::ColumnumnAlign::Center,
+                node::ColumnumnAlign::Right
+            ]
+        );
+        assert_eq!(table.children.len(), 2);
+        assert_eq!(
+            table.children[1]
+                .children
+                .iter()
+                .map(|cell| cell
+                    .children
+                    .children
+                    .iter()
+                    .map(|node| node.text.as_str())
+                    .collect::<String>())
+                .collect::<Vec<_>>(),
+            vec!["left", "middle", "right"]
+        );
+    }
+    #[test]
+    fn soft_and_hard_breaks_keep_distinct_reading_flow() {
+        let paragraph = paragraph("first\nsecond  \nthird");
+        assert_eq!(
+            paragraph
+                .children
+                .iter()
+                .map(|node| node.text.as_str())
+                .collect::<String>(),
+            "first second\nthird"
+        );
+    }
+    #[test]
+    #[ignore = "release parser CPU and memory probe; excludes native rendering and presentation"]
+    fn benchmark_supported_markdown() {
+        let unit = "Paragraph café 🙂 with **strong**, *emphasis* and `inline` plus [sibling](sibling.md). ".to_owned() + &"ordinary text ".repeat(12) + "\n\n";
+        let repetitions = (10 * 1024 * 1024 - 4096) / unit.len();
+        let source = "# Supported Markdown size\n\n".to_owned()
+            + &unit.repeat(repetitions)
+            + "\n# FINAL SUPPORTED SIZE MARKER\n";
+        assert!(source.len() <= 10 * 1024 * 1024);
+        let style = TextViewStyle::default();
+        let mut samples = Vec::new();
+        for _ in 0..10 {
+            let mut context = NodeContext::default();
+            let started = std::time::Instant::now();
+            let parsed = parse(&source, &style, &mut context, &style.highlight_theme).unwrap();
+            samples.push(started.elapsed().as_secs_f64() * 1000.);
+            let node::Node::Root { children } = &parsed else {
+                panic!("expected blocks")
+            };
+            assert_eq!(children.len(), repetitions + 2);
+            let node::Node::Heading {
+                children: heading, ..
+            } = children.last().unwrap()
+            else {
+                panic!("expected final heading")
+            };
+            assert_eq!(
+                heading
+                    .children
+                    .iter()
+                    .map(|node| node.text.as_str())
+                    .collect::<String>(),
+                "FINAL SUPPORTED SIZE MARKER"
+            );
+            std::hint::black_box(parsed);
+        }
+        samples.sort_by(f64::total_cmp);
+        println!("native-node Markdown parse: bytes={}, n=10, p50={:.3}ms, p95={:.3}ms; excludes rendering/presentation", source.len(), samples[4], samples[9]);
+        #[cfg(target_os = "linux")]
+        println!(
+            "{}",
+            std::fs::read_to_string("/proc/self/status")
+                .unwrap()
+                .lines()
+                .filter(|line| line.starts_with("VmRSS:") || line.starts_with("VmHWM:"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
     }
 }
