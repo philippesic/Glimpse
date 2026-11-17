@@ -233,10 +233,7 @@ impl InputState {
         };
 
         let text = self.text.clone();
-        let offset = self
-            .last_layout
-            .as_ref()
-            .map_or(0, |layout| layout.visible_range_offset.start);
+        let offset = self.cursor();
         search_panel.update(cx, |this, cx| {
             if this.open {
                 this.request_search(text, offset, cx);
@@ -264,10 +261,7 @@ impl InputState {
         };
 
         let text = self.text.clone();
-        let offset = self
-            .last_layout
-            .as_ref()
-            .map_or(0, |layout| layout.visible_range_offset.start);
+        let offset = self.cursor();
         let editor = cx.entity();
         let selected_text = Rope::from(self.selected_text());
         search_panel.update(cx, |this, cx| {
@@ -342,10 +336,7 @@ impl SearchPanel {
         };
         let editor = editor.read(cx);
         let text = editor.text.clone();
-        let offset = editor
-            .last_layout
-            .as_ref()
-            .map_or(0, |layout| layout.visible_range_offset.start);
+        let offset = editor.cursor();
         self.request_search(text, offset, cx);
     }
 

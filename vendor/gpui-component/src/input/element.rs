@@ -397,21 +397,60 @@ impl TextElement {
             return vec![];
         };
 
+        let mut offset = last_layout.visible_range_offset.start;
+        let mut visible = Vec::new();
+        for line in last_layout.lines.iter() {
+            visible.extend(
+                line.wrapped_lines
+                    .iter()
+                    .map(|row| offset + row.range.start..offset + row.range.end + 1),
+            );
+            offset += line.len() + 1;
+        }
         let mut paths = Vec::new();
-        let first =
-            ranges.partition_point(|range| range.end < last_layout.visible_range_offset.start);
-        for (index, range) in ranges
-            .iter()
-            .enumerate()
-            .skip(first)
-            .take_while(|(_, range)| range.start <= last_layout.visible_range_offset.end)
-        {
-            if let Some(path) = Self::layout_match_range(range.clone(), last_layout, bounds) {
+        for index in matching_indices(&ranges, &visible) {
+            if let Some(path) = Self::layout_search_range(&ranges[index], last_layout, bounds) {
                 paths.push((path, current_match_ix == index));
             }
         }
 
         paths
+    }
+
+    fn layout_search_range(
+        range: &Range<usize>,
+        layout: &LastLayout,
+        bounds: &Bounds<Pixels>,
+    ) -> Option<Path<Pixels>> {
+        let mut builder = gpui::PathBuilder::fill();
+        let mut offset = layout.visible_range_offset.start;
+        let mut top = layout.visible_top;
+        let mut painted = false;
+        for line in layout.lines.iter() {
+            for row in &line.wrapped_lines {
+                let start = offset + row.range.start;
+                let end = offset + row.range.end;
+                let from = range.start.max(start).min(end);
+                let to = range.end.min(end);
+                let newline = row.row + 1 == line.rows() && range.contains(&end);
+                if from >= to && !newline {
+                    continue;
+                }
+                let x = row.shaped.x_for_index(from - start);
+                let right = row.shaped.x_for_index(to.max(from) - start).max(x + px(6.));
+                let origin = bounds.origin
+                    + point(layout.line_number_width, top + row.row * layout.line_height);
+                builder.move_to(origin + point(x, px(0.)));
+                builder.line_to(origin + point(right, px(0.)));
+                builder.line_to(origin + point(right, layout.line_height));
+                builder.line_to(origin + point(x, layout.line_height));
+                builder.close();
+                painted = true;
+            }
+            offset += line.len() + 1;
+            top += line.size(layout.line_height).height;
+        }
+        painted.then(|| builder.build().ok()).flatten()
     }
 
     fn layout_hover_highlight(
@@ -1538,6 +1577,26 @@ impl Element for TextElement {
     }
 }
 
+fn matching_indices(ranges: &[Range<usize>], visible: &[Range<usize>]) -> Vec<usize> {
+    let mut indices = Vec::new();
+    for interval in visible {
+        if interval.is_empty() {
+            continue;
+        }
+        let first = ranges.partition_point(|range| range.end <= interval.start);
+        indices.extend(
+            ranges[first..]
+                .iter()
+                .take_while(|range| range.start < interval.end)
+                .enumerate()
+                .map(|(index, _)| first + index),
+        );
+    }
+    indices.sort_unstable();
+    indices.dedup();
+    indices
+}
+
 /// Get the runs for the given range.
 ///
 /// The range is the byte range of the wrapped line.
@@ -1642,6 +1701,85 @@ fn split_runs_by_bg_segments(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn visible_matches_equal_full_scan_across_gaps_and_wrapped_boundaries() {
+        for seed in 0..128 {
+            let mut cursor = 0;
+            let ranges = (0..400)
+                .map(|index| {
+                    cursor += (index + seed) % 3;
+                    let start = cursor;
+                    cursor += (index * seed + 1) % 17 + 1;
+                    start..cursor
+                })
+                .collect::<Vec<_>>();
+            let visible = (0..20)
+                .map(|index| {
+                    let start = (index * 317 + seed * 137) % (cursor + 100);
+                    start..start + index * 7
+                })
+                .collect::<Vec<_>>();
+            let expected = ranges
+                .iter()
+                .enumerate()
+                .filter(|(_, range)| {
+                    visible.iter().any(|interval| {
+                        !interval.is_empty()
+                            && range.start < interval.end
+                            && range.end > interval.start
+                    })
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            assert_eq!(matching_indices(&ranges, &visible), expected, "{seed}");
+        }
+        assert_eq!(
+            matching_indices(
+                &[0..100_000, 100_001..100_100],
+                &[10..20, 50..60, 100_010..100_020]
+            ),
+            vec![0, 1]
+        );
+    }
+
+    #[test]
+    fn search_paths_clip_matches_to_sparse_shaped_rows() {
+        let mut line = LineLayout::new();
+        line.set_visible_lines(
+            1000,
+            100,
+            smallvec::smallvec![
+                WrappedLine {
+                    row: 40,
+                    range: 400..410,
+                    shaped: ShapedLine::default().with_len(10)
+                },
+                WrappedLine {
+                    row: 80,
+                    range: 800..810,
+                    shaped: ShapedLine::default().with_len(10)
+                },
+            ],
+        );
+        let layout = LastLayout {
+            visible_range: 0..1,
+            visible_top: px(0.),
+            visible_range_offset: 0..1000,
+            lines: Rc::new(vec![line]),
+            line_height: px(10.),
+            wrap_width: Some(px(100.)),
+            line_number_width: px(20.),
+            cursor_bounds: None,
+        };
+        let bounds = Bounds::new(point(px(10.), px(30.)), size(px(300.), px(200.)));
+        for range in [300..500, 405..900, 0..1000] {
+            assert!(TextElement::layout_search_range(&range, &layout, &bounds).is_some());
+        }
+        for range in [0..100, 500..600, 900..1000] {
+            assert!(TextElement::layout_search_range(&range, &layout, &bounds).is_none());
+        }
+    }
 
     #[test]
     fn test_runs_for_range() {
