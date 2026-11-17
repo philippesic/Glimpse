@@ -1,20 +1,20 @@
-# macOS feature acceptance
+# GPUI feature acceptance
 
-Implementation descriptions and measurements below refer to the retired macOS prototype. The GPUI port has separate coverage and limitations in [core design](core-design.md); these records do not establish GPUI parity or qualification.
+This matrix describes the active GPUI application. It is not release certification. [Glimpse](../glimpse.md) defines scope; [core design](core-design.md) describes the implementation; [qualification](qualification.md) records the distinction between exercised behavior and remaining gates.
 
-Development status for the current native Rust implementation. Automated and native checks support the implemented workflows below; they do not establish release certification or full visual parity. Performance targets and failed/unverified gates are recorded in [qualification](qualification.md).
-
-| Area | Implemented and exercised | Remaining qualification |
+| Area | Implemented behavior | Remaining acceptance |
 | --- | --- | --- |
-| Disk navigation | Paths, Home/Volumes/favorites/recent locations; history; single directory list; retained per-folder scrolling; direct breadcrumbs/path completion; hidden-name filter; explicit document reveal; keyboard and one-step horizontal gesture navigation | Disconnected/slow real volumes and physical 120 Hz delivery lack native qualification |
-| Live updates | Visible-folder observation, clean-document refresh with Undo, dirty-buffer conflict, path-based selection/scroll retention; bounded navigation/live-batch transition and Reduce motion | OS events are hints; focus return and validated Save remain necessary fallbacks |
-| Search | Scoped filename ranking and saved-content results; exclusions/limits/cancellation; pinned/temporary/following scope; file/path/excerpt hierarchy; arrow/Return activation; stale-hit revalidation | Yellow match colors pass contrast checks; final native appearance check pending. Literal content search; no persistent content index or automatic disk crawl |
-| Optional filename index | Explicit one-scope session snapshot, bounded paths, as-you-type queries, selected-scope stale notification, explicit rebuild/remove | Snapshot freshness requires rebuild; unvisited disk discovery still costs I/O |
-| Editor essentials | Native text selection, undo/redo, clipboard, syntax, line numbers, current line, Find/Replace/All, go to line, indentation, wrapping, tabs/preview tabs and status | Real IME remains explicitly unverified; full VoiceOver not qualified; long lines pause wrap/ruler/current-line layout and still miss performance targets |
-| Markdown | Source/Read switch over current buffer, heading hierarchy, lists/tables/tasks/fences/links and bounded local raster images; code-tab return restores native editing | Documented dialect; complex/large pages retain library heading styling; code-copy glyph fallback differs; no remote image auto-fetch or executable embeds |
-| File safety | Byte/BOM/newline preservation; validated Save/As/Copy; no-clobber creation/rename; OS Trash; alias and destination-race checks; external conflict decisions | Bounded read-only line diff is implemented and unit-tested; final native presentation/input check is pending. Atomic replacement is not compare-and-swap against arbitrary writers |
-| Recovery | Exact generation drafts, live-session ownership, history limits, one-time import, observed-disk restoration and storage management | Forced termination can lose edits not yet persisted; not a backup service |
-| Preferences and layout | Functional category sidebar/menu, grouped settings/theme previews, font/density/scale/keymaps/search controls, narrow navigator/document switch, Cmd-L select-all | Latest typography/line-height Apply/Undo and responsive settings checks pending. Opaque material/custom symbols; modal settings with fewer reference options |
-| CLI | Open/scope/line/column, lossless picker JSON/NUL/cancel, wait/Finish destination ownership, isolated sessions | macOS only; no second desktop platform qualified |
+| Navigation | One directory list, paths and breadcrumbs, history, Home, volumes, pinned/recent locations, filtering, path completion and document reveal | Complete selection/scroll, gesture, path-transfer and slow-volume tour |
+| Documents | Preview and kept tabs, duplicate-name identity, per-document state, source/reading switch and persistent cursor/encoding information | Full preview promotion and switching matrix |
+| Search | Folder filtering, scoped filename/saved-content search, exclusions and coverage, pinned/temporary scope, explicit bounded filename snapshot | Full keyboard/scope/error tour, cancellation timing and resource bounds |
+| Editor | Rope-backed native input, clipboard, selection, Undo/Redo, Find/Replace/All, indentation, wrapping, line numbers and bounded syntax work | Complete input/selection, supported-size performance and assistive workflows |
+| Markdown | Read-only current-buffer rendering, selected CommonMark/GFM structures, bounded local raster images, safe links and literal HTML | Full dialect, overflow, image-error interactions, spoken reading and large-document responsiveness |
+| Files | New document/folder, validated Save/As/Copy, no-clobber creation, copy/reveal/external open, single rename and OS Trash | Complete native destination-race, rename/Trash and cancellation matrix |
+| Coexistence | Validated disk identity/bytes, clean refresh, explicit conflict decisions and observed-version preservation | Full delayed/concurrent interleavings and device matrix |
+| Recovery | Per-session transactional drafts, live-session ownership, automatic abandoned-work recovery, history and storage management | Full interrupted save/cleanup/restore lifecycle |
+| Preferences | Appearance, typography, density, scale, editing, search and keymaps; validation and persistence | Every control, shortcut, rendered state and invalid-setting route |
+| Accessibility | Semantic controls/text, keyboard menus/decisions, platform input methods and Linux AT-SPI integration | Complete keyboard/screen-reader tour and host compatibility; large-text resource costs remain open |
+| CLI | Explicit opens/scope/positions, picker output, waiting requests and deliberate completion/abandonment | Complete byte-safe output, independent callers, picker and destination lifecycle |
+| Linux distribution | Compressed ordinary build, verified payload, reversible user installation, desktop entry, icon and MIME registration | Broader installed-session integration |
 
-The automated suite also exercises file conflicts, recovery/storage failures, lifecycle cancellation, bounded streams and stale generations. Native checks use disposable paths/settings and verify resulting file bytes where mutations are involved. Prior safety evidence remains applicable; the reference refinement does not replace those checks.
+The interface and renderer use GPUI. Retained historical helper tests and optional vendored components do not establish active-path functionality. macOS remains separately unqualified.

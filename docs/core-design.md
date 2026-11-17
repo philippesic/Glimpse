@@ -16,6 +16,8 @@ The component is vendored under its Apache-2.0 license for externally supplied h
 
 Cursor movement, selection and deletion use extended grapheme boundaries across rope chunks. Pointer and requested positions clamp to those boundaries; combining sequences and joined emoji remain one editing unit. Performance qualification must cover 10 MiB documents, long lines, graphemes, real IME composition and clipboard. None of those requirements is relaxed by choosing this component.
 
+Linux Wayland forwards real keyboard events to the AT-SPI registry before dispatch and honors consumed events. Connection setup and reconnection run outside the interface thread; replies have a timeout, and inactive assistive access avoids the notification path. X11 retains its platform keyboard route. Native Orca checks exercise caret speech, editing, file navigation, Find, reading, native Save and decisions on both routes. The Sway host requires Orca's legacy AT-SPI device configuration; its installed library has an unresolved keysym-grab compatibility failure. These bounded workflows and an independent native key-consumption check do not qualify every screen-reader command or host configuration.
+
 ## File safety and services
 
 DiskFile retains observed identity, symlink binding and bytes. Save stages beside the target, preserves supported metadata, syncs, validates and atomically replaces. Hard links, unsupported ownership/metadata and changed destinations stop saving. Atomic replacement is not compare-and-swap against unrelated writers. External observation retains the existing binding when a symlink target changes, even when both targets have identical bytes; ordinary Save stays blocked until an explicit resolution.
