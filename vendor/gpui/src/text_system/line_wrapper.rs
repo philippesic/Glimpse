@@ -318,6 +318,19 @@ impl LineWrapState {
         self.last_wrap_ix
     }
 
+    /// Compare the state that can affect wrapping the remaining text.
+    pub fn same_continuation(mut self, mut other: Self) -> bool {
+        for state in [&mut self, &mut other] {
+            if state.indent.is_some() {
+                state.first_non_whitespace_ix = state.first_non_whitespace_ix.map(|_| 0);
+            }
+            if state.last_candidate_ix == 0 {
+                state.last_candidate_width = px(0.);
+            }
+        }
+        self == other
+    }
+
     /// Map stored positions through an edit, refusing positions within replaced text.
     pub fn after_edit(mut self, range: std::ops::Range<usize>, inserted: usize) -> Option<Self> {
         let shift = |index: usize| {
@@ -334,7 +347,9 @@ impl LineWrapState {
         if self.last_candidate_ix != 0 {
             self.last_candidate_ix = shift(self.last_candidate_ix)?;
         }
-        if let Some(index) = self.first_non_whitespace_ix {
+        if self.indent.is_none()
+            && let Some(index) = self.first_non_whitespace_ix
+        {
             self.first_non_whitespace_ix = Some(shift(index)?);
         }
         Some(self)

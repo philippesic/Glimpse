@@ -344,7 +344,7 @@ impl TextWrapper {
                         old_index += 1;
                         continue;
                     }
-                    if shifted == state && point.state.boundary() >= local.end {
+                    if shifted.same_continuation(state) && point.state.boundary() >= local.end {
                         let shift = |offset: usize| offset - range.len() + new_text.len();
                         let row_delta = (rows + wrapped.len()) as isize - point.rows as isize;
                         wrapped.extend(
