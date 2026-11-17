@@ -4,23 +4,54 @@ use gpui::accesskit::{
     Action, ActionData, ActionRequest, Node, NodeId, Role, TextDirection, TextPosition,
     TextSelection,
 };
+use gpui::accessibility::TextRunIds;
+use gpui::WeakEntity;
+use std::sync::Arc;
 
 #[derive(Default)]
 pub(super) struct Mapping {
-    owner: Option<gpui::accessibility::TextRunIds>,
+    owner: Option<TextRunIds>,
+    current: TextRuns,
+    running: bool,
+}
+
+#[derive(Clone, Default)]
+struct TextRuns {
     text: SharedString,
-    runs: Vec<Run>,
-    nodes: std::sync::Arc<[(NodeId, Node)]>,
+    runs: Arc<[Run]>,
+    nodes: Arc<[(NodeId, Node)]>,
     next_key: usize,
 }
+
+pub(super) struct PrepareTextRuns {
+    owner: TextRunIds,
+    previous: TextRuns,
+    text: SharedString,
+    changed: (Range<usize>, Range<usize>),
+}
+
 #[derive(Clone)]
 struct Run {
     id: NodeId,
     range: Range<usize>,
 }
-impl Mapping {
+impl TextRuns {
+    #[cfg(test)]
     fn update(&mut self, text: SharedString, mut node_id: impl FnMut(usize) -> NodeId) {
-        let (old, new) = changed_lines(&self.text, &text);
+        let changed = changed_lines(&self.text, &text);
+        self.update_changed(text, changed, &mut node_id);
+    }
+
+    fn matches(&self, text: &str) -> bool {
+        !self.nodes.is_empty() && std::ptr::eq(self.text.as_str(), text)
+    }
+
+    fn update_changed(
+        &mut self,
+        text: SharedString,
+        (old, new): (Range<usize>, Range<usize>),
+        mut node_id: impl FnMut(usize) -> NodeId,
+    ) {
         let prefix = self
             .runs
             .partition_point(|run| run.range.end <= old.start && run.range.start < old.start);
@@ -81,7 +112,7 @@ impl Mapping {
         }));
         self.text = text;
         self.nodes = nodes.into();
-        self.runs = runs;
+        self.runs = runs.into();
     }
 
     fn offset(&self, position: &TextPosition) -> Option<usize> {
@@ -115,6 +146,66 @@ impl Mapping {
             node: run.id,
             character_index,
         }
+    }
+}
+
+impl Mapping {
+    fn prepare(&mut self, owner: TextRunIds, text: SharedString) -> Option<PrepareTextRuns> {
+        if self.owner != Some(owner) {
+            self.owner = Some(owner);
+            self.current = TextRuns::default();
+        }
+        if self.current.matches(&text) || self.running {
+            return None;
+        }
+        let changed = changed_lines(&self.current.text, &text);
+        if changed.0.len().max(changed.1.len()) <= 64 * 1024
+            && self.current.nodes.len() <= 4096
+            && text.as_bytes()[changed.1.clone()]
+                .iter()
+                .filter(|&&byte| byte == b'\n')
+                .take(4096)
+                .count()
+                < 4096
+        {
+            self.current
+                .update_changed(text, changed, |key| owner.get(key));
+            return None;
+        }
+        self.running = true;
+        Some(PrepareTextRuns {
+            owner,
+            previous: self.current.clone(),
+            text,
+            changed,
+        })
+    }
+
+    fn finish(&mut self, owner: TextRunIds, current: TextRuns, text: &str) {
+        self.running = false;
+        if self.owner == Some(owner) && current.matches(text) {
+            self.current = current;
+        }
+    }
+}
+
+impl PrepareTextRuns {
+    fn build(mut self) -> TextRuns {
+        self.previous
+            .update_changed(self.text, self.changed, |key| self.owner.get(key));
+        self.previous
+    }
+
+    pub(super) async fn run(self, input: WeakEntity<InputState>, cx: &mut gpui::AsyncApp) {
+        let owner = self.owner;
+        let current = cx.background_spawn(async move { self.build() }).await;
+        _ = input.update(cx, |state, cx| {
+            state
+                .accessibility_mapping
+                .borrow_mut()
+                .finish(owner, current, &state.value());
+            cx.notify();
+        });
     }
 }
 fn common_bytes(first: &[u8], second: &[u8], reverse: bool) -> usize {
@@ -176,8 +267,8 @@ fn changed_lines(old: &str, new: &str) -> (Range<usize>, Range<usize>) {
 impl InputState {
     pub fn release_accessibility_cache(&mut self) {
         let mut mapping = self.accessibility_mapping.borrow_mut();
-        if !mapping.nodes.is_empty() {
-            *mapping = Mapping::default();
+        if mapping.owner.take().is_some() {
+            mapping.current = TextRuns::default();
         }
     }
 
@@ -186,7 +277,7 @@ impl InputState {
         id: &gpui::GlobalElementId,
         window: &mut Window,
         mapping: &mut Mapping,
-    ) -> gpui::AccessibilityInfo {
+    ) -> (gpui::AccessibilityInfo, Option<PrepareTextRuns>) {
         let text = self.value();
         if self.masked {
             let mut node = Node::new(Role::PasswordInput);
@@ -205,21 +296,12 @@ impl InputState {
             }
             let mut info = gpui::AccessibilityInfo::new(node);
             info.focused = self.focus_handle.is_focused(window);
-            return info;
+            return (info, None);
         }
         let owner = window.accessibility_text_run_ids(id);
-        if mapping.owner != Some(owner) {
-            *mapping = Mapping {
-                owner: Some(owner),
-                ..Mapping::default()
-            };
-        }
-        if mapping.nodes.is_empty()
-            || mapping.text.as_ptr() != text.as_ptr()
-            || mapping.text.len() != text.len()
-        {
-            mapping.update(text.clone(), |index| owner.get(index));
-        }
+        let work = mapping.prepare(owner, text.clone());
+        let current = &mapping.current;
+        let ready = current.matches(&text);
         let mut node = Node::new(if self.mode.is_multi_line() {
             Role::MultilineTextInput
         } else {
@@ -231,32 +313,31 @@ impl InputState {
                 .unwrap_or(&self.placeholder)
                 .to_string(),
         );
-        if self.disabled {
+        if self.disabled || !ready {
             node.set_read_only();
         } else {
             node.add_action(Action::SetValue);
             node.add_action(Action::ReplaceSelectedText);
         }
         node.add_action(Action::Focus);
-        node.add_action(Action::SetTextSelection);
-        node.set_children(mapping.nodes.iter().map(|(id, _)| *id).collect::<Vec<_>>());
-        let start = mapping.position(self.selected_range.start);
-        let end = mapping.position(self.selected_range.end);
-        node.set_text_selection(if self.selection_reversed {
-            TextSelection {
-                anchor: end,
-                focus: start,
-            }
+        node.set_children(current.nodes.iter().map(|(id, _)| *id).collect::<Vec<_>>());
+        if ready {
+            node.add_action(Action::SetTextSelection);
+            let start = current.position(self.selected_range.start);
+            let end = current.position(self.selected_range.end);
+            let (anchor, focus) = if self.selection_reversed {
+                (end, start)
+            } else {
+                (start, end)
+            };
+            node.set_text_selection(TextSelection { anchor, focus });
         } else {
-            TextSelection {
-                anchor: start,
-                focus: end,
-            }
-        });
+            node.set_busy();
+        }
         let mut info = gpui::AccessibilityInfo::new(node);
-        info.text = mapping.nodes.clone();
+        info.text = current.nodes.clone();
         info.focused = self.focus_handle.is_focused(window);
-        info
+        (info, work)
     }
     pub(super) fn accessibility_action(
         &mut self,
@@ -267,14 +348,11 @@ impl InputState {
     ) {
         match request.action {
             Action::Focus => self.focus(window, cx),
-            Action::SetTextSelection => {
-                if self.value() != mapping.text {
-                    return;
-                }
+            Action::SetTextSelection if mapping.current.matches(&self.value()) => {
                 if let Some(ActionData::SetTextSelection(selection)) = request.data {
                     let (Some(anchor), Some(focus)) = (
-                        mapping.offset(&selection.anchor),
-                        mapping.offset(&selection.focus),
+                        mapping.current.offset(&selection.anchor),
+                        mapping.current.offset(&selection.focus),
                     ) else {
                         return;
                     };
@@ -285,7 +363,9 @@ impl InputState {
                     cx.notify();
                 }
             }
-            Action::SetValue | Action::ReplaceSelectedText if !self.disabled => {
+            Action::SetValue | Action::ReplaceSelectedText
+                if !self.disabled && (self.masked || mapping.current.matches(&self.value())) =>
+            {
                 if let Some(ActionData::Value(value)) = request.data {
                     let range =
                         (request.action == Action::SetValue).then(|| 0..self.text.len_utf16());
@@ -301,7 +381,36 @@ impl InputState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn assert_complete_mapping(mapping: &Mapping, text: &str) {
+
+    #[gpui::test]
+    fn large_accessible_updates_reject_stale_text_and_owners(cx: &mut gpui::TestAppContext) {
+        let cx = cx.add_empty_window();
+        cx.update(|window, _| {
+            let owner = window.accessibility_text_run_ids(&gpui::GlobalElementId::default());
+            let mut new_id = gpui::GlobalElementId::default();
+            new_id.push("another input".into());
+            let new_owner = window.accessibility_text_run_ids(&new_id);
+            let initial: SharedString = "original café\r\n".repeat(5_000).into();
+            let latest: SharedString = "new é🙂\r\n".repeat(6_000).into();
+            let mut mapping = Mapping::default();
+            let pending = mapping.prepare(owner, initial.clone()).unwrap();
+            assert!(mapping.prepare(owner, latest.clone()).is_none());
+            mapping.finish(owner, pending.build(), &latest);
+            assert!(mapping.current.nodes.is_empty());
+
+            let pending = mapping.prepare(owner, latest.clone()).unwrap();
+            assert!(mapping.prepare(new_owner, latest.clone()).is_none());
+            mapping.finish(owner, pending.build(), &latest);
+            assert!(mapping.current.nodes.is_empty());
+
+            let pending = mapping.prepare(new_owner, latest.clone()).unwrap();
+            mapping.finish(new_owner, pending.build(), &latest);
+            assert_complete_mapping(&mapping.current, &latest);
+            assert!(mapping.prepare(new_owner, latest.clone()).is_none());
+        });
+    }
+
+    fn assert_complete_mapping(mapping: &TextRuns, text: &str) {
         let parts = segments(text);
         assert_eq!(mapping.nodes.len(), parts.len());
         assert_eq!(mapping.runs.len(), parts.len());
@@ -339,7 +448,7 @@ mod tests {
             format!("a{}\nend", "́".repeat(400)),
         ] {
             let mut text = initial;
-            let mut mapping = Mapping::default();
+            let mut mapping = TextRuns::default();
             mapping.update(text.clone().into(), |key| NodeId(key as u64 + 10));
             assert_complete_mapping(&mapping, &text);
             let mut random = 23u64;
@@ -361,7 +470,7 @@ mod tests {
     }
     #[test]
     fn unchanged_accessible_lines_keep_their_identity_across_edits() {
-        let mut mapping = Mapping::default();
+        let mut mapping = TextRuns::default();
         let initial = "first\nsecond\nthird\nlast é🙂";
         mapping.update(initial.into(), |key| NodeId(key as u64 + 10));
         let last = mapping.nodes.last().unwrap().clone();
@@ -381,19 +490,21 @@ mod tests {
             format!("a{}", "́".repeat(400)),
         ] {
             let segments = segments(&text);
-            let mut mapping = Mapping::default();
+            let mut mapping = TextRuns::default();
             let mut nodes = vec![];
+            let mut runs = vec![];
             for (index, segment) in segments.iter().enumerate() {
                 let id = NodeId((segments.len() - index) as u64 + 10);
                 let mut node = Node::new(Role::TextRun);
                 node.set_character_lengths(segment.lengths.clone());
                 nodes.push((id, node));
-                mapping.runs.push(Run {
+                runs.push(Run {
                     id,
                     range: segment.range.clone(),
                 });
             }
             mapping.nodes = nodes.into();
+            mapping.runs = runs.into();
             for offset in 0..=text.len() {
                 let index = segments
                     .iter()

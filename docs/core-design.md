@@ -20,6 +20,8 @@ Linux Wayland forwards real keyboard events to the AT-SPI registry before dispat
 
 Accessibility text runs retain stable identities and shared properties across unchanged lines. Metadata construction batches safe ASCII spans while preserving Unicode grapheme context, CRLF boundaries and selectable-character word offsets. The Linux AT-SPI adapter caches scalar offsets and compares edited leaf runs. Masked text, incomplete character metadata and hierarchy changes retain the complete traversal path. The shared consumer preserves existing child relationships when node properties change without changing topology or tree metadata.
 
+Large source text updates prepare accessible runs on a background thread. The text node reports a busy state while the snapshot is pending and accepts assistive edits and selection actions once its text matches the buffer. The editor continues to accept keyboard input during preparation. Completed snapshots are checked against the current buffer and element identity before publication.
+
 ## Reading pipeline
 
 The Markdown worker converts pulldown-cmark events directly into native blocks, retaining nested styles, reference links, tables, task lists and literal HTML. Linkify identifies URL and email autolinks within ordinary text; code and existing links keep their own semantics. Adjacent text shares one payload between image boundaries, with nested style and link ranges retained at their original offsets. Source remains authoritative. Image loading and link dispatch retain document-relative resolution and the existing resource and scheme limits.

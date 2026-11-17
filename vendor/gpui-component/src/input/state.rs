@@ -2354,9 +2354,15 @@ impl Render for InputState {
             .children(self.context_menu.as_ref().map(|menu| menu.render()))
             .children(self.hover_popover.clone());
         gpui::accessible("input-semantics", rendered, move |id, window, cx| {
-            input
-                .read(cx)
-                .accessibility_info(id, window, &mut mapping.borrow_mut())
+            let (info, work) =
+                input
+                    .read(cx)
+                    .accessibility_info(id, window, &mut mapping.borrow_mut());
+            if let Some(work) = work {
+                let input = input.downgrade();
+                cx.spawn(async move |cx| work.run(input, cx).await).detach();
+            }
+            info
         })
         .on_action(move |request, _, window, cx| {
             action_input.update(cx, |state, cx| {
