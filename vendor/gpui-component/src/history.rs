@@ -8,6 +8,10 @@ use std::{
 pub trait HistoryItem: Clone + PartialEq {
     fn version(&self) -> usize;
     fn set_version(&mut self, version: usize);
+
+    fn retained_bytes(&self) -> usize {
+        0
+    }
 }
 
 /// The History is used to keep track of changes to a model and to allow undo and redo operations.
@@ -28,6 +32,7 @@ pub struct History<I: HistoryItem> {
     version: usize,
     pub(crate) ignore: bool,
     max_undos: usize,
+    max_bytes: Option<usize>,
     group_interval: Option<Duration>,
     grouping: bool,
     unique: bool,
@@ -45,6 +50,7 @@ where
             last_changed_at: Instant::now(),
             version: 0,
             max_undos: 1000,
+            max_bytes: None,
             group_interval: None,
             grouping: false,
             unique: false,
@@ -54,6 +60,11 @@ where
     /// Set the maximum number of undo steps to keep, defaults to 1000.
     pub fn max_undos(mut self, max_undos: usize) -> Self {
         self.max_undos = max_undos;
+        self
+    }
+
+    pub(crate) fn max_bytes(mut self, maximum: usize) -> Self {
+        self.max_bytes = Some(maximum);
         self
     }
 
@@ -121,6 +132,32 @@ where
         let mut item = item;
         item.set_version(version);
         self.undos.push(item);
+        if let Some(limit) = self.max_bytes {
+            self.trim_old_groups(limit, version);
+        }
+    }
+
+    fn trim_old_groups(&mut self, limit: usize, latest: usize) {
+        let mut retained = self
+            .undos
+            .iter()
+            .map(HistoryItem::retained_bytes)
+            .sum::<usize>();
+        let mut first_kept = 0;
+        while retained > limit {
+            let rest = &self.undos[first_kept..];
+            let oldest = rest[0].version();
+            if oldest == latest {
+                break;
+            }
+            let count = rest.partition_point(|item| item.version() == oldest);
+            retained -= rest[..count]
+                .iter()
+                .map(HistoryItem::retained_bytes)
+                .sum::<usize>();
+            first_kept += count;
+        }
+        self.undos.drain(..first_kept);
     }
 
     /// Get the undo stack.
@@ -217,6 +254,10 @@ mod tests {
         fn set_version(&mut self, version: usize) {
             self.version = version;
         }
+
+        fn retained_bytes(&self) -> usize {
+            self.tab_index
+        }
     }
 
     #[test]
@@ -232,6 +273,25 @@ mod tests {
             assert_eq!(changes.len(), 1);
             assert_eq!(changes[0].tab_index, expected);
         }
+    }
+
+    #[test]
+    fn text_budget_evicts_old_groups_and_keeps_the_latest_edit() {
+        let mut history: History<TabIndex> = History::new().max_bytes(10);
+        history.start_grouping();
+        history.push(2.into());
+        history.push(3.into());
+        history.new_group();
+        history.push(7.into());
+        assert_eq!(history.undos().len(), 1);
+        assert_eq!(history.undo().unwrap()[0].tab_index, 7);
+        assert!(history.undo().is_none());
+        assert_eq!(history.redo().unwrap()[0].tab_index, 7);
+        history.clear_redo();
+        history.new_group();
+        history.push(12.into());
+        assert_eq!(history.undos().len(), 1);
+        assert_eq!(history.undo().unwrap()[0].tab_index, 12);
     }
 
     #[test]

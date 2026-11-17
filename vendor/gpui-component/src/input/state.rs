@@ -42,6 +42,8 @@ use crate::input::{InlineCompletion, RopeExt as _, Selection};
 use crate::{Root, history::History};
 use crate::{highlighter::DiagnosticSet, input::text_wrapper::LineItem};
 
+const UNDO_TEXT_BUDGET: usize = 32 * 1024 * 1024;
+
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
 #[action(namespace = input, no_json)]
 pub struct Enter {
@@ -416,10 +418,14 @@ impl InputState {
     }
 
     fn prepares_large_wrapped_layout(&self) -> bool {
+        self.defers_wrap_for(self.text.len())
+    }
+
+    fn defers_wrap_for(&self, bytes: usize) -> bool {
         self.defer_large_layout
             && self.mode.is_multi_line()
             && self.soft_wrap
-            && self.text.len() >= 512 * 1024
+            && bytes >= 512 * 1024
     }
 
     pub(super) fn prepare_layout(&mut self, config: LayoutConfig, cx: &mut Context<Self>) -> bool {
@@ -612,7 +618,9 @@ impl InputState {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle().tab_stop(true);
         let blink_cursor = cx.new(|_| BlinkCursor::new());
-        let history = History::new().group_interval(std::time::Duration::from_secs(1));
+        let history = History::new()
+            .group_interval(std::time::Duration::from_secs(1))
+            .max_bytes(UNDO_TEXT_BUDGET);
 
         let _subscriptions = vec![
             // Observe the blink cursor to repaint the view when it changes.
@@ -1777,6 +1785,18 @@ impl InputState {
             .push(Change::new(range.clone(), &old_text, new_range, new_text));
     }
 
+    fn release_retired_history_layout(&mut self) {
+        if let Some(layout) = &self.history_layout
+            && !self.history.undos().iter().chain(self.history.redos()).any(|change| {
+                [&change.old_text, &change.new_text].into_iter().any(|text| {
+                    matches!(text, HistoryText::Revision(revision) if layout.references_revision(&revision.text))
+                })
+            })
+        {
+            self.history_layout = None;
+        }
+    }
+
     pub(super) fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
         self.history.ignore = true;
         if let Some(changes) = self.history.undo() {
@@ -1814,7 +1834,9 @@ impl InputState {
                     && range.start == 0
                     && range.end == self.text.len()
                     && let Some(layout) = self.history_layout.take()
-                    && layout.matches_revision(&revision.text, &self.text_wrapper)
+                    && (layout.uses_same_layout(&self.text_wrapper)
+                        || self.defers_wrap_for(revision.text.len()))
+                    && layout.matches_revision(&revision.text)
                 {
                     self.install_revision(revision, None, layout, window, cx);
                 } else {
@@ -2330,7 +2352,6 @@ impl InputState {
         }
 
         self.value_cache.get_mut().take();
-        self.history_layout = None;
         if self.mode.is_single_line() {
             self.line_endings = super::text_metadata::LineEndings::new(&self.text.to_string());
         } else {
@@ -2351,6 +2372,7 @@ impl InputState {
         } else {
             self.push_history(&old_text, &range, &new_text);
         }
+        self.release_retired_history_layout();
         self.history.end_grouping();
         if let Some(diagnostics) = self.mode.diagnostics_mut() {
             diagnostics.reset(&self.text)
@@ -2420,6 +2442,7 @@ impl EntityInputHandler for InputState {
                     self.history
                         .push(Change::new(original.range, &original.text, marked, &text));
                     self.history.new_group();
+                    self.release_retired_history_layout();
                 }
                 self.update_search(cx);
                 cx.emit(InputEvent::Change);
@@ -2494,7 +2517,6 @@ impl EntityInputHandler for InputState {
         }
 
         self.value_cache.get_mut().take();
-        self.history_layout = None;
         if self.mode.is_single_line() {
             self.line_endings = super::text_metadata::LineEndings::new(&self.text.to_string());
         } else {
@@ -2853,6 +2875,13 @@ mod revision_tests {
                     assert_eq!(state.line_endings, LineEndings::new(after));
                     assert_eq!(state.text_wrapper.lines, expected.lines);
                     assert_eq!(state.cursor(), 0);
+                    assert!(state.history_layout.is_some());
+
+                    state.history.new_group();
+                    assert!(state.replace_text_checked(None, "x", window, cx));
+                    assert_eq!(state.value().as_str(), format!("x{after}"));
+                    state.undo(&Undo, window, cx);
+                    assert_eq!(state.value().as_str(), after);
                     assert!(state.history_layout.is_some());
 
                     state.undo(&Undo, window, cx);

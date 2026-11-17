@@ -370,8 +370,12 @@ impl TextWrapper {
             && self._initialized == prepared._initialized
     }
 
-    pub(super) fn matches_revision(&self, text: &Rope, layout: &Self) -> bool {
-        self.uses_same_layout(layout) && self.text == *text
+    pub(super) fn references_revision(&self, text: &Rope) -> bool {
+        ropey::extra::esoterica::ropes_are_instances(&self.text, text)
+    }
+
+    pub(super) fn matches_revision(&self, text: &Rope) -> bool {
+        self.references_revision(text) || self.text == *text
     }
 
     pub(super) fn retain_for_history(self) -> Option<Self> {
@@ -401,6 +405,16 @@ impl TextWrapper {
     pub(super) fn prepare_replacement(&mut self, text: &Rope, text_system: &Arc<TextSystem>) {
         self.set_default_text(text);
         self.update_with_text_system(text, &(0..text.len()), text, text_system);
+        for line in &mut self.lines {
+            if let Some(wraps) = &mut line.wraps
+                && wraps.ranges.capacity() >= 256
+            {
+                wraps.ranges.shrink_to_fit();
+            }
+        }
+        for checkpoints in self.checkpoints.values_mut() {
+            checkpoints.shrink_to_fit();
+        }
     }
 
     fn update_with_text_system(

@@ -19,6 +19,15 @@ pub(super) enum HistoryText {
     Revision(Revision),
 }
 
+impl HistoryText {
+    fn len(&self) -> usize {
+        match self {
+            Self::Fragment(text) => text.len(),
+            Self::Revision(revision) => revision.text.len(),
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Clone)]
 pub struct Change {
     pub(crate) old_range: Selection,
@@ -62,5 +71,9 @@ impl HistoryItem for Change {
 
     fn set_version(&mut self, version: usize) {
         self.version = version;
+    }
+
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.old_text.len() + self.new_text.len()
     }
 }
