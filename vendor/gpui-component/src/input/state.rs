@@ -1504,7 +1504,9 @@ impl InputState {
         let selected_text = self.text.slice(self.selected_range).to_string();
         cx.write_to_clipboard(ClipboardItem::new_string(selected_text));
 
+        self.history.new_group();
         self.replace_text_in_range_silent(None, "", window, cx);
+        self.history.new_group();
     }
 
     pub(super) fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
@@ -1514,7 +1516,9 @@ impl InputState {
                 new_text = new_text.replace('\n', "");
             }
 
+            self.history.new_group();
             self.replace_text_in_range_silent(None, &new_text, window, cx);
+            self.history.new_group();
             self.scroll_to(self.cursor(), None, cx);
         }
     }
@@ -2382,5 +2386,47 @@ mod refresh_tests {
         assert_eq!(refreshed_offset(9, &(4..9), 2), (6, false));
         assert_eq!(refreshed_offset(7, &(4..9), 2), (6, true));
         assert_eq!(refreshed_offset(9, &(4..4), 3), (12, false));
+    }
+}
+
+#[cfg(test)]
+mod clipboard_tests {
+    use super::*;
+
+    #[gpui::test]
+    fn cut_and_paste_are_separate_from_typing_and_each_other(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::init);
+        let cx = cx.add_empty_window();
+        cx.update(|window, cx| {
+            let editor = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .multi_line(true)
+                    .default_value("α\r\n")
+            });
+            editor.update(cx, |state, cx| {
+                state.history = History::new().group_interval(std::time::Duration::from_secs(60));
+                state.selected_range = (state.text.len()..state.text.len()).into();
+                state.replace_text_in_range_silent(None, "typed🙂", window, cx);
+                let typed = state.value();
+                state.select_all(&SelectAll, window, cx);
+                state.cut(&Cut, window, cx);
+                assert_eq!(state.value(), "");
+                assert_eq!(
+                    cx.read_from_clipboard().unwrap().text().unwrap(),
+                    typed.as_str()
+                );
+                state.paste(&Paste, window, cx);
+                assert_eq!(state.value(), typed);
+                state.replace_text_in_range_silent(None, "z", window, cx);
+                for expected in [typed.as_str(), "", typed.as_str(), "α\r\n"] {
+                    state.undo(&Undo, window, cx);
+                    assert_eq!(state.value(), expected);
+                }
+                for expected in [typed.as_str(), "", typed.as_str(), "α\r\ntyped🙂z"] {
+                    state.redo(&Redo, window, cx);
+                    assert_eq!(state.value(), expected);
+                }
+            });
+        });
     }
 }
