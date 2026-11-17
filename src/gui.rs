@@ -1030,7 +1030,7 @@ impl Shell {
                 .code_editor("text")
                 .line_number(self.settings.line_numbers)
                 .soft_wrap(self.settings.wrap)
-                .defer_large_initial_layout()
+                .defer_large_wrapped_layout()
                 .default_prepared_value(text);
             input.set_external_highlights(Vec::new(), cx);
             input.set_cursor_blink(false, cx);

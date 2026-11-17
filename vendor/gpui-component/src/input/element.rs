@@ -974,6 +974,7 @@ impl Element for TextElement {
         }
 
         let state = self.state.read(cx);
+        let wrap_width = state.text_wrapper.wrap_width();
         let line_height = window.line_height();
 
         let (visible_range, visible_top) =

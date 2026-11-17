@@ -284,9 +284,9 @@ pub struct InputState {
     accessibility_label: Option<SharedString>,
     accessibility_mapping: Rc<std::cell::RefCell<accessibility::Mapping>>,
     pub(super) text_wrapper: TextWrapper,
-    defer_initial_layout: bool,
-    requested_initial_layout: Option<LayoutConfig>,
-    initial_layout_task: Option<Task<()>>,
+    defer_large_layout: bool,
+    requested_layout: Option<LayoutConfig>,
+    layout_task: Option<Task<()>>,
     history_layout: Option<TextWrapper>,
     pub(super) history: History<Change>,
     pub(super) blink_cursor: Entity<BlinkCursor>,
@@ -406,22 +406,25 @@ impl PreparedReplacement {
 }
 
 impl InputState {
-    pub fn defer_large_initial_layout(mut self) -> Self {
-        self.defer_initial_layout = true;
+    pub fn defer_large_wrapped_layout(mut self) -> Self {
+        self.defer_large_layout = true;
         self
     }
 
     pub fn initial_layout_pending(&self) -> bool {
-        self.defer_initial_layout
+        self.prepares_large_wrapped_layout() && self.last_layout.is_none()
+    }
+
+    fn prepares_large_wrapped_layout(&self) -> bool {
+        self.defer_large_layout
             && self.mode.is_multi_line()
             && self.soft_wrap
             && self.text.len() >= 512 * 1024
-            && self.last_layout.is_none()
     }
 
     pub(super) fn prepare_layout(&mut self, config: LayoutConfig, cx: &mut Context<Self>) -> bool {
-        if !self.initial_layout_pending() || self.text_wrapper.matches_config(&config) {
-            self.requested_initial_layout = None;
+        if !self.prepares_large_wrapped_layout() || self.text_wrapper.matches_config(&config) {
+            self.requested_layout = None;
             self.text_wrapper.prepare(
                 &self.text,
                 config.font,
@@ -432,8 +435,11 @@ impl InputState {
             return true;
         }
 
-        self.requested_initial_layout = Some(config.clone());
-        if self.initial_layout_task.is_none() {
+        self.requested_layout = Some(config.clone());
+        if self.layout_task.is_none() {
+            let reflow = self.last_layout.is_some();
+            let old_offset = self.layout_scroll_offset();
+            let old_caret_visible = self.caret_visible(old_offset);
             let text = self.text.clone();
             let text_system = cx.text_system().clone();
             let executor = cx.background_executor().clone();
@@ -441,25 +447,69 @@ impl InputState {
                 let text = text.clone();
                 let config = config.clone();
                 async move {
-                    let _wrap = gpui::work_trace::Span::new("editor_wrap_worker");
-                    TextWrapper::prepare_initial_on_worker(config, text, text_system, executor)
-                        .await
+                    let _wrap = gpui::work_trace::Span::new(if reflow {
+                        "editor_reflow_worker"
+                    } else {
+                        "editor_wrap_worker"
+                    });
+                    TextWrapper::prepare_full_on_worker(config, text, text_system, executor).await
                 }
             });
-            self.initial_layout_task = Some(cx.spawn(async move |this, cx| {
+            self.layout_task = Some(cx.spawn(async move |this, cx| {
                 let layout = task.await;
                 _ = this.update(cx, |state, cx| {
-                    state.initial_layout_task.take();
-                    if state.requested_initial_layout.as_ref() == Some(&config)
+                    state.layout_task.take();
+                    if state.requested_layout.as_ref() == Some(&config)
                         && ropey::extra::esoterica::ropes_are_instances(&state.text, &text)
                     {
-                        state.text_wrapper = layout;
+                        let _install = gpui::work_trace::Span::new("editor_layout_install");
+                        let current = state.layout_scroll_offset();
+                        let keep_caret = state.caret_visible(current)
+                            || (old_caret_visible && current.y == old_offset.y);
+                        let offset = state.reflow_scroll_offset(&layout, current, keep_caret);
+                        let retired = std::mem::replace(&mut state.text_wrapper, layout);
+                        cx.background_spawn(async move { drop(retired) }).detach();
+                        state.deferred_scroll_offset = offset;
+                        state.mode.update_auto_grow(&state.text_wrapper);
                     }
                     cx.notify();
                 });
             }));
         }
-        false
+        self.last_layout.is_some()
+    }
+
+    fn layout_scroll_offset(&self) -> Point<Pixels> {
+        self.deferred_scroll_offset
+            .unwrap_or_else(|| self.scroll_handle.offset())
+    }
+
+    fn caret_visible(&self, scroll: Point<Pixels>) -> bool {
+        self.last_layout.as_ref().is_some_and(|last| {
+            let row = self.text_wrapper.offset_to_display_point(self.cursor()).row;
+            let top = row * last.line_height + scroll.y;
+            top >= px(0.) && top < self.input_bounds.size.height
+        })
+    }
+
+    fn reflow_scroll_offset(
+        &self,
+        layout: &TextWrapper,
+        current: Point<Pixels>,
+        keep_caret: bool,
+    ) -> Option<Point<Pixels>> {
+        let line_height = self.last_layout.as_ref()?.line_height;
+        let top = (f32::from(-current.y) / f32::from(line_height)).floor() as usize;
+        let (row, old_start) = self.text_wrapper.hard_row_at(top)?;
+        let byte = self.text_wrapper.line(row)?.range(top - old_start)?.start;
+        let new_top = layout.soft_row_start(row) + layout.line(row)?.row_at(byte);
+        let mut y = current.y + top * line_height - new_top * line_height;
+        if keep_caret {
+            let caret = layout.offset_to_display_point(self.cursor()).row * line_height;
+            let height = (self.input_bounds.size.height - line_height).max(px(0.));
+            y = y.max(-caret).min(height - caret);
+        }
+        Some(point(current.x, y))
     }
 
     fn can_install_revision(&self) -> bool {
@@ -596,9 +646,9 @@ impl InputState {
             value_cache: std::cell::RefCell::new(None),
             line_endings: Default::default(),
             text_wrapper: TextWrapper::new(text_style.font(), window.rem_size(), None),
-            defer_initial_layout: false,
-            requested_initial_layout: None,
-            initial_layout_task: None,
+            defer_large_layout: false,
+            requested_layout: None,
+            layout_task: None,
             history_layout: None,
             blink_cursor,
             history,
@@ -944,7 +994,7 @@ impl InputState {
     pub fn set_soft_wrap(&mut self, wrap: bool, _: &mut Window, cx: &mut Context<Self>) {
         debug_assert!(self.mode.is_multi_line());
         self.soft_wrap = wrap;
-        if self.defer_initial_layout && self.last_layout.is_none() {
+        if self.defer_large_layout && self.last_layout.is_none() {
             cx.notify();
             return;
         }
@@ -2093,6 +2143,9 @@ impl InputState {
     pub(super) fn set_input_bounds(&mut self, new_bounds: Bounds<Pixels>, cx: &mut Context<Self>) {
         let wrap_width_changed = self.input_bounds.size.width != new_bounds.size.width;
         self.input_bounds = new_bounds;
+        if self.prepares_large_wrapped_layout() {
+            return;
+        }
 
         // Update text_wrapper wrap_width if changed.
         if let Some(last_layout) = self.last_layout.as_ref() {
@@ -2653,7 +2706,7 @@ mod revision_tests {
             cx.new(|cx| {
                 InputState::new(window, cx)
                     .code_editor("text")
-                    .defer_large_initial_layout()
+                    .defer_large_wrapped_layout()
                     .default_value(before)
             })
         });
@@ -2687,10 +2740,80 @@ mod revision_tests {
                 assert!(state.prepare_layout(final_config.clone(), cx));
                 assert_eq!(state.value().as_str(), after);
                 assert_eq!(state.line_endings, LineEndings::new(&after));
-                let exact =
-                    TextWrapper::prepare_initial(final_config, &state.text, cx.text_system());
+                let exact = TextWrapper::prepare_full(final_config, &state.text, cx.text_system());
                 assert_eq!(state.text_wrapper.lines, exact.lines);
             });
+        });
+    }
+
+    #[gpui::test]
+    fn reflow_keeps_the_editor_live_and_preserves_its_top_row(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::init);
+        let cx = cx.add_empty_window();
+        let text = "La source contient du café 🦀 et un mot très long.\r\n".repeat(14_000);
+        let config = LayoutConfig {
+            font: gpui::font(".ZedMono"),
+            font_size: px(16.),
+            wrap_width: Some(px(320.)),
+        };
+        let newer = LayoutConfig {
+            wrap_width: Some(px(192.)),
+            ..config.clone()
+        };
+        let editor = cx.update(|window, cx| {
+            cx.new(|cx| {
+                InputState::new(window, cx)
+                    .code_editor("text")
+                    .defer_large_wrapped_layout()
+                    .default_value(text.clone())
+            })
+        });
+        cx.update(|window, cx| {
+            editor.update(cx, |state, cx| {
+                let row = 160;
+                let line_height = px(20.);
+                state.set_external_highlights(Vec::new(), cx);
+                state.text_wrapper =
+                    TextWrapper::prepare_full(config.clone(), &state.text, cx.text_system());
+                state.last_layout = Some(LastLayout {
+                    visible_range: row..row + 1,
+                    visible_top: state.text_wrapper.soft_row_start(row) * line_height,
+                    visible_range_offset: state.text.line_start_offset(row)
+                        ..state.text.line_end_offset(row),
+                    lines: Rc::new(Vec::new()),
+                    line_height,
+                    wrap_width: config.wrap_width,
+                    line_number_width: px(0.),
+                    cursor_bounds: None,
+                });
+                assert!(state.prepare_layout(newer.clone(), cx));
+                assert!(state.text_wrapper.matches_config(&config));
+                assert!(state.replace_text_checked(None, "✓", window, cx));
+                state.deferred_scroll_offset = Some(point(
+                    px(0.),
+                    -(state.text_wrapper.soft_row_start(row) * line_height) - px(2.),
+                ));
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            editor.update(cx, |state, cx| {
+                assert!(state.text_wrapper.matches_config(&config));
+                assert!(state.prepare_layout(newer.clone(), cx));
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            editor.update(cx, |state, cx| {
+                assert!(state.text_wrapper.matches_config(&newer));
+                assert_eq!(state.value().as_str(), format!("✓{text}"));
+                let exact = TextWrapper::prepare_full(newer, &state.text, cx.text_system());
+                assert_eq!(state.text_wrapper.lines, exact.lines);
+                assert_eq!(
+                    state.deferred_scroll_offset.unwrap().y,
+                    -(exact.soft_row_start(160) * px(20.)) - px(2.)
+                );
+            })
         });
     }
 

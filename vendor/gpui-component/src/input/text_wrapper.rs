@@ -254,7 +254,11 @@ impl TextWrapper {
             && self.wrap_width == config.wrap_width
     }
 
-    pub(super) fn prepare_initial(
+    pub(super) fn wrap_width(&self) -> Option<Pixels> {
+        self.wrap_width
+    }
+
+    pub(super) fn prepare_full(
         config: LayoutConfig,
         text: &Rope,
         text_system: &Arc<TextSystem>,
@@ -265,7 +269,7 @@ impl TextWrapper {
         layout
     }
 
-    pub(super) async fn prepare_initial_on_worker(
+    pub(super) async fn prepare_full_on_worker(
         config: LayoutConfig,
         text: Rope,
         text_system: Arc<TextSystem>,
@@ -277,7 +281,7 @@ impl TextWrapper {
             || text.len() < 2 * 1024 * 1024
             || rows > 8 * 1024 * 1024 / std::mem::size_of::<LineItem>()
         {
-            return Self::prepare_initial(config, &text, &text_system);
+            return Self::prepare_full(config, &text, &text_system);
         }
 
         let mut boundaries = vec![0];
@@ -288,7 +292,7 @@ impl TextWrapper {
             }
         }
         if boundaries.len() == 1 {
-            return Self::prepare_initial(config, &text, &text_system);
+            return Self::prepare_full(config, &text, &text_system);
         }
         boundaries.push(rows);
 
@@ -302,7 +306,7 @@ impl TextWrapper {
                 let config = config.clone();
                 let text_system = text_system.clone();
                 executor.spawn(async move {
-                    let mut layout = Self::prepare_initial(config, &part, &text_system);
+                    let mut layout = Self::prepare_full(config, &part, &text_system);
                     if end < rows {
                         layout.lines.pop();
                     }
@@ -1168,8 +1172,8 @@ mod tests {
             font_size: px(16.),
             wrap_width: Some(px(319.)),
         };
-        let exact = TextWrapper::prepare_initial(config.clone(), &text, &system);
-        let actual = executor.block_test(TextWrapper::prepare_initial_on_worker(
+        let exact = TextWrapper::prepare_full(config.clone(), &text, &system);
+        let actual = executor.block_test(TextWrapper::prepare_full_on_worker(
             config,
             text,
             system,
