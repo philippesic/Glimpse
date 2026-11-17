@@ -2708,6 +2708,7 @@ impl Shell {
                 }
             }
             "reading-retry" => self.reading_view = None,
+            "reading-notices" => self.reading_notices(window, cx),
             "keep-tab" => {
                 if let Some(doc) = self
                     .documents

@@ -62,6 +62,16 @@ impl Shell {
         };
         match result {
             Ok(prepared) => {
+                glimpse::metrics::event("reading-image-count", id, prepared.images.len() as u64);
+                glimpse::metrics::event(
+                    "reading-image-bytes",
+                    id,
+                    prepared
+                        .images
+                        .values()
+                        .map(|image| image.bgra.len() as u64)
+                        .sum(),
+                );
                 let base = view.path.clone();
                 view.resources = Arc::new(TextViewResources {
                     restrict_images: true,
@@ -106,6 +116,30 @@ impl Shell {
         }
         cx.notify();
     }
+    pub(super) fn reading_notices(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.reading_view.as_ref().filter(|view| {
+            self.documents.iter().any(|doc| {
+                Some(doc.id) == self.active
+                    && doc.id == view.id
+                    && doc.generation == view.generation
+                    && doc.disk.path == view.path
+            })
+        }) else {
+            return;
+        };
+        let notes = view.notes.clone();
+        if !notes.is_empty() {
+            self.ask_decision(
+                DecisionAction::Notice,
+                "Reading image notices".into(),
+                notes,
+                vec!["Close"],
+                window,
+                cx,
+            );
+        }
+    }
+
     pub(super) fn reading_element(
         &self,
         window: &mut Window,
@@ -133,18 +167,33 @@ impl Shell {
                 .into_any_element();
         }
         if !view.notes.is_empty() {
-            let notes = view.notes.clone();
+            let label = view.notes.clone();
             area = area.child(
                 div()
-                    .id("reading-notes")
+                    .flex()
+                    .items_center()
+                    .gap_2()
                     .w_full()
+                    .min_w_0()
                     .flex_shrink_0()
-                    .truncate()
-                    .text_sm()
-                    .child(notes.clone())
-                    .tooltip(move |window, cx| {
-                        gpui_component::tooltip::Tooltip::new(notes.clone()).build(window, cx)
-                    }),
+                    .child(
+                        div().flex_1().min_w_0().child(accessible(
+                            "reading-notices",
+                            div()
+                                .w_full()
+                                .truncate()
+                                .text_sm()
+                                .child("Images omitted or unavailable"),
+                            move |_, _, _| {
+                                let mut node =
+                                    gpui::accesskit::Node::new(gpui::accesskit::Role::Note);
+                                node.set_label(label.clone());
+                                AccessibilityInfo::new(node)
+                            },
+                        )),
+                    )
+                    .child(self.button("Image details…", "reading-notices", cx))
+                    .child(self.button("Reload images", "reading-retry", cx)),
             );
         }
         if let Some(source) = &view.source {

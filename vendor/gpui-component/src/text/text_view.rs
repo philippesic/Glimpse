@@ -751,9 +751,10 @@ impl Element for TextView {
                             "pageup" => state.list_state.scroll_by(-page),
                             "pagedown" | "space" => state.list_state.scroll_by(page),
                             "home" => state.list_state.scroll_to(gpui::ListOffset::default()),
-                            "end" => state.list_state.scroll_to_reveal_item(
-                                state.list_state.item_count().saturating_sub(1),
-                            ),
+                            "end" => state.list_state.scroll_to(gpui::ListOffset {
+                                item_ix: state.list_state.item_count(),
+                                offset_in_item: px(0.),
+                            }),
                             _ => return,
                         }
                         cx.stop_propagation();
