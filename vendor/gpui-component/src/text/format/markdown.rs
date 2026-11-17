@@ -135,10 +135,10 @@ impl Frame {
             end,
         });
         match self.kind {
-            Block::Paragraph | Block::Cell => node::Node::Paragraph(self.paragraph),
+            Block::Paragraph | Block::Cell => node::Node::Paragraph(self.paragraph.compact()),
             Block::Heading(level) => node::Node::Heading {
                 level,
-                children: self.paragraph,
+                children: self.paragraph.compact(),
             },
             Block::Code(lang) => {
                 node::Node::CodeBlock(CodeBlock::new(self.buffer.into(), lang, style, theme))
@@ -153,9 +153,12 @@ impl Frame {
             _ => {
                 self.finish_pending(marks, finder);
                 match self.kind {
-                    Block::Root => node::Node::Root {
-                        children: self.children.into(),
-                    },
+                    Block::Root => {
+                        self.children.shrink_to_fit();
+                        node::Node::Root {
+                            children: self.children.into(),
+                        }
+                    }
                     Block::Quote => node::Node::Blockquote {
                         children: self.children,
                     },
@@ -204,7 +207,7 @@ pub(crate) fn parse(
                         link: marks
                             .iter()
                             .rev()
-                            .find_map(|mark: &TextMark| mark.link.clone()),
+                            .find_map(|mark: &TextMark| mark.link.as_deref().cloned()),
                         ..Default::default()
                     },
                     alt: String::new(),
@@ -572,21 +575,20 @@ mod tests {
     #[ignore = "release parser CPU and memory probe; excludes native rendering and presentation"]
     fn benchmark_supported_markdown() {
         fn paragraph_storage(paragraph: &Paragraph) -> (usize, usize, usize) {
-            let bytes =
-                paragraph.children.capacity() * std::mem::size_of::<InlineNode>()
-                    + paragraph
-                        .children
-                        .iter()
-                        .map(|inline| {
-                            inline.text.len()
-                                + inline.marks.capacity()
-                                    * std::mem::size_of::<(std::ops::Range<usize>, TextMark)>()
-                                + std::mem::size_of::<
+            let bytes = paragraph.children.capacity() * std::mem::size_of::<InlineNode>()
+                + paragraph
+                    .children
+                    .iter()
+                    .map(|inline| {
+                        inline.text.len()
+                            + inline.marks.capacity()
+                                * std::mem::size_of::<(std::ops::Range<usize>, TextMark)>()
+                            + usize::from(inline.has_render_state())
+                                * (std::mem::size_of::<
                                     std::sync::Mutex<crate::text::inline::InlineState>,
-                                >()
-                                + 2 * std::mem::size_of::<usize>()
-                        })
-                        .sum::<usize>();
+                                >() + 2 * std::mem::size_of::<usize>())
+                    })
+                    .sum::<usize>();
             (
                 bytes,
                 paragraph.children.len(),

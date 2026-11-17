@@ -31,6 +31,7 @@ use gpui_component::{
     text::TextView,
 };
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
     path::PathBuf,
 };
@@ -91,7 +92,7 @@ struct Document {
     id: u64,
     disk: DiskFile,
     input: Entity<InputState>,
-    saved: SharedString,
+    verified_clean: RefCell<Option<SharedString>>,
     status_cursor: usize,
     generation: u64,
     preview: bool,
@@ -134,7 +135,41 @@ impl Document {
         )
     }
     fn dirty(&self, cx: &App) -> bool {
-        self.restored || self.input.read(cx).value().as_str() != self.saved.as_str()
+        if self.restored {
+            return true;
+        }
+        let value = self.input.read(cx).value();
+        let mut verified = self.verified_clean.borrow_mut();
+        if verified
+            .as_ref()
+            .is_some_and(|saved| std::ptr::eq(saved.as_str(), value.as_str()))
+        {
+            return false;
+        }
+        let clean = self.disk.content_bytes() == value.as_bytes();
+        *verified = clean.then_some(value);
+        !clean
+    }
+
+    fn set_disk(&mut self, disk: DiskFile) {
+        self.disk = disk;
+        self.verified_clean.get_mut().take();
+    }
+
+    fn grammar(&self, cx: &App) -> Option<&'static str> {
+        if self.restored {
+            return glimpse::syntax::grammar_extension(
+                &self.disk.path,
+                &self.input.read(cx).value(),
+            );
+        }
+        let content = self.disk.content_bytes();
+        let first_line = if content.starts_with(b"#!") {
+            String::from_utf8_lossy(&content[..content.len().min(256)])
+        } else {
+            "".into()
+        };
+        glimpse::syntax::grammar_extension(&self.disk.path, &first_line)
     }
 }
 #[derive(Clone, Copy, PartialEq)]
@@ -1059,7 +1094,7 @@ impl Shell {
             id,
             disk,
             input: input.clone(),
-            saved: text,
+            verified_clean: RefCell::default(),
             status_cursor: 0,
             generation: 0,
             preview,
@@ -1518,7 +1553,7 @@ impl Shell {
                         glimpse::closing::Outcome::Ignored => {}
                     }
                 }
-                Reply::Save(id, generation, text, result) => {
+                Reply::Save(id, generation, _, result) => {
                     glimpse::metrics::event("save-reply", id, generation);
                     let succeeded = result.is_ok();
                     if let Some(doc) = self.documents.iter_mut().find(|d| d.id == id) {
@@ -1533,8 +1568,7 @@ impl Shell {
                                 if !unrecovered {
                                     doc.recovery_error = None;
                                 }
-                                doc.disk = disk;
-                                doc.saved = text.into();
+                                doc.set_disk(disk);
                                 doc.restored = false;
                                 doc.external = None;
                                 doc.generation += 1;
@@ -1612,7 +1646,7 @@ impl Shell {
                                 doc.resolved_through =
                                     doc.resolved_through.max(destination.generation);
                                 doc.deferred_external = None;
-                                doc.disk = disk;
+                                doc.set_disk(disk);
                                 doc.input.update(cx, |input, cx| {
                                     input.set_accessibility_label(
                                         format!("Source: {}", paths::display(&doc.disk.path)),
@@ -1620,7 +1654,6 @@ impl Shell {
                                     )
                                 });
                                 doc.external = None;
-                                doc.saved = destination.text.into();
                                 doc.restored = false;
                                 doc.generation += 1;
                                 if doc.dirty(cx) {
@@ -1747,7 +1780,7 @@ impl Shell {
                             Ok((disk, _)) => {
                                 doc.deferred_external = None;
                                 doc.external = None;
-                                doc.disk = disk;
+                                doc.set_disk(disk);
                             }
                             Err(error) => {
                                 doc.error = Some(error.clone());
@@ -3624,16 +3657,11 @@ impl Render for Shell {
                     div()
                         .flex_1()
                         .min_h_0()
-                        .font_family(
-                            if self.settings.proportional
-                                && glimpse::syntax::grammar_extension(&doc.disk.path, &doc.saved)
-                                    .is_none()
-                            {
-                                cx.theme().font_family.clone()
-                            } else {
-                                cx.theme().mono_font_family.clone()
-                            },
-                        )
+                        .font_family(if self.settings.proportional && doc.grammar(cx).is_none() {
+                            cx.theme().font_family.clone()
+                        } else {
+                            cx.theme().mono_font_family.clone()
+                        })
                         .child(
                             Input::new(&doc.input)
                                 .text_size(px(self.settings.font_size * self.settings.ui_scale))

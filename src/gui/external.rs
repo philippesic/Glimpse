@@ -27,15 +27,14 @@ impl Shell {
             return;
         }
         let (disk, text) = doc.deferred_external.take().unwrap();
-        let (old_range, new_range) = glimpse::editor::difference(&doc.saved, &text);
+        let (old_range, new_range) = glimpse::editor::difference(&input.value(), &text);
         let outcome = doc.input.update(cx, |input, cx| {
             input.replace_text_preserving_selection(old_range, &text[new_range], window, cx)
         });
         if let Some(relocated) = outcome {
             glimpse::metrics::event("external-applied", id, doc.generation);
             doc.passive_refresh = true;
-            doc.saved = text.into();
-            doc.disk = disk;
+            doc.set_disk(disk);
             doc.external = None;
             self.status = if relocated {
                 "Reloaded external change; selection moved from changed text. Undo is available."

@@ -61,6 +61,16 @@ fn read_cancellable(path: &Path, cancelled: &dyn Fn() -> bool) -> Result<(Vec<u8
 }
 
 impl DiskFile {
+    pub fn content_bytes(&self) -> &[u8] {
+        if self.bom {
+            self.bytes
+                .strip_prefix(&[0xef, 0xbb, 0xbf])
+                .unwrap_or(&self.bytes)
+        } else {
+            &self.bytes
+        }
+    }
+
     pub fn draft() -> Self {
         Self {
             path: PathBuf::from("Untitled"),

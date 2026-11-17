@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     ops::Range,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use gpui::{
@@ -41,7 +41,7 @@ pub struct TextMark {
     pub italic: bool,
     pub strikethrough: bool,
     pub code: bool,
-    pub link: Option<LinkMark>,
+    pub link: Option<Arc<LinkMark>>,
 }
 
 impl TextMark {
@@ -66,7 +66,7 @@ impl TextMark {
     }
 
     pub fn link(mut self, link: impl Into<LinkMark>) -> Self {
-        self.link = Some(link.into());
+        self.link = Some(Arc::new(link.into()));
         self
     }
 }
@@ -122,7 +122,7 @@ pub(crate) struct InlineNode {
     /// The text styles, each tuple contains the range of the text and the style.
     pub(crate) marks: Vec<(Range<usize>, TextMark)>,
 
-    state: Arc<Mutex<InlineState>>,
+    state: OnceLock<Arc<Mutex<InlineState>>>,
 }
 
 impl PartialEq for InlineNode {
@@ -137,7 +137,7 @@ impl InlineNode {
             text: text.into(),
             image: None,
             marks: vec![],
-            state: Arc::new(Mutex::new(InlineState::default())),
+            state: OnceLock::new(),
         }
     }
 
@@ -147,9 +147,15 @@ impl InlineNode {
         this
     }
 
-    pub(crate) fn marks(mut self, marks: Vec<(Range<usize>, TextMark)>) -> Self {
+    pub(crate) fn marks(mut self, mut marks: Vec<(Range<usize>, TextMark)>) -> Self {
+        marks.shrink_to_fit();
         self.marks = marks;
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_render_state(&self) -> bool {
+        self.state.get().is_some()
     }
 }
 
@@ -161,19 +167,12 @@ impl InlineNode {
 pub(crate) struct Paragraph {
     pub(super) span: Option<Span>,
     pub(super) children: Vec<InlineNode>,
-    /// The link references in this paragraph, used for reference links.
-    ///
-    /// The key is the identifier, the value is the url.
-    pub(super) link_refs: HashMap<SharedString, SharedString>,
-
-    pub(crate) state: Arc<Mutex<InlineState>>,
+    pub(super) state: OnceLock<Arc<Mutex<InlineState>>>,
 }
 
 impl PartialEq for Paragraph {
     fn eq(&self, other: &Self) -> bool {
-        self.span == other.span
-            && self.children == other.children
-            && self.link_refs == other.link_refs
+        self.span == other.span && self.children == other.children
     }
 }
 
@@ -182,26 +181,23 @@ impl Paragraph {
         Self {
             span: None,
             children: vec![InlineNode::new(&text)],
-            link_refs: HashMap::new(),
-            state: Arc::new(Mutex::new(InlineState::default())),
+            state: OnceLock::new(),
         }
     }
 
     pub(super) fn selected_text(&self) -> String {
         let mut text = String::new();
 
-        for c in self.children.iter() {
-            let state = c.state.lock().unwrap();
+        for state in self
+            .children
+            .iter()
+            .filter_map(|child| child.state.get())
+            .chain(self.state.get())
+        {
+            let state = state.lock().unwrap();
             if let Some(selection) = &state.selection {
-                let part_text = state.text.clone();
-                text.push_str(&part_text[selection.start..selection.end]);
+                text.push_str(&state.text[selection.start..selection.end]);
             }
-        }
-
-        let state = self.state.lock().unwrap();
-        if let Some(selection) = &state.selection {
-            let all_text = state.text.clone();
-            text.push_str(&all_text[selection.start..selection.end]);
         }
 
         text
@@ -252,15 +248,12 @@ pub(crate) struct TableCell {
 
 impl Paragraph {
     pub(crate) fn take(&mut self) -> Paragraph {
-        std::mem::replace(
-            self,
-            Paragraph {
-                span: None,
-                children: vec![],
-                link_refs: Default::default(),
-                state: Arc::new(Mutex::new(InlineState::default())),
-            },
-        )
+        std::mem::take(self).compact()
+    }
+
+    pub(crate) fn compact(mut self) -> Self {
+        self.children.shrink_to_fit();
+        self
     }
 
     pub(crate) fn is_image(&self) -> bool {
@@ -584,15 +577,12 @@ impl Paragraph {
 
             if let Some(image) = &inline_node.image {
                 if text.len() > 0 {
-                    inline_node
-                        .state
-                        .lock()
-                        .unwrap()
-                        .set_text(text.clone().into());
+                    let state = inline_node.state.get_or_init(Arc::default);
+                    state.lock().unwrap().set_text(text.clone().into());
                     child_nodes.push(
                         Inline::new(
                             ix,
-                            inline_node.state.clone(),
+                            state.clone(),
                             links.clone(),
                             highlights.clone(),
                             node_cx.resources.on_link.clone(),
@@ -688,7 +678,7 @@ impl Paragraph {
                         highlight.background_color = Some(cx.theme().accent);
                     }
 
-                    if let Some(mut link_mark) = style.link.clone() {
+                    if let Some(mut link_mark) = style.link.as_deref().cloned() {
                         highlight.color = Some(cx.theme().link);
                         highlight.underline = Some(gpui::UnderlineStyle {
                             thickness: gpui::px(1.),
@@ -716,11 +706,12 @@ impl Paragraph {
 
         // Add the last text node
         if text.len() > 0 {
-            self.state.lock().unwrap().set_text(text.into());
+            let state = self.state.get_or_init(Arc::default);
+            state.lock().unwrap().set_text(text.into());
             child_nodes.push(
                 Inline::new(
                     ix,
-                    self.state.clone(),
+                    state.clone(),
                     links,
                     highlights,
                     node_cx.resources.on_link.clone(),
