@@ -6,6 +6,7 @@
 *.profraw
 *.profdata
 *.rs.bk
+__pycache__/
 
 # Private working material and disposable checkouts
 /.local/
