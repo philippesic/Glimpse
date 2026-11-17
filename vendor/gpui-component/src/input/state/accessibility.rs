@@ -50,6 +50,13 @@ impl Mapping {
     }
 }
 impl InputState {
+    pub fn release_accessibility_cache(&mut self) {
+        let mut mapping = self.accessibility_mapping.borrow_mut();
+        if !mapping.nodes.is_empty() {
+            *mapping = Mapping::default();
+        }
+    }
+
     pub(super) fn accessibility_info(
         &self,
         id: &gpui::GlobalElementId,

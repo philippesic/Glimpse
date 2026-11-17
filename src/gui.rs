@@ -3006,6 +3006,13 @@ impl Render for Shell {
             }));
         }
         let narrow = self.narrow(window);
+        let source_visible = !self.reading && (!narrow || !self.navigation_only);
+        for doc in &self.documents {
+            if !source_visible || Some(doc.id) != self.active {
+                doc.input
+                    .update(cx, |input, _| input.release_accessibility_cache());
+            }
+        }
         let mut toolbar = div()
             .flex()
             .flex_wrap()
