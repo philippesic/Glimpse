@@ -1,0 +1,34 @@
+[package]
+edition = "2024"
+rust-version = "1.87"
+name = "accesskit_consumer"
+version = "0.39.2"
+authors = ["The AccessKit contributors"]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "AccessKit consumer library (internal)"
+readme = "README.md"
+keywords = [
+    "gui",
+    "ui",
+    "accessibility",
+]
+categories = ["gui"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/AccessKit/accesskit"
+
+[lib]
+name = "accesskit_consumer"
+path = "src/lib.rs"
+
+[dependencies.accesskit]
+version = "0.25.2"
+
+[dependencies.hashbrown]
+version = "0.17"
+features = ["default-hasher"]
+default-features = false

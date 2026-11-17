@@ -1,5 +1,5 @@
 [workspace]
-members = ["vendor/gpui-component", "vendor/accesskit"]
+members = ["vendor/gpui-component", "vendor/accesskit", "vendor/accesskit_atspi_common", "vendor/accesskit_consumer"]
 default-members = ["."]
 exclude = ["vendor/gpui"]
 resolver = "3"
@@ -48,6 +48,8 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 
 [patch.crates-io]
 accesskit = { path = "vendor/accesskit" }
+accesskit_atspi_common = { path = "vendor/accesskit_atspi_common" }
+accesskit_consumer = { path = "vendor/accesskit_consumer" }
 gpui = { path = "vendor/gpui" }
 xattr = { path = "vendor/xattr" }
 gpui-component = { path = "vendor/gpui-component" }
