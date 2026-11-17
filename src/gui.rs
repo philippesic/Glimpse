@@ -110,6 +110,17 @@ struct Document {
     _subscriptions: Vec<Subscription>,
 }
 impl Document {
+    fn watched_paths(&self) -> impl Iterator<Item = &PathBuf> {
+        [
+            Some(&self.disk),
+            self.external.as_ref().map(|(disk, _)| disk),
+            self.deferred_external.as_ref().map(|(disk, _)| disk),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|disk| !disk.target.as_os_str().is_empty())
+        .flat_map(|disk| [&disk.path, &disk.target])
+    }
     fn information(&self, cx: &App, reading: bool) -> String {
         let input = self.input.read(cx);
         let position = input.cursor_position();
@@ -720,24 +731,23 @@ impl Shell {
     }
 
     fn watch(&mut self) {
-        let mut parents = std::collections::HashSet::from([self.current.clone()]);
-        for doc in &self.documents {
-            for disk in [
-                Some(&doc.disk),
-                doc.external.as_ref().map(|(disk, _)| disk),
-                doc.deferred_external.as_ref().map(|(disk, _)| disk),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                for path in [&disk.path, &disk.target] {
-                    if let Some(parent) = path.parent() {
-                        parents.insert(parent.to_owned());
-                    }
-                }
-            }
+        let paths = self
+            .documents
+            .iter()
+            .flat_map(Document::watched_paths)
+            .cloned()
+            .collect();
+        self.observer.update(self.current.clone(), paths);
+    }
+    fn warn(&mut self, error: String) {
+        if self.warnings.contains(&error) {
+            return;
         }
-        self.observer.update(parents);
+        if self.warnings.len() == 32 {
+            self.warnings.remove(0);
+            self.omitted_warnings = self.omitted_warnings.saturating_add(1);
+        }
+        self.warnings.push(error);
     }
     fn check_document(&mut self, id: u64) {
         if self
@@ -1441,6 +1451,7 @@ impl Shell {
                             if !self.keep_after_cleanup.remove(&id) {
                                 self.documents.retain(|d| d.id != id);
                                 self.checks.invalidate(id);
+                                self.watch();
                                 if self.active == Some(id) {
                                     self.active = self.documents.last().map(|d| d.id);
                                 }
@@ -1963,13 +1974,7 @@ impl Shell {
                     }
                 }
                 Reply::Done(Err(error)) => self.status = error,
-                Reply::HistoryWarning(error) if !self.warnings.contains(&error) => {
-                    if self.warnings.len() == 32 {
-                        self.warnings.remove(0);
-                        self.omitted_warnings = self.omitted_warnings.saturating_add(1);
-                    }
-                    self.warnings.push(error);
-                }
+                Reply::HistoryWarning(error) => self.warn(error),
                 Reply::Changed(result) => match result {
                     Ok(()) => {
                         self.refresh();
@@ -2023,18 +2028,27 @@ impl Shell {
                 }
             }
         }
-        if let Some(result) = self.observer.changed() {
-            match result {
-                Ok(()) => {
-                    let ids: Vec<_> = self.documents.iter().map(|doc| doc.id).collect();
-                    for id in ids {
-                        self.check_document(id);
-                    }
-                    if !self.listing_paused {
-                        self.refresh();
-                    }
-                }
-                Err(e) => self.status = e,
+        if let Some(change) = self.observer.changed() {
+            let refresh = change.listing_changed(&self.current);
+            let ids: Vec<_> = self
+                .documents
+                .iter()
+                .filter(|doc| doc.watched_paths().any(|path| change.affects(path)))
+                .map(|doc| doc.id)
+                .collect();
+            if std::env::var_os("GLIMPSE_NATIVE_TRACE").is_some() && (refresh || !ids.is_empty()) {
+                eprintln!("WATCH_EVENT {} {refresh}", ids.len());
+            }
+            if let Some(error) = change.error {
+                self.warn(format!(
+                    "File monitoring unavailable: {error}. Use Refresh Folder to retry monitoring."
+                ));
+            }
+            for id in ids {
+                self.check_document(id);
+            }
+            if refresh && !self.listing_paused {
+                self.refresh();
             }
         }
         if let Some(highlight) = self.syntax.take()
@@ -2525,7 +2539,7 @@ impl Shell {
                 }
                 self.ask_decision(
                     DecisionAction::Warnings,
-                    "Recovery warning".into(),
+                    "Warnings".into(),
                     detail,
                     vec!["Close", "Open Recovery", "Acknowledge"],
                     window,
@@ -2625,7 +2639,10 @@ impl Shell {
                     self.change_location(path);
                 }
             }
-            "refresh" => self.refresh(),
+            "refresh" => {
+                self.observer.rearm();
+                self.refresh();
+            }
             "stop-listing" => {
                 self.listing_paused = true;
                 self.directories.retain(&[]);
@@ -3466,7 +3483,7 @@ impl Render for Shell {
                         footer.flex_col().items_start().justify_center().gap_0()
                     })
                     .when(!self.warnings.is_empty(), |footer| {
-                        footer.child(self.button("Recovery Warning…", "warnings", cx))
+                        footer.child(self.button("Warnings…", "warnings", cx))
                     })
                     .when(self.warnings.is_empty(), |footer| {
                         let message = match &self.font_warning {

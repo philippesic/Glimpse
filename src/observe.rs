@@ -1,112 +1,235 @@
+mod changes;
+pub use changes::Changes;
+
 use notify::{RecursiveMode, Watcher};
 use std::{
     collections::HashSet,
     path::PathBuf,
-    sync::{Arc, Mutex, mpsc},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
 };
+
+#[derive(Clone, Default, PartialEq, Eq)]
+struct Watches {
+    directory: PathBuf,
+    documents: HashSet<PathBuf>,
+}
+impl Watches {
+    fn resolve(&self) -> Resolved {
+        let observed_directory =
+            std::fs::canonicalize(&self.directory).unwrap_or_else(|_| self.directory.clone());
+        let mut parents = HashSet::from([observed_directory.clone()]);
+        let mut directories =
+            std::collections::HashMap::from([(self.directory.clone(), observed_directory.clone())]);
+        let documents = self
+            .documents
+            .iter()
+            .map(|path| {
+                let observed = if let (Some(parent), Some(name)) = (path.parent(), path.file_name())
+                {
+                    let parent = directories.entry(parent.to_owned()).or_insert_with(|| {
+                        std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_owned())
+                    });
+                    parents.insert(parent.clone());
+                    parent.join(name)
+                } else {
+                    path.clone()
+                };
+                (observed, path.clone())
+            })
+            .collect();
+        Resolved {
+            directory: self.directory.clone(),
+            observed_directory,
+            documents,
+            parents,
+        }
+    }
+}
+#[derive(Default)]
+struct Resolved {
+    directory: PathBuf,
+    observed_directory: PathBuf,
+    documents: Vec<(PathBuf, PathBuf)>,
+    parents: HashSet<PathBuf>,
+}
 pub struct Observer {
-    paths: HashSet<PathBuf>,
-    latest: Arc<Mutex<HashSet<PathBuf>>>,
+    watches: Watches,
+    latest: Arc<Mutex<Watches>>,
+    force: Arc<AtomicBool>,
     jobs: mpsc::SyncSender<()>,
-    changes: mpsc::Receiver<Result<(), String>>,
+    changes: Arc<Mutex<Changes>>,
 }
 impl Observer {
     pub fn new(ctx: crate::wake::Context) -> Self {
         let (jobs, requests) = mpsc::sync_channel(1);
-        let (tx, changes) = mpsc::sync_channel(8);
-        let latest = Arc::new(Mutex::new(HashSet::<PathBuf>::new()));
-        let pending = latest.clone();
+        let latest = Arc::new(Mutex::new(Watches::default()));
+        let changes = Arc::new(Mutex::new(Changes::default()));
+        let force = Arc::new(AtomicBool::new(false));
+        let (requested, pending, forced) = (latest.clone(), changes.clone(), force.clone());
         thread::spawn(move || {
-            let events = tx.clone();
-            let repaint = ctx.clone();
-            let mut watcher =
+            let observed = Arc::new(Mutex::new(Resolved::default()));
+            let make = || {
+                let (events, interests, repaint) = (pending.clone(), observed.clone(), ctx.clone());
                 notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-                    if event.as_ref().is_ok_and(|event| {
-                        matches!(
-                            event.kind,
-                            notify::EventKind::Access(_) | notify::EventKind::Other
-                        )
-                    }) {
+                    let mut change = Changes::default();
+                    if !change.record(event) {
                         return;
                     }
-                    if std::env::var_os("GLIMPSE_NATIVE_TRACE").is_some() {
-                        eprintln!("WATCH_EVENT {:?}", event.as_ref().map(|event| &event.kind));
-                    }
-                    if events
-                        .try_send(event.map(|_| ()).map_err(|e| e.to_string()))
-                        .is_ok()
-                    {
-                        repaint.request_repaint();
-                    }
-                });
-            let mut paths = HashSet::new();
+                    let mapped = {
+                        let current = interests.lock().unwrap();
+                        change.mapped(
+                            &current.observed_directory,
+                            &current.directory,
+                            &current.documents,
+                        )
+                    };
+                    let Some(change) = mapped else {
+                        return;
+                    };
+                    events.lock().unwrap().merge(change);
+                    repaint.request_repaint();
+                })
+            };
+            let mut watcher = make();
+            let mut paths = HashSet::<PathBuf>::new();
             while requests.recv().is_ok() {
-                let next = pending.lock().unwrap().clone();
-                let result = (|| {
-                    let watcher = watcher.as_mut().map_err(|e| e.to_string())?;
-                    for path in paths.difference(&next) {
-                        let _ = watcher.unwatch(path);
-                    }
-                    for path in next.difference(&paths) {
-                        watcher
-                            .watch(path, RecursiveMode::NonRecursive)
-                            .map_err(|e| e.to_string())?;
-                    }
-                    Ok(())
-                })();
-                paths = next;
-                if result.is_err() {
-                    let _ = tx.try_send(result);
-                    ctx.request_repaint();
+                let request = requested.lock().unwrap().clone();
+                let resolved = request.resolve();
+                let parents = resolved.parents.clone();
+                *observed.lock().unwrap() = resolved;
+                let mut error = None;
+                if watcher.is_err() {
+                    watcher = make();
                 }
+                match watcher.as_mut() {
+                    Ok(watcher) => {
+                        let force = forced.swap(false, Ordering::AcqRel);
+                        let removed: Vec<_> = paths
+                            .iter()
+                            .filter(|path| force || !parents.contains(*path))
+                            .cloned()
+                            .collect();
+                        for path in removed {
+                            let _ = watcher.unwatch(&path);
+                            paths.remove(&path);
+                        }
+                        let added: Vec<_> = parents.difference(&paths).cloned().collect();
+                        for path in added {
+                            match watcher.watch(&path, RecursiveMode::NonRecursive) {
+                                Ok(()) => {
+                                    paths.insert(path);
+                                }
+                                Err(failure) => {
+                                    error.get_or_insert_with(|| {
+                                        format!("{}: {failure}", crate::paths::display(&path))
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    Err(failure) => {
+                        error = Some(failure.to_string());
+                    }
+                }
+                pending.lock().unwrap().registered(error);
+                ctx.request_repaint();
             }
         });
         Self {
-            paths: HashSet::new(),
+            watches: Watches::default(),
             latest,
+            force,
             jobs,
             changes,
         }
     }
-    pub fn update(&mut self, parents: HashSet<PathBuf>) {
-        if self.paths != parents {
-            self.paths = parents.clone();
-            *self.latest.lock().unwrap() = parents;
+    pub fn update(&mut self, directory: PathBuf, documents: HashSet<PathBuf>) {
+        let next = Watches {
+            directory,
+            documents,
+        };
+        if self.watches != next {
+            self.watches = next.clone();
+            *self.latest.lock().unwrap() = next;
             let _ = self.jobs.try_send(());
         }
     }
-    pub fn changed(&self) -> Option<Result<(), String>> {
-        let mut result = None;
-        while let Ok(change) = self.changes.try_recv() {
-            if result
-                .as_ref()
-                .is_none_or(|value: &Result<(), String>| value.is_ok())
-            {
-                result = Some(change);
-            }
-        }
-        result
+    pub fn rearm(&self) {
+        self.force.store(true, Ordering::Release);
+        let _ = self.jobs.try_send(());
+    }
+    pub fn changed(&self) -> Option<Changes> {
+        let mut changes = self.changes.lock().unwrap();
+        (!changes.empty()).then(|| std::mem::take(&mut *changes))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn directory_aliases_share_one_watch_and_keep_logical_path_events() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        let alias = root.path().join("alias");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let resolved = Watches {
+            directory: alias.clone(),
+            documents: HashSet::from([alias.join("source.txt"), real.join("source.txt")]),
+        }
+        .resolve();
+        assert_eq!(resolved.parents, HashSet::from([real.clone()]));
+        assert_eq!(resolved.observed_directory, real);
+        let mut created = Changes::default();
+        created.record(Ok(notify::Event::new(notify::EventKind::Create(
+            notify::event::CreateKind::File,
+        ))
+        .add_path(real.join("new.txt"))));
+        assert!(
+            created
+                .mapped(
+                    &resolved.observed_directory,
+                    &resolved.directory,
+                    &resolved.documents
+                )
+                .unwrap()
+                .listing_changed(&alias)
+        );
+        let mut edited = Changes::default();
+        edited.record(Ok(notify::Event::new(notify::EventKind::Modify(
+            notify::event::ModifyKind::Data(notify::event::DataChange::Any),
+        ))
+        .add_path(real.join("source.txt"))));
+        let mapped = edited
+            .mapped(
+                &resolved.observed_directory,
+                &resolved.directory,
+                &resolved.documents,
+            )
+            .unwrap();
+        assert!(mapped.affects(&alias.join("source.txt")));
+        assert!(mapped.affects(&real.join("source.txt")));
+    }
     #[test]
     fn queued_notifications_coalesce_without_losing_errors() {
-        let (jobs, _) = mpsc::sync_channel(1);
-        let (events, changes) = mpsc::sync_channel(8);
-        let observer = Observer {
-            paths: HashSet::new(),
-            latest: Arc::new(Mutex::new(HashSet::new())),
-            jobs,
-            changes,
-        };
-        for change in [Ok(()), Err("watch unavailable".into()), Ok(())] {
-            events.send(change).unwrap();
+        let observer = Observer::new(crate::wake::Context::default());
+        {
+            let mut changes = observer.changes.lock().unwrap();
+            changes.registered(None);
+            changes.registered(Some("watch unavailable".into()));
+            changes.registered(None);
         }
-        assert_eq!(observer.changed(), Some(Err("watch unavailable".into())));
+        assert_eq!(
+            observer.changed().unwrap().error.as_deref(),
+            Some("watch unavailable")
+        );
         assert!(observer.changed().is_none());
     }
 }

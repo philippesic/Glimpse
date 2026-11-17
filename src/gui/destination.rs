@@ -147,6 +147,7 @@ impl Shell {
                 return;
             }
             FailureAction::Check => {
+                self.observer.rearm();
                 self.check_document(doc.id);
                 return;
             }
