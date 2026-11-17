@@ -275,6 +275,7 @@ pub struct InputState {
     value_cache: std::cell::RefCell<Option<SharedString>>,
     line_endings: super::text_metadata::LineEndings,
     accessibility_label: Option<SharedString>,
+    accessibility_mapping: Rc<std::cell::RefCell<accessibility::Mapping>>,
     pub(super) text_wrapper: TextWrapper,
     pub(super) history: History<Change>,
     pub(super) blink_cursor: Entity<BlinkCursor>,
@@ -402,6 +403,9 @@ impl InputState {
 
         Self {
             accessibility_label: None,
+            accessibility_mapping: Rc::new(std::cell::RefCell::new(
+                accessibility::Mapping::default(),
+            )),
             external_highlights: None,
             focus_handle: focus_handle.clone(),
             text: "".into(),
@@ -2330,7 +2334,7 @@ impl Render for InputState {
 
         let input = cx.entity();
         let action_input = input.clone();
-        let mapping = Rc::new(std::cell::RefCell::new(accessibility::Mapping::default()));
+        let mapping = self.accessibility_mapping.clone();
         let action_mapping = mapping.clone();
         let rendered = div()
             .id("input-state")

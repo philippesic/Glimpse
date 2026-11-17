@@ -9,6 +9,7 @@ use gpui::accesskit::{
 pub(super) struct Mapping {
     text: SharedString,
     runs: Vec<Run>,
+    nodes: std::sync::Arc<[(NodeId, Node)]>,
 }
 struct Run {
     id: NodeId,
@@ -66,19 +67,47 @@ impl InputState {
             info.focused = self.focus_handle.is_focused(window);
             return info;
         }
-        let segments = segments(&text);
-        let ids: Vec<_> = (0..segments.len())
-            .map(|index| window.accessibility_child_id(id, ("text-run", index)))
-            .collect();
-        mapping.text = text.clone();
-        mapping.runs = segments
-            .iter()
-            .enumerate()
-            .map(|(index, segment)| Run {
-                id: ids[index],
-                boundaries: segment.boundaries.clone(),
-            })
-            .collect();
+        let first = window.accessibility_child_id(id, ("text-run", 0usize));
+        if mapping.nodes.first().map(|(id, _)| *id) != Some(first)
+            || mapping.text.as_ptr() != text.as_ptr()
+            || mapping.text.len() != text.len()
+        {
+            let segments = segments(&text);
+            let ids: Vec<_> = (0..segments.len())
+                .map(|index| window.accessibility_child_id(id, ("text-run", index)))
+                .collect();
+            let mut nodes = Vec::with_capacity(segments.len());
+            for (index, segment) in segments.iter().enumerate() {
+                let mut run = Node::new(Role::TextRun);
+                run.set_value(text[segment.range.clone()].to_owned());
+                run.set_character_lengths(
+                    segment
+                        .boundaries
+                        .windows(2)
+                        .map(|pair| (pair[1] - pair[0]) as u8)
+                        .collect::<Vec<_>>(),
+                );
+                run.set_word_starts(segment.words.clone());
+                run.set_text_direction(TextDirection::LeftToRight);
+                if index > 0 && segments[index - 1].line == segment.line {
+                    run.set_previous_on_line(ids[index - 1]);
+                }
+                if index + 1 < ids.len() && segments[index + 1].line == segment.line {
+                    run.set_next_on_line(ids[index + 1]);
+                }
+                nodes.push((ids[index], run));
+            }
+            mapping.runs = segments
+                .into_iter()
+                .enumerate()
+                .map(|(index, segment)| Run {
+                    id: ids[index],
+                    boundaries: segment.boundaries,
+                })
+                .collect();
+            mapping.nodes = nodes.into();
+            mapping.text = text.clone();
+        }
         let mut node = Node::new(if self.mode.is_multi_line() {
             Role::MultilineTextInput
         } else {
@@ -98,7 +127,7 @@ impl InputState {
         }
         node.add_action(Action::Focus);
         node.add_action(Action::SetTextSelection);
-        node.set_children(ids.clone());
+        node.set_children(mapping.nodes.iter().map(|(id, _)| *id).collect::<Vec<_>>());
         let start = mapping.position(self.selected_range.start);
         let end = mapping.position(self.selected_range.end);
         node.set_text_selection(if self.selection_reversed {
@@ -113,26 +142,7 @@ impl InputState {
             }
         });
         let mut info = gpui::AccessibilityInfo::new(node);
-        for (index, segment) in segments.iter().enumerate() {
-            let mut run = Node::new(Role::TextRun);
-            run.set_value(text[segment.range.clone()].to_owned());
-            run.set_character_lengths(
-                segment
-                    .boundaries
-                    .windows(2)
-                    .map(|pair| (pair[1] - pair[0]) as u8)
-                    .collect::<Vec<_>>(),
-            );
-            run.set_word_starts(segment.words.clone());
-            run.set_text_direction(TextDirection::LeftToRight);
-            if index > 0 && segments[index - 1].line == segment.line {
-                run.set_previous_on_line(ids[index - 1]);
-            }
-            if index + 1 < ids.len() && segments[index + 1].line == segment.line {
-                run.set_next_on_line(ids[index + 1]);
-            }
-            info.text.push((ids[index], run));
-        }
+        info.text = mapping.nodes.clone();
         info.focused = self.focus_handle.is_focused(window);
         info
     }

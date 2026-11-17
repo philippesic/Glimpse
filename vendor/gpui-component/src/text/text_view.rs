@@ -274,6 +274,7 @@ pub(crate) struct TextViewState {
     parsed_result: Option<Result<ParsedContent, SharedString>>,
     resources: Arc<super::TextViewResources>,
     focus_handle: Option<FocusHandle>,
+    focus_after_parse: bool,
     /// The bounds of the text view
     bounds: Bounds<Pixels>,
     /// The local (in TextView) position of the selection.
@@ -293,6 +294,7 @@ impl TextViewState {
             parsed_result: None,
             resources: Arc::default(),
             focus_handle: Some(focus_handle),
+            focus_after_parse: false,
             bounds: Bounds::default(),
             selection_positions: (None, None),
             is_selecting: false,
@@ -691,6 +693,28 @@ impl Element for TextView {
 
             self.init_state = Some(InitState::Initialized { tx });
         }
+
+        self.state.update(cx, |state, _| {
+            if state.parsed_result.is_none()
+                && state
+                    .focus_handle
+                    .as_ref()
+                    .is_some_and(|focus| focus.is_focused(window))
+            {
+                state.focus_after_parse = true;
+                window.blur();
+            }
+            if state.parsed_result.is_some() && std::mem::take(&mut state.focus_after_parse) {
+                let focus = state.focus_handle.clone();
+                window.on_next_frame(move |window, cx| {
+                    if window.focused(cx).is_none()
+                        && let Some(focus) = focus
+                    {
+                        focus.focus(window);
+                    }
+                });
+            }
+        });
 
         let list_state = &self.state.read(cx).list_state;
 

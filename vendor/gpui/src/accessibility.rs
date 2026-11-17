@@ -32,6 +32,7 @@ pub(crate) struct State {
     next_id: u64,
     ids: HashMap<GlobalElementId, NodeId>,
     visible: HashSet<NodeId>,
+    text_groups: HashMap<NodeId, Arc<[(NodeId, Node)]>>,
     pub(crate) parents: Vec<NodeId>,
     pub(crate) title: String,
     _task: Option<Task<()>>,
@@ -54,7 +55,7 @@ pub struct AccessibilityInfo {
     /// The element's role, label, state and supported actions.
     pub node: Node,
     /// Additional text-run nodes owned by this element.
-    pub text: Vec<(NodeId, Node)>,
+    pub text: Arc<[(NodeId, Node)]>,
     /// Whether this element has keyboard focus.
     pub focused: bool,
     /// Whether assistive access is contained within this element.
@@ -65,7 +66,7 @@ impl AccessibilityInfo {
     pub fn new(node: Node) -> Self {
         Self {
             node,
-            text: vec![],
+            text: Arc::from([]),
             focused: false,
             modal: false,
         }
@@ -193,7 +194,10 @@ impl State {
                 while let Ok(event) = rx.recv().await {
                     if handle
                         .update(cx, |_, window, cx| match event {
-                            Event::Refresh => window.refresh(),
+                            Event::Refresh => {
+                                window.accessibility.text_groups.clear();
+                                window.refresh();
+                            }
                             Event::Action(request) => {
                                 if !window.accessibility.active.load(Ordering::Acquire) {
                                     return;
@@ -249,7 +253,6 @@ impl State {
             .map(|record| record.id);
         for record in records {
             nodes.insert(record.id, record.info.node.clone());
-            nodes.extend(record.info.text.iter().cloned());
         }
         nodes.insert(NodeId(1), root);
         for record in records {
@@ -279,11 +282,35 @@ impl State {
         let mut tree = TreeInfo::new(NodeId(1));
         tree.toolkit_name = Some("GPUI".into());
         tree.toolkit_version = Some(env!("CARGO_PKG_VERSION").into());
-        let current_ids: HashSet<_> = nodes.keys().copied().collect();
+        let current_ids: HashSet<_> = nodes
+            .keys()
+            .copied()
+            .chain(
+                records
+                    .iter()
+                    .flat_map(|record| record.info.text.iter().map(|(id, _)| *id)),
+            )
+            .collect();
+        let mut text_groups = HashMap::default();
+        let mut changed_text = Vec::new();
+        for record in records.iter().filter(|record| visible.contains(&record.id)) {
+            if !self
+                .text_groups
+                .get(&record.id)
+                .is_some_and(|previous| Arc::ptr_eq(previous, &record.info.text))
+            {
+                changed_text.extend(record.info.text.iter().cloned());
+            }
+            if !record.info.text.is_empty() {
+                text_groups.insert(record.id, record.info.text.clone());
+            }
+        }
+        self.text_groups = text_groups;
         let update = TreeUpdate {
             nodes: nodes
                 .into_iter()
                 .filter(|(id, _)| visible.contains(id))
+                .chain(changed_text)
                 .collect(),
             tree: Some(tree),
             tree_id: TreeId::ROOT,

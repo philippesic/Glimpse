@@ -31,7 +31,8 @@ pub(crate) fn segments(text: &str) -> Vec<Segment> {
         for length in pieces {
             if boundaries.len() == 256 {
                 let end = *boundaries.last().unwrap();
-                let starts = words
+                let starts = words[words.partition_point(|word| *word < start)
+                    ..words.partition_point(|word| *word < end)]
                     .iter()
                     .filter_map(|word| {
                         boundaries
@@ -53,7 +54,8 @@ pub(crate) fn segments(text: &str) -> Vec<Segment> {
             boundaries.push(boundaries.last().unwrap() + length);
         }
         let end = offset + line.len();
-        let starts = words
+        let starts = words[words.partition_point(|word| *word < start)
+            ..words.partition_point(|word| *word < end)]
             .iter()
             .filter_map(|word| {
                 boundaries
@@ -96,6 +98,7 @@ pub(crate) fn text(
         node.set_read_only();
         node.set_children(ids.clone());
         let mut info = gpui::AccessibilityInfo::new(node);
+        let mut text_nodes = Vec::new();
         for (index, part) in parts.iter().enumerate() {
             let mut run = Node::new(Role::TextRun);
             run.set_value(text[part.range.clone()].to_owned());
@@ -113,8 +116,44 @@ pub(crate) fn text(
             if index + 1 < parts.len() && parts[index + 1].line == part.line {
                 run.set_next_on_line(ids[index + 1]);
             }
-            info.text.push((ids[index], run));
+            text_nodes.push((ids[index], run));
         }
+        info.text = text_nodes.into();
         info
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_line_segments_preserve_every_word_and_grapheme() {
+        let text = "🙂 café alpha_ 中文 é ".repeat(100_000);
+        let segments = segments(&text);
+        let starts: Vec<_> = segments
+            .iter()
+            .flat_map(|segment| {
+                segment
+                    .words
+                    .iter()
+                    .map(|&index| segment.boundaries[index as usize])
+            })
+            .collect();
+        let expected: Vec<_> = text
+            .unicode_word_indices()
+            .map(|(offset, _)| offset)
+            .collect();
+        assert_eq!(starts, expected);
+        assert_eq!(
+            segments
+                .iter()
+                .map(|segment| &text[segment.range.clone()])
+                .collect::<String>(),
+            text
+        );
+        assert!(segments
+            .iter()
+            .all(|segment| segment.boundaries.len() <= 256));
+    }
 }
