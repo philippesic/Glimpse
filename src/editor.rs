@@ -6,6 +6,9 @@ use egui::{
 use unicode_segmentation::UnicodeSegmentation;
 
 pub fn position(text: &str, line: usize, column: usize) -> (usize, bool) {
+    if line <= 1 && column <= 1 {
+        return (0, false);
+    }
     let mut ranges = line_ranges(text);
     let mut selected = 0..0;
     let mut clamped = false;
@@ -25,10 +28,13 @@ pub fn position(text: &str, line: usize, column: usize) -> (usize, bool) {
     let value = &text[selected];
     let requested = value
         .char_indices()
+        .map(|(byte, _)| byte)
+        .chain(std::iter::once(value.len()))
         .nth(column.saturating_sub(1))
-        .map(|v| v.0)
-        .unwrap_or(value.len());
-    clamped |= column.saturating_sub(1) > value.chars().count();
+        .unwrap_or_else(|| {
+            clamped = true;
+            value.len()
+        });
     let boundary = value
         .grapheme_indices(true)
         .map(|v| v.0)
@@ -77,6 +83,9 @@ mod tests {
         assert_eq!(position("a👨‍👩‍👧b\nlast", 1, 4), (1, true));
         assert_eq!(position("a\nlast", 2, 3), (4, false));
         assert_eq!(position("a", 9, 9), (1, true));
+        assert_eq!(position("", 1, 1), (0, false));
+        assert_eq!(position("🦀", 1, 2), (1, false));
+        assert_eq!(position("🦀", 1, 3), (1, true));
     }
     #[test]
     fn reload_is_one_undoable_transition() {

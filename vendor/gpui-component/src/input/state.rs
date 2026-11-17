@@ -363,6 +363,26 @@ pub struct InputState {
 
 impl EventEmitter<InputEvent> for InputState {}
 
+pub struct PreparedInput {
+    value: SharedString,
+    revision: Revision,
+}
+
+impl PreparedInput {
+    pub fn new(value: impl Into<SharedString>) -> Self {
+        let value = value.into();
+        let revision = Revision {
+            text: Rope::from(value.as_str()),
+            endings: LineEndings::new(&value),
+        };
+        Self { value, revision }
+    }
+
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
 pub(super) struct PreparedReplacement {
     value: SharedString,
     revision: Revision,
@@ -375,12 +395,11 @@ impl PreparedReplacement {
         mut layout: TextWrapper,
         text_system: &Arc<gpui::TextSystem>,
     ) -> Self {
-        let text = Rope::from(value.as_str());
-        let endings = LineEndings::new(&value);
-        layout.prepare_replacement(&text, text_system);
+        let PreparedInput { value, revision } = PreparedInput::new(value);
+        layout.prepare_replacement(&revision.text, text_system);
         Self {
             value,
-            revision: Revision { text, endings },
+            revision,
             layout,
         }
     }
@@ -987,11 +1006,14 @@ impl InputState {
     }
 
     /// Set the default value of the input field.
-    pub fn default_value(mut self, value: impl Into<SharedString>) -> Self {
-        let text: SharedString = value.into();
-        self.text = Rope::from(text.as_str());
-        self.line_endings = super::text_metadata::LineEndings::new(&text);
-        *self.value_cache.get_mut() = Some(text);
+    pub fn default_value(self, value: impl Into<SharedString>) -> Self {
+        self.default_prepared_value(PreparedInput::new(value))
+    }
+
+    pub fn default_prepared_value(mut self, prepared: PreparedInput) -> Self {
+        self.text = prepared.revision.text;
+        self.line_endings = prepared.revision.endings;
+        *self.value_cache.get_mut() = Some(prepared.value);
         if let Some(diagnostics) = self.mode.diagnostics_mut() {
             diagnostics.reset(&self.text)
         }

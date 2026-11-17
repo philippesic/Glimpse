@@ -1,5 +1,6 @@
 use crate::wake;
 use crate::{document::DiskFile, fileops, storage};
+use gpui_component::input::PreparedInput;
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -97,7 +98,7 @@ pub enum Reply {
     SavedTo(Box<SaveDestination>, Result<DiskFile, String>),
     Checked(u64, u64, Result<(DiskFile, Arc<str>), String>),
     CheckDeferred(u64, u64),
-    Open(PathBuf, u64, Result<(DiskFile, Arc<str>), String>),
+    Open(PathBuf, u64, Result<(DiskFile, PreparedInput), String>),
     Save(u64, u64, Arc<str>, Result<DiskFile, String>),
 }
 
@@ -509,7 +510,8 @@ impl IoWorker {
                             token,
                             DiskFile::open_cancellable(path, &|| {
                                 transient && preview.load(Ordering::Relaxed) != token
-                            }),
+                            })
+                            .map(|(disk, text)| (disk, PreparedInput::new(text))),
                         ),
                         Job::Reload(reload) => {
                             crate::metrics::event("reload-worker", reload.id, reload.generation);
@@ -1545,7 +1547,7 @@ mod tests {
         let reply = io.replies.recv_timeout(std::time::Duration::from_secs(2));
         release.send(()).unwrap();
         match reply.unwrap() {
-            Reply::Open(_, _, Ok((_, text))) => assert_eq!(text.as_ref(), "available"),
+            Reply::Open(_, _, Ok((_, text))) => assert_eq!(text.value(), "available"),
             _ => panic!("document worker did not run independently"),
         }
     }

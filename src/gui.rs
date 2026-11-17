@@ -27,7 +27,7 @@ use gpui::{prelude::*, *};
 use gpui_component::{
     ActiveTheme, Disableable, Root, Selectable, Sizable,
     button::{Button, ButtonVariants},
-    input::{Input, InputEvent, InputState, Position},
+    input::{Input, InputEvent, InputState, Position, PreparedInput},
     text::TextView,
 };
 use std::{
@@ -947,7 +947,7 @@ impl Shell {
     fn add_document(
         &mut self,
         disk: DiskFile,
-        text: impl Into<SharedString>,
+        text: PreparedInput,
         intent: OpenIntent,
         activate: bool,
         window: &mut Window,
@@ -956,7 +956,6 @@ impl Shell {
         let OpenIntent {
             preview, position, ..
         } = intent;
-        let text: SharedString = text.into();
         if activate && self.request.pick {
             self.search_ui.picker_selection = Some(disk.path.clone());
         }
@@ -1003,7 +1002,7 @@ impl Shell {
                 .line_number(self.settings.line_numbers)
                 .soft_wrap(self.settings.wrap)
                 .defer_large_initial_layout()
-                .default_value(text.clone());
+                .default_prepared_value(text);
             input.set_external_highlights(Vec::new(), cx);
             input.set_cursor_blink(false, cx);
             input.set_accessibility_label(format!("Source: {}", paths::display(&disk.path)), cx);
@@ -1938,7 +1937,7 @@ impl Shell {
                             self.next_id = import_id;
                             self.add_document(
                                 disk,
-                                draft.text,
+                                PreparedInput::new(draft.text),
                                 OpenIntent {
                                     preview: false,
                                     position: None,
@@ -2689,7 +2688,7 @@ impl Shell {
             "save-unrecovered" => self.ask_unrecovered_save(window, cx),
             "new" if !self.request.pick => self.add_document(
                 DiskFile::draft(),
-                String::new(),
+                PreparedInput::new(""),
                 OpenIntent {
                     preview: false,
                     position: None,
