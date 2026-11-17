@@ -46,6 +46,8 @@ pub fn apply(settings: &Settings, window: &mut Window, cx: &mut App) -> Option<S
         gpui::rgb(if theme.is_dark() { 0xaab5c5 } else { 0x4d596a }).into();
     theme.colors.border = gpui::rgb(if theme.is_dark() { 0x65758b } else { 0x7b8797 }).into();
     theme.colors.input = theme.colors.border;
+    theme.colors.scrollbar_thumb = theme.colors.muted_foreground;
+    theme.colors.scrollbar_thumb_hover = theme.colors.foreground;
     theme.colors.danger = gpui::rgb(if theme.is_dark() { 0xffb4ab } else { 0x9b1c1c }).into();
     theme.colors.danger_foreground = theme.colors.background;
     theme.colors.sidebar = theme.colors.muted;

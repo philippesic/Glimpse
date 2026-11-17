@@ -2304,11 +2304,19 @@ impl Shell {
                 self.active = Some(id);
                 self.save(window, cx);
             } else if self.decision.is_none() {
-                let names = self
+                let paths = self
                     .documents
                     .iter()
                     .filter(|doc| decision.documents.contains(&doc.id) && doc.dirty(cx))
-                    .map(|doc| paths::display(&doc.disk.path))
+                    .map(|doc| doc.disk.path.as_path())
+                    .collect::<Vec<_>>();
+                let labels = paths
+                    .iter()
+                    .map(|path| paths::tab_label(path, paths.iter().copied()))
+                    .collect::<Vec<_>>();
+                let names = paths
+                    .iter()
+                    .map(|path| paths::display(path))
                     .collect::<Vec<_>>()
                     .join("\n");
                 let finish = decision.finish;
@@ -2320,7 +2328,7 @@ impl Shell {
                         "Close with unsaved changes?"
                     }
                     .into(),
-                    format!("Unsaved documents:\n{names}"),
+                    format!("Full paths:\n{names}"),
                     vec![
                         "Cancel",
                         if finish {
@@ -2333,6 +2341,9 @@ impl Shell {
                     window,
                     cx,
                 );
+                if let Some(view) = &self.decision {
+                    view.update(cx, |view, cx| view.set_subjects(labels, cx));
+                }
             }
         } else {
             self.commit_close(false, cx);

@@ -1,19 +1,22 @@
 use gpui::{prelude::*, *};
 use gpui_component::{
-    ActiveTheme, Sizable,
+    ActiveTheme, Sizable, StyledExt,
     button::{Button, ButtonVariants},
     input::{Input, InputState},
+    scroll::{Scrollbar, ScrollbarShow},
 };
 
 pub struct Decision {
     title: String,
     detail: String,
+    subjects: Vec<String>,
     summary: Option<String>,
     primary: Option<usize>,
     destructive: Option<usize>,
     actions: Vec<&'static str>,
     focus: FocusHandle,
     comparison: Option<[Entity<InputState>; 2]>,
+    detail_scroll: ScrollHandle,
     _subscription: Subscription,
 }
 pub struct Choice(pub usize);
@@ -38,6 +41,29 @@ impl Decision {
                 if super::modal::tab(&event.keystroke, &this.focus, window, cx) {
                     return;
                 }
+                if this.comparison.is_none()
+                    && !event.keystroke.modifiers.control
+                    && !event.keystroke.modifiers.platform
+                    && !event.keystroke.modifiers.alt
+                {
+                    let old = this.detail_scroll.offset();
+                    let page = this.detail_scroll.bounds().size.height;
+                    let maximum = this.detail_scroll.max_offset().height;
+                    let offset = match event.keystroke.key.as_str() {
+                        "pageup" => Some((old.y + page).min(px(0.))),
+                        "pagedown" => Some((old.y - page).max(-maximum)),
+                        "home" => Some(px(0.)),
+                        "end" => Some(-maximum),
+                        _ => None,
+                    };
+                    if let Some(offset) = offset {
+                        this.detail_scroll.set_offset(point(old.x, offset));
+                        window.prevent_default();
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
+                }
                 if event.keystroke.key == "escape" {
                     cx.emit(Choice(0));
                     window.prevent_default();
@@ -48,21 +74,28 @@ impl Decision {
         Self {
             title,
             detail,
+            subjects: Vec::new(),
             summary: None,
             primary: None,
             destructive: None,
             actions,
             focus,
             comparison: None,
+            detail_scroll: ScrollHandle::new(),
             _subscription: subscription,
         }
     }
     pub fn close_actions(&mut self) {
         self.summary = Some(
-            "Save writes these documents. Discard closes them and removes their automatic drafts. Cancel keeps them open.".into(),
+            "Save writes changes. Discard closes without saving and removes automatic drafts."
+                .into(),
         );
         self.primary = Some(1);
         self.destructive = Some(2);
+    }
+    pub fn set_subjects(&mut self, subjects: Vec<String>, cx: &mut Context<Self>) {
+        self.subjects = subjects;
+        cx.notify();
     }
     pub fn compare(
         &mut self,
@@ -89,10 +122,16 @@ impl Decision {
 impl Render for Decision {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let semantic_title = self.title.clone();
-        let semantic_detail = self.summary.as_ref().map_or_else(
+        let mut semantic_detail = self.summary.as_ref().map_or_else(
             || self.detail.clone(),
             |summary| format!("{summary}\n\n{}", self.detail),
         );
+        if !self.subjects.is_empty() {
+            semantic_detail = format!(
+                "Unsaved documents:\n{}\n\n{semantic_detail}",
+                self.subjects.join("\n")
+            );
+        }
         let rendered = div()
             .id("decision-overlay")
             .absolute()
@@ -124,10 +163,42 @@ impl Render for Decision {
                     })
                     .child(
                         div()
-                            .id("decision-detail")
+                            .relative()
+                            .h(window.viewport_size().height * 0.4)
                             .min_h_0()
-                            .overflow_y_scroll()
-                            .child(self.detail.clone()),
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .id("decision-detail")
+                                    .size_full()
+                                    .overflow_y_scroll()
+                                    .track_scroll(&self.detail_scroll)
+                                    .pr_3()
+                                    .children(self.subjects.iter().enumerate().map(
+                                        |(index, label)| {
+                                            let name = label.clone();
+                                            gpui::accessible(
+                                                ("decision-subject", index),
+                                                div().pb_2().font_semibold().child(label.clone()),
+                                                move |_, _, _| {
+                                                    let mut node = gpui::accesskit::Node::new(
+                                                        gpui::accesskit::Role::Label,
+                                                    );
+                                                    node.set_value(name.clone());
+                                                    node.set_read_only();
+                                                    AccessibilityInfo::new(node)
+                                                },
+                                            )
+                                        },
+                                    ))
+                                    .child(self.detail.clone()),
+                            )
+                            .child(
+                                div().absolute().inset_0().child(
+                                    Scrollbar::vertical(&self.detail_scroll)
+                                        .scrollbar_show(ScrollbarShow::Always),
+                                ),
+                            ),
                     )
                     .when_some(self.comparison.as_ref(), |panel, inputs| {
                         panel.children(inputs.iter().enumerate().map(|(i, input)| {
