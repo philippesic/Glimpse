@@ -1,4 +1,5 @@
 use super::Event;
+pub(super) mod keyboard;
 use accesskit::{ActionHandler, ActionRequest, ActivationHandler, DeactivationHandler, TreeUpdate};
 use std::sync::{
     Arc,
@@ -12,6 +13,7 @@ struct Activate {
 impl ActivationHandler for Activate {
     fn request_initial_tree(&mut self) -> Option<TreeUpdate> {
         self.active.store(true, Ordering::Release);
+        keyboard::activate(self.active.clone());
         let _ = self.events.try_send(Event::Refresh);
         None
     }

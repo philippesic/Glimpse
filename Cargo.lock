@@ -2969,6 +2969,7 @@ dependencies = [
  "x11-clipboard",
  "x11rb",
  "xkbcommon",
+ "zbus",
  "zed-font-kit",
  "zed-scap",
  "zed-xim",

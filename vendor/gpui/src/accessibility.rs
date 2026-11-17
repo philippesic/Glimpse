@@ -3,6 +3,28 @@
 #[cfg(target_os = "linux")]
 mod linux;
 
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+pub(crate) struct KeyboardEvent {
+    pub pressed: bool,
+    pub keycode: u32,
+    pub keysym: u32,
+    pub modifiers: u32,
+    pub timestamp: u32,
+    pub text: String,
+    pub is_text: bool,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn notify_wayland_key(event: KeyboardEvent) -> bool {
+    linux::keyboard::notify(event)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn wayland_key_notifications_active() -> bool {
+    linux::keyboard::active()
+}
+
 use crate::{
     AnyElement, AnyWindowHandle, App, Bounds, Element, ElementId, GlobalElementId,
     InspectorElementId, IntoElement, LayoutId, Pixels, Task, Window,

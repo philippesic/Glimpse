@@ -1300,6 +1300,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
             }
             wl_keyboard::Event::Key {
                 serial,
+                time,
                 key,
                 state: WEnum::Value(key_state),
                 ..
@@ -1316,6 +1317,32 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                 };
                 let keycode = Keycode::from(key + MIN_KEYCODE);
                 let keysym = keymap_state.key_get_one_sym(keycode);
+
+                #[cfg(target_os = "linux")]
+                if crate::accessibility::wayland_key_notifications_active() {
+                    let text = keymap_state.key_get_utf8(keycode);
+                    let is_text = !text.is_empty() && !text.chars().any(char::is_control);
+                    if crate::accessibility::notify_wayland_key(
+                        crate::accessibility::KeyboardEvent {
+                            pressed: key_state == wl_keyboard::KeyState::Pressed,
+                            keycode: key + MIN_KEYCODE,
+                            keysym: keysym.raw(),
+                            modifiers: keymap_state.serialize_mods(xkb::STATE_MODS_EFFECTIVE),
+                            timestamp: time,
+                            text: if is_text {
+                                text
+                            } else {
+                                xkb::keysym_get_name(keysym)
+                            },
+                            is_text,
+                        },
+                    ) {
+                        if state.repeat.current_keycode == Some(keycode) {
+                            state.repeat.current_keycode = None;
+                        }
+                        return;
+                    }
+                }
 
                 match key_state {
                     wl_keyboard::KeyState::Pressed if !keysym.is_modifier_key() => {
