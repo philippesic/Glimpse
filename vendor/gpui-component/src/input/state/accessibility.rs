@@ -340,36 +340,41 @@ impl InputState {
         mapping: &Mapping,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        match request.action {
-            Action::Focus => self.focus(window, cx),
-            Action::SetTextSelection if mapping.current.matches(&self.value()) => {
-                if let Some(ActionData::SetTextSelection(selection)) = request.data {
-                    let (Some(anchor), Some(focus)) = (
-                        mapping.current.offset(&selection.anchor),
-                        mapping.current.offset(&selection.focus),
-                    ) else {
-                        return;
-                    };
-                    self.selected_range = (anchor.min(focus)..anchor.max(focus)).into();
-                    self.selection_reversed = focus < anchor;
-                    self.focus(window, cx);
-                    self.update_preferred_column();
-                    cx.notify();
-                }
+    ) -> bool {
+        if request.action == Action::Focus {
+            self.focus(window, cx);
+            return true;
+        }
+        if self.initial_layout_pending()
+            || (!self.masked && !mapping.current.matches(&self.value()))
+        {
+            return false;
+        }
+        match (request.action, request.data) {
+            (Action::SetTextSelection, Some(ActionData::SetTextSelection(selection))) => {
+                let (Some(anchor), Some(focus)) = (
+                    mapping.current.offset(&selection.anchor),
+                    mapping.current.offset(&selection.focus),
+                ) else {
+                    return false;
+                };
+                self.selected_range = (anchor.min(focus)..anchor.max(focus)).into();
+                self.selection_reversed = focus < anchor;
+                self.focus(window, cx);
+                self.update_preferred_column();
+                cx.notify();
+                true
             }
-            Action::SetValue | Action::ReplaceSelectedText
-                if !self.disabled && (self.masked || mapping.current.matches(&self.value())) =>
+            (Action::SetValue | Action::ReplaceSelectedText, Some(ActionData::Value(value)))
+                if !self.disabled =>
             {
-                if let Some(ActionData::Value(value)) = request.data {
-                    let range =
-                        (request.action == Action::SetValue).then(|| 0..self.text.len_utf16());
-                    self.history.new_group();
-                    self.replace_text_in_range(range, &value, window, cx);
-                    self.history.new_group();
-                }
+                let range = (request.action == Action::SetValue).then(|| 0..self.text.len_utf16());
+                self.history.new_group();
+                let applied = self.replace_text_checked(range, &value, window, cx);
+                self.history.new_group();
+                applied
             }
-            _ => {}
+            _ => false,
         }
     }
 }

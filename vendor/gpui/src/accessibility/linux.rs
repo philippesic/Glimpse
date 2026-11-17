@@ -2,14 +2,16 @@ use super::Event;
 pub(super) mod keyboard;
 use crate::{App, Task, work_trace::Span};
 use accesskit::{
-    ActionHandler, ActionRequest, ActivationHandler, DeactivationHandler, Node, NodeId, TreeId,
-    TreeInfo, TreeUpdate,
+    ActionHandler, ActionRequest, ActivationHandler, DeactivationHandler, Node, NodeId,
+    TextActionResult, TreeId, TreeInfo, TreeUpdate,
 };
 use collections::HashMap;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
+    mpsc,
 };
+use std::time::Duration;
 
 type TextGroups = HashMap<NodeId, Arc<[(NodeId, Node)]>>;
 
@@ -137,13 +139,63 @@ impl ActivationHandler for Activate {
     }
 }
 struct Actions(async_channel::Sender<Event>);
+
+const QUEUED: u8 = 0;
+const APPLYING: u8 = 1;
+const CANCELLED: u8 = 2;
+
+pub(crate) struct PendingTextAction {
+    state: Arc<AtomicU8>,
+    reply: mpsc::Sender<bool>,
+}
+
+impl PendingTextAction {
+    pub(super) fn apply(self, run: impl FnOnce() -> bool) {
+        if self
+            .state
+            .compare_exchange(QUEUED, APPLYING, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let _ = self.reply.send(run());
+        }
+    }
+}
+
 impl ActionHandler for Actions {
     fn do_action(&mut self, request: ActionRequest) {
-        let _ = self.0.try_send(Event::Action(request, None));
+        let _ = self.0.try_send(Event::Action(request, None, None));
     }
 
-    fn do_text_action(&mut self, request: ActionRequest, revision: Option<usize>) {
-        let _ = self.0.try_send(Event::Action(request, revision));
+    fn do_text_action(
+        &mut self,
+        request: ActionRequest,
+        revision: Option<usize>,
+    ) -> TextActionResult {
+        let (reply, result) = mpsc::channel();
+        let state = Arc::new(AtomicU8::new(QUEUED));
+        let action = PendingTextAction {
+            state: state.clone(),
+            reply,
+        };
+        if self
+            .0
+            .try_send(Event::Action(request, revision, Some(action)))
+            .is_err()
+        {
+            return TextActionResult::Immediate(false);
+        }
+        TextActionResult::Deferred(Box::new(move || {
+            match result.recv_timeout(Duration::from_millis(250)) {
+                Ok(applied) => applied,
+                Err(mpsc::RecvTimeoutError::Disconnected) => false,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let cancelled = state
+                        .compare_exchange(QUEUED, CANCELLED, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok();
+                    !cancelled && result.recv().unwrap_or(false)
+                }
+            }
+        }))
     }
 }
 struct Deactivate {

@@ -10,7 +10,7 @@
 
 use accesskit::{
     Action, ActionData, ActionRequest, Affine, Live, NodeId, Orientation, Point, Rect, Role,
-    Toggled, TreeId,
+    TextActionResult, Toggled, TreeId,
 };
 use accesskit_consumer::{FilterResult, FullNodeId, NodeRef, Tree, TreeState};
 use atspi_common::{
@@ -1226,13 +1226,13 @@ impl PlatformNode {
     }
 
     pub fn set_text_contents(&self, value: &str) -> Result<bool> {
-        self.resolve_with_context(|node, tree, context| {
-            if node.is_read_only() {
-                return Ok(false);
+        let outcome = self.resolve_with_context(|node, tree, context| {
+            if node.is_read_only() || node.data().is_busy() {
+                return Ok(TextActionResult::Immediate(false));
             }
             let (target_node, target_tree) =
                 tree.state().locate_node(self.id).ok_or(Error::Defunct)?;
-            context.do_text_action(
+            Ok(context.do_text_action(
                 ActionRequest {
                     action: Action::SetValue,
                     target_tree,
@@ -1240,9 +1240,9 @@ impl PlatformNode {
                     data: Some(ActionData::Value(value.into())),
                 },
                 node.data().text_revision(),
-            );
-            Ok(true)
-        })
+            ))
+        })?;
+        Ok(outcome.wait())
     }
 
     pub fn n_anchors(&self) -> Result<i32> {
@@ -1471,14 +1471,14 @@ impl PlatformNode {
     }
 
     pub fn set_caret_offset(&self, offset: i32) -> Result<bool> {
-        self.resolve_for_text_with_context(|node, tree, context| {
+        let outcome = self.resolve_for_text_with_context(|node, tree, context| {
             if node.data().is_busy() {
-                return Ok(false);
+                return Ok(TextActionResult::Immediate(false));
             }
             let offset = text_position_from_offset(&node, offset).ok_or(Error::IndexOutOfRange)?;
             let (target_node, target_tree) =
                 tree.state().locate_node(node.id()).ok_or(Error::Defunct)?;
-            context.do_text_action(
+            Ok(context.do_text_action(
                 ActionRequest {
                     action: Action::SetTextSelection,
                     target_tree,
@@ -1488,9 +1488,9 @@ impl PlatformNode {
                     )),
                 },
                 node.data().text_revision(),
-            );
-            Ok(true)
-        })
+            ))
+        })?;
+        Ok(outcome.wait())
     }
 
     pub fn text_attribute_value(&self, offset: i32, attribute_name: &str) -> Result<String> {
@@ -1599,9 +1599,9 @@ impl PlatformNode {
             return Ok(false);
         }
 
-        self.resolve_for_text_with_context(|node, tree, context| {
+        let outcome = self.resolve_for_text_with_context(|node, tree, context| {
             if node.data().is_busy() {
-                return Ok(false);
+                return Ok(TextActionResult::Immediate(false));
             }
             // Simply collapse the selection to the position of the caret if a caret is
             // visible, otherwise set the selection to 0.
@@ -1610,7 +1610,7 @@ impl PlatformNode {
                 .unwrap_or_else(|| node.document_range().start());
             let (target_node, target_tree) =
                 tree.state().locate_node(node.id()).ok_or(Error::Defunct)?;
-            context.do_text_action(
+            Ok(context.do_text_action(
                 ActionRequest {
                     action: Action::SetTextSelection,
                     target_tree,
@@ -1620,9 +1620,9 @@ impl PlatformNode {
                     )),
                 },
                 node.data().text_revision(),
-            );
-            Ok(true)
-        })
+            ))
+        })?;
+        Ok(outcome.wait())
     }
 
     pub fn set_selection(
@@ -1635,15 +1635,15 @@ impl PlatformNode {
             return Ok(false);
         }
 
-        self.resolve_for_text_with_context(|node, tree, context| {
+        let outcome = self.resolve_for_text_with_context(|node, tree, context| {
             if node.data().is_busy() {
-                return Ok(false);
+                return Ok(TextActionResult::Immediate(false));
             }
             let range = text_range_from_offsets(&node, start_offset, end_offset)
                 .ok_or(Error::IndexOutOfRange)?;
             let (target_node, target_tree) =
                 tree.state().locate_node(node.id()).ok_or(Error::Defunct)?;
-            context.do_text_action(
+            Ok(context.do_text_action(
                 ActionRequest {
                     action: Action::SetTextSelection,
                     target_tree,
@@ -1651,9 +1651,9 @@ impl PlatformNode {
                     data: Some(ActionData::SetTextSelection(range.to_text_selection())),
                 },
                 node.data().text_revision(),
-            );
-            Ok(true)
-        })
+            ))
+        })?;
+        Ok(outcome.wait())
     }
 
     pub fn range_extents(

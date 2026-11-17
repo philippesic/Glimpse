@@ -11,7 +11,7 @@ edition = "2024"
 rust-version = "1.95"
 
 [features]
-test-support = []
+test-support = ["gpui/accessibility-test-hooks"]
 
 [dependencies]
 gpui = "=0.2.2"

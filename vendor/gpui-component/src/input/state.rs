@@ -2235,6 +2235,96 @@ impl InputState {
         self.replace_text_in_range(range_utf16, new_text, window, cx);
         self.silent_replace_text = false;
     }
+
+    fn replace_text_checked(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.disabled {
+            return false;
+        }
+
+        self.pause_blink_cursor(cx);
+
+        let range = range_utf16
+            .as_ref()
+            .map(|range_utf16| self.range_from_utf16(range_utf16))
+            .or(self.ime_marked_range.map(|range| {
+                let range = self.range_to_utf16(&(range.start..range.end));
+                self.range_from_utf16(&range)
+            }))
+            .unwrap_or(self.selected_range.into());
+
+        let old_text = self.text.clone();
+        self.text.replace(range.clone(), new_text);
+
+        let mut new_offset = (range.start + new_text.len()).min(self.text.len());
+
+        if self.mode.is_single_line() {
+            let pending_text = self.text.to_string();
+            // Check if the new text is valid
+            if !self.is_valid_input(&pending_text, cx) {
+                self.text = old_text;
+                return false;
+            }
+
+            if !self.mask_pattern.is_none() {
+                let mask_text = self.mask_pattern.mask(&pending_text);
+                self.text = Rope::from(mask_text.as_str());
+                let new_text_len =
+                    (new_text.len() + mask_text.len()).saturating_sub(pending_text.len());
+                new_offset = (range.start + new_text_len).min(mask_text.len());
+            }
+        }
+
+        self.value_cache.get_mut().take();
+        self.history_layout = None;
+        if self.mode.is_single_line() {
+            self.line_endings = super::text_metadata::LineEndings::new(&self.text.to_string());
+        } else {
+            self.line_endings.replace(&old_text, &self.text, &range);
+        }
+        if let Some(original) = self.composition.take() {
+            if !self.history.ignore {
+                self.history.new_group();
+                self.history.clear_redo();
+                self.history.push(Change::new(
+                    original.range,
+                    &original.text,
+                    range.start..range.start + new_text.len(),
+                    &new_text,
+                ));
+                self.history.new_group();
+            }
+        } else {
+            self.push_history(&old_text, &range, &new_text);
+        }
+        self.history.end_grouping();
+        if let Some(diagnostics) = self.mode.diagnostics_mut() {
+            diagnostics.reset(&self.text)
+        }
+        self.text_wrapper
+            .update(&self.text, &range, &Rope::from(new_text), cx);
+        if self.external_highlights.is_none() {
+            self.mode
+                .update_highlighter(&range, &self.text, &new_text, true, cx);
+        }
+        self.lsp.update(&self.text, window, cx);
+        self.selected_range = (new_offset..new_offset).into();
+        self.ime_marked_range.take();
+        self.update_preferred_column();
+        self.update_search(cx);
+        self.mode.update_auto_grow(&self.text_wrapper);
+        if !self.silent_replace_text {
+            self.handle_completion_trigger(&range, &new_text, window, cx);
+        }
+        cx.emit(InputEvent::Change);
+        cx.notify();
+        true
+    }
 }
 
 impl EntityInputHandler for InputState {
@@ -2301,86 +2391,7 @@ impl EntityInputHandler for InputState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.disabled {
-            return;
-        }
-
-        self.pause_blink_cursor(cx);
-
-        let range = range_utf16
-            .as_ref()
-            .map(|range_utf16| self.range_from_utf16(range_utf16))
-            .or(self.ime_marked_range.map(|range| {
-                let range = self.range_to_utf16(&(range.start..range.end));
-                self.range_from_utf16(&range)
-            }))
-            .unwrap_or(self.selected_range.into());
-
-        let old_text = self.text.clone();
-        self.text.replace(range.clone(), new_text);
-
-        let mut new_offset = (range.start + new_text.len()).min(self.text.len());
-
-        if self.mode.is_single_line() {
-            let pending_text = self.text.to_string();
-            // Check if the new text is valid
-            if !self.is_valid_input(&pending_text, cx) {
-                self.text = old_text;
-                return;
-            }
-
-            if !self.mask_pattern.is_none() {
-                let mask_text = self.mask_pattern.mask(&pending_text);
-                self.text = Rope::from(mask_text.as_str());
-                let new_text_len =
-                    (new_text.len() + mask_text.len()).saturating_sub(pending_text.len());
-                new_offset = (range.start + new_text_len).min(mask_text.len());
-            }
-        }
-
-        self.value_cache.get_mut().take();
-        self.history_layout = None;
-        if self.mode.is_single_line() {
-            self.line_endings = super::text_metadata::LineEndings::new(&self.text.to_string());
-        } else {
-            self.line_endings.replace(&old_text, &self.text, &range);
-        }
-        if let Some(original) = self.composition.take() {
-            if !self.history.ignore {
-                self.history.new_group();
-                self.history.clear_redo();
-                self.history.push(Change::new(
-                    original.range,
-                    &original.text,
-                    range.start..range.start + new_text.len(),
-                    &new_text,
-                ));
-                self.history.new_group();
-            }
-        } else {
-            self.push_history(&old_text, &range, &new_text);
-        }
-        self.history.end_grouping();
-        if let Some(diagnostics) = self.mode.diagnostics_mut() {
-            diagnostics.reset(&self.text)
-        }
-        self.text_wrapper
-            .update(&self.text, &range, &Rope::from(new_text), cx);
-        if self.external_highlights.is_none() {
-            self.mode
-                .update_highlighter(&range, &self.text, &new_text, true, cx);
-        }
-        self.lsp.update(&self.text, window, cx);
-        self.selected_range = (new_offset..new_offset).into();
-        self.ime_marked_range.take();
-        self.update_preferred_column();
-        self.update_search(cx);
-        self.mode.update_auto_grow(&self.text_wrapper);
-        if !self.silent_replace_text {
-            self.handle_completion_trigger(&range, &new_text, window, cx);
-        }
-        cx.emit(InputEvent::Change);
-        cx.notify();
+        self.replace_text_checked(range_utf16, new_text, window, cx);
     }
 
     /// Mark text is the IME temporary insert on typing.
@@ -2592,10 +2603,10 @@ impl Render for InputState {
             }
             info
         })
-        .on_action(move |request, _, window, cx| {
+        .on_checked_action(move |request, _, window, cx| {
             action_input.update(cx, |state, cx| {
                 state.accessibility_action(request, &action_mapping.borrow(), window, cx)
-            });
+            })
         })
     }
 }

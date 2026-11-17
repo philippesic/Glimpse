@@ -39,12 +39,16 @@ use std::{
     },
 };
 
-type Handler = Rc<dyn Fn(ActionRequest, Bounds<Pixels>, &mut Window, &mut App)>;
+type Handler = Rc<dyn Fn(ActionRequest, Bounds<Pixels>, &mut Window, &mut App) -> bool>;
 
 #[cfg(target_os = "linux")]
 pub(crate) enum Event {
     Refresh,
-    Action(ActionRequest, Option<usize>),
+    Action(
+        ActionRequest,
+        Option<usize>,
+        Option<linux::PendingTextAction>,
+    ),
 }
 
 #[derive(Default)]
@@ -130,8 +134,19 @@ pub fn accessible(
 impl Accessible {
     /// Handle supported actions on the UI thread.
     pub fn on_action(
-        mut self,
+        self,
         handler: impl Fn(ActionRequest, Bounds<Pixels>, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_checked_action(move |request, bounds, window, cx| {
+            handler(request, bounds, window, cx);
+            true
+        })
+    }
+
+    /// Handle actions whose native callers need to know whether the action applied.
+    pub fn on_checked_action(
+        mut self,
+        handler: impl Fn(ActionRequest, Bounds<Pixels>, &mut Window, &mut App) -> bool + 'static,
     ) -> Self {
         self.handler = Some(Rc::new(handler));
         self
@@ -225,40 +240,58 @@ impl State {
             self.publisher = Some(linux::Publisher::new(self.active.clone(), tx, cx));
             self._task = Some(cx.spawn(async move |cx| {
                 while let Ok(event) = rx.recv().await {
+                    #[cfg(feature = "accessibility-test-hooks")]
+                    if matches!(&event, Event::Action(_, _, Some(_)))
+                        && let Some(delay) = std::env::var("GPUI_TEST_TEXT_ACTION_DELAY_MS")
+                            .ok()
+                            .and_then(|value| value.parse::<u64>().ok())
+                    {
+                        eprintln!("GPUI_TEST_TEXT_ACTION_QUEUED");
+                        crate::Timer::after(std::time::Duration::from_millis(delay)).await;
+                    }
                     if handle
                         .update(cx, |_, window, cx| match event {
                             Event::Refresh => window.refresh(),
-                            Event::Action(request, text_revision) => {
-                                if !window.accessibility.active.load(Ordering::Acquire) {
-                                    return;
-                                }
-                                let handler = window
-                                    .rendered_frame
-                                    .accessibility
-                                    .iter()
-                                    .find(|record| {
-                                        record.id == request.target_node
-                                            && window.accessibility.visible.contains(&record.id)
-                                            && record.info.node.supports_action(request.action)
-                                            && (!matches!(
-                                                request.action,
-                                                accesskit::Action::SetValue
-                                                    | accesskit::Action::SetTextSelection
-                                                    | accesskit::Action::ReplaceSelectedText
-                                            ) || record.info.node.text_revision()
-                                                == text_revision)
-                                    })
-                                    .and_then(|record| {
-                                        record
-                                            .handler
-                                            .clone()
-                                            .map(|handler| (handler, record.bounds))
-                                    });
-                                if let Some((handler, bounds)) = handler {
-                                    if request.action == accesskit::Action::Focus {
-                                        window.activate_window();
+                            Event::Action(request, text_revision, completion) => {
+                                let apply = || {
+                                    if !window.accessibility.active.load(Ordering::Acquire) {
+                                        return false;
                                     }
-                                    handler(request, bounds, window, cx);
+                                    let handler = window
+                                        .rendered_frame
+                                        .accessibility
+                                        .iter()
+                                        .find(|record| {
+                                            record.id == request.target_node
+                                                && window.accessibility.visible.contains(&record.id)
+                                                && record.info.node.supports_action(request.action)
+                                                && (!matches!(
+                                                    request.action,
+                                                    accesskit::Action::SetValue
+                                                        | accesskit::Action::SetTextSelection
+                                                        | accesskit::Action::ReplaceSelectedText
+                                                ) || record.info.node.text_revision()
+                                                    == text_revision)
+                                        })
+                                        .and_then(|record| {
+                                            record
+                                                .handler
+                                                .clone()
+                                                .map(|handler| (handler, record.bounds))
+                                        });
+                                    if let Some((handler, bounds)) = handler {
+                                        if request.action == accesskit::Action::Focus {
+                                            window.activate_window();
+                                        }
+                                        handler(request, bounds, window, cx)
+                                    } else {
+                                        false
+                                    }
+                                };
+                                if let Some(completion) = completion {
+                                    completion.apply(apply);
+                                } else {
+                                    let _ = apply();
                                 }
                             }
                         })

@@ -3,7 +3,7 @@
 // the LICENSE-APACHE file) or the MIT license (found in
 // the LICENSE-MIT file), at your option.
 
-use accesskit::{ActionHandler, ActionRequest};
+use accesskit::{ActionHandler, ActionRequest, TextActionResult};
 use accesskit_consumer::Tree;
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -15,8 +15,9 @@ use crate::WindowBounds;
 pub trait ActionHandlerNoMut {
     fn do_action(&self, request: ActionRequest);
 
-    fn do_text_action(&self, request: ActionRequest, _revision: Option<usize>) {
-        self.do_action(request)
+    fn do_text_action(&self, request: ActionRequest, _revision: Option<usize>) -> TextActionResult {
+        self.do_action(request);
+        TextActionResult::Immediate(true)
     }
 }
 
@@ -35,7 +36,7 @@ impl<H: ActionHandler + Send> ActionHandlerNoMut for ActionHandlerWrapper<H> {
         self.0.lock().unwrap().do_action(request)
     }
 
-    fn do_text_action(&self, request: ActionRequest, revision: Option<usize>) {
+    fn do_text_action(&self, request: ActionRequest, revision: Option<usize>) -> TextActionResult {
         self.0.lock().unwrap().do_text_action(request, revision)
     }
 }
@@ -85,8 +86,12 @@ impl Context {
         self.action_handler.do_action(request);
     }
 
-    pub fn do_text_action(&self, request: ActionRequest, revision: Option<usize>) {
-        self.action_handler.do_text_action(request, revision);
+    pub fn do_text_action(
+        &self,
+        request: ActionRequest,
+        revision: Option<usize>,
+    ) -> TextActionResult {
+        self.action_handler.do_text_action(request, revision)
     }
 
     pub(crate) fn read_app_context(&self) -> RwLockReadGuard<'_, AppContext> {

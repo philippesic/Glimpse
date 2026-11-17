@@ -223,8 +223,13 @@ mod tests {
                 self.do_text_action(request, None);
             }
 
-            fn do_text_action(&mut self, request: ActionRequest, revision: Option<usize>) {
+            fn do_text_action(
+                &mut self,
+                request: ActionRequest,
+                revision: Option<usize>,
+            ) -> accesskit::TextActionResult {
                 self.0.lock().unwrap().push((request.action, revision));
+                accesskit::TextActionResult::Deferred(Box::new(move || revision != Some(7)))
             }
         }
 
@@ -267,21 +272,23 @@ mod tests {
         assert!(native.set_caret_offset(1).unwrap());
         assert!(native.set_text_contents("tea").unwrap());
         source.set_busy();
-        source.set_read_only();
         adapter.update(update(vec![(id, source.clone())]));
         assert!(!native.set_selection(0, 0, 1).unwrap());
         assert!(!native.set_text_contents("stale").unwrap());
         source.clear_busy();
-        source.clear_read_only();
         source.set_text_revision(6);
-        adapter.update(update(vec![(id, source)]));
+        adapter.update(update(vec![(id, source.clone())]));
         assert!(native.set_selection(0, 0, 1).unwrap());
+        source.set_text_revision(7);
+        adapter.update(update(vec![(id, source)]));
+        assert!(!native.set_selection(0, 0, 1).unwrap());
         assert_eq!(
             *captured.lock().unwrap(),
             [
                 (Action::SetTextSelection, Some(5)),
                 (Action::SetValue, Some(5)),
                 (Action::SetTextSelection, Some(6)),
+                (Action::SetTextSelection, Some(7)),
             ]
         );
     }

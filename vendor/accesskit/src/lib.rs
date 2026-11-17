@@ -3465,6 +3465,22 @@ pub trait ActivationHandler {
     fn request_initial_tree(&mut self) -> Option<TreeUpdate>;
 }
 
+/// Completion of an action against a published text revision.
+pub enum TextActionResult {
+    Immediate(bool),
+    Deferred(Box<dyn FnOnce() -> bool + Send>),
+}
+
+impl TextActionResult {
+    /// Resolve the result after releasing the accessibility adapter's locks.
+    pub fn wait(self) -> bool {
+        match self {
+            Self::Immediate(result) => result,
+            Self::Deferred(wait) => wait(),
+        }
+    }
+}
+
 /// Handles requests from assistive technologies or other clients.
 pub trait ActionHandler {
     /// Perform the requested action. If the requested action is not supported,
@@ -3479,8 +3495,13 @@ pub trait ActionHandler {
     fn do_action(&mut self, request: ActionRequest);
 
     /// Dispatch an action against the text revision used to interpret the request.
-    fn do_text_action(&mut self, request: ActionRequest, _revision: Option<usize>) {
-        self.do_action(request)
+    fn do_text_action(
+        &mut self,
+        request: ActionRequest,
+        _revision: Option<usize>,
+    ) -> TextActionResult {
+        self.do_action(request);
+        TextActionResult::Immediate(true)
     }
 }
 
