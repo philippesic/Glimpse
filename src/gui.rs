@@ -2981,7 +2981,11 @@ impl Render for Shell {
         {
             self.ready = true;
             let failed = self.startup_failed;
+            let timing = std::env::var_os("GLIMPSE_TIMING").is_some();
             window.on_next_frame(move |window, _| {
+                if timing && !failed {
+                    eprintln!("GLIMPSE_EDITABLE_FRAME");
+                }
                 window.on_next_frame(move |_, _| {
                     let _ = lifecycle::notify(if failed { b'2' } else { b'0' });
                     if failed {
