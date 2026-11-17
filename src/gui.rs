@@ -2660,7 +2660,7 @@ impl Shell {
             "open" | "folder" => {
                 let prompt = cx.prompt_for_paths(PathPromptOptions {
                     files: command == "open",
-                    directories: true,
+                    directories: command == "folder",
                     multiple: command == "open",
                     prompt: None,
                 });
