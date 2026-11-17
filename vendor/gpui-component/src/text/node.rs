@@ -118,7 +118,7 @@ impl PartialEq for ImageNode {
 pub(crate) struct InlineNode {
     /// The text content.
     pub(crate) text: SharedString,
-    pub(crate) image: Option<ImageNode>,
+    pub(crate) image: Option<Box<ImageNode>>,
     /// The text styles, each tuple contains the range of the text and the style.
     pub(crate) marks: Vec<(Range<usize>, TextMark)>,
 
@@ -143,7 +143,7 @@ impl InlineNode {
 
     pub(crate) fn image(image: ImageNode) -> Self {
         let mut this = Self::new("");
-        this.image = Some(image);
+        this.image = Some(Box::new(image));
         this
     }
 
@@ -272,9 +272,7 @@ impl Paragraph {
     }
 
     pub(crate) fn push_str(&mut self, text: &str) {
-        self.children.push(
-            InlineNode::new(text.to_string()).marks(vec![(0..text.len(), TextMark::default())]),
-        );
+        self.children.push(InlineNode::new(text.to_string()));
     }
 
     pub(crate) fn push(&mut self, text: InlineNode) {
