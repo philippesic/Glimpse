@@ -48,7 +48,7 @@ impl Shell {
         self.io.send(Job::ReadMarkdown(
             doc.id,
             doc.generation,
-            doc.input.read(cx).value().to_string(),
+            doc.input.read(cx).value().into(),
             doc.disk.path.clone(),
         ));
     }

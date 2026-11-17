@@ -17,7 +17,7 @@ pub enum Job {
     HoldMaintenance(mpsc::Sender<()>, mpsc::Receiver<()>),
     #[cfg(test)]
     HoldRead(mpsc::Sender<()>, mpsc::Receiver<()>),
-    ReadMarkdown(u64, u64, String, PathBuf),
+    ReadMarkdown(u64, u64, Arc<str>, PathBuf),
     CompletePath(u64, String, PathBuf),
     Visit(PathBuf),
     RecentLocation(Vec<PathBuf>),

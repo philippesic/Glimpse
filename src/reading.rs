@@ -3,6 +3,7 @@ use std::{
     collections::HashMap,
     io::Read,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 pub struct Raster {
@@ -11,7 +12,7 @@ pub struct Raster {
     pub bgra: Vec<u8>,
 }
 pub struct Prepared {
-    pub source: String,
+    pub source: Arc<str>,
     pub images: HashMap<String, Raster>,
     pub notes: Vec<String>,
 }
@@ -50,7 +51,7 @@ fn decoded_path(value: &str) -> Option<PathBuf> {
     let bytes: Vec<_> = percent_encoding::percent_decode_str(value).collect();
     (!bytes.contains(&0)).then(|| PathBuf::from(std::ffi::OsString::from_vec(bytes)))
 }
-pub fn prepare(source: String, path: &Path) -> Prepared {
+pub fn prepare(source: Arc<str>, path: &Path) -> Prepared {
     let mut images = HashMap::new();
     let mut notes = vec![];
     let mut total = 0;
@@ -177,9 +178,9 @@ mod tests {
         image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]))
             .save(dir.path().join("local.png"))
             .unwrap();
-        let source =
+        let source: Arc<str> =
             "![local](local.png)\n![remote](http://127.0.0.1:1/trap.png)\n<script>raw</script>\n"
-                .to_owned();
+                .into();
         let prepared = prepare(source.clone(), &dir.path().join("read.md"));
         assert_eq!(prepared.source, source);
         assert_eq!(
