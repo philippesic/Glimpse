@@ -3120,16 +3120,20 @@ impl Render for Shell {
                         .clone()
                         .or_else(|| self.selected_path())
                 };
-                root.child(
-                    div()
-                        .px_2()
-                        .text_sm()
-                        .truncate()
-                        .child(candidate.map_or_else(
-                            || "Select a file, then Choose".into(),
-                            |path| format!("Selection: {}", paths::display(&path)),
-                        )),
-                )
+                let label = candidate.map_or_else(
+                    || "Select a file, then Choose".into(),
+                    |path| format!("Selection: {}", paths::display(&path)),
+                );
+                root.child(accessible(
+                    "picker-selection",
+                    div().px_2().text_sm().truncate().child(label.clone()),
+                    move |_, _, _| {
+                        let mut node = gpui::accesskit::Node::new(gpui::accesskit::Role::Status);
+                        node.set_label(label.clone());
+                        node.set_live(gpui::accesskit::Live::Polite);
+                        AccessibilityInfo::new(node)
+                    },
+                ))
             });
         if self.open_failure.is_some() {
             root = root.child(self.open_failure_view(cx));

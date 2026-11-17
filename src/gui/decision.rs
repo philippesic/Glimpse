@@ -153,7 +153,7 @@ impl Render for Decision {
                             Button::new(i)
                                 .label(*label)
                                 .small()
-                                .outline()
+                                .when(self.primary != Some(i), |button| button.outline())
                                 .when(self.primary == Some(i), |button| button.primary())
                                 .when(self.destructive == Some(i), |button| button.danger())
                                 .on_click(cx.listener(move |_, _, _, cx| cx.emit(Choice(i))))
