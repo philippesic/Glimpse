@@ -254,6 +254,7 @@ struct Shell {
     query: Entity<InputState>,
     reading: bool,
     reading_view: Option<reading::View>,
+    memory_release: Option<Task<()>>,
     status: String,
     open_failure: Option<open_failure::Failure>,
     font_warning: Option<String>,
@@ -426,6 +427,7 @@ impl Shell {
             query,
             reading: false,
             reading_view: None,
+            memory_release: None,
             status: String::new(),
             open_failure: None,
             font_warning: None,
@@ -947,7 +949,13 @@ impl Shell {
             return;
         }
         if preview {
+            let release = self.documents.iter().any(|doc| {
+                doc.preview && !doc.dirty(cx) && doc.input.read(cx).text().len() >= 1024 * 1024
+            });
             self.documents.retain(|d| !d.preview || d.dirty(cx));
+            if release {
+                self.release_view_memory(window, cx);
+            }
         }
         let id = self.next_id;
         self.next_id += 1;
@@ -1121,6 +1129,21 @@ impl Shell {
         }
     }
 
+    fn release_view_memory(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (released, rendered) = async_channel::bounded(1);
+        window.on_next_frame(move |window, _| {
+            window.refresh();
+            window.on_next_frame(move |_, _| {
+                let _ = released.try_send(());
+            });
+        });
+        self.memory_release = Some(cx.background_spawn(async move {
+            if rendered.recv().await.is_ok() {
+                Timer::after(std::time::Duration::from_millis(200)).await;
+                platform::release_unused_memory();
+            }
+        }));
+    }
     fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(index) = self
             .documents
@@ -1460,7 +1483,13 @@ impl Shell {
                                 self.completed.insert(id);
                             }
                             if !self.keep_after_cleanup.remove(&id) {
+                                let release = self.documents.iter().any(|doc| {
+                                    doc.id == id && doc.input.read(cx).text().len() >= 1024 * 1024
+                                });
                                 self.documents.retain(|d| d.id != id);
+                                if release {
+                                    self.release_view_memory(window, cx);
+                                }
                                 self.checks.invalidate(id);
                                 self.watch();
                                 if self.active == Some(id) {
@@ -2954,7 +2983,7 @@ impl Shell {
 }
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.prepare_reading(cx);
+        self.prepare_reading(window, cx);
         let title = self
             .documents
             .iter()

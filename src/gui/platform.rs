@@ -59,3 +59,10 @@ pub(super) fn configure_allocations() {
         }
     }
 }
+
+pub(super) fn release_unused_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}

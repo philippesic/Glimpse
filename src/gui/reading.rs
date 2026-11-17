@@ -12,7 +12,15 @@ pub(super) struct View {
     error: Option<String>,
 }
 impl Shell {
-    pub(super) fn prepare_reading(&mut self, cx: &App) {
+    pub(super) fn prepare_reading(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .reading_view
+            .as_ref()
+            .is_some_and(|view| !self.reading || self.active != Some(view.id))
+        {
+            self.reading_view = None;
+            self.release_view_memory(window, cx);
+        }
         if !self.reading {
             return;
         }
