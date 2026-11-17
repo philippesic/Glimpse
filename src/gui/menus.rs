@@ -115,9 +115,11 @@ impl Shell {
     pub(super) fn main_menu(&self, cx: &Context<Self>) -> impl IntoElement {
         let shell = cx.entity().downgrade();
         let settings = self.settings.clone();
-        let has_document = self.active.is_some();
-        let picker = self.request.pick;
-        let waiting = self.request.wait && !self.finished;
+        let disabled: std::collections::HashSet<_> = commands::COMMANDS
+            .iter()
+            .filter(|command| !self.command_enabled(command.id))
+            .map(|command| command.id)
+            .collect();
         Button::new("main-menu")
             .label("Menu")
             .small()
@@ -208,39 +210,12 @@ impl Shell {
                                 super::platform::shortcut_label(shortcut)
                             )
                         };
-                        let disabled = (picker
-                            && matches!(
-                                *id,
-                                "new"
-                                    | "save"
-                                    | "save-as"
-                                    | "save-copy"
-                                    | "named-file"
-                                    | "new-folder"
-                                    | "rename"
-                                    | "trash"
-                                    | "settings"
-                                    | "wrap"
-                                    | "indent"
-                                    | "outdent"
-                                    | "recovery"
-                                    | "pin"
-                            ))
-                            || (!has_document
-                                && matches!(
-                                    *id,
-                                    "save"
-                                        | "save-as"
-                                        | "save-copy"
-                                        | "find"
-                                        | "indent"
-                                        | "outdent"
-                                        | "read"
-                                        | "close"
-                                ))
-                            || (matches!(*id, "finish" | "abort") && !waiting)
-                            || (matches!(*id, "choose" | "cancel") && !picker);
-                        menu = menu.item(command_item(shell.clone(), command.id, label, disabled));
+                        menu = menu.item(command_item(
+                            shell.clone(),
+                            command.id,
+                            label,
+                            disabled.contains(id),
+                        ));
                     }
                     menu = menu.separator();
                 }

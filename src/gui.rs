@@ -25,7 +25,7 @@ use glimpse::{
 };
 use gpui::{prelude::*, *};
 use gpui_component::{
-    ActiveTheme, Root, Selectable, Sizable,
+    ActiveTheme, Disableable, Root, Selectable, Sizable,
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState, Position},
     text::TextView,
@@ -240,6 +240,8 @@ struct Shell {
     documents: Vec<Document>,
     active: Option<u64>,
     tab_scroll: ScrollHandle,
+    breadcrumb_scroll: ScrollHandle,
+    breadcrumb_view: Option<(PathBuf, Pixels, f32)>,
     next_id: u64,
     open_token: u64,
     interaction: u64,
@@ -410,6 +412,8 @@ impl Shell {
             documents: vec![],
             active: None,
             tab_scroll: ScrollHandle::new(),
+            breadcrumb_scroll: ScrollHandle::new(),
+            breadcrumb_view: None,
             next_id: 1,
             open_token: 0,
             interaction: 0,
@@ -2449,8 +2453,17 @@ impl Shell {
                 }
             }
             "find" => {
+                self.reading = false;
+                self.navigation_only = false;
                 self.focus(window, cx);
-                window.dispatch_action(Box::new(gpui_component::input::Search), cx);
+                if let Some(doc) = self
+                    .documents
+                    .iter()
+                    .find(|doc| Some(doc.id) == self.active)
+                {
+                    doc.input
+                        .update(cx, |input, cx| input.show_search(window, cx));
+                }
             }
             "submit" => self.submit(window, cx),
             "dismiss" => {
@@ -2620,7 +2633,11 @@ impl Shell {
             "refresh-recovery" => {
                 self.io.send(Job::Inventory);
             }
-            "line" => self.panel(Panel::Line, window, cx),
+            "line" => {
+                self.reading = false;
+                self.navigation_only = false;
+                self.panel(Panel::Line, window, cx);
+            }
             "parent" => {
                 if let Some(path) = self.current.parent().map(|p| p.to_owned()) {
                     self.navigate(path);
@@ -2665,6 +2682,9 @@ impl Shell {
                     "Refreshing mounted locations; reopen Locations for the result".into();
             }
             "indent" | "outdent" => {
+                if self.reading {
+                    return;
+                }
                 self.focus(window, cx);
                 let action: Box<dyn Action> = if command == "indent" {
                     Box::new(gpui_component::input::Indent)
@@ -2825,6 +2845,54 @@ impl Shell {
         }
         cx.notify();
     }
+    fn command_enabled(&self, command: &str) -> bool {
+        let document = self
+            .documents
+            .iter()
+            .find(|doc| Some(doc.id) == self.active);
+        if self.request.pick
+            && matches!(
+                command,
+                "new"
+                    | "save"
+                    | "save-as"
+                    | "save-copy"
+                    | "named-file"
+                    | "new-folder"
+                    | "rename"
+                    | "trash"
+                    | "settings"
+                    | "wrap"
+                    | "indent"
+                    | "outdent"
+                    | "recovery"
+                    | "pin"
+            )
+        {
+            return false;
+        }
+        match command {
+            "save" => document.is_some_and(|doc| !doc.saving),
+            "save-as" | "save-copy" => {
+                document.is_some_and(|doc| !doc.saving) && !self.destination_busy
+            }
+            "find" | "line" | "read" | "close" | "keep-tab" => document.is_some(),
+            "indent" | "outdent" => document.is_some() && !self.reading,
+            "reload" | "reveal" => {
+                document.is_some_and(|doc| !doc.disk.target.as_os_str().is_empty() && !doc.saving)
+            }
+            "compare" | "overwrite" => {
+                document.is_some_and(|doc| doc.external.is_some() && !doc.saving)
+            }
+            "back" => !self.history.is_empty(),
+            "forward" => !self.future.is_empty(),
+            "parent" => self.current.parent().is_some(),
+            "finish" | "abort" => self.request.wait && !self.finished,
+            "choose" | "cancel" => self.request.pick,
+            _ => true,
+        }
+    }
+
     fn button(
         &self,
         label: impl Into<SharedString>,
@@ -2844,7 +2912,16 @@ impl Shell {
             .label(label)
             .small()
             .compact()
-            .outline()
+            .ghost()
+            .disabled(!self.command_enabled(command))
+            .when(
+                command == "save"
+                    && self
+                        .documents
+                        .iter()
+                        .any(|doc| Some(doc.id) == self.active && doc.dirty(cx)),
+                |button| button.primary(),
+            )
             .on_click(cx.listener(move |this, _, window, cx| this.command(command, window, cx)))
     }
 }
@@ -2927,16 +3004,20 @@ impl Render for Shell {
                 .child(self.button("‹", "back", cx))
                 .child(self.button("›", "forward", cx))
                 .child(self.button("↑", "parent", cx))
-                .child(
-                    self.button("Location", "path", cx)
-                        .tooltip(paths::display(&self.current)),
-                )
                 .child(self.locations_menu(cx))
-                .child(self.button("Navigator", "toggle-navigator", cx))
+                .child(self.button(
+                    if self.navigator_visible {
+                        "Hide files"
+                    } else {
+                        "Show files"
+                    },
+                    "toggle-navigator",
+                    cx,
+                ))
                 .child(self.button("Open", "open", cx))
-                .child(self.button("Filter", "filter", cx))
-                .child(self.button("Files", "find-files", cx))
-                .child(self.button("Text", "find-text", cx))
+                .child(self.button("Filter folder", "filter", cx))
+                .child(self.button("Find files", "find-files", cx))
+                .child(self.button("Find text", "find-text", cx))
                 .child(self.button("Commands", "commands", cx));
         }
         if self.request.pick {
@@ -3335,7 +3416,7 @@ impl Render for Shell {
                         self.button(if self.reading { "Edit" } else { "Read" }, "read", cx)
                             .selected(self.reading),
                     )
-                    .child(self.button("Line", "line", cx))
+                    .child(self.button("Go to line", "line", cx))
                     .child(self.button("Close tab", "close", cx))
                     .child(self.button("Reload disk", "reload", cx))
             });

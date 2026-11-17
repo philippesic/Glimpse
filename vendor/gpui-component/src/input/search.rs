@@ -250,6 +250,10 @@ impl InputState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.show_search(window, cx);
+    }
+
+    pub fn show_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.searchable {
             return;
         }

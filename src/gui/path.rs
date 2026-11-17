@@ -76,7 +76,7 @@ impl Shell {
             Err(error) => self.status = format!("Path completion failed: {error}"),
         }
     }
-    pub(super) fn path_bar(&self, _window: &mut Window, cx: &Context<Self>) -> AnyElement {
+    pub(super) fn path_bar(&mut self, window: &mut Window, cx: &Context<Self>) -> AnyElement {
         if self.panel == Some(Panel::Path) {
             return div()
                 .flex()
@@ -94,37 +94,68 @@ impl Shell {
             .map(|path| path.to_owned())
             .collect();
         ancestors.reverse();
+        let count = ancestors.len();
+        let view = (
+            self.current.clone(),
+            window.viewport_size().width,
+            self.settings.ui_scale,
+        );
+        if self.breadcrumb_view.as_ref() != Some(&view) {
+            let scroll = self.breadcrumb_scroll.clone();
+            window.on_next_frame(move |window, _| {
+                scroll.scroll_to_item(count.saturating_sub(1) * 2);
+                window.refresh();
+            });
+            self.breadcrumb_view = Some(view);
+        }
         div()
-            .id("breadcrumbs")
             .flex()
             .items_center()
-            .gap_1()
+            .gap_2()
             .px_2()
             .py_1()
-            .overflow_x_scroll()
-            .children(ancestors.into_iter().enumerate().map(|(i, path)| {
-                let label = paths::name(&path);
-                Button::new(("crumb", i))
-                    .label(label)
-                    .tooltip(paths::display(&path))
-                    .small()
-                    .compact()
-                    .ghost()
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.navigate(path.clone());
-                        this.navigation_only = true;
-                        window.focus(&this.nav_focus);
-                        cx.notify();
-                    }))
-            }))
             .child(
-                self.command_button("edit-location", "…", "path", cx)
+                div()
+                    .id("breadcrumbs")
+                    .flex()
                     .flex_1()
-                    .min_w(px(28.))
-                    .tooltip("Edit path"),
+                    .min_w_0()
+                    .items_center()
+                    .gap_1()
+                    .overflow_x_scroll()
+                    .track_scroll(&self.breadcrumb_scroll)
+                    .children(ancestors.into_iter().enumerate().flat_map(|(i, path)| {
+                        let label = paths::name(&path);
+                        let button = Button::new(("crumb", i))
+                            .label(label)
+                            .tooltip(paths::display(&path))
+                            .small()
+                            .compact()
+                            .ghost()
+                            .flex_shrink_0()
+                            .selected(i + 1 == count)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.navigate(path.clone());
+                                this.navigation_only = true;
+                                window.focus(&this.nav_focus);
+                                cx.notify();
+                            }))
+                            .into_any_element();
+                        if i == 0 {
+                            vec![button]
+                        } else {
+                            vec![div().flex_shrink_0().child("›").into_any_element(), button]
+                        }
+                    })),
+            )
+            .child(
+                self.command_button("edit-location", "Edit path…", "path", cx)
+                    .flex_shrink_0()
+                    .tooltip(paths::display(&self.current)),
             )
             .into_any_element()
     }
+
     pub(super) fn path_matches(&self, cx: &Context<Self>) -> AnyElement {
         let current = self.query.read(cx).value();
         let Some(completions) = self
