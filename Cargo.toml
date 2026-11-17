@@ -1,5 +1,5 @@
 [workspace]
-members = ["vendor/gpui-component"]
+members = ["vendor/gpui-component", "vendor/accesskit"]
 default-members = ["."]
 exclude = ["vendor/gpui"]
 resolver = "3"
@@ -47,6 +47,7 @@ strip = true
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSFileManager", "NSURL", "NSString", "NSError", "NSAttributedString", "NSNotification", "NSRange", "NSObject", "NSDictionary"] }
 
 [patch.crates-io]
+accesskit = { path = "vendor/accesskit" }
 gpui = { path = "vendor/gpui" }
 xattr = { path = "vendor/xattr" }
 gpui-component = { path = "vendor/gpui-component" }
