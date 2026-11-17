@@ -476,13 +476,11 @@ impl RenderOnce for Button {
         let action_focus = focus_handle.clone();
         let rendered = self
             .base
-            .when(!self.disabled, |this| {
-                this.track_focus(
-                    &focus_handle
-                        .tab_index(self.tab_index)
-                        .tab_stop(self.tab_stop),
-                )
-            })
+            .track_focus(
+                &focus_handle
+                    .tab_index(self.tab_index)
+                    .tab_stop(self.tab_stop && !self.disabled),
+            )
             .cursor_default()
             .flex()
             .flex_shrink_0()

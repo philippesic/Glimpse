@@ -21,7 +21,8 @@ use crate::{
     button::{Button, ButtonVariants},
     h_flex,
     input::{
-        Enter, Escape, IndentInline, Input, InputEvent, InputState, Search, movement::MoveDirection,
+        Enter, Escape, IndentInline, Input, InputEvent, InputState, OutdentInline, Search,
+        movement::MoveDirection,
     },
     label::Label,
     v_flex,
@@ -446,6 +447,15 @@ impl SearchPanel {
         window.focus_next();
     }
 
+    fn on_action_tab_prev(
+        &mut self,
+        _: &OutdentInline,
+        window: &mut Window,
+        _: &mut Context<Self>,
+    ) {
+        window.focus_prev();
+    }
+
     fn prev(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(range) = self.matcher.next_back() {
             let _ = self.editor.update(cx, |state, cx| {
@@ -597,6 +607,7 @@ impl Render for SearchPanel {
             .on_action(cx.listener(Self::on_action_next))
             .on_action(cx.listener(Self::on_action_escape))
             .on_action(cx.listener(Self::on_action_tab))
+            .on_action(cx.listener(Self::on_action_tab_prev))
             .font_family(cx.theme().font_family.clone())
             .items_center()
             .py_2()
@@ -763,6 +774,97 @@ impl Render for SearchPanel {
 
 #[cfg(test)]
 mod tests {
+    struct SearchFixture {
+        editor: gpui::Entity<super::InputState>,
+    }
+
+    impl gpui::Render for SearchFixture {
+        fn render(
+            &mut self,
+            _: &mut gpui::Window,
+            _: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            super::Input::new(&self.editor)
+        }
+    }
+
+    #[gpui::test]
+    fn find_controls_preserve_keyboard_navigation_and_return_focus(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::init);
+        let mut editor = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let input = cx.new(|cx| {
+                super::InputState::new(window, cx)
+                    .multi_line(true)
+                    .default_value("    unchanged source")
+                    .searchable(true)
+            });
+            editor = Some(input.clone());
+            let fixture = cx.new(|_| SearchFixture { editor: input });
+            crate::Root::new(fixture, window, cx)
+        });
+        let editor = editor.unwrap();
+        cx.update(|window, cx| {
+            editor.update(cx, |state, cx| state.show_search(window, cx));
+        });
+        cx.run_until_parked();
+        let query = cx.update(|window, cx| window.focused(cx));
+        assert!(query.is_some());
+        cx.simulate_keystrokes("tab");
+        let case = cx.update(|window, cx| window.focused(cx));
+        assert!(case.is_some());
+        assert_ne!(case, query);
+        cx.simulate_keystrokes("tab");
+        let word = cx.update(|window, cx| window.focused(cx));
+        assert!(word.is_some());
+        assert_ne!(word, case);
+        cx.simulate_keystrokes("shift-tab");
+        assert_eq!(cx.update(|window, cx| window.focused(cx)), case);
+        cx.simulate_keystrokes("shift-tab");
+        assert_eq!(cx.update(|window, cx| window.focused(cx)), query);
+        editor.read_with(cx, |state, cx| {
+            assert_eq!(state.value(), "    unchanged source");
+            let panel = state.search_panel.as_ref().unwrap().read(cx);
+            assert_eq!(panel.search_input.read(cx).value(), "");
+        });
+        cx.simulate_input("unchanged");
+        editor.read_with(cx, |state, cx| {
+            assert_eq!(
+                state.search_panel.as_ref().unwrap().read(cx).matcher.len(),
+                1
+            );
+        });
+        cx.simulate_keystrokes("tab tab tab space");
+        cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse("space").unwrap(),
+        });
+        assert!(cx.update(|window, cx| {
+            editor
+                .read(cx)
+                .search_panel
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .replace_input
+                .read(cx)
+                .focus_handle
+                .is_focused(window)
+        }));
+        cx.simulate_input("updated");
+        cx.simulate_keystrokes("tab tab space");
+        cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse("space").unwrap(),
+        });
+        editor.read_with(cx, |state, _| {
+            assert_eq!(state.value(), "    updated source")
+        });
+        cx.simulate_keystrokes("escape");
+        editor.read_with(cx, |state, cx| {
+            assert!(!state.search_panel.as_ref().unwrap().read(cx).open);
+        });
+        assert!(cx.update(|window, cx| editor.read(cx).focus_handle.is_focused(window)));
+    }
+
     #[gpui::test]
     fn closing_an_input_releases_its_menu_and_search_fields(cx: &mut gpui::TestAppContext) {
         cx.update(crate::init);
