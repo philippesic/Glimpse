@@ -47,7 +47,7 @@ pub enum Job {
     Save {
         id: u64,
         disk: DiskFile,
-        text: String,
+        text: Arc<str>,
         generation: u64,
         without_recovery: bool,
     },
@@ -98,7 +98,7 @@ pub enum Reply {
     Checked(u64, u64, Result<(DiskFile, String), String>),
     CheckDeferred(u64, u64),
     Open(PathBuf, u64, Result<(DiskFile, String), String>),
-    Save(u64, u64, String, Result<DiskFile, String>),
+    Save(u64, u64, Arc<str>, Result<DiskFile, String>),
 }
 
 struct Rebinding {
@@ -554,7 +554,7 @@ impl IoWorker {
                                                 id,
                                                 &storage::Draft {
                                                     path: disk.path.clone(),
-                                                    text: text.clone().into(),
+                                                    text: text.clone(),
                                                     base: disk.bytes.clone(),
                                                     target: Some(disk.target.clone()),
                                                     generation,

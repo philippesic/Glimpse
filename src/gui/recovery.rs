@@ -245,7 +245,7 @@ impl Shell {
         self.io.send(Job::Save {
             id: doc.id,
             generation: snapshot.generation,
-            text: snapshot.text,
+            text: snapshot.text.into(),
             disk: snapshot.disk,
             without_recovery: true,
         });

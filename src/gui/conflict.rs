@@ -125,7 +125,7 @@ impl Shell {
                 id: doc.id,
                 generation: snapshot.generation,
                 disk: snapshot.disk,
-                text: snapshot.local,
+                text: snapshot.local.into(),
                 without_recovery: false,
             }),
         }
