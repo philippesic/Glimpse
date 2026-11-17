@@ -642,7 +642,14 @@ impl Shell {
             return;
         }
         self.decision_return = window.focused(cx);
-        let view = cx.new(|cx| decision::Decision::new(title, detail, actions, window, cx));
+        let closing = matches!(&action, DecisionAction::Close);
+        let view = cx.new(|cx| {
+            let mut decision = decision::Decision::new(title, detail, actions, window, cx);
+            if closing {
+                decision.close_actions();
+            }
+            decision
+        });
         self.decision_subscription =
             Some(
                 cx.subscribe_in(&view, window, |this, _, choice, window, cx| {
@@ -2276,9 +2283,27 @@ impl Shell {
                     .collect::<Vec<_>>()
                     .join("\n");
                 let finish = decision.finish;
-                self.ask_decision(DecisionAction::Close, if finish { "Finish Editing?" } else { "Close with unsaved changes?" }.into(),
-                    format!("Unsaved documents:\n{names}\nSave writes these documents before continuing. Discard closes these documents and retires their automatic drafts. Cancel keeps them open."),
-                    vec!["Cancel", if finish { "Save and Finish" } else { "Save and Close" }, "Discard"], window, cx);
+                self.ask_decision(
+                    DecisionAction::Close,
+                    if finish {
+                        "Finish Editing?"
+                    } else {
+                        "Close with unsaved changes?"
+                    }
+                    .into(),
+                    format!("Unsaved documents:\n{names}"),
+                    vec![
+                        "Cancel",
+                        if finish {
+                            "Save and Finish"
+                        } else {
+                            "Save and Close"
+                        },
+                        "Discard",
+                    ],
+                    window,
+                    cx,
+                );
             }
         } else {
             self.commit_close(false, cx);
@@ -2873,7 +2898,7 @@ impl Shell {
             return false;
         }
         match command {
-            "save" => document.is_some_and(|doc| !doc.saving),
+            "save" => document.is_some_and(|doc| !doc.saving && doc.external.is_none()),
             "save-as" | "save-copy" => {
                 document.is_some_and(|doc| !doc.saving) && !self.destination_busy
             }
@@ -2917,6 +2942,7 @@ impl Shell {
             .disabled(!self.command_enabled(command))
             .when(
                 command == "save"
+                    && self.command_enabled(command)
                     && self
                         .documents
                         .iter()

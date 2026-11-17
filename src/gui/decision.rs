@@ -1,13 +1,16 @@
 use gpui::{prelude::*, *};
 use gpui_component::{
     ActiveTheme, Sizable,
-    button::Button,
+    button::{Button, ButtonVariants},
     input::{Input, InputState},
 };
 
 pub struct Decision {
     title: String,
     detail: String,
+    summary: Option<String>,
+    primary: Option<usize>,
+    destructive: Option<usize>,
     actions: Vec<&'static str>,
     focus: FocusHandle,
     comparison: Option<[Entity<InputState>; 2]>,
@@ -45,11 +48,21 @@ impl Decision {
         Self {
             title,
             detail,
+            summary: None,
+            primary: None,
+            destructive: None,
             actions,
             focus,
             comparison: None,
             _subscription: subscription,
         }
+    }
+    pub fn close_actions(&mut self) {
+        self.summary = Some(
+            "Save writes these documents. Discard closes them and removes their automatic drafts. Cancel keeps them open.".into(),
+        );
+        self.primary = Some(1);
+        self.destructive = Some(2);
     }
     pub fn compare(
         &mut self,
@@ -76,7 +89,10 @@ impl Decision {
 impl Render for Decision {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let semantic_title = self.title.clone();
-        let semantic_detail = self.detail.clone();
+        let semantic_detail = self.summary.as_ref().map_or_else(
+            || self.detail.clone(),
+            |summary| format!("{summary}\n\n{}", self.detail),
+        );
         let rendered = div()
             .id("decision-overlay")
             .absolute()
@@ -102,7 +118,10 @@ impl Render for Decision {
                     .border_color(cx.theme().border)
                     .bg(cx.theme().background)
                     .text_color(cx.theme().foreground)
-                    .child(div().text_xl().child(self.title.clone()))
+                    .child(div().flex_shrink_0().text_xl().child(self.title.clone()))
+                    .when_some(self.summary.as_ref(), |panel, summary| {
+                        panel.child(div().flex_shrink_0().text_sm().child(summary.clone()))
+                    })
                     .child(
                         div()
                             .id("decision-detail")
@@ -135,6 +154,8 @@ impl Render for Decision {
                                 .label(*label)
                                 .small()
                                 .outline()
+                                .when(self.primary == Some(i), |button| button.primary())
+                                .when(self.destructive == Some(i), |button| button.danger())
                                 .on_click(cx.listener(move |_, _, _, cx| cx.emit(Choice(i))))
                         }),
                     )),

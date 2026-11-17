@@ -110,7 +110,7 @@ impl Shell {
                     })),
                 });
                 view.source = Some(prepared.source.into());
-                view.notes = prepared.notes.join(" ");
+                view.notes = prepared.notes.join("\n\n");
             }
             Err(error) => view.error = Some(error),
         }
