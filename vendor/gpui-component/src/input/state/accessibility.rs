@@ -55,12 +55,7 @@ impl Mapping {
             let mut run = Node::new(Role::TextRun);
             let range = new.start + part.range.start..new.start + part.range.end;
             run.set_value(text[range.clone()].to_owned());
-            run.set_character_lengths(
-                part.boundaries
-                    .windows(2)
-                    .map(|pair| (pair[1] - pair[0]) as u8)
-                    .collect::<Vec<_>>(),
-            );
+            run.set_character_lengths(part.lengths.clone());
             run.set_word_starts(part.words.clone());
             run.set_text_direction(TextDirection::LeftToRight);
             if index > 0 && parts[index - 1].line == part.line {
@@ -311,13 +306,7 @@ mod tests {
             assert_eq!(mapping.runs[index].id, *id);
             assert_eq!(mapping.runs[index].range, part.range);
             assert_eq!(node.value(), Some(&text[part.range.clone()]));
-            assert_eq!(
-                node.character_lengths(),
-                part.boundaries
-                    .windows(2)
-                    .map(|pair| (pair[1] - pair[0]) as u8)
-                    .collect::<Vec<_>>()
-            );
+            assert_eq!(node.character_lengths(), part.lengths.clone());
             assert_eq!(node.word_starts(), part.words);
             assert_eq!(
                 node.previous_on_line(),
@@ -329,7 +318,7 @@ mod tests {
                 (index + 1 < parts.len() && parts[index + 1].line == part.line)
                     .then(|| mapping.runs[index + 1].id)
             );
-            for &byte in &part.boundaries {
+            for &byte in &part.boundaries() {
                 let position = mapping.position(byte);
                 assert_eq!(mapping.offset(&position), Some(byte));
             }
@@ -392,13 +381,7 @@ mod tests {
             for (index, segment) in segments.iter().enumerate() {
                 let id = NodeId((segments.len() - index) as u64 + 10);
                 let mut node = Node::new(Role::TextRun);
-                node.set_character_lengths(
-                    segment
-                        .boundaries
-                        .windows(2)
-                        .map(|pair| (pair[1] - pair[0]) as u8)
-                        .collect::<Vec<_>>(),
-                );
+                node.set_character_lengths(segment.lengths.clone());
                 nodes.push((id, node));
                 mapping.runs.push(Run {
                     id,
@@ -412,7 +395,7 @@ mod tests {
                     .position(|run| offset < run.range.end)
                     .unwrap_or(segments.len() - 1);
                 let character = segments[index]
-                    .boundaries
+                    .boundaries()
                     .partition_point(|&byte| byte <= offset)
                     .saturating_sub(1);
                 let position = mapping.position(offset);
@@ -420,13 +403,13 @@ mod tests {
                 assert_eq!(position.character_index, character);
                 assert_eq!(
                     mapping.offset(&position),
-                    Some(segments[index].boundaries[character])
+                    Some(segments[index].boundaries()[character])
                 );
             }
             assert_eq!(
                 mapping.offset(&TextPosition {
                     node: mapping.runs[0].id,
-                    character_index: segments[0].boundaries.len(),
+                    character_index: segments[0].boundaries().len(),
                 }),
                 None
             );
@@ -449,17 +432,17 @@ mod tests {
                 .collect::<String>(),
             text
         );
-        assert!(runs.iter().all(|run| run.boundaries.len() <= 256));
-        assert_eq!(&text[runs[0].boundaries[2]..runs[0].boundaries[3]], "é");
+        assert!(runs.iter().all(|run| run.boundaries().len() <= 256));
+        assert_eq!(&text[runs[0].boundaries()[2]..runs[0].boundaries()[3]], "é");
         assert_eq!(
-            &text[runs[0].boundaries[runs[0].boundaries.len() - 2]..runs[0].range.end],
+            &text[runs[0].boundaries()[runs[0].boundaries().len() - 2]..runs[0].range.end],
             "\r\n"
         );
         assert_eq!(runs.last().unwrap().range, text.len()..text.len());
     }
     #[test]
     fn empty_text_and_oversized_combining_sequences_remain_representable() {
-        assert_eq!(segments("")[0].boundaries, vec![0]);
+        assert_eq!(segments("")[0].boundaries(), vec![0]);
         let text = format!("a{}", "́".repeat(400));
         let runs = segments(&text);
         assert_eq!(
@@ -469,7 +452,7 @@ mod tests {
             text
         );
         assert!(runs.iter().all(|run| run
-            .boundaries
+            .boundaries()
             .windows(2)
             .all(|pair| pair[1] - pair[0] <= 255)));
     }
