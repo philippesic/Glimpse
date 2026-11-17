@@ -31,14 +31,12 @@ struct Frame {
     children: Vec<node::Node>,
     paragraph: Paragraph,
     buffer: String,
+    text: String,
+    text_marks: Vec<(std::ops::Range<usize>, TextMark)>,
     rows: Vec<TableRow>,
     cells: Vec<TableCell>,
     checked: Option<bool>,
     spread: bool,
-}
-fn inline(text: String, marks: &[TextMark]) -> InlineNode {
-    let length = text.len();
-    InlineNode::new(text).marks(marks.iter().map(|mark| (0..length, mark.clone())).collect())
 }
 impl Frame {
     fn new(kind: Block, start: usize) -> Self {
@@ -48,10 +46,29 @@ impl Frame {
             children: vec![],
             paragraph: Paragraph::default(),
             buffer: String::new(),
+            text: String::new(),
+            text_marks: vec![],
             rows: vec![],
             cells: vec![],
             checked: None,
             spread: false,
+        }
+    }
+    fn append(&mut self, text: &str, marks: &[TextMark]) {
+        let start = self.text.len();
+        self.text.push_str(text);
+        self.text_marks.extend(
+            marks
+                .iter()
+                .map(|mark| (start..self.text.len(), mark.clone())),
+        );
+    }
+    fn finish_text(&mut self) {
+        if !self.text.is_empty() {
+            self.paragraph.push(
+                InlineNode::new(std::mem::take(&mut self.text))
+                    .marks(std::mem::take(&mut self.text_marks)),
+            );
         }
     }
     fn flush(&mut self, marks: &[TextMark], finder: &LinkFinder) {
@@ -62,7 +79,7 @@ impl Frame {
         if marks.iter().any(|mark| mark.code || mark.link.is_some())
             || !text.contains([':', '@']) && !text.contains("www.")
         {
-            self.paragraph.push(inline(text, marks));
+            self.append(&text, marks);
             return;
         }
         let mut offset = 0;
@@ -81,25 +98,23 @@ impl Frame {
                 _ => continue,
             };
             if link.start() > offset {
-                self.paragraph
-                    .push(inline(text[offset..link.start()].to_owned(), marks));
+                self.append(&text[offset..link.start()], marks);
             }
             let mut link_marks = marks.to_vec();
             link_marks.push(TextMark::default().link(LinkMark {
                 url: url.into(),
                 ..Default::default()
             }));
-            self.paragraph
-                .push(inline(link.as_str().to_owned(), &link_marks));
+            self.append(link.as_str(), &link_marks);
             offset = link.end();
         }
         if offset < text.len() {
-            self.paragraph
-                .push(inline(text[offset..].to_owned(), marks));
+            self.append(&text[offset..], marks);
         }
     }
     fn finish_pending(&mut self, marks: &[TextMark], finder: &LinkFinder) {
         self.flush(marks, finder);
+        self.finish_text();
         if !self.paragraph.is_empty() {
             self.children
                 .push(node::Node::Paragraph(self.paragraph.take()));
@@ -114,6 +129,7 @@ impl Frame {
         theme: &HighlightTheme,
     ) -> node::Node {
         self.flush(marks, finder);
+        self.finish_text();
         self.paragraph.set_span(Span {
             start: self.start,
             end,
@@ -200,7 +216,9 @@ pub(crate) fn parse(
                         parent.alt.push_str(&image.alt);
                     } else {
                         image.image.alt = Some(image.alt.into());
-                        frames.last_mut().unwrap().paragraph.push_image(image.image);
+                        let frame = frames.last_mut().unwrap();
+                        frame.finish_text();
+                        frame.paragraph.push_image(image.image);
                     }
                 }
             }
@@ -274,6 +292,7 @@ pub(crate) fn parse(
                     });
                 } else if tag == TagEnd::TableCell {
                     frame.flush(&marks, &finder);
+                    frame.finish_text();
                     frame.paragraph.set_span(Span {
                         start: frame.start,
                         end: range.end,
@@ -305,9 +324,7 @@ pub(crate) fn parse(
                     frame.flush(&marks, &finder);
                     let mut code_marks = marks.clone();
                     code_marks.push(TextMark::default().code());
-                    frame
-                        .paragraph
-                        .push(inline(text.into_string(), &code_marks));
+                    frame.append(&text, &code_marks);
                 }
             }
             Event::Html(text) => frames.last_mut().unwrap().buffer.push_str(&text),
@@ -318,7 +335,7 @@ pub(crate) fn parse(
                 }
                 let frame = frames.last_mut().unwrap();
                 frame.flush(&marks, &finder);
-                frame.paragraph.push(inline(text.into_string(), &marks));
+                frame.append(&text, &marks);
             }
             Event::SoftBreak | Event::HardBreak => {
                 let text = if matches!(event, Event::SoftBreak) {
@@ -376,27 +393,33 @@ mod tests {
         };
         paragraph.clone()
     }
+    fn marks_for<'a>(paragraph: &'a Paragraph, text: &str) -> Vec<&'a TextMark> {
+        let child = paragraph
+            .children
+            .iter()
+            .find(|child| child.text.contains(text))
+            .unwrap();
+        let start = child.text.find(text).unwrap();
+        child
+            .marks
+            .iter()
+            .filter(|(range, _)| range.start <= start && range.end >= start + text.len())
+            .map(|(_, mark)| mark)
+            .collect()
+    }
     #[test]
     fn nested_inline_marks_keep_links_code_and_images() {
         let paragraph = paragraph("**outer *inner [link](next.md)* `code` ![alt](local.png)**");
-        let link = paragraph
-            .children
-            .iter()
-            .find(|child| child.text.as_str() == "link")
-            .unwrap();
-        assert!(link.marks.iter().any(|(_, mark)| mark.bold));
-        assert!(link.marks.iter().any(|(_, mark)| mark.italic));
-        assert!(link.marks.iter().any(|(_, mark)| mark
+        let link = marks_for(&paragraph, "link");
+        assert!(link.iter().any(|mark| mark.bold));
+        assert!(link.iter().any(|mark| mark.italic));
+        assert!(link.iter().any(|mark| mark
             .link
             .as_ref()
             .is_some_and(|link| link.url.as_str() == "next.md")));
-        let code = paragraph
-            .children
-            .iter()
-            .find(|child| child.text.as_str() == "code")
-            .unwrap();
-        assert!(code.marks.iter().any(|(_, mark)| mark.bold));
-        assert!(code.marks.iter().any(|(_, mark)| mark.code));
+        let code = marks_for(&paragraph, "code");
+        assert!(code.iter().any(|mark| mark.bold));
+        assert!(code.iter().any(|mark| mark.code));
         assert!(paragraph.children.iter().any(|child| child
             .image
             .as_ref()
@@ -407,17 +430,12 @@ mod tests {
     fn reference_links_keep_nested_formatting_and_linked_images() {
         let paragraph =
             paragraph("[*nested **bold** ![alt](local.png)*][target]\n\n[target]: next.md");
-        let bold = paragraph
-            .children
-            .iter()
-            .find(|child| child.text.as_str() == "bold")
-            .unwrap();
-        assert!(bold.marks.iter().any(|(_, mark)| mark.bold));
-        assert!(bold.marks.iter().any(|(_, mark)| mark.italic));
+        let bold = marks_for(&paragraph, "bold");
+        assert!(bold.iter().any(|mark| mark.bold));
+        assert!(bold.iter().any(|mark| mark.italic));
         assert!(bold
-            .marks
             .iter()
-            .any(|(_, mark)| mark.link.as_ref().is_some_and(|link| link
+            .any(|mark| mark.link.as_ref().is_some_and(|link| link
                 .identifier
                 .as_ref()
                 .is_some_and(|identifier| identifier.as_str() == "target"))));
@@ -473,13 +491,9 @@ mod tests {
             ]
         );
         let text = paragraph(source);
-        let code = text
-            .children
-            .iter()
-            .find(|node| node.text.as_str() == "https://code.example.test")
-            .unwrap();
-        assert!(code.marks.iter().any(|(_, mark)| mark.code));
-        assert!(code.marks.iter().all(|(_, mark)| mark.link.is_none()));
+        let code = marks_for(&text, "https://code.example.test");
+        assert!(code.iter().any(|mark| mark.code));
+        assert!(code.iter().all(|mark| mark.link.is_none()));
         assert_eq!(text.children.iter().map(|node| node.text.as_str()).collect::<String>(), "Visit http://example.test/a_(b). www.example.test a@example.test and https://code.example.test.");
     }
     #[test]
@@ -557,6 +571,32 @@ mod tests {
     #[test]
     #[ignore = "release parser CPU and memory probe; excludes native rendering and presentation"]
     fn benchmark_supported_markdown() {
+        fn paragraph_storage(paragraph: &Paragraph) -> (usize, usize, usize) {
+            let bytes =
+                paragraph.children.capacity() * std::mem::size_of::<InlineNode>()
+                    + paragraph
+                        .children
+                        .iter()
+                        .map(|inline| {
+                            inline.text.len()
+                                + inline.marks.capacity()
+                                    * std::mem::size_of::<(std::ops::Range<usize>, TextMark)>()
+                                + std::mem::size_of::<
+                                    std::sync::Mutex<crate::text::inline::InlineState>,
+                                >()
+                                + 2 * std::mem::size_of::<usize>()
+                        })
+                        .sum::<usize>();
+            (
+                bytes,
+                paragraph.children.len(),
+                paragraph
+                    .children
+                    .iter()
+                    .map(|inline| inline.marks.len())
+                    .sum(),
+            )
+        }
         let unit = "Paragraph café 🙂 with **strong**, *emphasis* and `inline` plus [sibling](sibling.md). ".to_owned() + &"ordinary text ".repeat(12) + "\n\n";
         let repetitions = (10 * 1024 * 1024 - 4096) / unit.len();
         let source = "# Supported Markdown size\n\n".to_owned()
@@ -588,6 +628,23 @@ mod tests {
                     .collect::<String>(),
                 "FINAL SUPPORTED SIZE MARKER"
             );
+            if samples.len() == 1 {
+                let storage: Vec<_> = children
+                    .iter()
+                    .filter_map(|node| match node {
+                        node::Node::Paragraph(paragraph)
+                        | node::Node::Heading {
+                            children: paragraph,
+                            ..
+                        } => Some(paragraph_storage(paragraph)),
+                        _ => None,
+                    })
+                    .collect();
+                println!("Markdown ownership: blocks={}, Node={}B, InlineNode={}B, TextMark={}B, InlineState={}B, inlines={}, marks={}, paragraph-owned-lower-bound={}B; excludes allocator, links, rendering and accessibility",
+                    children.len(), std::mem::size_of::<node::Node>(), std::mem::size_of::<InlineNode>(), std::mem::size_of::<TextMark>(), std::mem::size_of::<crate::text::inline::InlineState>(),
+                    storage.iter().map(|(_, inlines, _)| inlines).sum::<usize>(), storage.iter().map(|(_, _, marks)| marks).sum::<usize>(),
+                    children.capacity() * std::mem::size_of::<node::Node>() + storage.iter().map(|(bytes, _, _)| bytes).sum::<usize>());
+            }
             std::hint::black_box(parsed);
         }
         samples.sort_by(f64::total_cmp);
@@ -602,5 +659,98 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("; ")
         );
+    }
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+
+    #[derive(Debug, PartialEq)]
+    enum Atom {
+        Text(char, Vec<TextMark>),
+        Image(ImageNode),
+    }
+
+    fn atoms(paragraph: &Paragraph) -> Vec<Atom> {
+        paragraph
+            .children
+            .iter()
+            .flat_map(|child| {
+                let mut atoms = child
+                    .text
+                    .char_indices()
+                    .map(|(byte, character)| {
+                        Atom::Text(
+                            character,
+                            child
+                                .marks
+                                .iter()
+                                .filter(|(range, _)| {
+                                    range.start <= byte && range.end >= byte + character.len_utf8()
+                                })
+                                .map(|(_, mark)| mark.clone())
+                                .collect(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if let Some(image) = &child.image {
+                    atoms.push(Atom::Image(image.as_ref().clone()));
+                }
+                atoms
+            })
+            .collect()
+    }
+
+    #[test]
+    fn streamed_text_preserves_every_character_mark_link_and_image_boundary() {
+        for seed in 0..100usize {
+            let mut expected = Paragraph::default();
+            let mut frame = Frame::new(Block::Paragraph, 0);
+            for index in 0..seed + 10 {
+                let text = ["café 🙂", "é中文", "\r\n", "", "plain"][index % 5];
+                let mut marks = Vec::new();
+                if index % 2 == 0 {
+                    marks.push((0..text.len(), TextMark::default().bold()));
+                }
+                if index % 3 == 0 {
+                    marks.push((0..text.len(), TextMark::default().italic()));
+                }
+                if index % 4 == 0 {
+                    marks.push((
+                        0..text.len(),
+                        TextMark::default().link(LinkMark {
+                            url: format!("next-{index}.md").into(),
+                            ..Default::default()
+                        }),
+                    ));
+                }
+                expected.push(InlineNode::new(text).marks(marks.clone()));
+                frame.append(
+                    text,
+                    &marks
+                        .iter()
+                        .map(|(_, mark)| mark.clone())
+                        .collect::<Vec<_>>(),
+                );
+                if index % 7 == 0 {
+                    let image = ImageNode {
+                        url: format!("local-{index}.png").into(),
+                        alt: Some(format!("alt {index}").into()),
+                        ..Default::default()
+                    };
+                    expected.push_image(image.clone());
+                    frame.finish_text();
+                    frame.paragraph.push_image(image);
+                }
+            }
+            frame.finish_text();
+            assert_eq!(atoms(&frame.paragraph), atoms(&expected));
+            assert!(frame
+                .paragraph
+                .children
+                .windows(2)
+                .all(|pair| pair[0].image.is_some() || pair[1].image.is_some()));
+        }
     }
 }
