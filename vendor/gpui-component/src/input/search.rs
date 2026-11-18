@@ -849,6 +849,7 @@ impl Render for SearchPanel {
 
         v_flex()
             .id("search-panel")
+            .tab_group()
             .occlude()
             .track_focus(&self.focus_handle(cx))
             .key_context(CONTEXT)
@@ -906,6 +907,7 @@ impl Render for SearchPanel {
                             })
                             .child(
                                 Button::new("close")
+                                    .tab_index(1)
                                     .xsmall()
                                     .ghost()
                                     .flex_shrink_0()
@@ -1087,15 +1089,21 @@ mod tests {
         assert!(case.is_some());
         assert_ne!(case, query);
         cx.simulate_keystrokes("tab");
-        let close = cx.update(|window, cx| window.focused(cx));
-        assert!(close.is_some());
-        assert_ne!(close, case);
-        cx.simulate_keystrokes("tab");
         let word = cx.update(|window, cx| window.focused(cx));
         assert!(word.is_some());
-        assert_ne!(word, close);
+        assert_ne!(word, case);
+        cx.simulate_keystrokes("tab");
+        let replace = cx.update(|window, cx| window.focused(cx));
+        assert!(replace.is_some());
+        assert_ne!(replace, word);
+        cx.simulate_keystrokes("tab");
+        let close = cx.update(|window, cx| window.focused(cx));
+        assert!(close.is_some());
+        assert_ne!(close, replace);
         cx.simulate_keystrokes("shift-tab");
-        assert_eq!(cx.update(|window, cx| window.focused(cx)), close);
+        assert_eq!(cx.update(|window, cx| window.focused(cx)), replace);
+        cx.simulate_keystrokes("shift-tab");
+        assert_eq!(cx.update(|window, cx| window.focused(cx)), word);
         cx.simulate_keystrokes("shift-tab");
         assert_eq!(cx.update(|window, cx| window.focused(cx)), case);
         cx.simulate_keystrokes("shift-tab");
@@ -1112,7 +1120,9 @@ mod tests {
                 1
             );
         });
-        cx.simulate_keystrokes("tab tab tab tab space");
+        cx.simulate_keystrokes("tab tab tab");
+        assert_eq!(cx.update(|window, cx| window.focused(cx)), replace);
+        cx.simulate_keystrokes("space");
         cx.simulate_event(gpui::KeyUpEvent {
             keystroke: gpui::Keystroke::parse("space").unwrap(),
         });
