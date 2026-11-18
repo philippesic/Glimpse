@@ -395,6 +395,8 @@ pub(crate) struct LineLayoutCache {
     platform_text_system: Arc<dyn PlatformTextSystem>,
 }
 
+pub(super) struct PreparedLines(FxHashMap<Arc<CacheKey>, Arc<LineLayout>>);
+
 #[derive(Default)]
 struct FrameCache {
     lines: FxHashMap<Arc<CacheKey>, Arc<LineLayout>>,
@@ -415,6 +417,33 @@ impl LineLayoutCache {
             previous_frame: Mutex::default(),
             current_frame: RwLock::default(),
             platform_text_system,
+        }
+    }
+
+    pub(super) fn into_prepared_lines(self) -> PreparedLines {
+        PreparedLines(self.current_frame.into_inner().lines)
+    }
+
+    pub(super) fn retain_recent_lines(&self) -> PreparedLines {
+        let previous = self.previous_frame.lock();
+        let mut lines = FxHashMap::default();
+        let mut bytes_left = 8 * 1024;
+        for key in previous.used_lines.iter().rev().take(64) {
+            if key.text.len() <= bytes_left
+                && let Some(line) = previous.lines.get(key)
+            {
+                bytes_left -= key.text.len();
+                lines.insert(key.clone(), line.clone());
+            }
+        }
+        PreparedLines(lines)
+    }
+
+    pub(super) fn adopt_prepared_lines(&self, prepared: &PreparedLines) {
+        let _work = crate::work_trace::Span::new("adopt_prepared_lines");
+        let mut previous = self.previous_frame.lock();
+        for (key, line) in &prepared.0 {
+            previous.lines.entry(key.clone()).or_insert_with(|| line.clone());
         }
     }
 
@@ -561,9 +590,7 @@ impl LineLayoutCache {
             layout
         } else {
             let text = SharedString::from(text);
-            let mut layout = self
-                .platform_text_system
-                .layout_line(&text, font_size, runs);
+            let mut layout = self.platform_text_system.layout_line(&text, font_size, runs);
 
             if let Some(force_width) = force_width {
                 let mut glyph_pos = 0;

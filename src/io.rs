@@ -29,6 +29,7 @@ pub enum Job {
         source: Rope,
         path: PathBuf,
         theme: Arc<HighlightTheme>,
+        layout: Box<gpui_component::text::MarkdownLayout>,
         reclaim: Option<fn()>,
     },
     CompletePath(u64, String, PathBuf),
@@ -429,6 +430,7 @@ impl IoWorker {
                             source,
                             path,
                             theme,
+                            layout,
                             reclaim,
                         } => {
                             if reading.load(Ordering::Relaxed) != request {
@@ -443,8 +445,12 @@ impl IoWorker {
                                     continue;
                                 }
                             }
-                            let prepared =
+                            let mut prepared =
                                 crate::reading::prepare(String::from(source), &path, &theme);
+                            if reading.load(Ordering::Relaxed) != request {
+                                continue;
+                            }
+                            layout.prepare(&mut prepared.markdown);
                             if reading.load(Ordering::Relaxed) != request {
                                 continue;
                             }

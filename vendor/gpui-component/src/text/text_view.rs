@@ -184,18 +184,24 @@ impl ParsedContent {
     }
 }
 
-pub struct ParsedMarkdown(Result<ParsedContent, SharedString>);
+pub struct ParsedMarkdown(
+    Result<ParsedContent, SharedString>,
+    Option<gpui::PreparedTextLines>,
+);
 
 impl ParsedMarkdown {
     pub fn new(raw: &str, theme: &HighlightTheme, on_image: impl FnMut(&str)) -> Self {
-        Self(parse_content(
-            TextViewType::Markdown,
-            raw,
-            TextViewStyle::default(),
-            theme,
-            &None,
-            on_image,
-        ))
+        Self(
+            parse_content(
+                TextViewType::Markdown,
+                raw,
+                TextViewStyle::default(),
+                theme,
+                &None,
+                on_image,
+            ),
+            None,
+        )
     }
 
     pub fn share_reading_text_storage(&mut self) {
@@ -204,6 +210,45 @@ impl ParsedMarkdown {
                 content.document_source = Some(DocumentSource::new(&mut content.root_node));
             }
         }
+    }
+}
+
+pub struct MarkdownLayout {
+    layouts: gpui::WindowTextSystem,
+    style: gpui::TextStyle,
+    colors: crate::theme::ThemeColor,
+    rem_size: Pixels,
+}
+
+impl MarkdownLayout {
+    pub fn new(window: &Window, style: gpui::TextStyle, colors: crate::theme::ThemeColor) -> Self {
+        Self {
+            layouts: window.text_system().prepare_in_separate_cache(),
+            style,
+            colors,
+            rem_size: window.rem_size(),
+        }
+    }
+
+    pub fn prepare(self, markdown: &mut ParsedMarkdown) {
+        let Ok(content) = &mut markdown.0 else {
+            return;
+        };
+        let node::Node::Root { children } = &content.root_node else {
+            return;
+        };
+        if children.len() < 48 {
+            return;
+        }
+        let _work = gpui::work_trace::Span::new("reading_prepare_opening_shapes_worker");
+        let request = node::OpeningShapeRequest {
+            style: self.style,
+            colors: self.colors,
+            view_style: content.node_cx.style.clone(),
+            rem_size: self.rem_size,
+        };
+        request.prepare(children, &self.layouts);
+        markdown.1 = Some(self.layouts.into_prepared_lines());
     }
 }
 
@@ -232,6 +277,7 @@ impl MarkdownView {
             state: cx.new(|cx| {
                 let mut state = TextViewState::new(cx, on_retired);
                 state.parsed_result = Some(content.0);
+                state.prepared_lines = content.1;
                 state.resources = resources;
                 state.focus_handle = Some(focus);
                 state
@@ -373,6 +419,7 @@ pub(crate) struct TextViewState {
     tx: Option<smol::channel::Sender<Update>>,
     parsed_result: Option<Result<ParsedContent, SharedString>>,
     pending_document_text: Option<TextRunIds>,
+    prepared_lines: Option<gpui::PreparedTextLines>,
     resources: Arc<super::TextViewResources>,
     focus_handle: Option<FocusHandle>,
     focus_after_parse: bool,
@@ -400,6 +447,7 @@ impl TextViewState {
             tx: None,
             parsed_result: None,
             pending_document_text: None,
+            prepared_lines: None,
             resources: Arc::default(),
             focus_handle: Some(focus_handle),
             focus_after_parse: false,
@@ -859,6 +907,9 @@ impl Element for TextView {
         }
 
         self.state.update(cx, |state, _| {
+            if let Some(lines) = &state.prepared_lines {
+                window.text_system().adopt_prepared_lines(lines);
+            }
             if state.parsed_result.is_none()
                 && state
                     .focus_handle

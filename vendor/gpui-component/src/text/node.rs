@@ -599,6 +599,35 @@ impl Node {
     }
 }
 
+impl TextMark {
+    fn reading_highlight(&self, colors: &crate::theme::ThemeColor) -> HighlightStyle {
+        let mut highlight = HighlightStyle::default();
+        if self.bold {
+            highlight.font_weight = Some(FontWeight::BOLD);
+        }
+        if self.italic {
+            highlight.font_style = Some(FontStyle::Italic);
+        }
+        if self.strikethrough {
+            highlight.strikethrough = Some(gpui::StrikethroughStyle {
+                thickness: px(1.),
+                ..Default::default()
+            });
+        }
+        if self.code {
+            highlight.background_color = Some(colors.accent);
+        }
+        if self.link.is_some() {
+            highlight.color = Some(colors.link);
+            highlight.underline = Some(gpui::UnderlineStyle {
+                thickness: px(1.),
+                ..Default::default()
+            });
+        }
+        highlight
+    }
+}
+
 impl Paragraph {
     fn render(
         &self,
@@ -707,30 +736,8 @@ impl Paragraph {
                 for (range, style) in inline_node.marks.iter() {
                     let inner_range = (offset + range.start)..(offset + range.end);
 
-                    let mut highlight = HighlightStyle::default();
-                    if style.bold {
-                        highlight.font_weight = Some(FontWeight::BOLD);
-                    }
-                    if style.italic {
-                        highlight.font_style = Some(FontStyle::Italic);
-                    }
-                    if style.strikethrough {
-                        highlight.strikethrough = Some(gpui::StrikethroughStyle {
-                            thickness: gpui::px(1.),
-                            ..Default::default()
-                        });
-                    }
-                    if style.code {
-                        highlight.background_color = Some(cx.theme().accent);
-                    }
-
+                    let highlight = style.reading_highlight(&cx.theme().colors);
                     if let Some(mut link_mark) = style.link.as_deref().cloned() {
-                        highlight.color = Some(cx.theme().link);
-                        highlight.underline = Some(gpui::UnderlineStyle {
-                            thickness: gpui::px(1.),
-                            ..Default::default()
-                        });
-
                         // convert link references, replace link
                         if let Some(identifier) = link_mark.identifier.as_ref() {
                             if let Some(mark) = node_cx.link_refs.get(identifier) {
@@ -829,6 +836,123 @@ impl Paragraph {
         text.push_str("\n\n");
         text
     }
+}
+
+pub(super) struct OpeningShapeRequest {
+    pub(super) style: gpui::TextStyle,
+    pub(super) colors: crate::theme::ThemeColor,
+    pub(super) view_style: TextViewStyle,
+    pub(super) rem_size: Pixels,
+}
+
+struct OpeningShapeBuilder<'a> {
+    request: &'a OpeningShapeRequest,
+    layouts: &'a gpui::WindowTextSystem,
+    remaining_bytes: usize,
+    remaining_nodes: usize,
+}
+
+impl OpeningShapeRequest {
+    pub(super) fn prepare(&self, children: &[Node], layouts: &gpui::WindowTextSystem) {
+        let mut batch = OpeningShapeBuilder {
+            request: self,
+            layouts,
+            remaining_bytes: 48 * 1024,
+            remaining_nodes: 180,
+        };
+        let head = 24.min(children.len());
+        let tail = children.len().saturating_sub(24).max(head);
+        for node in children[..head].iter().chain(&children[tail..]) {
+            batch.node(node, &self.style);
+        }
+    }
+}
+
+impl OpeningShapeBuilder<'_> {
+    fn node(&mut self, node: &Node, style: &gpui::TextStyle) {
+        if self.remaining_nodes == 0 || self.remaining_bytes == 0 {
+            return;
+        }
+        self.remaining_nodes -= 1;
+        match node {
+            Node::Paragraph(paragraph) => self.paragraph(paragraph, style),
+            Node::Heading { level, children } => {
+                let (size, weight) = heading_style(*level, &self.request.view_style);
+                let mut style = style.clone();
+                style.font_size = size.into();
+                style.font_weight = weight;
+                self.paragraph(children, &style);
+            }
+            Node::Blockquote { children } => {
+                let mut style = style.clone();
+                style.color = self.request.colors.muted_foreground;
+                for child in children.iter().take(24) {
+                    self.node(child, &style);
+                }
+            }
+            Node::List { children, .. } | Node::ListItem { children, .. } => {
+                for child in children.iter().take(24) {
+                    self.node(child, style);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn paragraph(&mut self, paragraph: &Paragraph, style: &gpui::TextStyle) {
+        if paragraph.children.len() > 32 {
+            return;
+        }
+        let limit = self.remaining_bytes.min(2 * 1024);
+        let mut text = String::new();
+        let mut highlights = Vec::new();
+        for inline in &paragraph.children {
+            let offset = text.len();
+            if inline.image.is_some() || offset + inline.text.len() > limit {
+                return;
+            }
+            text.push_str(&inline.text);
+            let marks = inline
+                .marks
+                .iter()
+                .map(|(range, mark)| {
+                    (
+                        (offset + range.start)..(offset + range.end),
+                        mark.reading_highlight(&self.request.colors),
+                    )
+                })
+                .collect::<Vec<_>>();
+            highlights = gpui::combine_highlights(highlights, marks).collect();
+        }
+        if !text.is_empty() {
+            self.remaining_bytes -= text.len();
+            let runs = Inline::text_runs(&text, style, &highlights);
+            let _ = self.layouts.shape_text(
+                text.into(),
+                style.font_size.to_pixels(self.request.rem_size),
+                &runs,
+                None,
+                style.line_clamp,
+            );
+        }
+    }
+}
+
+fn heading_style(level: u8, style: &TextViewStyle) -> (Pixels, FontWeight) {
+    let (size, weight) = match level {
+        1 => (rems(2.), FontWeight::BOLD),
+        2 => (rems(1.5), FontWeight::SEMIBOLD),
+        3 => (rems(1.25), FontWeight::SEMIBOLD),
+        4 => (rems(1.125), FontWeight::SEMIBOLD),
+        5 => (rems(1.), FontWeight::SEMIBOLD),
+        6 => (rems(1.), FontWeight::MEDIUM),
+        _ => (rems(1.), FontWeight::NORMAL),
+    };
+    let size = style.heading_font_size.as_ref().map_or_else(
+        || size.to_pixels(style.heading_base_font_size),
+        |value| value(level, style.heading_base_font_size),
+    );
+    (size, weight)
 }
 
 impl Node {
@@ -1377,20 +1501,7 @@ impl Node {
                 .child(paragraph.render(node_cx, window, cx))
                 .into_any_element(),
             Node::Heading { level, children } => {
-                let (text_size, font_weight) = match level {
-                    1 => (rems(2.), FontWeight::BOLD),
-                    2 => (rems(1.5), FontWeight::SEMIBOLD),
-                    3 => (rems(1.25), FontWeight::SEMIBOLD),
-                    4 => (rems(1.125), FontWeight::SEMIBOLD),
-                    5 => (rems(1.), FontWeight::SEMIBOLD),
-                    6 => (rems(1.), FontWeight::MEDIUM),
-                    _ => (rems(1.), FontWeight::NORMAL),
-                };
-
-                let mut text_size = text_size.to_pixels(node_cx.style.heading_base_font_size);
-                if let Some(f) = node_cx.style.heading_font_size.as_ref() {
-                    text_size = (f)(*level, node_cx.style.heading_base_font_size);
-                }
+                let (text_size, font_weight) = heading_style(*level, &node_cx.style);
 
                 let level = *level;
                 let label: String = children

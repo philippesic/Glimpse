@@ -1,7 +1,7 @@
 use super::*;
 use gpui_component::{
     highlighter::HighlightTheme,
-    text::{MarkdownView, TextViewResources},
+    text::{MarkdownLayout, MarkdownView, TextViewResources},
 };
 use std::sync::Arc;
 
@@ -12,6 +12,7 @@ pub(super) struct View {
     path: PathBuf,
     theme: Arc<HighlightTheme>,
     content: Option<MarkdownView>,
+    source_lines: Option<gpui::PreparedTextLines>,
     release_memory: bool,
     notes: String,
     error: Option<String>,
@@ -23,7 +24,12 @@ impl Shell {
             .as_ref()
             .is_some_and(|view| !self.reading || self.active != Some(view.id))
         {
-            self.reading_view = None;
+            if let Some(view) = self.reading_view.take()
+                && self.active == Some(view.id)
+                && let Some(lines) = view.source_lines
+            {
+                window.text_system().adopt_prepared_lines(&lines);
+            }
             self.io.cancel_reading();
             self.release_view_memory(window, cx);
         }
@@ -52,6 +58,11 @@ impl Shell {
         if release_memory {
             self.syntax.retire_assets(platform::release_unused_memory);
         }
+        let source_lines = self
+            .reading_view
+            .as_mut()
+            .and_then(|view| view.source_lines.take())
+            .or_else(|| release_memory.then(|| window.text_system().retain_recent_lines()));
         self.reading_view = Some(View {
             request,
             id: doc.id,
@@ -59,15 +70,21 @@ impl Shell {
             path: doc.disk.path.clone(),
             theme: theme.clone(),
             content: None,
+            source_lines,
             release_memory,
             notes: String::new(),
             error: None,
         });
+        let mut text_style = window.text_style();
+        text_style.font_size = self.reading_font_size().into();
+        text_style.color = cx.theme().foreground;
+        let layout = Box::new(MarkdownLayout::new(window, text_style, cx.theme().colors));
         self.io.send(Job::ReadMarkdown {
             request,
             source: doc.input.read(cx).text().clone(),
             path: doc.disk.path.clone(),
             theme,
+            layout,
             reclaim: release_memory.then_some(platform::release_unused_memory),
         });
     }
@@ -177,8 +194,12 @@ impl Shell {
         }
     }
 
+    fn reading_font_size(&self) -> Pixels {
+        px(self.settings.markdown_font_size * self.settings.ui_scale)
+    }
+
     pub(super) fn reading_element(&self, cx: &mut Context<Self>) -> AnyElement {
-        let font_size = px(self.settings.markdown_font_size * self.settings.ui_scale);
+        let font_size = self.reading_font_size();
         let mut area = div()
             .id("reading")
             .flex_1()
