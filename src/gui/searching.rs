@@ -267,6 +267,10 @@ impl Shell {
         let hits = self.hits.clone();
         let count = hits.len().min(1000);
         let row_height = px(32. * self.settings.ui_scale);
+        let status = format!(
+            "{} · {} displayed (limit 1,000)",
+            self.search_ui.status, count
+        );
         div()
             .flex()
             .flex_col()
@@ -349,14 +353,19 @@ impl Shell {
                 }
             )))
             .when_some(index, |panel, index| {
-                panel.child(div().px_2().text_sm().child(format!(
+                let status = format!(
                     "{index}{}",
                     if compatible {
                         ""
                     } else {
                         " · settings changed; rebuild to use"
                     }
-                )))
+                );
+                panel.child(accessibility::message(
+                    "filename-index-status",
+                    status.clone(),
+                    div().px_2().text_sm().child(status),
+                ))
             })
             .child(
                 div()
@@ -365,10 +374,11 @@ impl Shell {
                     .gap_2()
                     .px_2()
                     .py_1()
-                    .child(div().flex_1().min_w_0().text_sm().child(format!(
-                        "{} · {} displayed (limit 1,000)",
-                        self.search_ui.status, count
-                    )))
+                    .child(accessibility::message(
+                        "search-result-status",
+                        status.clone(),
+                        div().flex_1().min_w_0().text_sm().child(status),
+                    ))
                     .when(count > 0, |row| {
                         row.child(self.button("Focus Results", "focus-results", cx))
                     })
