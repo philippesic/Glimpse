@@ -16,6 +16,8 @@ use ropey::Rope;
 use crate::{
     ActiveTheme as _, Icon, IconName, StyledExt, h_flex,
     highlighter::{HighlightTheme, SyntaxHighlighter},
+    scroll::ScrollableElement,
+    styled::FocusableExt,
     text::{
         CodeBlockActionsFn,
         inline::{Inline, InlineState},
@@ -24,7 +26,10 @@ use crate::{
     v_flex,
 };
 
-use super::{TextViewStyle, utils::list_item_prefix};
+use super::{
+    TextViewStyle,
+    utils::{list_item_prefix, scroll_reading_list},
+};
 
 #[allow(unused)]
 #[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
@@ -345,6 +350,32 @@ pub struct CodeBlock {
     lang: Option<SharedString>,
     styles: Vec<(Range<usize>, HighlightStyle)>,
     state: Arc<Mutex<InlineState>>,
+    page: Option<Box<CodePage>>,
+    pages: Option<Arc<Vec<Self>>>,
+}
+
+#[derive(Debug, Clone)]
+struct CodePage {
+    source: SharedString,
+    range: Range<usize>,
+}
+
+impl CodePage {
+    fn text(&self) -> &str {
+        &self.source[self.range.clone()]
+    }
+
+    fn break_after(&self) -> &str {
+        if self.range.end == self.source.len() {
+            ""
+        } else if self.text().ends_with("\r\n") {
+            "\r\n"
+        } else if self.text().ends_with('\n') {
+            "\n"
+        } else {
+            ""
+        }
+    }
 }
 
 impl PartialEq for CodeBlock {
@@ -361,7 +392,23 @@ impl CodeBlock {
 
     /// Get the code content of the code block.
     pub fn code(&self) -> SharedString {
-        self.state.lock().unwrap().text.clone()
+        self.page.as_ref().map_or_else(
+            || self.state.lock().unwrap().text.clone(),
+            |page| SharedString::new(page.text()),
+        )
+    }
+
+    fn display_code(&self) -> SharedString {
+        let mut state = self.state.lock().unwrap();
+        if state.text.is_empty()
+            && let Some(page) = &self.page
+        {
+            let text = page.text();
+            state.set_text(SharedString::new(
+                &text[..text.len() - page.break_after().len()],
+            ));
+        }
+        state.text.clone()
     }
 
     pub(crate) fn new(
@@ -384,15 +431,98 @@ impl CodeBlock {
             lang,
             styles,
             state,
+            page: None,
+            pages: None,
         }
     }
 
+    fn needs_reading_pages(&self) -> bool {
+        self.pages.is_none() && self.state.lock().unwrap().text.len() > LONG_READING_BLOCK_BYTES
+    }
+
+    fn paginate_nested(&mut self) {
+        let mut pages = Vec::new();
+        self.reading_pages(|page| pages.push(page));
+        self.styles = Vec::new();
+        self.pages = Some(Arc::new(pages));
+    }
+
+    fn map_colors(&mut self, map: &impl Fn(gpui::Hsla) -> gpui::Hsla) {
+        for (_, style) in &mut self.styles {
+            style.color = style.color.map(map);
+        }
+        if let Some(pages) = &mut self.pages {
+            for page in Arc::make_mut(pages) {
+                page.map_colors(map);
+            }
+        }
+    }
+
+    fn reading_pages(&self, mut emit: impl FnMut(Self)) {
+        let source = self.code();
+        let mut start = 0;
+        while start < source.len() {
+            let remaining = &source[start..];
+            let limit = remaining.floor_char_boundary(READING_PAGE_BYTES.min(remaining.len()));
+            let end = start
+                + if limit == remaining.len() {
+                    limit
+                } else if let Some(line) = remaining[..limit].rfind('\n') {
+                    line + 1
+                } else {
+                    reading_page_end(remaining, READING_PAGE_BYTES)
+                };
+            let page = CodePage {
+                source: source.clone(),
+                range: start..end,
+            };
+            let display_end = end - page.break_after().len();
+            let first = self.styles.partition_point(|(range, _)| range.end <= start);
+            let styles = self.styles[first..]
+                .iter()
+                .take_while(|(range, _)| range.start < display_end)
+                .map(|(range, style)| {
+                    (
+                        range.start.max(start) - start..range.end.min(display_end) - start,
+                        *style,
+                    )
+                })
+                .collect();
+            emit(Self {
+                lang: self.lang.clone(),
+                styles,
+                state: Arc::new(Mutex::new(InlineState::default())),
+                page: Some(Box::new(page)),
+                pages: None,
+            });
+            start = end;
+        }
+    }
+
+    fn starts_block(&self) -> bool {
+        self.page.as_ref().is_none_or(|page| page.range.start == 0)
+    }
+
+    fn ends_block(&self) -> bool {
+        self.page
+            .as_ref()
+            .is_none_or(|page| page.range.end == page.source.len())
+    }
+
     pub(super) fn selected_text(&self) -> String {
+        if let Some(pages) = &self.pages {
+            return pages.iter().map(Self::selected_text).collect();
+        }
         let mut text = String::new();
         let state = self.state.lock().unwrap();
         if let Some(selection) = &state.selection {
             let part_text = state.text.clone();
             text.push_str(&part_text[selection.start..selection.end]);
+            if let Some(page) = &self.page
+                && selection.end == part_text.len()
+            {
+                text.push_str(page.break_after());
+            }
         }
         text
     }
@@ -405,15 +535,28 @@ impl CodeBlock {
         cx: &mut App,
     ) -> AnyElement {
         let style = &node_cx.style;
+        if let Some(pages) = &self.pages {
+            return Self::render_pages(pages, options, node_cx, window, cx);
+        }
+        let paged = self.page.is_some();
+        if paged {
+            self.display_code();
+        }
 
         div()
-            .when(!options.is_last, |this| this.pb(style.paragraph_gap))
+            .when(self.ends_block() && !options.is_last, |this| {
+                this.pb(style.paragraph_gap)
+            })
             .child(
                 div()
                     .id("codeblock")
-                    .overflow_x_scroll()
-                    .p_3()
-                    .rounded(cx.theme().radius)
+                    .when(!paged, |block| {
+                        block.overflow_x_scroll().rounded(cx.theme().radius)
+                    })
+                    .when(paged, |block| block.w_full().min_w_0().whitespace_normal())
+                    .px_3()
+                    .when(self.starts_block(), |block| block.pt_3())
+                    .when(self.ends_block(), |block| block.pb_3())
                     .bg(cx.theme().muted)
                     .font_family(cx.theme().mono_font_family.clone())
                     .text_size(cx.theme().mono_font_size)
@@ -440,6 +583,75 @@ impl CodeBlock {
                                 .child(actions(&self, window, cx)),
                         )
                     }),
+            )
+            .into_any_element()
+    }
+    fn render_pages(
+        pages: &Arc<Vec<Self>>,
+        options: &NodeRenderOptions,
+        node_cx: &NodeContext,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
+        let id = ("nested-code", Arc::as_ptr(pages) as usize);
+        let controls = window.use_keyed_state(id, cx, |_, cx| {
+            (
+                ListState::new(pages.len(), gpui::ListAlignment::Top, px(120.)),
+                cx.focus_handle().tab_stop(true),
+            )
+        });
+        let (list, focus) = controls.read(cx).clone();
+        let height = px(260.).min(window.viewport_size().height / 2.);
+        let page_options = options.is_last(true);
+        let context = node_cx.clone();
+        let rows = pages.clone();
+        let content = gpui::list(list.clone(), move |index, window, cx| {
+            div()
+                .id(("code-page", index))
+                .child(rows[index].render(&page_options, &context, window, cx))
+                .into_any_element()
+        });
+        let input_list = list.clone();
+        let input_focus = focus.clone();
+        let panel = div()
+            .id(id)
+            .relative()
+            .w_full()
+            .min_w_0()
+            .h(height)
+            .rounded(cx.theme().radius)
+            .bg(cx.theme().muted)
+            .track_focus(&focus)
+            .focus_ring(focus.is_focused(window), px(2.), window, cx)
+            .child(content.size_full())
+            .vertical_scrollbar(&list)
+            .on_key_down(move |event, window, cx| {
+                if input_focus.is_focused(window)
+                    && scroll_reading_list(&input_list, event.keystroke.key.as_str(), height)
+                {
+                    cx.stop_propagation();
+                    window.refresh();
+                }
+            });
+        let focus_for_action = focus.clone();
+        div()
+            .when(!options.is_last, |block| {
+                block.pb(node_cx.style.paragraph_gap)
+            })
+            .child(
+                gpui::accessible(id, panel, move |_, window, _| {
+                    let mut node = gpui::accesskit::Node::new(gpui::accesskit::Role::Group);
+                    node.set_label("Scrollable code block");
+                    node.add_action(gpui::accesskit::Action::Focus);
+                    let mut info = gpui::AccessibilityInfo::new(node);
+                    info.focused = focus.is_focused(window);
+                    info
+                })
+                .on_action(move |request, _, window, _| {
+                    if request.action == gpui::accesskit::Action::Focus {
+                        focus_for_action.focus(window);
+                    }
+                }),
             )
             .into_any_element()
     }
@@ -506,11 +718,11 @@ pub(crate) enum Node {
 }
 
 const READING_PAGE_BYTES: usize = 2048;
-const LONG_READING_PARAGRAPH_BYTES: usize = 16 * 1024;
+const LONG_READING_BLOCK_BYTES: usize = 16 * 1024;
 
 impl Paragraph {
     fn needs_reading_pages(&self) -> bool {
-        self.text_len() > LONG_READING_PARAGRAPH_BYTES
+        self.text_len() > LONG_READING_BLOCK_BYTES
     }
 
     fn into_reading_pages(self, rows: &mut Vec<Node>) {
@@ -600,14 +812,18 @@ fn reading_page_end(text: &str, budget: usize) -> usize {
 }
 
 impl Node {
-    pub(super) fn paginate_reading_paragraphs(&mut self) {
+    pub(super) fn paginate_reading_blocks(&mut self) {
         let Self::Root { children } = self else {
             return;
         };
-        if !children
-            .iter()
-            .any(|node| matches!(node, Self::Paragraph(p) if p.needs_reading_pages()))
-        {
+        for node in Arc::make_mut(children) {
+            node.paginate_nested_code();
+        }
+        if !children.iter().any(|node| match node {
+            Self::Paragraph(paragraph) => paragraph.needs_reading_pages(),
+            Self::CodeBlock(code) => code.needs_reading_pages(),
+            _ => false,
+        }) {
             return;
         }
         let children = Arc::make_mut(children);
@@ -618,10 +834,41 @@ impl Node {
                 Self::Paragraph(paragraph) if paragraph.needs_reading_pages() => {
                     paragraph.into_reading_pages(children);
                 }
+                Self::CodeBlock(code) if code.needs_reading_pages() => {
+                    code.reading_pages(|page| children.push(Self::CodeBlock(page)));
+                }
                 node => children.push(node),
             }
         }
         children.shrink_to_fit();
+    }
+
+    fn paginate_nested_code(&mut self) {
+        let nested = match self {
+            Self::Blockquote { children }
+            | Self::List { children, .. }
+            | Self::ListItem { children, .. } => children,
+            _ => return,
+        };
+        for node in nested {
+            if let Self::CodeBlock(code) = node
+                && code.needs_reading_pages()
+            {
+                code.paginate_nested();
+            } else {
+                node.paginate_nested_code();
+            }
+        }
+    }
+
+    pub(super) fn has_nested_code_pages(&self) -> bool {
+        match self {
+            Self::CodeBlock(code) => code.pages.is_some(),
+            Self::Blockquote { children }
+            | Self::List { children, .. }
+            | Self::ListItem { children, .. } => children.iter().any(Self::has_nested_code_pages),
+            _ => false,
+        }
     }
 }
 
@@ -633,9 +880,7 @@ impl Node {
             | Self::List { children, .. }
             | Self::ListItem { children, .. } => children,
             Self::CodeBlock(block) => {
-                for (_, style) in &mut block.styles {
-                    style.color = style.color.map(map);
-                }
+                block.map_colors(map);
                 return;
             }
             _ => return,
@@ -730,7 +975,9 @@ impl Node {
                 let block_text = code_block.selected_text();
                 if !block_text.is_empty() {
                     text.push_str(&block_text);
-                    text.push('\n');
+                    if code_block.ends_block() {
+                        text.push('\n');
+                    }
                 }
             }
             Node::Break { .. } | Node::Divider | Node::Unknown => {}
@@ -981,6 +1228,7 @@ impl Paragraph {
 
 pub(super) struct ShapeRequest {
     pub(super) style: gpui::TextStyle,
+    pub(super) code_style: gpui::TextStyle,
     pub(super) colors: crate::theme::ThemeColor,
     pub(super) view_style: TextViewStyle,
     pub(super) rem_size: Pixels,
@@ -994,6 +1242,13 @@ struct ShapeBuilder<'a> {
 }
 
 impl ShapeRequest {
+    pub(super) fn code_style(style: &gpui::TextStyle, theme: &crate::Theme) -> gpui::TextStyle {
+        let mut style = style.clone();
+        style.font_family = theme.mono_font_family.clone();
+        style.font_size = theme.mono_font_size.into();
+        style
+    }
+
     pub(super) fn prepare<'a>(
         &self,
         children: impl IntoIterator<Item = &'a Node>,
@@ -1021,6 +1276,14 @@ impl ShapeBuilder<'_> {
             Node::Paragraph(paragraph) | Node::ParagraphPage(paragraph) => {
                 self.paragraph(paragraph, style)
             }
+            Node::CodeBlock(block) if block.page.is_some() => self.code(block),
+            Node::CodeBlock(block) => {
+                if let Some(pages) = &block.pages {
+                    for page in pages.iter().take(4).chain(pages.iter().rev().take(4)) {
+                        self.code(page);
+                    }
+                }
+            }
             Node::Heading { level, children } => {
                 let (size, weight) = heading_style(*level, &self.request.view_style);
                 let mut style = style.clone();
@@ -1041,6 +1304,22 @@ impl ShapeBuilder<'_> {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn code(&mut self, block: &CodeBlock) {
+        let text = block.display_code();
+        if text.len() <= self.remaining_bytes {
+            self.remaining_bytes -= text.len();
+            let style = &self.request.code_style;
+            let runs = Inline::text_runs(&text, style, &block.styles);
+            let _ = self.layouts.shape_text(
+                text,
+                style.font_size.to_pixels(self.request.rem_size),
+                &runs,
+                None,
+                style.line_clamp,
+            );
         }
     }
 
@@ -1407,7 +1686,8 @@ impl Node {
                                         .child(div().overflow_hidden().child(text)),
                                 );
                             }
-                            Node::List { .. } => {
+                            Node::Break { .. } | Node::Unknown => {}
+                            _ => {
                                 items.push(div().ml(rems(1.)).child(child.render_block(
                                     NodeRenderOptions {
                                         depth: options.depth + 1,
@@ -1420,7 +1700,6 @@ impl Node {
                                     cx,
                                 )));
                             }
-                            _ => {}
                         }
                     }
                     items
@@ -1765,7 +2044,7 @@ mod reading_page_tests {
         let mut root = Node::Root {
             children: Arc::new(vec![Node::Paragraph(original)]),
         };
-        root.paginate_reading_paragraphs();
+        root.paginate_reading_blocks();
         let Node::Root { children } = &root else {
             panic!()
         };
@@ -1802,6 +2081,75 @@ mod reading_page_tests {
             state.set_text(inline.text.as_str().to_owned().into());
             state.selection = Some(crate::input::Selection::new(0, inline.text.len()));
             offset = end;
+        }
+        assert_eq!(offset, text.len());
+        assert_eq!(root.selected_text(), format!("{text}\n\n"));
+    }
+
+    #[test]
+    fn long_code_pages_share_source_and_preserve_styles_and_selection() {
+        let prefix = "let start = 1;\r\n";
+        let long_line = "A\u{301} 🪴 β code ".repeat(1_500);
+        let text = SharedString::new(format!("{prefix}{long_line}\nlast line\n"));
+        let emphasis = HighlightStyle {
+            font_style: Some(FontStyle::Italic),
+            ..Default::default()
+        };
+        let marked = prefix.len()..prefix.len() + long_line.len();
+        let mut state = InlineState::default();
+        state.set_text(text.clone());
+        let code = CodeBlock {
+            lang: Some("text".into()),
+            styles: vec![(marked.clone(), emphasis)],
+            state: Arc::new(Mutex::new(state)),
+            page: None,
+            pages: None,
+        };
+        let mut quote = Node::Blockquote {
+            children: vec![Node::CodeBlock(code.clone())],
+        };
+        quote.paginate_nested_code();
+        assert!(quote.has_nested_code_pages());
+        let Node::Blockquote { children: quote } = &quote else {
+            panic!()
+        };
+        let [Node::CodeBlock(nested)] = quote.as_slice() else {
+            panic!()
+        };
+        assert!(std::ptr::eq(nested.code().as_str(), text.as_str()));
+        assert!(nested.pages.as_ref().is_some_and(|pages| pages.len() > 4));
+        let mut root = Node::Root {
+            children: Arc::new(vec![Node::CodeBlock(code)]),
+        };
+        root.paginate_reading_blocks();
+        let Node::Root { children } = &root else {
+            panic!()
+        };
+        assert!(children.len() > 4);
+        let mut offset = 0;
+        for (index, row) in children.iter().enumerate() {
+            let Node::CodeBlock(code) = row else { panic!() };
+            let page = code.page.as_ref().unwrap();
+            assert!(std::ptr::eq(page.source.as_str(), text.as_str()));
+            assert_eq!(page.range.start, offset);
+            assert!(page.range.len() <= READING_PAGE_BYTES);
+            assert_eq!(code.starts_block(), index == 0);
+            assert_eq!(code.ends_block(), index + 1 == children.len());
+            assert_eq!(code.code().as_str(), &text[page.range.clone()]);
+            assert_eq!(
+                code.display_code().as_str(),
+                &page.text()[..page.text().len() - page.break_after().len()]
+            );
+            let start = marked.start.max(page.range.start);
+            let end = marked.end.min(page.range.end);
+            if start < end {
+                assert_eq!(code.styles, vec![(start - offset..end - offset, emphasis)]);
+            } else {
+                assert!(code.styles.is_empty());
+            }
+            let mut state = code.state.lock().unwrap();
+            state.selection = Some(crate::input::Selection::new(0, state.text.len()));
+            offset = page.range.end;
         }
         assert_eq!(offset, text.len());
         assert_eq!(root.selected_text(), format!("{text}\n\n"));

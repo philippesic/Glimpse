@@ -18,6 +18,7 @@ use crate::scroll::ScrollableElement;
 use crate::text::{
     document_text::{DocumentSource, DocumentText},
     node::CodeBlock,
+    utils::scroll_reading_list,
 };
 use crate::{ActiveTheme, StyledExt, v_flex};
 use crate::{
@@ -208,7 +209,7 @@ impl ParsedMarkdown {
         if let Ok(content) = &mut self.0 {
             if content.document_source.is_none() {
                 content.document_source = Some(DocumentSource::new(&mut content.root_node));
-                content.root_node.paginate_reading_paragraphs();
+                content.root_node.paginate_reading_blocks();
             }
         }
     }
@@ -223,16 +224,19 @@ impl ParsedMarkdown {
 pub struct MarkdownLayout {
     layouts: gpui::WindowTextSystem,
     style: gpui::TextStyle,
+    code_style: gpui::TextStyle,
     colors: crate::theme::ThemeColor,
     rem_size: Pixels,
 }
 
 impl MarkdownLayout {
-    pub fn new(window: &Window, style: gpui::TextStyle, colors: crate::theme::ThemeColor) -> Self {
+    pub fn new(window: &Window, style: gpui::TextStyle, theme: &crate::Theme) -> Self {
+        let code_style = node::ShapeRequest::code_style(&style, theme);
         Self {
             layouts: window.text_system().prepare_in_separate_cache(),
             style,
-            colors,
+            code_style,
+            colors: theme.colors,
             rem_size: window.rem_size(),
         }
     }
@@ -244,20 +248,26 @@ impl MarkdownLayout {
         let node::Node::Root { children } = &content.root_node else {
             return;
         };
-        if children.len() < 48 {
+        if children.len() < 48 && !children.iter().any(node::Node::has_nested_code_pages) {
             return;
         }
         let _work = gpui::work_trace::Span::new("reading_prepare_opening_shapes_worker");
         let request = node::ShapeRequest {
             style: self.style,
+            code_style: self.code_style,
             colors: self.colors,
             view_style: content.node_cx.style.clone(),
             rem_size: self.rem_size,
         };
-        let head = 24.min(children.len());
-        let tail = children.len().saturating_sub(24).max(head);
+        let first = children.len().div_ceil(2).min(24);
+        let last = children.len().saturating_sub(first).min(24);
+        let opening = children.iter().take(first);
+        let closing = children.iter().rev().take(last);
         request.prepare(
-            children[..head].iter().chain(&children[tail..]),
+            opening
+                .zip(closing)
+                .flat_map(|(first, last)| [first, last])
+                .chain(children.iter().skip(last).take(first - last)),
             &self.layouts,
         );
         markdown.1 = Some(self.layouts.into_prepared_lines());
@@ -513,8 +523,10 @@ impl TextViewState {
         }
         let rows = first.saturating_sub(12)..first.saturating_add(42).min(children.len());
         let children = children.clone();
+        let style = window.text_style();
         let request = node::ShapeRequest {
-            style: window.text_style(),
+            code_style: node::ShapeRequest::code_style(&style, cx.theme()),
+            style,
             colors: cx.theme().colors,
             view_style: content.node_cx.style.clone(),
             rem_size: window.rem_size(),
@@ -1051,20 +1063,14 @@ impl Element for TextView {
                     }
                     state.update(cx, |state, cx| {
                         let page = state.bounds.size.height.max(px(100.));
-                        match event.keystroke.key.as_str() {
-                            "up" => state.list_state.scroll_by(-px(24.)),
-                            "down" => state.list_state.scroll_by(px(24.)),
-                            "pageup" => state.list_state.scroll_by(-page),
-                            "pagedown" | "space" => state.list_state.scroll_by(page),
-                            "home" => state.list_state.scroll_to(gpui::ListOffset::default()),
-                            "end" => state.list_state.scroll_to(gpui::ListOffset {
-                                item_ix: state.list_state.item_count(),
-                                offset_in_item: px(0.),
-                            }),
-                            _ => return,
+                        if scroll_reading_list(
+                            &state.list_state,
+                            event.keystroke.key.as_str(),
+                            page,
+                        ) {
+                            cx.stop_propagation();
+                            cx.notify();
                         }
-                        cx.stop_propagation();
-                        cx.notify();
                     });
                     window.refresh();
                 }

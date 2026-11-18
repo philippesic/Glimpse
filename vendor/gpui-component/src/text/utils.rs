@@ -1,3 +1,21 @@
+use gpui::{ListOffset, ListState, Pixels, px};
+
+pub(super) fn scroll_reading_list(list: &ListState, key: &str, page: Pixels) -> bool {
+    match key {
+        "up" => list.scroll_by(-px(24.)),
+        "down" => list.scroll_by(px(24.)),
+        "pageup" => list.scroll_by(-page),
+        "pagedown" | "space" => list.scroll_by(page),
+        "home" => list.scroll_to(ListOffset::default()),
+        "end" => list.scroll_to(ListOffset {
+            item_ix: list.item_count(),
+            offset_in_item: px(0.),
+        }),
+        _ => return false,
+    }
+    true
+}
+
 const NUMBERED_PREFIXES_1: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 const NUMBERED_PREFIXES_2: &str = "abcdefghijklmnopqrstuvwxyz";
 

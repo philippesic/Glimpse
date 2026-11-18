@@ -67,7 +67,7 @@ impl Shell {
         let mut text_style = window.text_style();
         text_style.font_size = self.reading_font_size().into();
         text_style.color = cx.theme().foreground;
-        let layout = Box::new(MarkdownLayout::new(window, text_style, cx.theme().colors));
+        let layout = Box::new(MarkdownLayout::new(window, text_style, cx.theme()));
         let job = Job::ReadMarkdown {
             request,
             source: doc.input.read(cx).text().clone(),
