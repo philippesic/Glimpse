@@ -27,6 +27,23 @@ use std::{
     },
 };
 
+fn text_change(mut text: String, prefix: usize, suffix: usize) -> Option<(i32, String)> {
+    let end = text.len() - suffix;
+    let changed = &text[prefix..end];
+    let length: i32 = changed.chars().count().try_into().ok()?;
+    if length == 0 {
+        return None;
+    }
+    if changed.len() <= text.capacity() / 2 {
+        return Some((length, changed.to_owned()));
+    }
+    text.truncate(end);
+    if prefix > 0 {
+        text.drain(..prefix);
+    }
+    Some((length, text))
+}
+
 struct AdapterChangeHandler<'a> {
     adapter: &'a Adapter,
     added_nodes: HashSet<FullNodeId>,
@@ -184,32 +201,28 @@ impl<'a> AdapterChangeHandler<'a> {
             .take_while(|(old_char, new_char)| old_char == new_char)
             .fold(0, |count, (c, _)| count + c.len_utf8());
 
-        let old_content = &old_text[prefix_byte_count..old_text.len() - suffix_byte_count];
-        if let Ok(length) = old_content.chars().count().try_into() {
-            if length > 0 {
-                self.adapter.emit_object_event(
-                    id,
-                    ObjectEvent::TextRemoved {
-                        start_index: prefix_usv_count,
-                        length,
-                        content: old_content.to_string(),
-                    },
-                );
-            }
+        if let Some((length, content)) = text_change(old_text, prefix_byte_count, suffix_byte_count)
+        {
+            self.adapter.emit_object_event(
+                id,
+                ObjectEvent::TextRemoved {
+                    start_index: prefix_usv_count,
+                    length,
+                    content,
+                },
+            );
         }
 
-        let new_content = &new_text[prefix_byte_count..new_text.len() - suffix_byte_count];
-        if let Ok(length) = new_content.chars().count().try_into() {
-            if length > 0 {
-                self.adapter.emit_object_event(
-                    id,
-                    ObjectEvent::TextInserted {
-                        start_index: prefix_usv_count,
-                        length,
-                        content: new_content.to_string(),
-                    },
-                );
-            }
+        if let Some((length, content)) = text_change(new_text, prefix_byte_count, suffix_byte_count)
+        {
+            self.adapter.emit_object_event(
+                id,
+                ObjectEvent::TextInserted {
+                    start_index: prefix_usv_count,
+                    length,
+                    content,
+                },
+            );
         }
     }
 
