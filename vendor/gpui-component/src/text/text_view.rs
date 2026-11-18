@@ -241,13 +241,18 @@ impl MarkdownLayout {
             return;
         }
         let _work = gpui::work_trace::Span::new("reading_prepare_opening_shapes_worker");
-        let request = node::OpeningShapeRequest {
+        let request = node::ShapeRequest {
             style: self.style,
             colors: self.colors,
             view_style: content.node_cx.style.clone(),
             rem_size: self.rem_size,
         };
-        request.prepare(children, &self.layouts);
+        let head = 24.min(children.len());
+        let tail = children.len().saturating_sub(24).max(head);
+        request.prepare(
+            children[..head].iter().chain(&children[tail..]),
+            &self.layouts,
+        );
         markdown.1 = Some(self.layouts.into_prepared_lines());
     }
 }
@@ -414,12 +419,19 @@ enum InitState {
     },
 }
 
+struct PageShapes {
+    rows: std::ops::Range<usize>,
+    lines: gpui::PreparedTextLines,
+}
+
 pub(crate) struct TextViewState {
     parent_entity: Option<EntityId>,
     tx: Option<smol::channel::Sender<Update>>,
     parsed_result: Option<Result<ParsedContent, SharedString>>,
     pending_document_text: Option<TextRunIds>,
     prepared_lines: Option<gpui::PreparedTextLines>,
+    page_shapes: Option<PageShapes>,
+    preparing_page_shapes: bool,
     resources: Arc<super::TextViewResources>,
     focus_handle: Option<FocusHandle>,
     focus_after_parse: bool,
@@ -448,6 +460,8 @@ impl TextViewState {
             parsed_result: None,
             pending_document_text: None,
             prepared_lines: None,
+            page_shapes: None,
+            preparing_page_shapes: false,
             resources: Arc::default(),
             focus_handle: Some(focus_handle),
             focus_after_parse: false,
@@ -463,6 +477,75 @@ impl TextViewState {
 impl TextViewState {
     fn prepared_content(&mut self) -> Option<&mut ParsedContent> {
         self.parsed_result.as_mut()?.as_mut().ok()
+    }
+
+    fn prepare_scrolling(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(page) = &self.page_shapes {
+            window.text_system().adopt_prepared_lines(&page.lines);
+        }
+        if self.preparing_page_shapes {
+            return;
+        }
+        let first = self.list_state.logical_scroll_top().item_ix;
+        if first == 0 {
+            return;
+        }
+        let Some(Ok(content)) = &self.parsed_result else {
+            return;
+        };
+        let node::Node::Root { children } = &content.root_node else {
+            return;
+        };
+        if first >= children.len().saturating_sub(24)
+            || self.page_shapes.as_ref().is_some_and(|page| {
+                (page.rows.start == 0 || first >= page.rows.start.saturating_add(4))
+                    && first.saturating_add(24) < page.rows.end
+            })
+        {
+            return;
+        }
+        let rows = first.saturating_sub(12)..first.saturating_add(42).min(children.len());
+        let children = children.clone();
+        let request = node::ShapeRequest {
+            style: window.text_style(),
+            colors: cx.theme().colors,
+            view_style: content.node_cx.style.clone(),
+            rem_size: window.rem_size(),
+        };
+        self.preparing_page_shapes = true;
+        cx.defer_in(window, move |state, window, cx| {
+            let first = state.list_state.logical_scroll_top().item_ix;
+            if !rows.contains(&first) {
+                state.preparing_page_shapes = false;
+                return;
+            }
+            let layouts = window.text_system().prepare_in_separate_cache();
+            if let Some(opening) = &state.prepared_lines {
+                layouts.adopt_prepared_lines(opening);
+            }
+            if let Some(page) = &state.page_shapes {
+                layouts.adopt_prepared_lines(&page.lines);
+            }
+            let task = cx.background_spawn(async move {
+                let _work = gpui::work_trace::Span::new("reading_prepare_page_worker");
+                request.prepare(&children[rows.clone()], &layouts);
+                PageShapes {
+                    rows,
+                    lines: layouts.into_prepared_lines(),
+                }
+            });
+            cx.spawn(async move |state, cx| {
+                let shapes = task.await;
+                let _ = state.update(cx, |state, _| {
+                    state.preparing_page_shapes = false;
+                    let first = state.list_state.logical_scroll_top().item_ix;
+                    if shapes.rows.contains(&first) {
+                        state.page_shapes = Some(shapes);
+                    }
+                });
+            })
+            .detach();
+        });
     }
 
     fn prepare_document_text(&mut self, owner: TextRunIds, cx: &mut Context<Self>) {
@@ -906,9 +989,10 @@ impl Element for TextView {
             self.init_state = Some(InitState::Initialized { tx });
         }
 
-        self.state.update(cx, |state, _| {
+        self.state.update(cx, |state, cx| {
             if let Some(lines) = &state.prepared_lines {
                 window.text_system().adopt_prepared_lines(lines);
+                state.prepare_scrolling(window, cx);
             }
             if state.parsed_result.is_none()
                 && state

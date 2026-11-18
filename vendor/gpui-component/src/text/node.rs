@@ -838,37 +838,39 @@ impl Paragraph {
     }
 }
 
-pub(super) struct OpeningShapeRequest {
+pub(super) struct ShapeRequest {
     pub(super) style: gpui::TextStyle,
     pub(super) colors: crate::theme::ThemeColor,
     pub(super) view_style: TextViewStyle,
     pub(super) rem_size: Pixels,
 }
 
-struct OpeningShapeBuilder<'a> {
-    request: &'a OpeningShapeRequest,
+struct ShapeBuilder<'a> {
+    request: &'a ShapeRequest,
     layouts: &'a gpui::WindowTextSystem,
     remaining_bytes: usize,
     remaining_nodes: usize,
 }
 
-impl OpeningShapeRequest {
-    pub(super) fn prepare(&self, children: &[Node], layouts: &gpui::WindowTextSystem) {
-        let mut batch = OpeningShapeBuilder {
+impl ShapeRequest {
+    pub(super) fn prepare<'a>(
+        &self,
+        children: impl IntoIterator<Item = &'a Node>,
+        layouts: &gpui::WindowTextSystem,
+    ) {
+        let mut batch = ShapeBuilder {
             request: self,
             layouts,
             remaining_bytes: 48 * 1024,
             remaining_nodes: 180,
         };
-        let head = 24.min(children.len());
-        let tail = children.len().saturating_sub(24).max(head);
-        for node in children[..head].iter().chain(&children[tail..]) {
+        for node in children {
             batch.node(node, &self.style);
         }
     }
 }
 
-impl OpeningShapeBuilder<'_> {
+impl ShapeBuilder<'_> {
     fn node(&mut self, node: &Node, style: &gpui::TextStyle) {
         if self.remaining_nodes == 0 || self.remaining_bytes == 0 {
             return;
