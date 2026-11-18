@@ -1288,7 +1288,8 @@ impl ShapeBuilder<'_> {
                 }
             }
             Node::Heading { level, children } => {
-                let (size, weight) = heading_style(*level, &self.request.view_style);
+                let body_size = style.font_size.to_pixels(self.request.rem_size);
+                let (size, weight) = heading_style(*level, &self.request.view_style, body_size);
                 let mut style = style.clone();
                 style.font_size = size.into();
                 style.font_weight = weight;
@@ -1365,7 +1366,7 @@ impl ShapeBuilder<'_> {
     }
 }
 
-fn heading_style(level: u8, style: &TextViewStyle) -> (Pixels, FontWeight) {
+fn heading_style(level: u8, style: &TextViewStyle, body_size: Pixels) -> (Pixels, FontWeight) {
     let (size, weight) = match level {
         1 => (rems(2.), FontWeight::BOLD),
         2 => (rems(1.5), FontWeight::SEMIBOLD),
@@ -1376,7 +1377,7 @@ fn heading_style(level: u8, style: &TextViewStyle) -> (Pixels, FontWeight) {
         _ => (rems(1.), FontWeight::NORMAL),
     };
     let size = style.heading_font_size.as_ref().map_or_else(
-        || size.to_pixels(style.heading_base_font_size),
+        || size.to_pixels(style.heading_base_font_size).max(body_size),
         |value| value(level, style.heading_base_font_size),
     );
     (size, weight)
@@ -1929,7 +1930,8 @@ impl Node {
                 .child(paragraph.render(node_cx, window, cx))
                 .into_any_element(),
             Node::Heading { level, children } => {
-                let (text_size, font_weight) = heading_style(*level, &node_cx.style);
+                let body_size = window.text_style().font_size.to_pixels(window.rem_size());
+                let (text_size, font_weight) = heading_style(*level, &node_cx.style, body_size);
 
                 let level = *level;
                 let label: String = children
@@ -2021,6 +2023,17 @@ impl Node {
 #[cfg(test)]
 mod reading_page_tests {
     use super::*;
+
+    #[test]
+    fn default_heading_sizes_keep_up_with_scaled_prose() {
+        let style = TextViewStyle::default();
+        assert_eq!(heading_style(1, &style, px(16.)).0, px(28.));
+        for level in 1..=6 {
+            assert_eq!(heading_style(level, &style, px(56.)).0, px(56.));
+        }
+        let customized = style.heading_font_size(|_, _| px(34.));
+        assert_eq!(heading_style(1, &customized, px(56.)).0, px(34.));
+    }
 
     #[test]
     fn long_paragraph_pages_share_text_and_preserve_marks_and_copy() {
