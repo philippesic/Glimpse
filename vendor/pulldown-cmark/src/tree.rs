@@ -9,7 +9,7 @@
 use std::num;
 use std::ops::{Add, Sub};
 
-use crate::parse::{Item, ItemBody};
+use crate::parse::{item_field, Item, ItemBody};
 
 const PAGE_SIZE: usize = 32 * 1024;
 
@@ -237,7 +237,7 @@ impl Tree<Item> {
 
         // drop or truncate children based on its range
         while let Some(child_ix) = next_child_ix {
-            let child_end = self[child_ix].item.end;
+            let child_end = self[child_ix].item.end();
             if child_end < end_byte_ix {
                 // preserve this node, and go to the next
                 prev_child_ix = Some(child_ix);
@@ -248,7 +248,7 @@ impl Tree<Item> {
                 self[child_ix].next = None;
                 // focus to the new last child (this node)
                 self.cur = Some(child_ix);
-            } else if self[child_ix].item.start == end_byte_ix {
+            } else if self[child_ix].item.start() == end_byte_ix {
                 // check whether the previous character is a backslash
                 let is_previous_char_backslash_escape = match self[child_ix].item.body {
                     ItemBody::Text { backslash_escaped } => backslash_escaped,
@@ -257,8 +257,8 @@ impl Tree<Item> {
                 if is_previous_char_backslash_escape {
                     // rescue the backslash as a plain text content
                     let last_byte_ix = end_byte_ix - 1;
-                    self[child_ix].item.start = last_byte_ix;
-                    self[child_ix].item.end = end_byte_ix;
+                    self[child_ix].item.start = item_field(last_byte_ix);
+                    self[child_ix].item.end = item_field(end_byte_ix);
                     self.cur = Some(child_ix);
                 } else if let Some(prev_child_ix) = prev_child_ix {
                     // the node will become empty. drop the node
@@ -271,10 +271,10 @@ impl Tree<Item> {
                     self.cur = None;
                 }
             } else {
-                debug_assert!(self[child_ix].item.start < end_byte_ix);
+                debug_assert!(self[child_ix].item.start() < end_byte_ix);
                 debug_assert!(end_byte_ix < child_end);
                 // truncate the node
-                self[child_ix].item.end = end_byte_ix;
+                self[child_ix].item.end = item_field(end_byte_ix);
                 self[child_ix].next = None;
                 // focus to the new last child
                 self.cur = Some(child_ix);

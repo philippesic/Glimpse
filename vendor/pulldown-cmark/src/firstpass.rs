@@ -20,7 +20,7 @@ use core::cell::Cell;
 
 use unicase::UniCase;
 
-use crate::parse::ListFlags;
+use crate::parse::{field_index, item_field, ListFlags};
 
 /// Runs the first pass, which resolves the block structure of the document,
 /// and returns the resulting tree.
@@ -133,9 +133,9 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                 let after_marker_index = start_ix + line_start.bytes_scanned();
                 self.continue_list(container_start - outer_indent, ch, index);
                 self.tree.append(Item {
-                    start: container_start - outer_indent,
-                    end: after_marker_index, // will get updated later if item not empty
-                    body: ItemBody::ListItem(indent),
+                    start: item_field(container_start - outer_indent),
+                    end: item_field(after_marker_index), // will get updated later if item not empty
+                    body: ItemBody::ListItem(item_field(indent)),
                 });
                 self.tree.push();
                 if let Some(n) = scan_blank_line(&bytes[after_marker_index..]) {
@@ -145,13 +145,13 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                 if self.options.contains(Options::ENABLE_TASKLISTS) {
                     let task_list_marker =
                         line_start.scan_task_list_marker().map(|is_checked| Item {
-                            start: after_marker_index,
-                            end: start_ix + line_start.bytes_scanned(),
+                            start: item_field(after_marker_index),
+                            end: item_field(start_ix + line_start.bytes_scanned()),
                             body: ItemBody::TaskListMarker(is_checked),
                         });
                     if let Some(task_list_marker) = task_list_marker {
-                        if let Some(n) = scan_blank_line(&bytes[task_list_marker.end..]) {
-                            let end = task_list_marker.end;
+                        if let Some(n) = scan_blank_line(&bytes[task_list_marker.end()..]) {
+                            let end = task_list_marker.end();
                             self.tree.append(task_list_marker);
                             self.begin_list_item = Some(end + n);
                             return end + n;
@@ -195,11 +195,12 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                 match item.body {
                     ItemBody::Paragraph | ItemBody::TightParagraph => {
                         item.body = ItemBody::DefinitionList(Cell::new(ListFlags::IS_TIGHT));
-                        let Item { start, end, .. } = *item;
+                        let start = item.start();
+                        let end = item.end();
                         let list_idx = self.tree.cur().unwrap();
                         let title_idx = self.tree.create_node(Item {
-                            start,
-                            end, // will get updated later if item not empty
+                            start: item_field(start),
+                            end: item_field(end), // will get updated later if item not empty
                             body: ItemBody::DefinitionListTitle,
                         });
                         self.tree[title_idx].child = child;
@@ -216,9 +217,9 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                 // `outer_indent` is columns, not bytes. Subtracting it from a
                 // source offset can land inside a multibyte character (issue 1142).
                 self.tree.append(Item {
-                    start: start_ix + save.bytes_scanned(),
-                    end: after_marker_index, // will get updated later if item not empty
-                    body: ItemBody::DefinitionListDefinition(indent),
+                    start: item_field(start_ix + save.bytes_scanned()),
+                    end: item_field(after_marker_index), // will get updated later if item not empty
+                    body: ItemBody::DefinitionListDefinition(item_field(indent)),
                 });
                 if let Some(ItemBody::DefinitionList(ref list_flags)) =
                     self.tree.peek_up().map(|cur| &mut self.tree[cur].item.body)
@@ -241,8 +242,8 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                 };
                 self.finish_list(start_ix);
                 self.tree.append(Item {
-                    start: container_start,
-                    end: 0, // will get set later
+                    start: item_field(container_start),
+                    end: item_field(0), // will get set later
                     body: ItemBody::BlockQuote(kind),
                 });
                 self.tree.push();
@@ -488,8 +489,8 @@ impl<'a, 'b> FirstPass<'a, 'b> {
 
         let old_cur = self.tree.cur();
         let row_ix = self.tree.append(Item {
-            start: ix,
-            end: 0, // set at end of this function
+            start: item_field(ix),
+            end: item_field(0), // set at end of this function
             body: ItemBody::TableRow,
         });
         self.tree.push();
@@ -505,14 +506,14 @@ impl<'a, 'b> FirstPass<'a, 'b> {
             }
 
             let cell_ix = self.tree.append(Item {
-                start: start_ix,
-                end: ix,
+                start: item_field(start_ix),
+                end: item_field(ix),
                 body: ItemBody::TableCell,
             });
             self.tree.push();
             let (next_ix, _brk) = self.parse_line(ix, None, TableParseMode::Active);
 
-            self.tree[cell_ix].item.end = next_ix;
+            self.tree[cell_ix].item.end = item_field(next_ix);
             self.tree.pop();
 
             ix = next_ix;
@@ -538,8 +539,8 @@ impl<'a, 'b> FirstPass<'a, 'b> {
             }
             *missing_empty_cells += 1;
             self.tree.append(Item {
-                start: ix,
-                end: ix,
+                start: item_field(ix),
+                end: item_field(ix),
                 body: ItemBody::TableCell,
             });
         }
@@ -608,8 +609,8 @@ impl<'a, 'b> FirstPass<'a, 'b> {
             ItemBody::Paragraph
         };
         let node_ix = self.tree.append(Item {
-            start: start_ix,
-            end: 0, // will get set later
+            start: item_field(start_ix),
+            end: item_field(0), // will get set later
             body: body.clone(),
         });
         self.tree.push();
@@ -658,7 +659,7 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                     start,
                     body: ItemBody::HardBreak(true),
                     ..
-                }) if bytes[start] == b'\\' => Some(start),
+                }) if bytes[field_index(start)] == b'\\' => Some(field_index(start)),
                 _ => None,
             };
             if !line_start.scan_space(4) {
@@ -716,11 +717,11 @@ impl<'a, 'b> FirstPass<'a, 'b> {
 
         if let Some(cur_ix) = self.tree.cur() {
             let parent_ix = self.tree.peek_up().unwrap();
-            let header_start = self.tree[parent_ix].item.start;
-            // Note that `self.tree[parent_ix].item.end` might be zero at this point.
+            let header_start = self.tree[parent_ix].item.start();
+            // Note that `self.tree[parent_ix].item.end()` might be zero at this point.
             // Use the end position of the current node (i.e. the last known child
             // of the parent) instead.
-            let header_end = self.tree[cur_ix].item.end;
+            let header_end = self.tree[cur_ix].item.end();
 
             // extract the trailing attribute block
             let (content_end, attrs_) =
@@ -761,7 +762,7 @@ impl<'a, 'b> FirstPass<'a, 'b> {
             }
 
             if let Some(cur_ix) = self.tree.cur() {
-                self.tree[cur_ix].item.end = new_end;
+                self.tree[cur_ix].item.end = item_field(new_end);
             }
         }
 
@@ -812,8 +813,8 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                         return LoopInstruction::BreakAtWith(
                             end_ix,
                             Some(Item {
-                                start: i,
-                                end: end_ix,
+                                start: item_field(i),
+                                end: item_field(end_ix),
                                 body: ItemBody::HardBreak(true),
                             }),
                         );
@@ -842,8 +843,8 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                                     return LoopInstruction::BreakAtWith(
                                         end_ix,
                                         Some(Item {
-                                            start: i,
-                                            end: end_ix, // must update later
+                                            start: item_field(i),
+                                            end: item_field(end_ix), // must update later
                                             body: ItemBody::Table(alignment_ix),
                                         }),
                                     );
@@ -861,8 +862,8 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                         return LoopInstruction::BreakAtWith(
                             end_ix,
                             Some(Item {
-                                start: i,
-                                end: end_ix,
+                                start: item_field(i),
+                                end: item_field(end_ix),
                                 body: ItemBody::HardBreak(false),
                             }),
                         );
@@ -875,8 +876,8 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                     LoopInstruction::BreakAtWith(
                         end_ix,
                         Some(Item {
-                            start: i,
-                            end: end_ix,
+                            start: item_field(i),
+                            end: item_field(end_ix),
                             body: ItemBody::SoftBreak,
                         }),
                     )
@@ -887,9 +888,9 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                         if bytes[ix + 1] == b'`' {
                             let count = 1 + scan_ch_repeat(&bytes[(ix + 2)..], b'`');
                             self.tree.append(Item {
-                                start: ix + 1,
-                                end: ix + count + 1,
-                                body: ItemBody::MaybeCode(count, true),
+                                start: item_field(ix + 1),
+                                end: item_field(ix + count + 1),
+                                body: ItemBody::MaybeCode(item_field(count), true),
                             });
                             begin_text = ix + 1 + count;
                             backslash_escaped = false;
@@ -946,9 +947,13 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                         backslash_escaped = false;
                         for i in 0..count {
                             self.tree.append(Item {
-                                start: ix + i,
-                                end: ix + i + 1,
-                                body: ItemBody::MaybeEmphasis(count - i, can_open, can_close),
+                                start: item_field(ix + i),
+                                end: item_field(ix + i + 1),
+                                body: ItemBody::MaybeEmphasis(
+                                    item_field(count - i),
+                                    can_open,
+                                    can_close,
+                                ),
                             });
                         }
                         begin_text = ix + count;
@@ -987,8 +992,8 @@ impl<'a, 'b> FirstPass<'a, 'b> {
 
                     self.tree.append_text(begin_text, ix, backslash_escaped);
                     self.tree.append(Item {
-                        start: ix,
-                        end: ix + 1,
+                        start: item_field(ix),
+                        end: item_field(ix + 1),
                         body: ItemBody::MaybeMath(can_open, can_close, brace_context),
                     });
                     begin_text = ix + 1;
@@ -1045,9 +1050,9 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                     backslash_escaped = false;
                     let count = 1 + scan_ch_repeat(&bytes[(ix + 1)..], b'`');
                     self.tree.append(Item {
-                        start: ix,
-                        end: ix + count,
-                        body: ItemBody::MaybeCode(count, false),
+                        start: item_field(ix),
+                        end: item_field(ix + count),
+                        body: ItemBody::MaybeCode(item_field(count), false),
                     });
                     begin_text = ix + count;
                     LoopInstruction::ContinueAndSkip(count - 1)
@@ -1058,8 +1063,8 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                     self.tree.append_text(begin_text, ix, backslash_escaped);
                     backslash_escaped = false;
                     self.tree.append(Item {
-                        start: ix,
-                        end: ix + 1,
+                        start: item_field(ix),
+                        end: item_field(ix + 1),
                         body: ItemBody::MaybeHtml,
                     });
                     begin_text = ix + 1;
@@ -1070,8 +1075,8 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                         self.tree.append_text(begin_text, ix, backslash_escaped);
                         backslash_escaped = false;
                         self.tree.append(Item {
-                            start: ix,
-                            end: ix + 2,
+                            start: item_field(ix),
+                            end: item_field(ix + 2),
                             body: ItemBody::MaybeImage,
                         });
                         begin_text = ix + 2;
@@ -1084,8 +1089,8 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                     self.tree.append_text(begin_text, ix, backslash_escaped);
                     backslash_escaped = false;
                     self.tree.append(Item {
-                        start: ix,
-                        end: ix + 1,
+                        start: item_field(ix),
+                        end: item_field(ix + 1),
                         body: ItemBody::MaybeLinkOpen,
                     });
                     begin_text = ix + 1;
@@ -1095,8 +1100,8 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                     self.tree.append_text(begin_text, ix, backslash_escaped);
                     backslash_escaped = false;
                     self.tree.append(Item {
-                        start: ix,
-                        end: ix + 1,
+                        start: item_field(ix),
+                        end: item_field(ix + 1),
                         body: ItemBody::MaybeLinkClose(true),
                     });
                     begin_text = ix + 1;
@@ -1107,8 +1112,8 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                         self.tree.append_text(begin_text, ix, backslash_escaped);
                         backslash_escaped = false;
                         self.tree.append(Item {
-                            start: ix,
-                            end: ix + n,
+                            start: item_field(ix),
+                            end: item_field(ix + n),
                             body: ItemBody::SynthesizeText(self.allocs.allocate_cow(value)),
                         });
                         begin_text = ix + n;
@@ -1132,8 +1137,8 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                         self.tree.append_text(begin_text, ix, backslash_escaped);
                         backslash_escaped = false;
                         self.tree.append(Item {
-                            start: ix,
-                            end: ix + 3,
+                            start: item_field(ix),
+                            end: item_field(ix + 3),
                             body: ItemBody::SynthesizeChar('…'),
                         });
                         begin_text = ix + 3;
@@ -1172,8 +1177,8 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                         self.tree.append_text(begin_text, ix, backslash_escaped);
                         backslash_escaped = false;
                         self.tree.append(Item {
-                            start: ix,
-                            end: ix + count,
+                            start: item_field(ix),
+                            end: item_field(ix + count),
                             body: itembody,
                         });
                         begin_text = ix + count;
@@ -1195,8 +1200,8 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                     self.tree.append_text(begin_text, ix, backslash_escaped);
                     backslash_escaped = false;
                     self.tree.append(Item {
-                        start: ix,
-                        end: ix + 1,
+                        start: item_field(ix),
+                        end: item_field(ix + 1),
                         body: ItemBody::MaybeSmartQuote(c, can_open, can_close),
                     });
                     begin_text = ix + 1;
@@ -1233,8 +1238,8 @@ impl<'a, 'b> FirstPass<'a, 'b> {
         mut indent: usize,
     ) -> usize {
         self.tree.append(Item {
-            start: start_ix,
-            end: 0, // set later
+            start: item_field(start_ix),
+            end: item_field(0), // set later
             body: ItemBody::HtmlBlock,
         });
         self.tree.push();
@@ -1282,8 +1287,8 @@ impl<'a, 'b> FirstPass<'a, 'b> {
         mut indent: usize,
     ) -> usize {
         self.tree.append(Item {
-            start: start_ix,
-            end: 0, // set later
+            start: item_field(start_ix),
+            end: item_field(0), // set later
             body: ItemBody::HtmlBlock,
         });
         self.tree.push();
@@ -1319,8 +1324,8 @@ impl<'a, 'b> FirstPass<'a, 'b> {
 
     fn parse_indented_code_block(&mut self, start_ix: usize, mut remaining_space: usize) -> usize {
         self.tree.append(Item {
-            start: start_ix,
-            end: 0, // will get set later
+            start: item_field(start_ix),
+            end: item_field(0), // will get set later
             body: ItemBody::IndentCodeBlock,
         });
         self.tree.push();
@@ -1362,7 +1367,7 @@ impl<'a, 'b> FirstPass<'a, 'b> {
         // Trim trailing blank lines.
         if let Some(child) = last_nonblank_child {
             self.tree[child].next = None;
-            self.tree[child].item.end = last_nonblank_ix;
+            self.tree[child].item.end = item_field(last_nonblank_ix);
         }
         self.pop(end_ix);
         ix
@@ -1384,8 +1389,8 @@ impl<'a, 'b> FirstPass<'a, 'b> {
         let info_end = ix - scan_rev_while(&bytes[info_start..ix], is_ascii_whitespace);
         let info_string = unescape(&self.text[info_start..info_end], self.tree.is_in_table());
         self.tree.append(Item {
-            start: start_ix,
-            end: 0, // will get set later
+            start: item_field(start_ix),
+            end: item_field(0), // will get set later
             body: ItemBody::FencedCodeBlock(self.allocs.allocate_cow(info_string)),
         });
         self.tree.push();
@@ -1428,8 +1433,8 @@ impl<'a, 'b> FirstPass<'a, 'b> {
         // 3 delimiter characters
         let mut ix = start_ix + 3 + scan_nextline(&bytes[start_ix + 3..]);
         self.tree.append(Item {
-            start: start_ix,
-            end: 0, // will get set later
+            start: item_field(start_ix),
+            end: item_field(0), // will get set later
             body: ItemBody::MetadataBlock(metadata_block_kind),
         });
         self.tree.push();
@@ -1462,8 +1467,8 @@ impl<'a, 'b> FirstPass<'a, 'b> {
         if remaining_space > 0 {
             let cow_ix = self.allocs.allocate_cow("   "[..remaining_space].into());
             self.tree.append(Item {
-                start,
-                end: start,
+                start: item_field(start),
+                end: item_field(start),
                 body: ItemBody::SynthesizeText(cow_ix),
             });
         }
@@ -1481,27 +1486,27 @@ impl<'a, 'b> FirstPass<'a, 'b> {
         if remaining_space > 0 {
             let cow_ix = self.allocs.allocate_cow("   "[..remaining_space].into());
             self.tree.append(Item {
-                start,
-                end: start,
+                start: item_field(start),
+                end: item_field(start),
                 body: ItemBody::SynthesizeText(cow_ix),
             });
         }
         if self.text.as_bytes()[end - 2] == b'\r' {
             // Normalize CRLF to LF
             self.tree.append(Item {
-                start,
-                end: end - 2,
+                start: item_field(start),
+                end: item_field(end - 2),
                 body: ItemBody::Html,
             });
             self.tree.append(Item {
-                start: end - 1,
-                end,
+                start: item_field(end - 1),
+                end: item_field(end),
                 body: ItemBody::Html,
             });
         } else {
             self.tree.append(Item {
-                start,
-                end,
+                start: item_field(start),
+                end: item_field(end),
                 body: ItemBody::Html,
             });
         }
@@ -1510,7 +1515,7 @@ impl<'a, 'b> FirstPass<'a, 'b> {
     /// Pop a container, setting its end.
     fn pop(&mut self, ix: usize) {
         let cur_ix = self.tree.pop().unwrap();
-        self.tree[cur_ix].item.end = ix;
+        self.tree[cur_ix].item.end = item_field(ix);
         if let ItemBody::DefinitionList(_) = self.tree[cur_ix].item.body {
             fixup_end_of_definition_list(&mut self.tree, cur_ix);
             self.begin_list_item = None;
@@ -1582,9 +1587,13 @@ impl<'a, 'b> FirstPass<'a, 'b> {
             self.finish_list(start);
         }
         self.tree.append(Item {
-            start,
-            end: 0, // will get set later
-            body: ItemBody::List(Cell::new(ListFlags::IS_TIGHT), ch, index),
+            start: item_field(start),
+            end: item_field(0), // will get set later
+            body: ItemBody::List(
+                Cell::new(ListFlags::IS_TIGHT),
+                ch,
+                u32::try_from(index).expect("Ordered list marker exceeds the Markdown range"),
+            ),
         });
         self.tree.push();
         self.last_line_blank = false;
@@ -1595,8 +1604,8 @@ impl<'a, 'b> FirstPass<'a, 'b> {
     /// Returns index of start of next line.
     fn parse_hrule(&mut self, hrule_size: usize, ix: usize) -> usize {
         self.tree.append(Item {
-            start: ix,
-            end: ix + hrule_size,
+            start: item_field(ix),
+            end: item_field(ix + hrule_size),
             body: ItemBody::Rule,
         });
         ix + hrule_size
@@ -1608,15 +1617,15 @@ impl<'a, 'b> FirstPass<'a, 'b> {
     fn parse_atx_heading(&mut self, start: usize, atx_level: HeadingLevel) -> usize {
         let mut ix = start;
         let heading_ix = self.tree.append(Item {
-            start,
-            end: 0,                    // set later
+            start: item_field(start),
+            end: item_field(0),        // set later
             body: ItemBody::default(), // set later
         });
         ix += atx_level as usize;
         // next char is space or eol (guaranteed by scan_atx_heading)
         let bytes = self.text.as_bytes();
         if let Some(eol_bytes) = scan_eol(&bytes[ix..]) {
-            self.tree[heading_ix].item.end = ix + eol_bytes;
+            self.tree[heading_ix].item.end = item_field(ix + eol_bytes);
             self.tree[heading_ix].item.body = ItemBody::Heading(atx_level, None);
             return ix + eol_bytes;
         }
@@ -1648,11 +1657,12 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                 body: ItemBody::HardBreak(true),
             }) = line_brk
             {
-                self.tree.append_text(start, end, false);
+                self.tree
+                    .append_text(field_index(start), field_index(end), false);
             }
             (ix, ix, None)
         };
-        self.tree[header_node_idx].item.end = end;
+        self.tree[header_node_idx].item.end = item_field(end);
 
         // remove trailing matter from header text
         let mut empty_text_node = false;
@@ -1676,7 +1686,7 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                 }
             }
             // if text is only spaces, then remove them
-            self.tree[cur_ix].item.end = limit + header_start;
+            self.tree[cur_ix].item.end = item_field(limit + header_start);
 
             // limit = 0 when text is empty after removing spaces
             if limit == 0 {
@@ -1736,7 +1746,7 @@ impl<'a, 'b> FirstPass<'a, 'b> {
             .0
             .insert(UniCase::new(label.clone()), FootnoteDef { use_count: 0 });
         self.tree.append(Item {
-            start,
+            start: item_field(start),
             end: 0, // will get set later
             // TODO: check whether the label here is strictly necessary
             body: ItemBody::FootnoteDefinition(self.allocs.allocate_cow(label)),

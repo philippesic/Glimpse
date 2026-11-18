@@ -24,7 +24,10 @@ use core::cell::Cell;
 use std::cmp::{max, min};
 use std::collections::{HashMap, VecDeque};
 use std::iter::FusedIterator;
-use std::num::NonZeroUsize;
+#[cfg(feature = "compact-tree")]
+use std::num::NonZeroU32 as NonZeroField;
+#[cfg(not(feature = "compact-tree"))]
+use std::num::NonZeroUsize as NonZeroField;
 use std::ops::{Index, Range};
 
 use unicase::UniCase;
@@ -46,11 +49,46 @@ use crate::{
 // https://spec.commonmark.org/0.29/#link-destination
 pub(crate) const LINK_MAX_NESTED_PARENS: usize = 32;
 
+#[cfg(feature = "compact-tree")]
+pub(crate) type ItemField = u32;
+#[cfg(not(feature = "compact-tree"))]
+pub(crate) type ItemField = usize;
+
+#[cfg(feature = "compact-tree")]
+pub(crate) fn item_field(value: usize) -> ItemField {
+    u32::try_from(value).expect("Markdown item exceeds the compact range")
+}
+
+#[cfg(not(feature = "compact-tree"))]
+pub(crate) fn item_field(value: usize) -> ItemField {
+    value
+}
+
+#[cfg(feature = "compact-tree")]
+pub(crate) fn field_index(value: ItemField) -> usize {
+    value as usize
+}
+
+#[cfg(not(feature = "compact-tree"))]
+pub(crate) fn field_index(value: ItemField) -> usize {
+    value
+}
+
 #[derive(Debug, Default, Clone)]
 pub(crate) struct Item {
-    pub start: usize,
-    pub end: usize,
+    pub(crate) start: ItemField,
+    pub(crate) end: ItemField,
     pub body: ItemBody,
+}
+
+impl Item {
+    pub(crate) fn start(&self) -> usize {
+        field_index(self.start)
+    }
+
+    pub(crate) fn end(&self) -> usize {
+        field_index(self.end)
+    }
 }
 
 #[derive(Debug, PartialEq, Clone, Default)]
@@ -58,12 +96,12 @@ pub(crate) enum ItemBody {
     // These are possible inline items, need to be resolved in second pass.
 
     // repeats, can_open, can_close
-    MaybeEmphasis(usize, bool, bool),
+    MaybeEmphasis(ItemField, bool, bool),
     // can_open, can_close, brace context
     MaybeMath(bool, bool, u8),
     // quote byte, can_open, can_close
     MaybeSmartQuote(u8, bool, bool),
-    MaybeCode(usize, bool), // number of backticks, preceded by backslash
+    MaybeCode(ItemField, bool), // number of backticks, preceded by backslash
     MaybeHtml,
     MaybeLinkOpen,
     // bool indicates whether or not the preceding section could be a reference
@@ -110,8 +148,8 @@ pub(crate) enum ItemBody {
     HtmlBlock,
     BlockQuote(Option<BlockQuoteKind>),
     // is_tight|last_line empty, list character, list start index
-    List(Cell<ListFlags>, u8, u64),
-    ListItem(usize), // indent level
+    List(Cell<ListFlags>, u8, u32),
+    ListItem(ItemField), // indent level
     FootnoteDefinition(CowIndex),
     MetadataBlock(MetadataBlockKind),
 
@@ -121,7 +159,7 @@ pub(crate) enum ItemBody {
     // depending on whether there's a definition after it
     MaybeDefinitionListTitle,
     DefinitionListTitle,
-    DefinitionListDefinition(usize),
+    DefinitionListDefinition(ItemField),
 
     // Tables
     Table(AlignmentIndex),
@@ -400,7 +438,7 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
         let mut cur = self.tree.cur();
         let mut prev = None;
 
-        let block_end = self.tree[self.tree.peek_up().unwrap()].item.end;
+        let block_end = self.tree[self.tree.peek_up().unwrap()].item.end();
         let block_text = &self.text[..block_end];
 
         while let Some(mut cur_ix) = cur {
@@ -408,7 +446,7 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
                 ItemBody::MaybeHtml => {
                     let next = self.tree[cur_ix].next;
                     let autolink = if let Some(next_ix) = next {
-                        scan_autolink(block_text, self.tree[next_ix].item.start)
+                        scan_autolink(block_text, self.tree[next_ix].item.start())
                     } else {
                         None
                     };
@@ -416,8 +454,8 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
                     if let Some((ix, uri, link_type)) = autolink {
                         let node = scan_nodes_to_ix(&self.tree, next, ix);
                         let text_node = self.tree.create_node(Item {
-                            start: self.tree[cur_ix].item.start + 1,
-                            end: ix - 1,
+                            start: item_field(self.tree[cur_ix].item.start() + 1),
+                            end: item_field(ix - 1),
                             body: ItemBody::Text {
                                 backslash_escaped: false,
                             },
@@ -426,20 +464,21 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
                             self.allocs
                                 .allocate_link(link_type, uri, "".into(), "".into());
                         self.tree[cur_ix].item.body = ItemBody::Link(link_ix);
-                        self.tree[cur_ix].item.end = ix;
+                        self.tree[cur_ix].item.end = item_field(ix);
                         self.tree[cur_ix].next = node;
                         self.tree[cur_ix].child = Some(text_node);
                         prev = cur;
                         cur = node;
                         if let Some(node_ix) = cur {
-                            self.tree[node_ix].item.start = max(self.tree[node_ix].item.start, ix);
+                            self.tree[node_ix].item.start =
+                                item_field(max(self.tree[node_ix].item.start(), ix));
                         }
                         continue;
                     } else {
                         let inline_html = next.and_then(|next_ix| {
                             self.scan_inline_html(
                                 block_text.as_bytes(),
-                                self.tree[next_ix].item.start,
+                                self.tree[next_ix].item.start(),
                             )
                         });
                         if let Some((span, ix)) = inline_html {
@@ -453,13 +492,13 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
                             } else {
                                 ItemBody::InlineHtml
                             };
-                            self.tree[cur_ix].item.end = ix;
+                            self.tree[cur_ix].item.end = item_field(ix);
                             self.tree[cur_ix].next = node;
                             prev = cur;
                             cur = node;
                             if let Some(node_ix) = cur {
                                 self.tree[node_ix].item.start =
-                                    max(self.tree[node_ix].item.start, ix);
+                                    item_field(max(self.tree[node_ix].item.start(), ix));
                             }
                             continue;
                         }
@@ -564,7 +603,9 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
                     if self.code_delims.is_populated() {
                         // we have previously scanned all codeblock delimiters,
                         // so we can reuse that work
-                        if let Some(scan_ix) = self.code_delims.find(cur_ix, search_count) {
+                        if let Some(scan_ix) =
+                            self.code_delims.find(cur_ix, field_index(search_count))
+                        {
                             self.make_code_span(cur_ix, scan_ix, preceded_by_backslash);
                         } else {
                             self.tree[cur_ix].item.body = ItemBody::Text {
@@ -588,7 +629,7 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
                                     self.code_delims.clear();
                                     break;
                                 } else {
-                                    self.code_delims.insert(delim_count, scan_ix);
+                                    self.code_delims.insert(field_index(delim_count), scan_ix);
                                 }
                             }
                             scan = self.tree[scan_ix].next;
@@ -673,7 +714,7 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
                         }
                         let next = self.tree[cur_ix].next;
                         if let Some((next_ix, url, title)) =
-                            self.scan_inline_link(block_text, self.tree[cur_ix].item.end, next)
+                            self.scan_inline_link(block_text, self.tree[cur_ix].item.end(), next)
                         {
                             let next_node = scan_nodes_to_ix(&self.tree, next, next_ix);
                             if let Some(prev_ix) = prev {
@@ -691,10 +732,10 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
                             };
                             self.tree[cur_ix].child = self.tree[cur_ix].next;
                             self.tree[cur_ix].next = next_node;
-                            self.tree[cur_ix].item.end = next_ix;
+                            self.tree[cur_ix].item.end = item_field(next_ix);
                             if let Some(next_node_ix) = next_node {
                                 self.tree[next_node_ix].item.start =
-                                    max(self.tree[next_node_ix].item.start, next_ix);
+                                    item_field(max(self.tree[next_node_ix].item.start(), next_ix));
                             }
 
                             if tos.ty == LinkStackTy::Link {
@@ -757,8 +798,8 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
                                 | RefScan::Failed
                                 | RefScan::UnexpectedFootnote => {
                                     // No label? maybe it is a shortcut reference
-                                    let label_start = self.tree[tos.node].item.end - 1;
-                                    let label_end = self.tree[cur_ix].item.end;
+                                    let label_start = self.tree[tos.node].item.end() - 1;
+                                    let label_end = self.tree[cur_ix].item.end();
                                     scan_link_label(
                                         &self.tree,
                                         &self.text[label_start..label_end],
@@ -782,12 +823,15 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
                                 if let Some(def) = self
                                     .allocs
                                     .footdefs
-                                    .get_mut(self.allocs.cows[footref.0].to_owned())
+                                    .get_mut(self.allocs.cows[field_index(footref.0)].to_owned())
                                 {
                                     def.use_count += 1;
                                 }
                                 if !self.options.has_gfm_footnotes()
-                                    || self.allocs.footdefs.contains(&self.allocs.cows[footref.0])
+                                    || self
+                                        .allocs
+                                        .footdefs
+                                        .contains(&self.allocs.cows[field_index(footref.0)])
                                 {
                                     // If this came from a MaybeImage, then the `!` prefix
                                     // isn't part of the footnote reference.
@@ -797,9 +841,9 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
                                         self.tree[tos.node].item.body =
                                             ItemBody::SynthesizeChar('!');
                                         self.tree[cur_ix].item.start =
-                                            self.tree[tos.node].item.start + 1;
+                                            item_field(self.tree[tos.node].item.start() + 1);
                                         self.tree[tos.node].item.end =
-                                            self.tree[tos.node].item.start + 1;
+                                            item_field(self.tree[tos.node].item.start() + 1);
                                         cur_ix
                                     } else {
                                         tos.node
@@ -811,7 +855,7 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
                                     self.tree[footnote_ix].child = None;
                                     self.tree[footnote_ix].item.body =
                                         ItemBody::FootnoteReference(footref);
-                                    self.tree[footnote_ix].item.end = end;
+                                    self.tree[footnote_ix].item.end = item_field(end);
                                     prev = Some(footnote_ix);
                                     cur = next;
                                     self.link_stack.clear();
@@ -821,7 +865,7 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
                                 if let Some((def_link_type, url, title)) = self
                                     .fetch_link_type_url_title(
                                         link_label,
-                                        (self.tree[tos.node].item.start)..end,
+                                        (self.tree[tos.node].item.start())..end,
                                         link_type,
                                     )
                                 {
@@ -849,7 +893,7 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
                                         }
                                     }
 
-                                    self.tree[tos.node].item.end = end;
+                                    self.tree[tos.node].item.end = item_field(end);
 
                                     // set up cur so next node will be node_after_link
                                     cur = Some(tos.node);
@@ -897,8 +941,8 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
                 // skip if no next node exists, like at end of input
                 return None;
             };
-            let start_ix = self.tree[body_node].item.start;
-            let end_ix = self.tree[cur_ix].item.start;
+            let start_ix = self.tree[body_node].item.start();
+            let end_ix = self.tree[cur_ix].item.start();
             // bail early in case the link is malformed: on some inputs the
             // body can begin at or after the closing delimiter, which would
             // otherwise underflow the length below and invert the slice.
@@ -922,8 +966,8 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
                         // anchor has no content, rather than accidentally
                         // capturing the closing `]` delimiter.
                         let body_node = self.tree.create_node(Item {
-                            start: rest,
-                            end: rest,
+                            start: item_field(rest),
+                            end: item_field(rest),
                             body: ItemBody::Text {
                                 backslash_escaped: false,
                             },
@@ -934,7 +978,7 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
                         if let Some(body_node) = body_node {
                             // break node so passes can actually format
                             // the display text
-                            self.tree[body_node].item.start = rest;
+                            self.tree[body_node].item.start = item_field(rest);
 
                             Some((true, body_node, wikitext))
                         } else {
@@ -949,8 +993,8 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
                         return None;
                     }
                     let body_node = self.tree.create_node(Item {
-                        start: start_ix,
-                        end: end_ix,
+                        start: item_field(start_ix),
+                        end: item_field(end_ix),
                         body: ItemBody::Text {
                             backslash_escaped: false,
                         },
@@ -976,7 +1020,7 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
                 }
                 self.tree[tos.node].child = Some(body_node);
                 self.tree[tos.node].next = self.tree[next_ix].next;
-                self.tree[tos.node].item.end = end_ix + 2;
+                self.tree[tos.node].item.end = item_field(end_ix + 2);
                 self.disable_all_links();
                 return Some(tos.node);
             }
@@ -995,9 +1039,10 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
 
         while let Some(mut cur_ix) = cur {
             match self.tree[cur_ix].item.body {
-                ItemBody::MaybeEmphasis(mut count, can_open, can_close) => {
+                ItemBody::MaybeEmphasis(count, can_open, can_close) => {
+                    let mut count = field_index(count);
                     let run_length = count;
-                    let c = self.text.as_bytes()[self.tree[cur_ix].item.start];
+                    let c = self.text.as_bytes()[self.tree[cur_ix].item.start()];
                     let both = can_open && can_close;
                     if can_close {
                         while let Some(el) =
@@ -1060,7 +1105,7 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
                                 let root = start - inc;
                                 end = end + inc;
                                 self.tree[root].item.body = ty;
-                                self.tree[root].item.end = self.tree[end].item.end;
+                                self.tree[root].item.end = item_field(self.tree[end].item.end());
                                 self.tree[root].child = Some(start);
                                 self.tree[root].next = None;
                                 start = root;
@@ -1242,10 +1287,10 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
 
             if c == b'\n' || c == b'\r' {
                 if let Some(node_ix) = scan_nodes_to_ix(&self.tree, node, i + 1) {
-                    if self.tree[node_ix].item.start > i {
+                    if self.tree[node_ix].item.start() > i {
                         title.push_str(&text[mark..i]);
                         title.push('\n');
-                        i = self.tree[node_ix].item.start;
+                        i = self.tree[node_ix].item.start();
                         mark = i;
                         continue;
                     }
@@ -1303,10 +1348,10 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
             // This unwrap() can't panic, because if the next variable were None, end_is_display would be None
             close = self.tree[close].next.unwrap();
             self.tree[open].next = Some(close);
-            self.tree[open].item.end += 1;
-            self.tree[close].item.start -= 1;
+            self.tree[open].item.end = item_field(self.tree[open].item.end() + 1);
+            self.tree[close].item.start = item_field(self.tree[close].item.start() - 1);
         } else {
-            if self.tree[open].item.end == self.tree[close].item.start {
+            if self.tree[open].item.end() == self.tree[close].item.start() {
                 // inline math spans cannot be empty
                 self.tree[open].item.body = ItemBody::Text {
                     backslash_escaped: false,
@@ -1315,8 +1360,8 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
             }
             self.tree[open].next = Some(close);
         }
-        let span_start = self.tree[open].item.end;
-        let span_end = self.tree[close].item.start;
+        let span_start = self.tree[open].item.end();
+        let span_end = self.tree[close].item.start();
 
         let spanned_text = &self.text[span_start..span_end];
         let spanned_bytes = spanned_text.as_bytes();
@@ -1354,7 +1399,7 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
         };
 
         self.tree[open].item.body = ItemBody::Math(self.allocs.allocate_cow(cow), is_display);
-        self.tree[open].item.end = self.tree[close].item.end;
+        self.tree[open].item.end = item_field(self.tree[close].item.end());
         self.tree[open].next = self.tree[close].next;
     }
 
@@ -1362,8 +1407,8 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
     ///
     /// Both `open` and `close` are matching MaybeCode items.
     fn make_code_span(&mut self, open: TreeIndex, close: TreeIndex, preceding_backslash: bool) {
-        let span_start = self.tree[open].item.end;
-        let span_end = self.tree[close].item.start;
+        let span_start = self.tree[open].item.end();
+        let span_end = self.tree[close].item.start();
         let mut buf: Option<String> = None;
 
         let spanned_text = &self.text[span_start..span_end];
@@ -1427,13 +1472,13 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
             self.tree[open].item.body = ItemBody::Text {
                 backslash_escaped: true,
             };
-            self.tree[open].item.end = self.tree[open].item.start + 1;
+            self.tree[open].item.end = item_field(self.tree[open].item.start() + 1);
             self.tree[open].next = Some(close);
             self.tree[close].item.body = ItemBody::Code(self.allocs.allocate_cow(cow));
-            self.tree[close].item.start = self.tree[open].item.start + 1;
+            self.tree[close].item.start = item_field(self.tree[open].item.start() + 1);
         } else {
             self.tree[open].item.body = ItemBody::Code(self.allocs.allocate_cow(cow));
-            self.tree[open].item.end = self.tree[close].item.end;
+            self.tree[open].item.end = item_field(self.tree[close].item.end());
             self.tree[open].next = self.tree[close].next;
         }
     }
@@ -1517,14 +1562,14 @@ pub(crate) fn scan_containers(
             }
             ItemBody::ListItem(indent) => {
                 let save = line_start.clone();
-                if !line_start.scan_space(indent) && !line_start.is_at_eol() {
+                if !line_start.scan_space(field_index(indent)) && !line_start.is_at_eol() {
                     *line_start = save;
                     break;
                 }
             }
             ItemBody::DefinitionListDefinition(indent) => {
                 let save = line_start.clone();
-                if !line_start.scan_space(indent) && !line_start.is_at_eol() {
+                if !line_start.scan_space(field_index(indent)) && !line_start.is_at_eol() {
                     *line_start = save;
                     break;
                 }
@@ -1559,15 +1604,16 @@ impl Tree<Item> {
     pub(crate) fn append_text(&mut self, start: usize, end: usize, backslash_escaped: bool) {
         if end > start {
             if let Some(ix) = self.cur() {
-                if matches!(self[ix].item.body, ItemBody::Text { .. }) && self[ix].item.end == start
+                if matches!(self[ix].item.body, ItemBody::Text { .. })
+                    && self[ix].item.end() == start
                 {
-                    self[ix].item.end = end;
+                    self[ix].item.end = item_field(end);
                     return;
                 }
             }
             self.append(Item {
-                start,
-                end,
+                start: item_field(start),
+                end: item_field(end),
                 body: ItemBody::Text { backslash_escaped },
             });
         }
@@ -1761,7 +1807,7 @@ fn scan_nodes_to_ix(
     ix: usize,
 ) -> Option<TreeIndex> {
     while let Some(node_ix) = node {
-        if tree[node_ix].item.end <= ix {
+        if tree[node_ix].item.end() <= ix {
             node = tree[node_ix].next;
         } else {
             break;
@@ -1812,7 +1858,7 @@ fn scan_reference<'b>(
         None => return RefScan::Failed,
         Some(cur_ix) => cur_ix,
     };
-    let start = tree[cur_ix].item.start;
+    let start = tree[cur_ix].item.start();
     let tail = &text.as_bytes()[start..];
 
     if tail.starts_with(b"[]") {
@@ -1985,7 +2031,7 @@ impl MathDelims {
             if ix <= open_ix || (is_display && tree[open_ix].next == Some(ix)) {
                 continue;
             }
-            let can_close = can_close && tree[open_ix].item.end != tree[ix].item.start;
+            let can_close = can_close && tree[open_ix].item.end() != tree[ix].item.start();
             if (!is_display && can_close) || (is_display && delim_is_display) {
                 return Some(ix);
             }
@@ -2005,16 +2051,16 @@ impl MathDelims {
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub(crate) struct LinkIndex(usize);
+pub(crate) struct LinkIndex(ItemField);
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub(crate) struct CowIndex(usize);
+pub(crate) struct CowIndex(ItemField);
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub(crate) struct AlignmentIndex(usize);
+pub(crate) struct AlignmentIndex(ItemField);
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub(crate) struct HeadingIndex(NonZeroUsize);
+pub(crate) struct HeadingIndex(NonZeroField);
 
 #[derive(Clone)]
 pub(crate) struct Allocations<'a> {
@@ -2086,7 +2132,7 @@ impl<'a> Allocations<'a> {
     pub fn allocate_cow(&mut self, cow: CowStr<'a>) -> CowIndex {
         let ix = self.cows.len();
         self.cows.push(cow);
-        CowIndex(ix)
+        CowIndex(item_field(ix))
     }
 
     pub fn allocate_link(
@@ -2098,13 +2144,13 @@ impl<'a> Allocations<'a> {
     ) -> LinkIndex {
         let ix = self.links.len();
         self.links.push((ty, url, title, id));
-        LinkIndex(ix)
+        LinkIndex(item_field(ix))
     }
 
     pub fn allocate_alignment(&mut self, alignment: Vec<Alignment>) -> AlignmentIndex {
         let ix = self.alignments.len();
         self.alignments.push(alignment);
-        AlignmentIndex(ix)
+        AlignmentIndex(item_field(ix))
     }
 
     pub fn allocate_heading(&mut self, attrs: HeadingAttributes<'a>) -> HeadingIndex {
@@ -2112,21 +2158,21 @@ impl<'a> Allocations<'a> {
         self.headings.push(attrs);
         // This won't panic. `self.headings.len()` can't be `usize::MAX` since
         // such a long Vec cannot fit in memory.
-        let ix_nonzero = NonZeroUsize::new(ix.wrapping_add(1)).expect("too many headings");
+        let ix_nonzero = NonZeroField::new(item_field(ix + 1)).expect("too many headings");
         HeadingIndex(ix_nonzero)
     }
 
     pub fn take_cow(&mut self, ix: CowIndex) -> CowStr<'a> {
-        std::mem::replace(&mut self.cows[ix.0], "".into())
+        std::mem::replace(&mut self.cows[field_index(ix.0)], "".into())
     }
 
     pub fn take_link(&mut self, ix: LinkIndex) -> (LinkType, CowStr<'a>, CowStr<'a>, CowStr<'a>) {
         let default_link = (LinkType::ShortcutUnknown, "".into(), "".into(), "".into());
-        std::mem::replace(&mut self.links[ix.0], default_link)
+        std::mem::replace(&mut self.links[field_index(ix.0)], default_link)
     }
 
     pub fn take_alignment(&mut self, ix: AlignmentIndex) -> Vec<Alignment> {
-        std::mem::take(&mut self.alignments[ix.0])
+        std::mem::take(&mut self.alignments[field_index(ix.0)])
     }
 }
 
@@ -2134,7 +2180,7 @@ impl<'a> Index<CowIndex> for Allocations<'a> {
     type Output = CowStr<'a>;
 
     fn index(&self, ix: CowIndex) -> &Self::Output {
-        self.cows.index(ix.0)
+        self.cows.index(field_index(ix.0))
     }
 }
 
@@ -2142,7 +2188,7 @@ impl<'a> Index<LinkIndex> for Allocations<'a> {
     type Output = (LinkType, CowStr<'a>, CowStr<'a>, CowStr<'a>);
 
     fn index(&self, ix: LinkIndex) -> &Self::Output {
-        self.links.index(ix.0)
+        self.links.index(field_index(ix.0))
     }
 }
 
@@ -2150,7 +2196,7 @@ impl<'a> Index<AlignmentIndex> for Allocations<'a> {
     type Output = Vec<Alignment>;
 
     fn index(&self, ix: AlignmentIndex) -> &Self::Output {
-        self.alignments.index(ix.0)
+        self.alignments.index(field_index(ix.0))
     }
 }
 
@@ -2158,7 +2204,7 @@ impl<'a> Index<HeadingIndex> for Allocations<'a> {
     type Output = HeadingAttributes<'a>;
 
     fn index(&self, ix: HeadingIndex) -> &Self::Output {
-        self.headings.index(ix.0.get() - 1)
+        self.headings.index(field_index(ix.0.get()) - 1)
     }
 }
 
@@ -2254,7 +2300,7 @@ impl<'a, F: BrokenLinkCallback<'a>> Iterator for OffsetIter<'a, F> {
                     ix
                 };
                 let tag_end = body_to_tag_end(&self.inner.tree[ix].item.body);
-                let span = self.inner.tree[ix].item.start..self.inner.tree[ix].item.end;
+                let span = self.inner.tree[ix].item.start()..self.inner.tree[ix].item.end();
                 self.inner.tree.next_sibling(ix);
                 debug_assert!(span.start <= span.end);
                 Some((Event::End(tag_end), span))
@@ -2279,8 +2325,8 @@ impl<'a, F: BrokenLinkCallback<'a>> Iterator for OffsetIter<'a, F> {
                 } else {
                     self.inner.tree.next_sibling(cur_ix);
                 }
-                debug_assert!(item.start <= item.end);
-                Some((event, item.start..item.end))
+                debug_assert!(item.start() <= item.end());
+                Some((event, item.start()..item.end()))
             }
         }
     }
@@ -2320,13 +2366,13 @@ fn body_to_tag_end(body: &ItemBody) -> TagEnd {
 
 fn item_to_event<'a>(item: &Item, text: &'a str, allocs: &mut Allocations<'a>) -> Event<'a> {
     let tag = match item.body {
-        ItemBody::Text { .. } => return Event::Text(text[item.start..item.end].into()),
+        ItemBody::Text { .. } => return Event::Text(text[item.start()..item.end()].into()),
         ItemBody::Code(cow_ix) => return Event::Code(allocs.take_cow(cow_ix)),
         ItemBody::SynthesizeText(cow_ix) => return Event::Text(allocs.take_cow(cow_ix)),
         ItemBody::SynthesizeChar(c) => return Event::Text(c.into()),
         ItemBody::HtmlBlock => Tag::HtmlBlock,
-        ItemBody::Html => return Event::Html(text[item.start..item.end].into()),
-        ItemBody::InlineHtml => return Event::InlineHtml(text[item.start..item.end].into()),
+        ItemBody::Html => return Event::Html(text[item.start()..item.end()].into()),
+        ItemBody::InlineHtml => return Event::InlineHtml(text[item.start()..item.end()].into()),
         ItemBody::OwnedInlineHtml(cow_ix) => return Event::InlineHtml(allocs.take_cow(cow_ix)),
         ItemBody::SoftBreak => return Event::SoftBreak,
         ItemBody::HardBreak(_) => return Event::HardBreak,
@@ -2381,7 +2427,7 @@ fn item_to_event<'a>(item: &Item, text: &'a str, allocs: &mut Allocations<'a>) -
         ItemBody::BlockQuote(kind) => Tag::BlockQuote(kind),
         ItemBody::List(_, c, listitem_start) => {
             if c == b'.' || c == b')' {
-                Tag::List(Some(listitem_start))
+                Tag::List(Some(u64::from(listitem_start)))
             } else {
                 Tag::List(None)
             }
@@ -2483,7 +2529,7 @@ mod test {
     fn node_size() {
         let node_size = std::mem::size_of::<Node<Item>>();
         let expected = if cfg!(feature = "compact-tree") {
-            40
+            24
         } else {
             48
         };
@@ -2494,7 +2540,14 @@ mod test {
     #[cfg(target_pointer_width = "64")]
     fn body_size() {
         let body_size = std::mem::size_of::<ItemBody>();
-        assert_eq!(16, body_size);
+        assert_eq!(
+            if cfg!(feature = "compact-tree") {
+                8
+            } else {
+                16
+            },
+            body_size
+        );
     }
 
     #[test]
@@ -3028,8 +3081,8 @@ text
         let mut stack = InlineStack::default();
         for _ in 0..3 {
             let start = tree.append(Item {
-                start: 0,
-                end: 1,
+                start: item_field(0),
+                end: item_field(1),
                 body: ItemBody::Text {
                     backslash_escaped: false,
                 },
