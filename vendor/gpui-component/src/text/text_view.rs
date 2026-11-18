@@ -168,6 +168,61 @@ impl ParsedContent {
     }
 }
 
+pub struct ParsedMarkdown(Result<ParsedContent, SharedString>);
+
+impl ParsedMarkdown {
+    pub fn new(raw: &str, theme: &HighlightTheme, on_image: impl FnMut(&str)) -> Self {
+        Self(parse_content(
+            TextViewType::Markdown,
+            raw,
+            TextViewStyle::default(),
+            theme,
+            &None,
+            on_image,
+        ))
+    }
+}
+
+pub struct MarkdownView {
+    id: ElementId,
+    state: Entity<TextViewState>,
+}
+
+impl MarkdownView {
+    pub fn new(
+        id: impl Into<ElementId>,
+        content: ParsedMarkdown,
+        resources: Arc<super::TextViewResources>,
+        focus: FocusHandle,
+        cx: &mut App,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            state: cx.new(|cx| {
+                let mut state = TextViewState::new(cx);
+                state.parsed_result = Some(content.0);
+                state.resources = resources;
+                state.focus_handle = Some(focus);
+                state
+            }),
+        }
+    }
+
+    pub fn element(&self) -> AnyElement {
+        TextView {
+            id: self.id.clone(),
+            init_state: None,
+            raw: SharedString::default(),
+            state: self.state.clone(),
+            style: StyleRefinement::default(),
+            selectable: true,
+            scrollable: true,
+            code_block_actions: None,
+        }
+        .into_any_element()
+    }
+}
+
 /// The type of the text view.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TextViewType {
@@ -256,6 +311,7 @@ impl Future for UpdateFuture {
                         self.current_style.clone(),
                         &self.highlight_theme,
                         &self.code_block_actions.clone(),
+                        |_| {},
                     );
                     _ = self.tx_result.try_send(res);
                     continue;
@@ -956,6 +1012,7 @@ fn parse_content(
     style: TextViewStyle,
     highlight_theme: &HighlightTheme,
     code_block_actions: &Option<Arc<CodeBlockActionsFn>>,
+    on_image: impl FnMut(&str),
 ) -> Result<ParsedContent, SharedString> {
     let mut node_cx = NodeContext {
         style: style.clone(),
@@ -965,7 +1022,7 @@ fn parse_content(
 
     let res = match type_ {
         TextViewType::Markdown => {
-            super::format::markdown::parse(text, &style, &mut node_cx, highlight_theme)
+            super::format::markdown::parse(text, &style, &mut node_cx, highlight_theme, on_image)
         }
         TextViewType::Html => super::format::html::parse(text, &mut node_cx),
     };

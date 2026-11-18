@@ -28,7 +28,6 @@ use gpui_component::{
     ActiveTheme, Disableable, Root, Selectable, Sizable,
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState, Position, PreparedInput, Rope},
-    text::TextView,
 };
 use std::{
     cell::RefCell,
@@ -289,6 +288,7 @@ struct Shell {
     query: Entity<InputState>,
     reading: bool,
     reading_view: Option<reading::View>,
+    reading_request: u64,
     memory_release: Option<Task<()>>,
     status: String,
     open_failure: Option<open_failure::Failure>,
@@ -461,6 +461,7 @@ impl Shell {
             query,
             reading: false,
             reading_view: None,
+            reading_request: 0,
             memory_release: None,
             status: String::new(),
             open_failure: None,
@@ -1219,6 +1220,7 @@ impl Shell {
         self.memory_release = Some(cx.background_spawn(async move {
             if rendered.recv().await.is_ok() {
                 Timer::after(std::time::Duration::from_millis(200)).await;
+                let _work = gpui::work_trace::Span::new("view_memory_release");
                 platform::release_unused_memory();
             }
         }));
@@ -1408,9 +1410,7 @@ impl Shell {
         }
         while let Ok(reply) = self.io.replies.try_recv() {
             match reply {
-                Reply::Markdown(id, generation, path, result) => {
-                    self.reading_ready(id, generation, path, result, cx)
-                }
+                Reply::Markdown(request, result) => self.reading_ready(request, result, cx),
                 Reply::PathCompleted(token, value, result) => {
                     self.path_completed(token, value, result, window, cx)
                 }
@@ -2868,7 +2868,10 @@ impl Shell {
                     }
                 }
             }
-            "reading-retry" => self.reading_view = None,
+            "reading-retry" => {
+                self.io.cancel_reading();
+                self.reading_view = None;
+            }
             "reading-notices" => self.reading_notices(window, cx),
             "keep-tab" => {
                 if let Some(doc) = self
@@ -3690,7 +3693,7 @@ impl Render for Shell {
                 );
             }
             if self.reading {
-                content = content.child(self.reading_element(window, cx));
+                content = content.child(self.reading_element(cx));
             } else {
                 content = content.child(
                     div()

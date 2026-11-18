@@ -1,13 +1,17 @@
 use super::*;
-use gpui_component::text::TextViewResources;
+use gpui_component::{
+    highlighter::HighlightTheme,
+    text::{MarkdownView, TextViewResources},
+};
 use std::sync::Arc;
 
 pub(super) struct View {
+    request: u64,
     id: u64,
     generation: u64,
     path: PathBuf,
-    source: Option<SharedString>,
-    resources: Arc<TextViewResources>,
+    theme: Arc<HighlightTheme>,
+    content: Option<MarkdownView>,
     notes: String,
     error: Option<String>,
 }
@@ -19,6 +23,7 @@ impl Shell {
             .is_some_and(|view| !self.reading || self.active != Some(view.id))
         {
             self.reading_view = None;
+            self.io.cancel_reading();
             self.release_view_memory(window, cx);
         }
         if !self.reading {
@@ -31,45 +36,54 @@ impl Shell {
         else {
             return;
         };
+        let theme = cx.theme().highlight_theme.clone();
         if self.reading_view.as_ref().is_some_and(|view| {
-            view.id == doc.id && view.generation == doc.generation && view.path == doc.disk.path
+            view.id == doc.id
+                && view.generation == doc.generation
+                && view.path == doc.disk.path
+                && Arc::ptr_eq(&view.theme, &theme)
         }) {
             return;
         }
+        self.reading_request += 1;
+        let request = self.reading_request;
         self.reading_view = Some(View {
+            request,
             id: doc.id,
             generation: doc.generation,
             path: doc.disk.path.clone(),
-            source: None,
-            resources: Arc::default(),
+            theme: theme.clone(),
+            content: None,
             notes: String::new(),
             error: None,
         });
-        self.io.send(Job::ReadMarkdown(
-            doc.id,
-            doc.generation,
-            doc.input.read(cx).text().clone(),
-            doc.disk.path.clone(),
-        ));
+        self.io.send(Job::ReadMarkdown {
+            request,
+            source: doc.input.read(cx).text().clone(),
+            path: doc.disk.path.clone(),
+            theme,
+        });
     }
     pub(super) fn reading_ready(
         &mut self,
-        id: u64,
-        generation: u64,
-        path: PathBuf,
-        result: Result<glimpse::reading::Prepared, String>,
+        request: u64,
+        result: Result<Box<glimpse::reading::Prepared>, String>,
         cx: &mut Context<Self>,
     ) {
         let weak = cx.entity().downgrade();
         let Some(view) = self
             .reading_view
             .as_mut()
-            .filter(|view| view.id == id && view.generation == generation && view.path == path)
+            .filter(|view| self.reading && self.active == Some(view.id) && view.request == request)
         else {
+            if let Ok(retired) = result {
+                cx.background_spawn(async move { drop(retired) }).detach();
+            }
             return;
         };
         match result {
             Ok(prepared) => {
+                let id = view.id;
                 glimpse::metrics::event("reading-image-count", id, prepared.images.len() as u64);
                 glimpse::metrics::event(
                     "reading-image-bytes",
@@ -81,7 +95,7 @@ impl Shell {
                         .sum(),
                 );
                 let base = view.path.clone();
-                view.resources = Arc::new(TextViewResources {
+                let resources = Arc::new(TextViewResources {
                     restrict_images: true,
                     images: prepared
                         .images
@@ -117,7 +131,13 @@ impl Shell {
                         });
                     })),
                 });
-                view.source = Some(prepared.source.into());
+                view.content = Some(MarkdownView::new(
+                    SharedString::from(format!("markdown-{}", view.request)),
+                    prepared.markdown,
+                    resources,
+                    self.reading_focus.clone(),
+                    cx,
+                ));
                 view.notes = prepared.notes.join("\n\n");
             }
             Err(error) => view.error = Some(error),
@@ -148,11 +168,7 @@ impl Shell {
         }
     }
 
-    pub(super) fn reading_element(
-        &self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    pub(super) fn reading_element(&self, cx: &mut Context<Self>) -> AnyElement {
         let mut area = div()
             .id("reading")
             .flex_1()
@@ -204,19 +220,8 @@ impl Shell {
                     .child(self.button("Reload images", "reading-retry", cx)),
             );
         }
-        if let Some(source) = &view.source {
-            area = area.child(
-                TextView::markdown(
-                    SharedString::from(format!("markdown-{}-{}", view.id, view.generation)),
-                    source.clone(),
-                    window,
-                    cx,
-                )
-                .resources(view.resources.clone(), cx)
-                .focus_handle(self.reading_focus.clone(), cx)
-                .selectable(true)
-                .scrollable(true),
-            );
+        if let Some(content) = &view.content {
+            area = area.child(content.element());
         } else {
             area = area.child("Preparing reading view…")
         }

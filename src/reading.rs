@@ -1,10 +1,11 @@
-use pulldown_cmark::{Event, Options, Parser, Tag};
+use gpui_component::{highlighter::HighlightTheme, text::ParsedMarkdown};
 use std::{
     collections::HashMap,
     io::Read,
     path::{Path, PathBuf},
-    sync::Arc,
 };
+
+const MAX_READ_IMAGES: usize = 32;
 
 pub struct Raster {
     pub width: u32,
@@ -12,7 +13,7 @@ pub struct Raster {
     pub bgra: Vec<u8>,
 }
 pub struct Prepared {
-    pub source: Arc<str>,
+    pub markdown: ParsedMarkdown,
     pub images: HashMap<String, Raster>,
     pub notes: Vec<String>,
 }
@@ -51,27 +52,22 @@ fn decoded_path(value: &str) -> Option<PathBuf> {
     let bytes: Vec<_> = percent_encoding::percent_decode_str(value).collect();
     (!bytes.contains(&0)).then(|| PathBuf::from(std::ffi::OsString::from_vec(bytes)))
 }
-pub fn prepare(source: Arc<str>, path: &Path) -> Prepared {
+pub fn prepare(source: String, path: &Path, theme: &HighlightTheme) -> Prepared {
+    let mut destinations = Vec::new();
+    let markdown = ParsedMarkdown::new(&source, theme, |url| {
+        if destinations.len() <= MAX_READ_IMAGES && !destinations.iter().any(|item| item == url) {
+            destinations.push(url.to_owned());
+        }
+    });
+    drop(source);
     let mut images = HashMap::new();
     let mut notes = vec![];
+    if destinations.len() > MAX_READ_IMAGES {
+        notes.push("Additional images omitted: at most 32 local images per document.".into());
+    }
     let mut total = 0;
-    let mut attempted = std::collections::HashSet::new();
-    for event in Parser::new_ext(
-        &source,
-        Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS | Options::ENABLE_STRIKETHROUGH,
-    ) {
-        let Event::Start(Tag::Image { dest_url, .. }) = event else {
-            continue;
-        };
-        if !attempted.insert(dest_url.to_string()) {
-            continue;
-        }
-        if attempted.len() > 32 {
-            notes.push("Additional images omitted: at most 32 local images per document.".into());
-            break;
-        }
-        let resource: &str = &dest_url;
-        let result = match resolve_link(path, &dest_url) {
+    for resource in destinations.into_iter().take(MAX_READ_IMAGES) {
+        let result = match resolve_link(path, &resource) {
             Link::Local(path) => raster(&path),
             _ => {
                 notes.push(format!(
@@ -83,7 +79,7 @@ pub fn prepare(source: Arc<str>, path: &Path) -> Prepared {
         match result {
             Ok(image) if total + image.bgra.len() <= 32 * 1024 * 1024 => {
                 total += image.bgra.len();
-                images.insert(dest_url.to_string(), image);
+                images.insert(resource, image);
             }
             Ok(_) => notes.push(format!(
                 "Local image omitted: {resource:?}. The document image cache is limited to 32 MiB."
@@ -94,7 +90,7 @@ pub fn prepare(source: Arc<str>, path: &Path) -> Prepared {
     notes.sort();
     notes.dedup();
     Prepared {
-        source,
+        markdown,
         images,
         notes,
     }
@@ -178,11 +174,12 @@ mod tests {
         image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]))
             .save(dir.path().join("local.png"))
             .unwrap();
-        let source: Arc<str> =
-            "![local](local.png)\n![remote](http://127.0.0.1:1/trap.png)\n<script>raw</script>\n"
-                .into();
-        let prepared = prepare(source.clone(), &dir.path().join("read.md"));
-        assert_eq!(prepared.source, source);
+        let source =
+            "![local](local.png)\n![remote](http://127.0.0.1:1/trap.png)\n<script>raw</script>\n";
+        let path = dir.path().join("read.md");
+        std::fs::write(&path, source).unwrap();
+        let prepared = prepare(source.to_owned(), &path, &HighlightTheme::default_light());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), source);
         assert_eq!(
             (
                 prepared.images["local.png"].width,
@@ -204,5 +201,33 @@ mod tests {
             .set_len(8 * 1024 * 1024 + 1)
             .unwrap();
         assert!(raster(&file).err().unwrap().contains("8 MiB"));
+    }
+
+    #[test]
+    fn image_limit_counts_distinct_destinations() {
+        let dir = tempfile::tempdir().unwrap();
+        let initial = dir.path().join("0.png");
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]))
+            .save(&initial)
+            .unwrap();
+        let mut source = "![repeat][first]\n\n".repeat(40);
+        for index in 1..=MAX_READ_IMAGES {
+            let name = format!("{index}.png");
+            std::fs::copy(&initial, dir.path().join(&name)).unwrap();
+            source.push_str(&format!("![image]({name})\n\n"));
+        }
+        source.push_str("[first]: 0.png\n");
+        let prepared = prepare(
+            source,
+            &dir.path().join("read.md"),
+            &HighlightTheme::default_light(),
+        );
+        assert_eq!(prepared.images.len(), MAX_READ_IMAGES);
+        assert!(prepared.images.contains_key("0.png"));
+        assert!(!prepared.images.contains_key("32.png"));
+        assert_eq!(
+            prepared.notes,
+            ["Additional images omitted: at most 32 local images per document."]
+        );
     }
 }

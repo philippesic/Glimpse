@@ -235,6 +235,7 @@ pub(crate) fn parse(
     style: &TextViewStyle,
     cx: &mut NodeContext,
     theme: &HighlightTheme,
+    mut on_image: impl FnMut(&str),
 ) -> Result<node::Node, SharedString> {
     let mut finder = LinkFinder::new();
     finder.url_must_have_scheme(false);
@@ -252,6 +253,7 @@ pub(crate) fn parse(
             Event::Start(Tag::Image {
                 dest_url, title, ..
             }) => {
+                on_image(&dest_url);
                 frames.last_mut().unwrap().flush(&marks, &finder);
                 images.push(Image {
                     image: ImageNode {
@@ -439,6 +441,16 @@ pub(crate) fn parse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse(
+        raw: &str,
+        style: &TextViewStyle,
+        cx: &mut NodeContext,
+        theme: &HighlightTheme,
+    ) -> Result<node::Node, SharedString> {
+        super::parse(raw, style, cx, theme, |_| {})
+    }
+
     fn paragraph(source: &str) -> Paragraph {
         let style = TextViewStyle::default();
         let mut context = NodeContext::default();

@@ -3,7 +3,10 @@ use crate::{
     document::{DiskFile, Observation},
     fileops, storage,
 };
-use gpui_component::input::{PreparedInput, Rope};
+use gpui_component::{
+    highlighter::HighlightTheme,
+    input::{PreparedInput, Rope},
+};
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -21,7 +24,12 @@ pub enum Job {
     HoldMaintenance(mpsc::Sender<()>, mpsc::Receiver<()>),
     #[cfg(test)]
     HoldRead(mpsc::Sender<()>, mpsc::Receiver<()>),
-    ReadMarkdown(u64, u64, Rope, PathBuf),
+    ReadMarkdown {
+        request: u64,
+        source: Rope,
+        path: PathBuf,
+        theme: Arc<HighlightTheme>,
+    },
     CompletePath(u64, String, PathBuf),
     Visit(PathBuf),
     RecentLocation(Vec<PathBuf>),
@@ -78,7 +86,7 @@ pub struct SaveDestination {
     pub recovery_copy: bool,
 }
 pub enum Reply {
-    Markdown(u64, u64, PathBuf, Result<crate::reading::Prepared, String>),
+    Markdown(u64, Result<Box<crate::reading::Prepared>, String>),
     PathCompleted(u64, String, Result<crate::path_completion::Matches, String>),
     RecentLocation(Option<PathBuf>),
     Volumes(Result<crate::locations::Volumes, String>),
@@ -141,6 +149,7 @@ pub struct IoWorker {
     cleared_through: Arc<Mutex<HashMap<u64, u64>>>,
     pending: Arc<AtomicUsize>,
     preview: Arc<AtomicU64>,
+    reading: Arc<AtomicU64>,
     wake: wake::Context,
     rebindings: Arc<Rebindings>,
 }
@@ -213,6 +222,7 @@ impl IoWorker {
             HashMap::<u64, storage::Draft<TextSnapshot>>::new(),
         ));
         let preview = Arc::new(AtomicU64::new(0));
+        let reading = Arc::new(AtomicU64::new(0));
         let rebindings = Arc::new(Rebindings::default());
         let recovery_store = Arc::new(RecoveryStore {
             root: root.clone(),
@@ -233,6 +243,7 @@ impl IoWorker {
             let count = pending.clone();
             let root = root.clone();
             let preview = preview.clone();
+            let reading = reading.clone();
             let settings_root = root.parent().unwrap_or(&root).to_owned();
             thread::spawn(move || {
                 let rx = Requests(requests);
@@ -412,12 +423,31 @@ impl IoWorker {
                             crate::metrics::event("finish-worker-done", id, generation);
                             Reply::Finished(id, generation, attempt, disk, result)
                         }
-                        Job::ReadMarkdown(id, generation, source, path) => Reply::Markdown(
-                            id,
-                            generation,
-                            path.clone(),
-                            Ok(crate::reading::prepare(String::from(source).into(), &path)),
-                        ),
+                        Job::ReadMarkdown {
+                            request,
+                            source,
+                            path,
+                            theme,
+                        } => {
+                            if reading.load(Ordering::Relaxed) != request {
+                                continue;
+                            }
+                            #[cfg(feature = "test-support")]
+                            {
+                                crate::metrics::event("reading-request-held", request, 0);
+                                crate::metrics::delay("READ_MARKDOWN");
+                                if reading.load(Ordering::Relaxed) != request {
+                                    crate::metrics::event("reading-request-cancelled", request, 0);
+                                    continue;
+                                }
+                            }
+                            let prepared =
+                                crate::reading::prepare(String::from(source), &path, &theme);
+                            if reading.load(Ordering::Relaxed) != request {
+                                continue;
+                            }
+                            Reply::Markdown(request, Ok(Box::new(prepared)))
+                        }
                         Job::Check(id, disk, generation) => {
                             crate::metrics::event("check-worker", id, generation);
                             #[cfg(feature = "test-support")]
@@ -656,6 +686,7 @@ impl IoWorker {
             cleared_through,
             pending,
             preview,
+            reading,
             wake: ctx,
             rebindings,
         }
@@ -665,6 +696,9 @@ impl IoWorker {
     }
     pub fn cancel_previews(&self, token: u64) {
         self.preview.store(token, Ordering::Relaxed);
+    }
+    pub fn cancel_reading(&self) {
+        self.reading.store(0, Ordering::Relaxed);
     }
     pub fn send(&self, job: Job) {
         if let Job::BindingApplied(id, saved, adopted) = &job
@@ -682,6 +716,9 @@ impl IoWorker {
         }
         if let Job::Open(_, token, _) = &job {
             self.preview.store(*token, Ordering::Relaxed);
+        }
+        if let Job::ReadMarkdown { request, .. } = &job {
+            self.reading.store(*request, Ordering::Relaxed);
         }
         let clearing = match &job {
             Job::ClearThrough(id, generation) => Some((*id, *generation)),
@@ -728,7 +765,7 @@ impl IoWorker {
             #[cfg(test)]
             Job::HoldMaintenance(..) => &self.maintenance,
             Job::Volumes
-            | Job::ReadMarkdown(..)
+            | Job::ReadMarkdown { .. }
             | Job::CompletePath(..)
             | Job::Open(..)
             | Job::Choose(..)
@@ -765,9 +802,7 @@ impl IoWorker {
                 let reply = match job {
                     Job::Check(id, _, token) if full => Reply::CheckDeferred(id, token),
                     Job::Check(id, _, token) => Reply::Checked(id, token, Err(message)),
-                    Job::ReadMarkdown(id, generation, _, path) => {
-                        Reply::Markdown(id, generation, path, Err(message))
-                    }
+                    Job::ReadMarkdown { request, .. } => Reply::Markdown(request, Err(message)),
                     Job::CompletePath(token, value, _) => {
                         Reply::PathCompleted(token, value, Err(message))
                     }
