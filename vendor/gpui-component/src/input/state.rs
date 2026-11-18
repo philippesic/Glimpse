@@ -391,7 +391,6 @@ impl PreparedInput {
 }
 
 pub(super) struct PreparedReplacement {
-    value: SharedString,
     revision: Revision,
     layout: TextWrapper,
     glyphs: Option<gpui::PreparedTextLines>,
@@ -399,14 +398,17 @@ pub(super) struct PreparedReplacement {
 
 impl PreparedReplacement {
     pub(super) fn new(
-        value: SharedString,
+        text: Rope,
         mut layout: TextWrapper,
         text_system: &Arc<gpui::TextSystem>,
     ) -> Self {
-        let PreparedInput { value, revision } = PreparedInput::new(value);
+        let revision = Revision {
+            endings: LineEndings::from_rope(&text),
+            text,
+        };
         layout.prepare_replacement(&revision.text, text_system);
+        layout.share_line_wraps();
         Self {
-            value,
             revision,
             layout,
             glyphs: None,
@@ -563,7 +565,10 @@ impl InputState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if !self.can_install_revision() || !self.text_wrapper.uses_same_layout(&prepared.layout) {
+        if !self.can_install_revision()
+            || !(self.text_wrapper.uses_same_layout(&prepared.layout)
+                || self.defers_wrap_for(prepared.revision.text.len()))
+        {
             return false;
         }
         if let Some(glyphs) = &prepared.glyphs {
@@ -580,20 +585,13 @@ impl InputState {
             ));
         }
         self.history.end_grouping();
-        self.install_revision(
-            prepared.revision,
-            Some(prepared.value),
-            prepared.layout,
-            window,
-            cx,
-        );
+        self.install_revision(prepared.revision, prepared.layout, window, cx);
         true
     }
 
     fn install_revision(
         &mut self,
         revision: Revision,
-        value: Option<SharedString>,
         layout: TextWrapper,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -601,7 +599,7 @@ impl InputState {
         self.pause_blink_cursor(cx);
         self.text = revision.text;
         self.line_endings = revision.endings;
-        *self.value_cache.get_mut() = value;
+        self.value_cache.get_mut().take();
         self.history_layout =
             std::mem::replace(&mut self.text_wrapper, layout).retain_for_history();
         if let Some(diagnostics) = self.mode.diagnostics_mut() {
@@ -1875,7 +1873,7 @@ impl InputState {
                         || self.defers_wrap_for(revision.text.len()))
                     && layout.matches_revision(&revision.text)
                 {
-                    self.install_revision(revision, None, layout, window, cx);
+                    self.install_revision(revision, layout, window, cx);
                 } else {
                     let range_utf16 = self.range_to_utf16(&range.into());
                     self.replace_text_in_range_silent(
@@ -2904,7 +2902,7 @@ mod revision_tests {
                     let mut expected = TextWrapper::new(font.clone(), size, width);
                     expected.prepare(&Rope::from(after), font.clone(), size, width, cx);
                     let prepared = PreparedReplacement::new(
-                        after.to_owned().into(),
+                        Rope::from(after),
                         state.replacement_layout().unwrap(),
                         cx.text_system(),
                     );
@@ -2935,7 +2933,7 @@ mod revision_tests {
 
                     let resized = Some(px(81.));
                     let prepared = PreparedReplacement::new(
-                        before.to_owned().into(),
+                        Rope::from(before),
                         state.replacement_layout().unwrap(),
                         cx.text_system(),
                     );

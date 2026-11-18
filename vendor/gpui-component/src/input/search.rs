@@ -13,7 +13,7 @@ use gpui::{
     InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Render, Styled,
     Subscription, WeakEntity, Window, actions, prelude::FluentBuilder as _, px, relative, rems,
 };
-use ropey::{Rope, extra::esoterica::ropes_are_instances};
+use ropey::{Rope, RopeBuilder, extra::esoterica::ropes_are_instances};
 
 use crate::{
     ActiveTheme, Disableable, IconName, Selectable, Sizable,
@@ -155,26 +155,42 @@ fn replace_matches(
     ranges: &MatchRanges,
     replacement: &str,
     cancel: &AtomicBool,
-) -> Option<String> {
+) -> Option<Rope> {
     let mut chunks = source.chunks();
     let mut remaining = "";
-    let mut output = String::new();
+    const CHUNK_BYTES: usize = 32 * 1024;
+    let mut output = RopeBuilder::new();
+    let mut batch = String::with_capacity(CHUNK_BYTES);
+    let mut append = |text: &str| {
+        if batch.len() + text.len() > CHUNK_BYTES {
+            output.append(&batch);
+            batch.clear();
+        }
+        if text.len() >= CHUNK_BYTES {
+            output.append(text);
+        } else {
+            batch.push_str(text);
+        }
+    };
     let mut offset = 0;
     for (index, range) in ranges.iter().enumerate() {
         if index % 1024 == 0 && cancel.load(Ordering::Relaxed) {
             return None;
         }
         advance_source(&mut chunks, &mut remaining, range.start - offset, |text| {
-            output.push_str(text);
+            append(text);
         });
         advance_source(&mut chunks, &mut remaining, range.len(), |_| {});
-        output.push_str(replacement);
+        append(replacement);
         offset = range.end;
     }
     advance_source(&mut chunks, &mut remaining, source.len() - offset, |text| {
-        output.push_str(text);
+        append(text);
     });
-    (!cancel.load(Ordering::Relaxed)).then_some(output)
+    (!cancel.load(Ordering::Relaxed)).then(|| {
+        output.append(&batch);
+        output.finish()
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -775,9 +791,8 @@ impl SearchPanel {
         self.searching = true;
         self.matcher.matched_ranges = Arc::new(MatchRanges::new(0));
         let task = cx.background_spawn(async move {
-            let output: gpui::SharedString =
-                replace_matches(&worker_original, &ranges, new_text.as_str(), &worker_cancel)?
-                    .into();
+            let output =
+                replace_matches(&worker_original, &ranges, new_text.as_str(), &worker_cancel)?;
             if worker_cancel.load(Ordering::Relaxed) {
                 return None;
             }
@@ -801,7 +816,12 @@ impl SearchPanel {
                         .is_some_and(|edit| state.apply_prepared_replacement(edit, window, cx))
                     {
                         let full_range = state.range_to_utf16(&(0..state.text.len()));
-                        state.replace_text_in_range_silent(Some(full_range), &replaced, window, cx);
+                        state.replace_text_in_range_silent(
+                            Some(full_range),
+                            &replaced.to_string(),
+                            window,
+                            cx,
+                        );
                     }
                     state.history.new_group();
                     state.scroll_to(0, Some(MoveDirection::Down), cx);
@@ -1041,7 +1061,9 @@ mod tests {
         for replacement in ["", "🦀$5\r\n"] {
             let expected = pattern.replace_all(&text, regex::NoExpand(replacement));
             assert_eq!(
-                replace_matches(&source, &ranges, replacement, &AtomicBool::new(false)).unwrap(),
+                replace_matches(&source, &ranges, replacement, &AtomicBool::new(false))
+                    .unwrap()
+                    .to_string(),
                 expected
             );
         }

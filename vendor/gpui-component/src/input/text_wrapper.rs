@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasher;
 use std::ops::Range;
 use std::sync::Arc;
@@ -345,7 +345,7 @@ impl TextWrapper {
         layout
     }
 
-    fn share_line_wraps(&mut self) {
+    pub(super) fn share_line_wraps(&mut self) {
         const MAX_SHARED_WRAPS: usize = 256;
         if self.lines.len() < 4096 || self.wrap_width.is_none() {
             return;
@@ -413,18 +413,23 @@ impl TextWrapper {
 
     pub(super) fn retain_for_history(self) -> Option<Self> {
         const MAX_LAYOUT_BYTES: usize = 4 * 1024 * 1024;
-        let lines = self.lines.capacity() * std::mem::size_of::<LineItem>()
+        let mut bytes = self.lines.capacity() * std::mem::size_of::<LineItem>()
             + self.block_starts.capacity() * std::mem::size_of::<usize>();
-        let wraps: usize = self
-            .lines
-            .iter()
-            .filter_map(|line| line.wraps.as_ref())
-            .map(|wraps| {
-                std::mem::size_of::<LineWraps>()
-                    + std::mem::size_of::<[usize; 2]>()
-                    + wraps.ranges.capacity() * std::mem::size_of::<Range<usize>>()
-            })
-            .sum();
+        if !self._initialized || bytes > MAX_LAYOUT_BYTES {
+            return None;
+        }
+        let mut shared = HashSet::new();
+        for wraps in self.lines.iter().filter_map(|line| line.wraps.as_ref()) {
+            if Arc::strong_count(wraps) > 1 && !shared.insert(Arc::as_ptr(wraps)) {
+                continue;
+            }
+            bytes += std::mem::size_of::<LineWraps>()
+                + std::mem::size_of::<[usize; 2]>()
+                + wraps.ranges.capacity() * std::mem::size_of::<Range<usize>>();
+            if bytes > MAX_LAYOUT_BYTES {
+                return None;
+            }
+        }
         let checkpoints: usize = self
             .checkpoints
             .values()
@@ -433,7 +438,7 @@ impl TextWrapper {
                     + 4 * std::mem::size_of::<(usize, Vec<WrapCheckpoint>)>()
             })
             .sum();
-        (self._initialized && lines + wraps + checkpoints <= MAX_LAYOUT_BYTES).then_some(self)
+        (bytes + checkpoints <= MAX_LAYOUT_BYTES).then_some(self)
     }
 
     pub(super) fn prepare_glyphs(
