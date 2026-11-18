@@ -7,8 +7,8 @@ use std::{
 use gpui::{
     Pixels, AnyElement, App, DefiniteLength, Div, Element, ElementId, FontStyle, FontWeight, Half,
     HighlightStyle, InteractiveElement as _, IntoElement, ListState, ObjectFit, ParentElement,
-    SharedString, SharedUri, StatefulInteractiveElement, Styled, StyledImage as _, Window, div,
-    img, prelude::FluentBuilder as _, px, relative, rems,
+    ScrollHandle, SharedString, SharedUri, StatefulInteractiveElement, Styled, StyledImage as _,
+    Window, div, img, prelude::FluentBuilder as _, px, relative, rems,
 };
 use pulldown_cmark::Alignment;
 use ropey::Rope;
@@ -1741,14 +1741,40 @@ impl Node {
         };
 
         match item {
-            Node::Table(table) => div()
+            Node::Table(table) => {
+                let id = ("markdown-table", table as *const Table as usize);
+                let controls = window.use_keyed_state(id, cx, |_, cx| {
+                    (ScrollHandle::new(), cx.focus_handle().tab_stop(true))
+                });
+                let (scroll, focus) = controls.read(cx).clone();
+                let input_scroll = scroll.clone();
+                let input_focus = focus.clone();
+                div()
+                .id(id)
+                .relative()
                 .pb(rems(1.))
                 .w_full()
+                .track_focus(&focus)
+                .focus_ring(focus.is_focused(window), px(0.), window, cx)
+                .on_key_down(move |event, window, cx| {
+                    let key = &event.keystroke;
+                    if input_focus.is_focused(window)
+                        && !key.modifiers.control
+                        && !key.modifiers.platform
+                        && !key.modifiers.alt
+                        && Self::scroll_table(&input_scroll, &key.key)
+                    {
+                        window.prevent_default();
+                        cx.stop_propagation();
+                        window.refresh();
+                    }
+                })
                 .child(
                     div()
                         .id("table")
                         .w_full()
                         .overflow_x_scroll()
+                        .track_scroll(&scroll)
                         .border_1()
                         .border_color(cx.theme().border)
                         .rounded(cx.theme().radius)
@@ -1842,20 +1868,67 @@ impl Node {
                             }
                             rows
                         })
+                        .horizontal_scrollbar(&scroll)
                         .map(|rendered| {
                             let row_count = table.children.len();
                             let column_count = col_lens.len();
-                            gpui::accessible("table-role", rendered, move |_, _, _| {
-                                let mut node = gpui::accesskit::Node::new(gpui::accesskit::Role::Table);
+                            let focus_action = focus.clone();
+                            let scroll_action = scroll.clone();
+                            gpui::accessible("table-role", rendered, move |_, window, _| {
+                                use gpui::accesskit::{Action, Node, Role};
+                                let mut node = Node::new(Role::Table);
                                 node.set_row_count(row_count);
                                 node.set_column_count(column_count);
-                                gpui::AccessibilityInfo::new(node)
+                                node.add_action(Action::Focus);
+                                if scroll.max_offset().width > px(0.) {
+                                    node.set_label("Scrollable table");
+                                    node.set_description("Use Left and Right to scroll. Home and End reach the first and last columns.");
+                                    node.add_action(Action::ScrollLeft);
+                                    node.add_action(Action::ScrollRight);
+                                }
+                                let mut info = gpui::AccessibilityInfo::new(node);
+                                info.focused = focus.is_focused(window);
+                                info
+                            })
+                            .on_checked_action(move |request, _, window, _| {
+                                use gpui::accesskit::Action;
+                                match request.action {
+                                    Action::Focus => focus_action.focus(window),
+                                    Action::ScrollLeft | Action::ScrollRight => {
+                                        let key = if request.action == Action::ScrollLeft { "left" } else { "right" };
+                                        if !Self::scroll_table(&scroll_action, key) {
+                                            return false;
+                                        }
+                                        window.refresh();
+                                    }
+                                    _ => return false,
+                                }
+                                true
                             })
                         }),
                 )
-                .into_any_element(),
+                .into_any_element()
+            }
             _ => div().into_any_element(),
         }
+    }
+
+    fn scroll_table(scroll: &ScrollHandle, key: &str) -> bool {
+        let maximum = scroll.max_offset().width;
+        if maximum <= px(0.) {
+            return false;
+        }
+        let mut offset = scroll.offset();
+        let step = px(64.).min(scroll.bounds().size.width);
+        offset.x = match key {
+            "left" => (offset.x + step).min(px(0.)),
+            "right" => (offset.x - step).max(-maximum),
+            "home" => px(0.),
+            "end" => -maximum,
+            _ => return false,
+        };
+        scroll.set_offset(offset);
+        true
     }
 
     pub(super) fn render_root(

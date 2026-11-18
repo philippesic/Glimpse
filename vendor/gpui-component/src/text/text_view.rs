@@ -17,6 +17,7 @@ use crate::highlighter::HighlightTheme;
 use crate::button::Button;
 use crate::menu::{DropdownMenu, PopupMenuItem};
 use crate::scroll::ScrollableElement;
+use crate::styled::FocusableExt;
 use crate::text::{
     document_text::{DocumentSource, DocumentSourceBuilder, DocumentText},
     node::CodeBlock,
@@ -1080,6 +1081,7 @@ impl Element for TextView {
             .track_focus(focus_handle)
             .size_full()
             .relative()
+            .focus_ring(focus_handle.is_focused(window), px(0.), window, cx)
             .on_action({
                 let state = self.state.clone();
                 move |_: &input::Copy, _, cx| {

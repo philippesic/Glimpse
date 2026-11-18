@@ -4070,7 +4070,10 @@ impl Render for Shell {
                             this.command("parent", window, cx);
                             return;
                         }
-                        "right" | "enter" => {
+                        "right" | "enter"
+                            if key.key == "enter"
+                                || index.is_some_and(|index| rows[visible[index]].directory) =>
+                        {
                             if let Some(path) = this.selected_path() {
                                 this.open(path, false, None);
                             }
