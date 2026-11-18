@@ -699,17 +699,25 @@ enum TextSnapshotContent {
     Runs(Vec<(Node, core::ops::Range<usize>)>),
 }
 
+impl TextSnapshot {
+    pub fn fragments(&self) -> impl Iterator<Item = &str> + '_ {
+        let (text, runs) = match &self.0 {
+            TextSnapshotContent::Owned(text) => (Some(text.as_str()), &[][..]),
+            TextSnapshotContent::Runs(runs) => (None, runs.as_slice()),
+        };
+        text.into_iter().chain(
+            runs.iter()
+                .map(|(run, range)| &run.value().unwrap()[range.clone()]),
+        )
+    }
+}
+
 impl fmt::Display for TextSnapshot {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.0 {
-            TextSnapshotContent::Owned(text) => formatter.write_str(text),
-            TextSnapshotContent::Runs(runs) => {
-                for (run, range) in runs {
-                    formatter.write_str(&run.value().unwrap()[range.clone()])?;
-                }
-                Ok(())
-            }
+        for fragment in self.fragments() {
+            formatter.write_str(fragment)?;
         }
+        Ok(())
     }
 }
 
