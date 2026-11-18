@@ -865,8 +865,8 @@ enum PropertyValue {
     Usize(usize),
     Color(Color),
     TextDecoration(TextDecoration),
-    LengthVec(Vec<u8>),
-    WordIndexVec(Vec<u16>),
+    LengthVec(Arc<Vec<u8>>),
+    WordIndexVec(Arc<Vec<u16>>),
     CoordVec(Vec<f32>),
     Bool(bool),
     Invalid(Invalid),
@@ -1014,6 +1014,14 @@ enum PropertyId {
     Unset,
 }
 
+fn clone_shared_values<T: Clone>(destination: &mut Arc<Vec<T>>, source: &Arc<Vec<T>>) {
+    if let Some(values) = Arc::get_mut(destination) {
+        values.clone_from(source);
+    } else {
+        destination.clone_from(source);
+    }
+}
+
 impl Clone for PropertyValue {
     fn clone(&self) -> Self {
         match self {
@@ -1054,8 +1062,10 @@ impl Clone for PropertyValue {
         match (self, source) {
             (Self::NodeIdVec(dest), Self::NodeIdVec(source)) => dest.clone_from(source),
             (Self::String(dest), Self::String(source)) => dest.clone_from(source),
-            (Self::LengthVec(dest), Self::LengthVec(source)) => dest.clone_from(source),
-            (Self::WordIndexVec(dest), Self::WordIndexVec(source)) => dest.clone_from(source),
+            (Self::LengthVec(dest), Self::LengthVec(source)) => clone_shared_values(dest, source),
+            (Self::WordIndexVec(dest), Self::WordIndexVec(source)) => {
+                clone_shared_values(dest, source)
+            }
             (Self::CoordVec(dest), Self::CoordVec(source)) => dest.clone_from(source),
             (Self::CustomActionVec(dest), Self::CustomActionVec(source)) => dest.clone_from(source),
             (Self::Affine(dest), Self::Affine(source)) => dest.clone_from(source),
@@ -2112,10 +2122,20 @@ copy_type_getters! {
 owned_type_setters! {
     (set_affine_property, Box<Affine>, Affine),
     (set_string_property, String, String),
-    (set_length_vec_property, Vec<u8>, LengthVec),
-    (set_word_index_vec_property, Vec<u16>, WordIndexVec),
     (set_coord_vec_property, Vec<f32>, CoordVec),
     (set_text_selection_property, Box<TextSelection>, TextSelection)
+}
+
+impl Node {
+    fn set_length_vec_property(&mut self, id: PropertyId, value: impl Into<Vec<u8>>) {
+        let value = PropertyValue::LengthVec(Arc::new(value.into()));
+        Arc::make_mut(&mut self.properties).set(id, value);
+    }
+
+    fn set_word_index_vec_property(&mut self, id: PropertyId, value: impl Into<Vec<u16>>) {
+        let value = PropertyValue::WordIndexVec(Arc::new(value.into()));
+        Arc::make_mut(&mut self.properties).set(id, value);
+    }
 }
 
 copy_type_setters! {

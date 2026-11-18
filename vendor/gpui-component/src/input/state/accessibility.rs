@@ -54,6 +54,7 @@ struct PackedLines {
     words: Vec<u16>,
     line_starts: Vec<u16>,
     shared: Option<HashMap<u64, Node>>,
+    layouts: HashMap<u64, Node>,
 }
 
 impl PackedLines {
@@ -94,17 +95,7 @@ impl PackedLines {
             self.line_starts.clear();
             run.clone()
         } else {
-            self.lengths.shrink_to_fit();
-            self.words.shrink_to_fit();
-            let mut run = text_run(
-                &self.text,
-                std::mem::take(&mut self.lengths),
-                std::mem::take(&mut self.words),
-            );
-            if !self.line_starts.is_empty() {
-                self.line_starts.shrink_to_fit();
-                run.set_hard_line_starts(std::mem::take(&mut self.line_starts));
-            }
+            let run = self.build_run();
             if let (Some(shared), Some(hash)) = (&mut self.shared, fingerprint)
                 && shared.len() < MAX_SHARED_RUNS
             {
@@ -114,6 +105,50 @@ impl PackedLines {
         };
         emit(self.start..self.start + self.text.len(), None, node);
         self.text.clear();
+    }
+
+    fn build_run(&mut self) -> Node {
+        let layout = self.shared.as_ref().map(|shared| {
+            shared
+                .hasher()
+                .hash_one((&self.lengths, &self.words, &self.line_starts))
+        });
+        let template = layout
+            .and_then(|key| self.layouts.get(&key))
+            .filter(|node| {
+                node.hard_line_starts() == self.line_starts
+                    && has_text_boundaries(node, &self.lengths, &self.words)
+            });
+        if let Some(template) = template {
+            let mut run = template.clone();
+            run.set_value(self.text.as_str());
+            self.lengths.clear();
+            self.words.clear();
+            self.line_starts.clear();
+            return run;
+        }
+
+        self.lengths.shrink_to_fit();
+        self.words.shrink_to_fit();
+        let mut run = text_run(
+            &self.text,
+            std::mem::take(&mut self.lengths),
+            std::mem::take(&mut self.words),
+        );
+        if !self.line_starts.is_empty() {
+            self.line_starts.shrink_to_fit();
+            run.set_hard_line_starts(std::mem::take(&mut self.line_starts));
+        }
+        if let Some(key) = layout
+            && self.layouts.len() < MAX_SHARED_RUNS
+        {
+            self.layouts.entry(key).or_insert_with(|| {
+                let mut template = run.clone();
+                template.clear_value();
+                template
+            });
+        }
+        run
     }
 }
 
@@ -552,6 +587,38 @@ impl InputState {
 mod tests {
     use super::*;
     use crate::semantic_text::segments;
+
+    #[test]
+    fn distinct_text_reuses_only_equal_grapheme_word_and_line_boundaries() {
+        let mut packed = PackedLines {
+            shared: Some(HashMap::new()),
+            ..Default::default()
+        };
+        let mut build = |value: &str, lengths: Vec<u8>, words: Vec<u16>, starts: Vec<u16>| {
+            packed.text = value.into();
+            packed.lengths = lengths;
+            packed.words = words;
+            packed.line_starts = starts;
+            packed.build_run()
+        };
+        let first = build("a\nb\n", vec![1, 1, 1, 1], vec![0, 2], vec![2]);
+        let second = build("c\nd\n", vec![1, 1, 1, 1], vec![0, 2], vec![2]);
+        let different = build("efg\n", vec![1, 1, 1, 1], vec![0], vec![]);
+        assert_eq!(first.value(), Some("a\nb\n"));
+        assert_eq!(second.value(), Some("c\nd\n"));
+        assert_eq!(different.value(), Some("efg\n"));
+        assert!(std::ptr::eq(
+            first.character_lengths(),
+            second.character_lengths()
+        ));
+        assert!(std::ptr::eq(first.word_starts(), second.word_starts()));
+        assert!(std::ptr::eq(
+            first.hard_line_starts(),
+            second.hard_line_starts()
+        ));
+        assert_eq!(different.word_starts(), [0]);
+        assert!(different.hard_line_starts().is_empty());
+    }
 
     #[test]
     fn equal_packed_runs_share_properties_and_keep_distinct_positions() {
