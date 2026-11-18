@@ -137,9 +137,9 @@ impl Preferences {
             .iter()
             .enumerate()
             .map(|(index, focus)| {
-                cx.on_focus_in(focus, window, move |this, _, cx| {
+                cx.on_focus_in(focus, window, move |this, window, cx| {
                     this.scroll.scroll_to_item(index);
-                    cx.notify();
+                    cx.defer_in(window, |_, _, cx| cx.notify());
                 })
             })
             .collect();
@@ -482,6 +482,9 @@ impl Render for Preferences {
                     .flex_col()
                     .gap(px(12.))
                     .p(px(16.))
+                    .when(window.viewport_size().height < px(480.), |panel| {
+                        panel.gap(px(8.)).py(px(10.))
+                    })
                     .rounded_lg()
                     .border_1()
                     .border_color(cx.theme().border)
