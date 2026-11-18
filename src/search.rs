@@ -34,6 +34,8 @@ pub struct ResultSet {
 pub struct Filters {
     pub ignored: bool,
     pub metadata: bool,
+    pub cross_mounts: bool,
+    pub directory_links: bool,
     pub exclude: String,
     pub file_bytes: usize,
 }
@@ -42,6 +44,8 @@ impl Default for Filters {
         Self {
             ignored: false,
             metadata: false,
+            cross_mounts: false,
+            directory_links: false,
             exclude: String::new(),
             file_bytes: 1024 * 1024,
         }
@@ -304,12 +308,12 @@ impl Search {
                 }
                 let stale = Arc::new(AtomicBool::new(false));
                 let mut index_watcher = None;
+                use notify::Watcher;
                 if building {
-                    use notify::Watcher;
                     let dirty = stale.clone();
                     let repaint = ctx.clone();
-                    if let Ok(mut watcher) =
-                        notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                    if let Ok(watcher) = notify::RecommendedWatcher::new(
+                        move |event: notify::Result<notify::Event>| {
                             if event.as_ref().is_ok_and(|event| {
                                 matches!(
                                     event.kind,
@@ -321,11 +325,9 @@ impl Search {
                             if !dirty.swap(true, Ordering::Relaxed) {
                                 repaint.request_repaint();
                             }
-                        })
-                        && watcher
-                            .watch(&scope, notify::RecursiveMode::Recursive)
-                            .is_ok()
-                    {
+                        },
+                        notify::Config::default().with_follow_symlinks(filters.directory_links),
+                    ) {
                         index_watcher = Some(watcher);
                     }
                     if index_watcher.is_none() {
@@ -359,27 +361,36 @@ impl Search {
                         continue;
                     }
                 };
-                let (resolved_scope, mount_points) = match std::fs::canonicalize(&scope)
-                    .map_err(|error| error.to_string())
-                    .and_then(|scope| {
-                        crate::locations::mount_points().map(|points| (scope, points))
-                    }) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        send(
-                            &[],
-                            &format!("Failed — cannot validate mount boundaries: {error}"),
-                            true,
-                        );
-                        continue;
+                let boundaries = if filters.cross_mounts {
+                    None
+                } else {
+                    match std::fs::canonicalize(&scope)
+                        .map_err(|error| error.to_string())
+                        .and_then(|scope| {
+                            crate::locations::mount_points().map(|points| (scope, points))
+                        }) {
+                        Ok((resolved, mounts)) => {
+                            let outside = mounts
+                                .into_iter()
+                                .filter(|path| !resolved.starts_with(path))
+                                .collect::<std::collections::HashSet<_>>();
+                            Some((resolved, outside))
+                        }
+                        Err(error) => {
+                            send(
+                                &[],
+                                &format!("Failed — cannot validate mount boundaries: {error}"),
+                                true,
+                            );
+                            continue;
+                        }
                     }
                 };
-                let boundaries: std::collections::HashSet<_> = mount_points
-                    .into_iter()
-                    .filter(|path| path != &resolved_scope && path.starts_with(&resolved_scope))
-                    .collect();
                 let walked_scope = scope.clone();
                 let metadata = filters.metadata;
+                let directory_links = filters.directory_links;
+                let incomplete = Arc::new(AtomicBool::new(false));
+                let skipped_entry = incomplete.clone();
                 let file_bytes = filters.file_bytes.clamp(1, 10 * 1024 * 1024);
                 let walker = ignore::WalkBuilder::new(&scope)
                     .hidden(false)
@@ -387,22 +398,37 @@ impl Search {
                     .ignore(!filters.ignored)
                     .git_exclude(!filters.ignored)
                     .require_git(false)
-                    .follow_links(false)
-                    .same_file_system(true)
+                    .follow_links(directory_links)
+                    .same_file_system(!filters.cross_mounts)
                     .overrides(exclusions)
                     .filter_entry(move |entry| {
-                        let allowed_metadata = metadata
-                            || ![".git", ".hg", ".svn"]
+                        if entry.depth() == 0 {
+                            return true;
+                        }
+                        if !metadata
+                            && [".git", ".hg", ".svn"]
                                 .iter()
-                                .any(|name| entry.file_name() == *name);
-                        let boundary =
-                            entry
-                                .path()
-                                .strip_prefix(&walked_scope)
-                                .is_ok_and(|relative| {
-                                    boundaries.contains(&resolved_scope.join(relative))
-                                });
-                        allowed_metadata && !boundary
+                                .any(|name| entry.file_name() == *name)
+                        {
+                            return false;
+                        }
+                        if !entry.file_type().is_some_and(|kind| kind.is_dir()) {
+                            return !entry.path_is_symlink();
+                        }
+                        let Some((scope, mounts)) = &boundaries else {
+                            return true;
+                        };
+                        if directory_links {
+                            let Ok(target) = std::fs::canonicalize(entry.path()) else {
+                                skipped_entry.store(true, Ordering::Relaxed);
+                                return false;
+                            };
+                            return !target.ancestors().any(|path| mounts.contains(path));
+                        }
+                        entry
+                            .path()
+                            .strip_prefix(&walked_scope)
+                            .is_ok_and(|relative| !mounts.contains(&scope.join(relative)))
                     })
                     .build();
                 for entry in walker {
@@ -421,6 +447,14 @@ impl Search {
                             continue;
                         }
                     };
+                    if entry.file_type().is_some_and(|kind| kind.is_dir())
+                        && let Some(watcher) = &mut index_watcher
+                        && watcher
+                            .watch(entry.path(), notify::RecursiveMode::NonRecursive)
+                            .is_err()
+                    {
+                        stale.store(true, Ordering::Relaxed);
+                    }
                     if !entry.file_type().is_some_and(|t| t.is_file()) {
                         continue;
                     }
@@ -520,6 +554,7 @@ impl Search {
                         last = Instant::now();
                     }
                 }
+                partial |= incomplete.load(Ordering::Relaxed);
                 if !cancelled() {
                     if building {
                         let mut index = worker_index.lock().unwrap();
@@ -988,7 +1023,7 @@ mod presentation_tests {
 mod mount_tests {
     use super::*;
     #[test]
-    fn same_device_bind_mounts_and_directory_aliases_remain_outside_search() {
+    fn same_device_mounts_and_symlinks_require_independent_search_opt_ins() {
         use std::os::unix::fs::{MetadataExt, symlink};
         if let Some(root) = std::env::var_os("GLIMPSE_MOUNT_FIXTURE") {
             let root = PathBuf::from(root);
@@ -1013,31 +1048,57 @@ mod mount_tests {
             assert!(root.join("scope/mounted/needle-outside.txt").is_file());
             let search = Search::new(crate::wake::Context::default());
             let scope = root.join("scope");
-            for indexed in [false, true] {
-                if indexed {
-                    search
-                        .start_filtered(scope.clone(), String::new(), false, Filters::default())
-                        .unwrap();
-                    loop {
-                        if search
-                            .replies
-                            .recv_timeout(Duration::from_secs(5))
-                            .unwrap()
-                            .completed
-                        {
-                            break;
-                        }
-                    }
+            let terminal = |generation| loop {
+                let result = search.replies.recv_timeout(Duration::from_secs(5)).unwrap();
+                if result.generation == generation && result.completed {
+                    break result;
                 }
-                search
-                    .start_filtered(scope.clone(), "needle".into(), false, Filters::default())
-                    .unwrap();
-                loop {
-                    let result = search.replies.recv_timeout(Duration::from_secs(5)).unwrap();
-                    if result.completed {
-                        assert_eq!(result.hits.len(), 1, "{}", result.state);
-                        assert_eq!(result.hits[0].path, scope.join("needle-visible.txt"));
-                        break;
+            };
+            for (cross_mounts, directory_links) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let filters = Filters {
+                    cross_mounts,
+                    directory_links,
+                    ..Default::default()
+                };
+                let mut expected = vec![scope.join("needle-visible.txt")];
+                if cross_mounts {
+                    expected.push(scope.join("mounted/needle-outside.txt"));
+                }
+                if directory_links {
+                    expected.push(scope.join("alias/needle-outside.txt"));
+                }
+                if cross_mounts && directory_links {
+                    expected.push(scope.join("through-mount/needle-outside.txt"));
+                }
+                expected.sort();
+                for indexed in [false, true] {
+                    search.clear_index();
+                    if indexed {
+                        let id = search
+                            .start_filtered(scope.clone(), String::new(), false, filters.clone())
+                            .unwrap();
+                        terminal(id);
+                        assert!(search.index_compatible(&scope, &filters));
+                    }
+                    let id = search
+                        .start_filtered(scope.clone(), "needle".into(), false, filters.clone())
+                        .unwrap();
+                    let result = terminal(id);
+                    let mut paths = result
+                        .hits
+                        .into_iter()
+                        .map(|hit| hit.path)
+                        .collect::<Vec<_>>();
+                    paths.sort();
+                    assert_eq!(paths, expected, "{}", result.state);
+                    if directory_links {
+                        assert!(
+                            result.state.to_lowercase().contains("partial"),
+                            "{}",
+                            result.state
+                        );
                     }
                 }
             }
@@ -1049,10 +1110,21 @@ mod mount_tests {
         std::fs::write(root.path().join("scope/needle-visible.txt"), b"inside").unwrap();
         std::fs::write(root.path().join("outside/needle-outside.txt"), b"outside").unwrap();
         symlink(root.path().join("outside"), root.path().join("scope/alias")).unwrap();
+        symlink(
+            root.path().join("scope/mounted"),
+            root.path().join("scope/through-mount"),
+        )
+        .unwrap();
+        symlink(root.path().join("scope"), root.path().join("scope/cycle")).unwrap();
+        symlink(
+            root.path().join("outside/needle-outside.txt"),
+            root.path().join("scope/needle-file-link.txt"),
+        )
+        .unwrap();
         let result = std::process::Command::new("unshare")
             .args(["--user","--map-root-user","--mount","--propagation","private","--"])
             .arg(std::env::current_exe().unwrap())
-            .args(["--exact","search::mount_tests::same_device_bind_mounts_and_directory_aliases_remain_outside_search","--nocapture"])
+            .args(["--exact","search::mount_tests::same_device_mounts_and_symlinks_require_independent_search_opt_ins","--nocapture"])
             .env("GLIMPSE_MOUNT_FIXTURE",root.path())
             .env("GLIMPSE_PARENT_MOUNT_NAMESPACE",std::fs::read_link("/proc/self/ns/mnt").unwrap())
             .output().unwrap();

@@ -139,6 +139,8 @@ pub struct Settings {
     pub markdown_font_size: f32,
     pub remember_locations: bool,
     pub search_metadata: bool,
+    pub search_mounts: bool,
+    pub search_directory_links: bool,
     pub search_exclude: String,
     pub search_file_mib: usize,
     #[serde(skip)]
@@ -176,6 +178,8 @@ impl Default for Settings {
             markdown_font_size: 16.,
             remember_locations: true,
             search_metadata: false,
+            search_mounts: false,
+            search_directory_links: false,
             search_exclude: String::new(),
             search_file_mib: 1,
             disk_base: None,

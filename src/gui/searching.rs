@@ -79,6 +79,8 @@ impl Shell {
         search::Filters {
             ignored: self.settings.search_ignored,
             metadata: self.settings.search_metadata,
+            cross_mounts: self.settings.search_mounts,
+            directory_links: self.settings.search_directory_links,
             exclude: self.settings.search_exclude.clone(),
             file_bytes: self.settings.search_file_mib * 1024 * 1024,
         }
@@ -247,7 +249,7 @@ impl Shell {
             &self.settings.search_exclude
         };
         let detail = format!(
-            "Search folder: {scope}\nScope: {}\nIgnore files: {}\nRepository metadata: {}\nAdditional exclusions: {exclusions}\nSaved-file content limit: {} MiB per file. Unsaved buffers are excluded from recursive text search; use Find in Document for the active buffer.\nRecursive traversal does not follow directory symlinks or cross nested mounts.\nCoverage is bounded to 100,000 entries and 1,000 displayed matches. Unreadable paths and reached limits produce Partial. A filename index is a session snapshot with a 16 MiB path budget; filesystem notifications can mark it stale. Rebuild refreshes it, and Remove releases it. Content searches always read saved files.\nCurrent result state: {}",
+            "Search folder: {scope}\nScope: {}\nIgnore files: {}\nRepository metadata: {}\nAdditional exclusions: {exclusions}\nSaved-file content limit: {} MiB per file. Unsaved buffers are excluded from recursive text search; use Find in Document for the active buffer.\n{} {}\nCoverage is bounded to 100,000 entries and 1,000 displayed matches. Unreadable paths and reached limits produce Partial. A filename index is a session snapshot with a 16 MiB path budget; filesystem notifications can mark it stale. Rebuild refreshes it, and Remove releases it. Content searches always read saved files.\nCurrent result state: {}",
             if self.search_ui.temporary.is_some() {
                 "temporary; existing pin retained"
             } else if self.scope.is_some() {
@@ -266,6 +268,16 @@ impl Shell {
                 "excluded"
             },
             self.settings.search_file_mib,
+            if self.settings.search_directory_links {
+                "Follows directory symlinks, which can lead outside the search folder."
+            } else {
+                "Skips directory symlinks."
+            },
+            if self.settings.search_mounts {
+                "Includes nested mounted volumes."
+            } else {
+                "Skips nested mounted volumes."
+            },
             self.search_ui.status
         );
         self.ask_decision(
@@ -350,8 +362,26 @@ impl Shell {
                         row.child(self.button("Stop Search", "stop-search", cx))
                     }),
             )
+            .when(
+                self.settings.search_directory_links || self.settings.search_mounts,
+                |panel| {
+                    let expansion = match (
+                        self.settings.search_directory_links,
+                        self.settings.search_mounts,
+                    ) {
+                        (true, true) => "Includes directory symlinks and mounted volumes",
+                        (true, false) => "Includes directory symlinks",
+                        (false, _) => "Includes mounted volumes",
+                    };
+                    panel.child(accessibility::message(
+                        "search-traversal",
+                        expansion.into(),
+                        div().px_2().text_sm().child(expansion),
+                    ))
+                },
+            )
             .child(div().px_2().text_sm().truncate().child(format!(
-                "{} · metadata {} · symlinks excluded · content ≤ {} MiB/file · exclusions: {}",
+                "{} · metadata {} · content ≤ {} MiB/file · exclusions: {}",
                 if self.settings.search_ignored {
                     "Ignore rules bypassed"
                 } else {

@@ -410,6 +410,12 @@ impl Render for Preferences {
                 rows.push(self.toggle("Show hidden files", |s| &mut s.show_hidden, cx));
                 rows.push(self.toggle("Search ignored files", |s| &mut s.search_ignored, cx));
                 rows.push(self.toggle("Search metadata folders", |s| &mut s.search_metadata, cx));
+                rows.push(self.toggle("Cross mounted volumes", |s| &mut s.search_mounts, cx));
+                rows.push(self.toggle(
+                    "Follow directory symlinks",
+                    |s| &mut s.search_directory_links,
+                    cx,
+                ));
                 rows.push(self.field(Field::FileLimit));
                 rows.push(self.field(Field::Exclusions));
             }
