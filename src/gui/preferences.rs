@@ -2,9 +2,10 @@ use super::accessibility::message;
 use glimpse::storage::Settings;
 use gpui::{prelude::*, *};
 use gpui_component::{
-    ActiveTheme, Disableable, IconName, Selectable, Sizable,
+    ActiveTheme, Disableable, Selectable, Sizable,
     button::{Button, ButtonVariants},
     input::{Input, InputState},
+    menu::{DropdownMenu, PopupMenuItem},
     scroll::{Scrollbar, ScrollbarShow},
 };
 
@@ -152,6 +153,29 @@ impl Preferences {
                 return;
             }
             let _ = view.update(cx, |this: &mut Self, cx| {
+                let key = &event.keystroke;
+                let modifiers = &key.modifiers;
+                if modifiers.alt
+                    && !modifiers.control
+                    && !modifiers.platform
+                    && !modifiers.shift
+                    && let Ok(number) = key.key.parse::<usize>()
+                    && let Some(page) = number.checked_sub(1).and_then(|i| Page::ALL.get(i))
+                    && !this.pending
+                {
+                    this.select_page(*page, cx);
+                    this.focus.focus(window);
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    return;
+                }
+                if event
+                    .context_stack
+                    .iter()
+                    .any(|context| context.contains("PopupMenu"))
+                {
+                    return;
+                }
                 if super::modal::tab(&event.keystroke, &this.focus, window, cx) {
                     return;
                 }
@@ -178,6 +202,14 @@ impl Preferences {
 
     pub fn busy(&self) -> bool {
         self.pending
+    }
+
+    fn select_page(&mut self, page: Page, cx: &mut Context<Self>) {
+        if self.page != page {
+            self.page = page;
+            self.scroll.set_offset(Point::default());
+            cx.notify();
+        }
     }
 
     pub fn failed(&mut self, error: String, cx: &mut Context<Self>) {
@@ -402,54 +434,53 @@ impl Render for Preferences {
                 );
             }
         }
-        let categories = if self.draft.ui_scale > 1.25 || window.viewport_size().width < px(600.) {
-            let index = Page::ALL
-                .iter()
-                .position(|page| *page == self.page)
-                .unwrap();
-            let category = format!("{} ({}/{})", self.page.label(), index + 1, Page::ALL.len());
+        let compact_categories =
+            self.draft.ui_scale > 1.25 || window.viewport_size().width < px(600.);
+        let categories = if compact_categories {
+            let selected = self.page;
+            let view = cx.weak_entity();
             div()
                 .flex()
                 .items_center()
-                .justify_between()
-                .gap(px(8.))
                 .child(
-                    Button::new("previous-category")
-                        .icon(IconName::ChevronLeft)
+                    Button::new("preferences-category-menu")
+                        .label(format!("Category · {}", selected.label()))
                         .small()
-                        .tooltip("Previous category")
+                        .outline()
+                        .dropdown_caret(true)
                         .disabled(self.pending)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            let index = Page::ALL
-                                .iter()
-                                .position(|page| *page == this.page)
-                                .unwrap();
-                            this.page = Page::ALL[(index + 4) % 5];
-                            this.scroll.set_offset(Point::default());
-                            cx.notify();
-                        })),
+                        .dropdown_menu(move |mut menu, window, _| {
+                            menu = menu
+                                .scrollable(true)
+                                .max_w(window.viewport_size().width - px(16.))
+                                .max_h((window.viewport_size().height - px(40.)).max(px(100.)));
+                            for (index, page) in Page::ALL.into_iter().enumerate() {
+                                let view = view.clone();
+                                menu = menu.item(
+                                    PopupMenuItem::new(page.label())
+                                        .checked(page == selected)
+                                        .shortcut_hint(super::platform::shortcut_label(&format!(
+                                            "Alt+{}",
+                                            index + 1
+                                        )))
+                                        .on_click(move |_, window, cx| {
+                                            let view = view.clone();
+                                            window.defer(cx, move |_, cx| {
+                                                let _ = view.update(cx, |this, cx| {
+                                                    this.select_page(page, cx)
+                                                });
+                                            });
+                                        }),
+                                );
+                            }
+                            menu
+                        }),
                 )
                 .child(message(
                     "preferences-category",
-                    category.clone(),
-                    div().child(category),
+                    selected.label().into(),
+                    div().size_0(),
                 ))
-                .child(
-                    Button::new("next-category")
-                        .icon(IconName::ChevronRight)
-                        .small()
-                        .tooltip("Next category")
-                        .disabled(self.pending)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            let index = Page::ALL
-                                .iter()
-                                .position(|page| *page == this.page)
-                                .unwrap();
-                            this.page = Page::ALL[(index + 1) % 5];
-                            this.scroll.set_offset(Point::default());
-                            cx.notify();
-                        })),
-                )
                 .into_any_element()
         } else {
             div()
@@ -464,11 +495,7 @@ impl Render for Preferences {
                         .when(page != self.page, |button| button.outline())
                         .selected(page == self.page)
                         .disabled(self.pending)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.page = page;
-                            this.scroll.set_offset(Point::default());
-                            cx.notify();
-                        }))
+                        .on_click(cx.listener(move |this, _, _, cx| this.select_page(page, cx)))
                 }))
                 .into_any_element()
         };
@@ -515,6 +542,10 @@ impl Render for Preferences {
                             .flex_1()
                             .flex()
                             .flex_col()
+                            .overflow_hidden()
+                            .when(compact_categories, |fields| {
+                                fields.border_t_1().border_color(cx.theme().border).pt_1()
+                            })
                             .child(
                                 div()
                                     .id("preference-fields")

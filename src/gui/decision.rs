@@ -85,10 +85,7 @@ impl Decision {
         }
     }
     pub fn close_actions(&mut self) {
-        self.summary = Some(
-            "Save writes changes. Discard closes without saving and removes automatic drafts."
-                .into(),
-        );
+        self.summary = Some("Discard removes recovery drafts.".into());
         self.primary = Some(1);
         self.destructive = Some(2);
     }
@@ -122,6 +119,7 @@ impl Render for Decision {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let viewport = window.viewport_size();
         let compact = viewport.height < px(480.);
+        let narrow = viewport.width < px(400.) * (cx.theme().font_size / px(16.));
         let comparison_height = px(160.).min(viewport.height * 0.22);
         let detail_fraction = if self.comparison.is_some() { 0.67 } else { 0.4 };
         let semantic_title = self.title.clone();
@@ -186,9 +184,6 @@ impl Render for Decision {
                                     .overflow_y_scroll()
                                     .track_scroll(&self.detail_scroll)
                                     .pr(px(18.))
-                                    .when_some(self.summary.as_ref(), |body, summary| {
-                                        body.child(div().pb_3().text_sm().child(summary.clone()))
-                                    })
                                     .children(self.subjects.iter().enumerate().map(
                                         |(index, label)| {
                                             let name = label.clone();
@@ -231,17 +226,58 @@ impl Render for Decision {
                                 ),
                             ),
                     )
-                    .child(div().flex().flex_shrink_0().flex_wrap().gap_2().children(
-                        self.actions.iter().enumerate().map(|(i, label)| {
-                            Button::new(i)
-                                .label(*label)
-                                .small()
-                                .when(self.primary != Some(i), |button| button.outline())
-                                .when(self.primary == Some(i), |button| button.primary())
-                                .when(self.destructive == Some(i), |button| button.danger())
-                                .on_click(cx.listener(move |_, _, _, cx| cx.emit(Choice(i))))
-                        }),
-                    )),
+                    .child(
+                        div()
+                            .flex()
+                            .flex_shrink_0()
+                            .flex_col()
+                            .gap_2()
+                            .when_some(self.summary.as_ref(), |footer, summary| {
+                                footer.child(
+                                    div()
+                                        .text_sm()
+                                        .line_height(relative(1.2))
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(summary.clone()),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .justify_end()
+                                    .gap_2()
+                                    .when(narrow, |row| row.gap_1())
+                                    .children(self.actions.iter().enumerate().map(|(i, label)| {
+                                        let label = if narrow
+                                            && self.primary == Some(i)
+                                            && matches!(
+                                                *label,
+                                                "Save and Close" | "Save and Finish"
+                                            ) {
+                                            "Save"
+                                        } else {
+                                            *label
+                                        };
+                                        Button::new(i)
+                                            .label(label)
+                                            .small()
+                                            .when(narrow, |button| button.compact())
+                                            .when(self.primary != Some(i), |button| {
+                                                button.outline()
+                                            })
+                                            .when(self.primary == Some(i), |button| {
+                                                button.primary()
+                                            })
+                                            .when(self.destructive == Some(i), |button| {
+                                                button.danger()
+                                            })
+                                            .on_click(
+                                                cx.listener(move |_, _, _, cx| cx.emit(Choice(i))),
+                                            )
+                                    })),
+                            ),
+                    ),
             );
         gpui::accessible("modal-semantics", rendered, move |_, _, _| {
             let mut node = gpui::accesskit::Node::new(gpui::accesskit::Role::Dialog);

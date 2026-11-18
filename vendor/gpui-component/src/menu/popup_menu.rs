@@ -36,6 +36,7 @@ pub enum PopupMenuItem {
     Item {
         icon: Option<Icon>,
         label: SharedString,
+        shortcut_hint: Option<SharedString>,
         disabled: bool,
         checked: bool,
         is_link: bool,
@@ -71,6 +72,7 @@ impl PopupMenuItem {
         PopupMenuItem::Item {
             icon: None,
             label: label.into(),
+            shortcut_hint: None,
             disabled: false,
             checked: false,
             action: None,
@@ -189,6 +191,13 @@ impl PopupMenuItem {
         self
     }
 
+    pub fn shortcut_hint(mut self, hint: impl Into<SharedString>) -> Self {
+        if let Self::Item { shortcut_hint, .. } = &mut self {
+            *shortcut_hint = Some(hint.into());
+        }
+        self
+    }
+
     /// Add a click handler for the menu item.
     ///
     /// Only works for [`PopupMenuItem::Item`] and [`PopupMenuItem::ElementItem`].
@@ -215,6 +224,7 @@ impl PopupMenuItem {
         PopupMenuItem::Item {
             icon: None,
             label: label.into(),
+            shortcut_hint: None,
             disabled: false,
             checked: false,
             action: None,
@@ -1147,6 +1157,7 @@ impl PopupMenu {
             PopupMenuItem::Item {
                 icon,
                 label,
+                shortcut_hint,
                 action,
                 disabled,
                 is_link,
@@ -1154,7 +1165,10 @@ impl PopupMenu {
             } => {
                 let show_link_icon = *is_link && self.external_link_icon;
                 let action = action.as_ref().map(|action| action.boxed_clone());
-                let key = self.render_key_binding(action, window, cx);
+                let key = shortcut_hint
+                    .is_none()
+                    .then(|| self.render_key_binding(action, window, cx))
+                    .flatten();
                 let full_label = label.clone();
                 let label_element = || {
                     div()
@@ -1180,6 +1194,7 @@ impl PopupMenu {
                     )
                 })
                 .disabled(*disabled)
+                .when_some(shortcut_hint.clone(), |row, hint| row.shortcut(hint))
                 .h(item_height)
                 .gap_x_1()
                 .children(Self::render_icon(
@@ -1212,6 +1227,9 @@ impl PopupMenu {
                                             .text_color(cx.theme().muted_foreground),
                                     ),
                             )
+                        })
+                        .when_some(shortcut_hint.clone(), |row, hint| {
+                            row.child(div().flex_shrink_0().whitespace_nowrap().child(hint))
                         })
                         .children(key),
                 )

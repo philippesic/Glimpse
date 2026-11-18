@@ -537,6 +537,16 @@ impl NodeWrapper<'_> {
         })
     }
 
+    fn action_key_binding(&self, index: i32) -> String {
+        if index != 0 || self.n_actions() == 0 {
+            return String::new();
+        }
+        self.0
+            .data()
+            .keyboard_shortcut()
+            .map_or_else(String::new, |shortcut| format!(";;{shortcut}"))
+    }
+
     fn raw_bounds_and_transform(&self) -> (Option<Rect>, Affine) {
         let state = self.0;
         (state.raw_bounds(), state.direct_transform())
@@ -1104,6 +1114,10 @@ impl PlatformNode {
         })
     }
 
+    pub fn action_key_binding(&self, index: i32) -> Result<String> {
+        self.resolve(|node| Ok(NodeWrapper(&node).action_key_binding(index)))
+    }
+
     pub fn actions(&self) -> Result<Vec<AtspiAction>> {
         self.resolve(|node| {
             let wrapper = NodeWrapper(&node);
@@ -1113,7 +1127,7 @@ impl PlatformNode {
                 actions.push(AtspiAction {
                     localized_name: wrapper.get_action_name(i as i32),
                     description: "".into(),
-                    key_binding: "".into(),
+                    key_binding: wrapper.action_key_binding(i as i32),
                 });
             }
             Ok(actions)

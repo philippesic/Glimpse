@@ -201,21 +201,16 @@ impl Shell {
                             .get(*id)
                             .map(String::as_str)
                             .unwrap_or(command.shortcut);
-                        let label = if shortcut.is_empty() {
-                            command.label.to_owned()
-                        } else {
-                            format!(
-                                "{}    {}",
-                                command.label,
-                                super::platform::shortcut_label(shortcut)
-                            )
-                        };
-                        menu = menu.item(command_item(
+                        let item = command_item(
                             shell.clone(),
                             command.id,
-                            label,
+                            command.label.to_owned(),
                             disabled.contains(id),
-                        ));
+                        )
+                        .when(!shortcut.is_empty(), |item| {
+                            item.shortcut_hint(super::platform::shortcut_label(shortcut))
+                        });
+                        menu = menu.item(item);
                     }
                     menu = menu.separator();
                 }

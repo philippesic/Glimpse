@@ -11,6 +11,7 @@ use std::rc::Rc;
 pub(crate) struct MenuItemElement {
     id: ElementId,
     label: SharedString,
+    shortcut: Option<SharedString>,
     focus: Option<gpui::FocusHandle>,
     on_focus: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
     role: gpui::accesskit::Role,
@@ -30,6 +31,7 @@ impl MenuItemElement {
         Self {
             id: id.clone(),
             label: "Menu item".into(),
+            shortcut: None,
             focus: None,
             on_focus: None,
             role: gpui::accesskit::Role::MenuItem,
@@ -54,6 +56,11 @@ impl MenuItemElement {
         self.role = role;
         self.focus = Some(focus);
         self.on_focus = Some(Rc::new(on_focus));
+        self
+    }
+
+    pub(crate) fn shortcut(mut self, shortcut: SharedString) -> Self {
+        self.shortcut = Some(shortcut);
         self
     }
 
@@ -110,6 +117,7 @@ impl RenderOnce for MenuItemElement {
         let semantic_id = self.id.clone();
         let label = self.label;
         let role = self.role;
+        let shortcut = self.shortcut;
         let disabled = self.disabled;
         let selected = self.selected;
         let focus = self.focus;
@@ -154,6 +162,9 @@ impl RenderOnce for MenuItemElement {
             use gpui::accesskit::{Action, Node};
             let mut node = Node::new(role);
             node.set_label(label.to_string());
+            if let Some(shortcut) = &shortcut {
+                node.set_keyboard_shortcut(shortcut.to_string());
+            }
             node.set_selected(selected);
             if disabled {
                 node.set_disabled()
