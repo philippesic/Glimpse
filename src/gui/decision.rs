@@ -7,6 +7,7 @@ use gpui_component::{
     scroll::{Scrollbar, ScrollbarShow},
 };
 use std::path::{MAIN_SEPARATOR, Path};
+use unicode_segmentation::UnicodeSegmentation;
 
 pub(super) struct UnsavedSubject {
     name: String,
@@ -18,7 +19,13 @@ impl UnsavedSubject {
         format!("{} — {}", self.name, self.folder)
     }
 
-    fn element(&self, index: usize, lines: Option<usize>, cx: &App) -> impl IntoElement {
+    fn element(
+        &self,
+        index: usize,
+        lines: Option<usize>,
+        folder: SharedString,
+        cx: &App,
+    ) -> impl IntoElement {
         let label = self.label();
         gpui::accessible(
             ("decision-subject", index),
@@ -38,7 +45,7 @@ impl UnsavedSubject {
                     div()
                         .text_color(cx.theme().muted_foreground)
                         .truncate()
-                        .child(self.folder.clone()),
+                        .child(folder),
                 ),
             move |_, _, _| {
                 let mut node = gpui::accesskit::Node::new(gpui::accesskit::Role::Label);
@@ -48,6 +55,49 @@ impl UnsavedSubject {
             },
         )
     }
+}
+
+fn abbreviate_folder(folder: &str, width: Pixels, window: &Window) -> SharedString {
+    let style = window.text_style();
+    let font_size = window.rem_size() * 0.875;
+    let text_width = |text: SharedString| {
+        let run = style.to_run(text.len());
+        window
+            .text_system()
+            .shape_line(text, font_size, &[run], None)
+            .width
+    };
+    let full = SharedString::from(folder.to_owned());
+    if text_width(full.clone()) <= width {
+        return full;
+    }
+
+    let mut offsets: Vec<_> = folder
+        .grapheme_indices(true)
+        .map(|(offset, _)| offset)
+        .collect();
+    offsets.push(folder.len());
+    let count = offsets.len() - 1;
+    let mut abbreviated = SharedString::from("…");
+    let mut shortest = 1;
+    let mut longest = count.saturating_sub(1);
+    while shortest <= longest {
+        let kept = shortest + (longest - shortest) / 2;
+        let prefix = kept * 2 / 5;
+        let suffix = kept - prefix;
+        let candidate = SharedString::from(format!(
+            "{}…{}",
+            &folder[..offsets[prefix]],
+            &folder[offsets[count - suffix]..],
+        ));
+        if text_width(candidate.clone()) <= width {
+            abbreviated = candidate;
+            shortest = kept + 1;
+        } else {
+            longest = kept - 1;
+        }
+    }
+    abbreviated
 }
 
 pub struct Decision {
@@ -169,7 +219,7 @@ impl Decision {
                         div()
                             .max_w_full()
                             .flex_shrink_0()
-                            .truncate()
+                            .whitespace_normal()
                             .child(part.to_owned())
                     }))
                     .tooltip(move |window, cx| {
@@ -215,6 +265,9 @@ impl Render for Decision {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let viewport = window.viewport_size();
         let compact = viewport.height < px(480.);
+        let panel_width = px(640.).min(viewport.width - px(32.));
+        let scroll_inset = px(18.);
+        let compact_text_width = panel_width - px(2.) - window.rem_size() - scroll_inset;
         let narrow = viewport.width < px(400.) * (cx.theme().font_size / px(16.));
         let comparison_height = px(160.).min(viewport.height * 0.22);
         let detail_fraction = if self.comparison.is_some() { 0.67 } else { 0.4 };
@@ -254,7 +307,7 @@ impl Render for Decision {
                     .id("decision")
                     .track_focus(&self.focus)
                     .occlude()
-                    .w(px(640.).min(viewport.width - px(32.)))
+                    .w(panel_width)
                     .max_h(viewport.height - px(32.))
                     .flex()
                     .flex_col()
@@ -292,13 +345,22 @@ impl Render for Decision {
                                     .flex_shrink()
                                     .overflow_y_scroll()
                                     .track_scroll(&self.detail_scroll)
-                                    .pr(px(18.))
+                                    .pr(scroll_inset)
                                     .when(compact && self.comparison.is_none(), |body| {
                                         body.text_sm().line_height(relative(1.25))
                                     })
                                     .children(self.subjects.iter().enumerate().map(
                                         |(index, subject)| {
-                                            subject.element(index, subject_lines, cx)
+                                            let folder = if compact {
+                                                abbreviate_folder(
+                                                    &subject.folder,
+                                                    compact_text_width,
+                                                    window,
+                                                )
+                                            } else {
+                                                subject.folder.clone().into()
+                                            };
+                                            subject.element(index, subject_lines, folder, cx)
                                         },
                                     ))
                                     .when_some(self.comparison.as_ref(), |body, inputs| {
