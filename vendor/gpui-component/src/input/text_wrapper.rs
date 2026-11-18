@@ -449,6 +449,20 @@ impl TextWrapper {
         self.prepare_first_rows(&self.text, cache, rows, 16 * 1024)
     }
 
+    pub(super) fn prepare_opening_prefix(
+        config: LayoutConfig,
+        text: &Rope,
+        system: &Arc<TextSystem>,
+        cache: WindowTextSystem,
+        rows: usize,
+    ) -> PreparedTextLines {
+        let end = text.line_start_offset(rows.min(64)).min(64 * 1024);
+        let end = text.clip_offset(end, sum_tree::Bias::Left);
+        let prefix = Rope::from(text.slice(..end));
+        let layout = Self::prepare_full(config, &prefix, system);
+        layout.prepare_opening_lines(cache, rows)
+    }
+
     pub(super) fn prepare_glyphs(
         &self,
         text: &Rope,

@@ -500,6 +500,27 @@ impl InputState {
                 let text = text.clone();
                 let config = config.clone();
                 async move {
+                    let (opening, shaped) = if executor.num_cpus() > 4 {
+                        let shaped = opening.map(|(layouts, rows)| {
+                            let text = text.clone();
+                            let config = config.clone();
+                            let text_system = text_system.clone();
+                            executor.spawn(async move {
+                                let _shape =
+                                    gpui::work_trace::Span::new("editor_opening_shape_worker");
+                                TextWrapper::prepare_opening_prefix(
+                                    config,
+                                    &text,
+                                    &text_system,
+                                    layouts,
+                                    rows,
+                                )
+                            })
+                        });
+                        (None, shaped)
+                    } else {
+                        (opening, None)
+                    };
                     let wrap = gpui::work_trace::Span::new(if reflow {
                         "editor_reflow_worker"
                     } else {
@@ -509,10 +530,13 @@ impl InputState {
                         TextWrapper::prepare_full_on_worker(config, text, text_system, executor)
                             .await;
                     drop(wrap);
-                    let opening_lines = opening.map(|(layouts, rows)| {
-                        let _shape = gpui::work_trace::Span::new("editor_opening_shape_worker");
-                        layout.prepare_opening_lines(layouts, rows)
-                    });
+                    let opening_lines = match shaped {
+                        Some(shaped) => Some(shaped.await),
+                        None => opening.map(|(layouts, rows)| {
+                            let _shape = gpui::work_trace::Span::new("editor_opening_shape_worker");
+                            layout.prepare_opening_lines(layouts, rows)
+                        }),
+                    };
                     (layout, opening_lines)
                 }
             });
