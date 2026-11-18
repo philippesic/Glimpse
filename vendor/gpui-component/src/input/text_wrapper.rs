@@ -14,7 +14,7 @@ use crate::input::RopeExt;
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct LineItem {
     length: usize,
-    wraps: Option<Box<LineWraps>>,
+    wraps: Option<Arc<LineWraps>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -28,7 +28,7 @@ struct LineWraps {
 impl LineItem {
     fn new(length: usize, indent: Option<u32>, ranges: SmallVec<[Range<usize>; 1]>) -> Self {
         let wraps = (ranges.len() > 1).then(|| {
-            Box::new(LineWraps {
+            Arc::new(LineWraps {
                 indent,
                 word_columns: 0,
                 word_width: px(0.),
@@ -388,6 +388,7 @@ impl TextWrapper {
             .filter_map(|line| line.wraps.as_ref())
             .map(|wraps| {
                 std::mem::size_of::<LineWraps>()
+                    + std::mem::size_of::<[usize; 2]>()
                     + wraps.ranges.capacity() * std::mem::size_of::<Range<usize>>()
             })
             .sum();
@@ -409,7 +410,7 @@ impl TextWrapper {
             if let Some(wraps) = &mut line.wraps
                 && wraps.ranges.capacity() >= 256
             {
-                wraps.ranges.shrink_to_fit();
+                Arc::make_mut(wraps).ranges.shrink_to_fit();
             }
         }
         for checkpoints in self.checkpoints.values_mut() {
@@ -465,6 +466,7 @@ impl TextWrapper {
                     && let Some(width) = line_wrapper
                         .uniform_word_width_for_bytes(changed_text.slice_line(row).bytes())
                 {
+                    let wraps = Arc::make_mut(wraps);
                     wraps.word_width = width;
                     wraps.word_columns = wraps.ranges[0].len() as u32;
                 }
@@ -581,6 +583,7 @@ impl TextWrapper {
         if rows + wrapped.len() <= 1 {
             line.wraps = None;
         } else if let Some(wraps) = line.wraps.as_mut() {
+            let wraps = Arc::make_mut(wraps);
             wraps.ranges.truncate(rows);
             wraps.ranges.extend(wrapped);
             wraps.word_columns = 0;
@@ -661,6 +664,7 @@ impl TextWrapper {
         if rows == 1 {
             line.wraps = None;
         } else {
+            let wraps = Arc::make_mut(wraps);
             wraps.ranges.resize(rows, 0..0);
             for (row, range) in wraps.ranges.iter_mut().enumerate() {
                 *range = row * columns..((row + 1) * columns).min(length);
@@ -725,6 +729,7 @@ impl TextWrapper {
             .to_string();
         let fragments = [LineFragment::text(&tail)];
         let indent = (prefix > 0).then_some(continuation_indent);
+        let wraps = Arc::make_mut(wraps);
         wraps.ranges.truncate(prefix);
         let mut previous = start;
         for boundary in wrapper.wrap_line_with_indent(&fragments, width, indent) {
@@ -792,9 +797,12 @@ impl TextWrapper {
         let new_end_offset = changed_text.line_end_offset(new_end_row);
         let new_range = new_start_offset..new_end_offset;
 
-        let mut new_lines = Vec::with_capacity(new_end_row - new_start_row + 1);
+        let row_count = new_end_row - new_start_row + 1;
+        let mut new_lines = Vec::with_capacity(row_count);
         let mut new_checkpoints = std::collections::BTreeMap::new();
         let wrap_width = self.wrap_width;
+        let mut recent: Option<[Option<(RopeSlice<'_>, LineItem)>; 64]> =
+            (wrap_width.is_some() && row_count >= 64).then(|| [const { None }; 64]);
 
         // line not contains `\n`.
         for (ix, line) in changed_text
@@ -814,6 +822,20 @@ impl TextWrapper {
             if line.len() > longest_row_len {
                 longest_row_ix = new_start_row + ix;
                 longest_row_len = line.len();
+            }
+
+            let cached = recent
+                .as_mut()
+                .filter(|_| (1..1024).contains(&line.len()))
+                .map(|rows| {
+                    let slot = line.len() % rows.len();
+                    &mut rows[slot]
+                });
+            if let Some(Some((previous, item))) = cached.as_deref()
+                && *previous == line
+            {
+                new_lines.push(item.clone());
+                continue;
             }
 
             // If wrap_width is Pixels::MAX, skip wrapping to disable word wrap
@@ -842,7 +864,11 @@ impl TextWrapper {
             } else {
                 None
             };
-            new_lines.push(LineItem::new(line.len(), indent, wrapped_lines));
+            let item = LineItem::new(line.len(), indent, wrapped_lines);
+            if let Some(slot) = cached {
+                *slot = Some((line, item.clone()));
+            }
+            new_lines.push(item);
         }
 
         if self.lines.is_empty() {
@@ -1207,6 +1233,41 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(checkpoint_states(&actual), checkpoint_states(&exact));
+    }
+
+    #[gpui::test]
+    fn repeated_wraps_share_geometry_and_keep_independent_edits(cx: &mut gpui::TestAppContext) {
+        let system = cx.update(|cx| cx.text_system().clone());
+        let config = LayoutConfig {
+            font: gpui::font(".ZedMono"),
+            font_size: px(16.),
+            wrap_width: Some(px(110.)),
+        };
+        let row = "    repeat café 日本語 and more words";
+        let mut text = Rope::from(format!("{row}\r\n\nother text\n").repeat(96).as_str());
+        let mut layout = TextWrapper::prepare_full(config.clone(), &text, &system);
+        let shared = layout.lines[3].wraps.as_ref().unwrap().clone();
+        assert!(Arc::ptr_eq(
+            layout.lines[0].wraps.as_ref().unwrap(),
+            &shared
+        ));
+
+        let offset = text.line_end_offset(0);
+        let range = offset..offset;
+        text.replace(range.clone(), " longer");
+        layout.update_with_text_system(&text, &range, &Rope::from(" longer"), &system);
+
+        let exact = TextWrapper::prepare_full(config, &text, &system);
+        assert_eq!(layout.lines, exact.lines);
+        assert_eq!(layout.len(), exact.len());
+        assert!(Arc::ptr_eq(
+            layout.lines[3].wraps.as_ref().unwrap(),
+            &shared
+        ));
+        assert!(!Arc::ptr_eq(
+            layout.lines[0].wraps.as_ref().unwrap(),
+            &shared
+        ));
     }
 
     #[gpui::test]
