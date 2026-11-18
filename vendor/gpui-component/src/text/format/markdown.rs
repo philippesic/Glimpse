@@ -69,7 +69,7 @@ enum Block {
     Paragraph,
     Heading(u8),
     Quote,
-    List(bool),
+    List(Option<u64>),
     Item,
     Code(Option<SharedString>),
     Html,
@@ -226,8 +226,8 @@ impl Frame {
                     Block::Quote => node::Node::Blockquote {
                         children: self.children,
                     },
-                    Block::List(ordered) => node::Node::List {
-                        ordered,
+                    Block::List(start) => node::Node::List {
+                        start,
                         children: self.children,
                     },
                     Block::Item => node::Node::ListItem {
@@ -346,7 +346,7 @@ pub(crate) fn parse(
                     }
                     Tag::Heading { level, .. } => Block::Heading(level as u8),
                     Tag::BlockQuote(_) => Block::Quote,
-                    Tag::List(start) => Block::List(start.is_some()),
+                    Tag::List(start) => Block::List(start),
                     Tag::Item => Block::Item,
                     Tag::CodeBlock(code) => Block::Code(match code {
                         CodeBlockKind::Indented => None,
@@ -658,7 +658,7 @@ mod tests {
         };
         assert!(quote
             .iter()
-            .any(|node| matches!(node, node::Node::List { ordered: true, .. })));
+            .any(|node| matches!(node, node::Node::List { start: Some(3), .. })));
         let node::Node::List {
             children: tasks, ..
         } = &children[2]

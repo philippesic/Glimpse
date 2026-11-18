@@ -702,7 +702,7 @@ pub(crate) enum Node {
     List {
         /// Only contains ListItem, others will be ignored
         children: Vec<Node>,
-        ordered: bool,
+        start: Option<u64>,
     },
     ListItem {
         children: Vec<Node>,
@@ -1173,7 +1173,7 @@ impl Paragraph {
 struct NodeRenderOptions {
     in_list: bool,
     todo: bool,
-    ordered: bool,
+    list_start: Option<u64>,
     depth: usize,
     is_last: bool,
 }
@@ -1489,15 +1489,14 @@ impl Node {
                     .collect::<Vec<_>>()
                     .join("\n")
             }
-            Node::List { children, ordered } => children
+            Node::List { children, start } => children
                 .iter()
                 .enumerate()
                 .map(|(i, child)| {
-                    let prefix = if *ordered {
-                        format!("{}. ", i + 1)
-                    } else {
-                        "- ".to_string()
-                    };
+                    let prefix = start.map_or_else(
+                        || "- ".to_string(),
+                        |start| list_item_prefix(i, Some(start), 0),
+                    );
                     format!("{}{}", prefix, child.to_markdown())
                 })
                 .collect::<Vec<_>>()
@@ -1644,7 +1643,7 @@ impl Node {
                                         .when(!options.todo && checked.is_none(), |this| {
                                             this.child(list_item_prefix(
                                                 ix,
-                                                options.ordered,
+                                                options.list_start,
                                                 options.depth,
                                             ))
                                         })
@@ -1973,8 +1972,8 @@ impl Node {
                         }),
                 )
                 .into_any_element(),
-            Node::List { children, ordered } => v_flex()
-                .id(if *ordered { "ol" } else { "ul" })
+            Node::List { children, start } => v_flex()
+                .id(if start.is_some() { "ol" } else { "ul" })
                 .pb(mb)
                 .children({
                     let mut items = Vec::with_capacity(children.len());
@@ -1986,7 +1985,7 @@ impl Node {
                             item,
                             ix,
                             NodeRenderOptions {
-                                ordered: *ordered,
+                                list_start: *start,
                                 ..options
                             },
                             node_cx,

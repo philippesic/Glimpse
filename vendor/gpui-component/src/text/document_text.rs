@@ -10,7 +10,10 @@ use gpui::{
     accesskit::{Node, NodeId, Role, TextPosition, TextSelection},
 };
 
-use super::node::{InlineText, Node as Block, Paragraph};
+use super::{
+    node::{InlineText, Node as Block, Paragraph},
+    utils::list_item_prefix,
+};
 use crate::semantic_text::{MAX_RUN_CHARACTERS, Segment, text_run_with_boundaries, visit_line_segments};
 
 const MAX_CACHED_RUNS: usize = 256;
@@ -140,9 +143,40 @@ impl<'a> SourceBuilder<'a, '_> {
     fn block(&mut self, node: &'a mut Block) {
         match node {
             Block::Root { children } => self.blocks(Arc::make_mut(children).as_mut_slice()),
-            Block::Blockquote { children }
-            | Block::List { children, .. }
-            | Block::ListItem { children, .. } => self.blocks(children),
+            Block::List { children, start } => {
+                let Some(start) = start.filter(|&start| start != 1) else {
+                    self.blocks(children);
+                    return;
+                };
+                let mut index = 0;
+                for child in children {
+                    let is_item = child.is_list_item();
+                    match child {
+                        Block::ListItem {
+                            children,
+                            checked: None,
+                            ..
+                        } => match children.split_first_mut() {
+                            Some((Block::Paragraph(paragraph), tail)) => {
+                                self.paragraph_break();
+                                self.write(&list_item_prefix(index, Some(start), 0));
+                                self.paragraph(paragraph);
+                                self.blocks(tail);
+                            }
+                            Some((first, tail)) => {
+                                self.block(first);
+                                self.blocks(tail);
+                            }
+                            None => {}
+                        },
+                        _ => self.block(child),
+                    }
+                    index += usize::from(is_item);
+                }
+            }
+            Block::Blockquote { children } | Block::ListItem { children, .. } => {
+                self.blocks(children);
+            }
             Block::ParagraphPage(p) => self.paragraph(p),
             Block::Paragraph(p) | Block::Heading { children: p, .. } => {
                 self.paragraph_break();
@@ -511,6 +545,30 @@ impl LineBoundaries {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reading_preserves_numbered_lists_that_start_away_from_one() {
+        use crate::text::{TextViewStyle, format::markdown::parse, node::NodeContext};
+
+        let style = TextViewStyle::default();
+        let mut root = parse(
+            "7. Seventh\n4. Eighth\n\n> 0. Zero\n> 1. One\n\n1. Regular\n",
+            &style,
+            &mut NodeContext::default(),
+            &style.highlight_theme,
+            |_| {},
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            DocumentSource::new(&mut root)
+                .0
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<String>(),
+            "7. Seventh\n8. Eighth\n0. Zero\n1. One\nRegular"
+        );
+    }
 
     #[test]
     fn packed_parser_batches_preserve_rendered_blocks_and_text() {
