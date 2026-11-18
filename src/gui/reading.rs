@@ -11,6 +11,7 @@ pub(super) struct View {
     generation: u64,
     path: PathBuf,
     theme: Arc<HighlightTheme>,
+    pending: Option<Box<Job>>,
     content: Option<MarkdownView>,
     source_lines: Option<gpui::PreparedTextLines>,
     release_memory: bool,
@@ -63,18 +64,6 @@ impl Shell {
             .as_mut()
             .and_then(|view| view.source_lines.take())
             .or_else(|| release_memory.then(|| window.text_system().retain_recent_lines()));
-        self.reading_view = Some(View {
-            request,
-            id: doc.id,
-            generation: doc.generation,
-            path: doc.disk.path.clone(),
-            theme: theme.clone(),
-            content: None,
-            source_lines,
-            release_memory,
-            notes: String::new(),
-            error: None,
-        });
         let mut text_style = window.text_style();
         text_style.font_size = self.reading_font_size().into();
         text_style.color = cx.theme().foreground;
@@ -83,25 +72,60 @@ impl Shell {
             request,
             source: doc.input.read(cx).text().clone(),
             path: doc.disk.path.clone(),
-            theme,
+            theme: theme.clone(),
             code_canvases: super::theme::reading_code_canvases(cx),
             layout,
             reclaim: release_memory.then_some(platform::release_unused_memory),
         };
-        if release_memory {
-            cx.on_next_frame(window, move |this, _, _| {
-                if this.reading
-                    && this
-                        .reading_view
-                        .as_ref()
-                        .is_some_and(|view| this.active == Some(view.id) && view.request == request)
-                {
-                    this.io.send(job);
-                }
+        self.reading_view = Some(View {
+            request,
+            id: doc.id,
+            generation: doc.generation,
+            path: doc.disk.path.clone(),
+            theme,
+            pending: Some(Box::new(job)),
+            content: None,
+            source_lines,
+            release_memory,
+            notes: String::new(),
+            error: None,
+        });
+        if release_memory && window.is_window_active() {
+            cx.on_next_frame(window, move |this, _, cx| {
+                this.dispatch_reading(request, cx)
             });
         } else {
-            self.io.send(job);
+            self.dispatch_reading(request, cx);
         }
+    }
+
+    pub(super) fn prepare_inactive_reading(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !window.is_window_active() {
+            self.prepare_reading(window, cx);
+            if let Some(request) = self.reading_view.as_ref().map(|view| view.request) {
+                self.dispatch_reading(request, cx);
+            }
+        }
+    }
+
+    fn dispatch_reading(&mut self, request: u64, cx: &mut Context<Self>) {
+        let Some(view) = self
+            .reading_view
+            .as_mut()
+            .filter(|view| self.reading && self.active == Some(view.id) && view.request == request)
+        else {
+            return;
+        };
+        let Some(job) = view.pending.take() else {
+            return;
+        };
+        if view.release_memory
+            && let Some(doc) = self.documents.iter().find(|doc| doc.id == view.id)
+        {
+            doc.input
+                .update(cx, |input, _| input.release_accessibility_cache());
+        }
+        self.io.send(*job);
     }
     pub(super) fn reading_ready(
         &mut self,

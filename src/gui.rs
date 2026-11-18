@@ -564,6 +564,12 @@ impl Shell {
         this.refresh();
         this.subscriptions
             .push(cx.observe(&this.pane_state, |_, _, cx| cx.notify()));
+        this.subscriptions
+            .push(cx.observe_window_activation(window, |this, window, cx| {
+                if this.reading {
+                    this.prepare_inactive_reading(window, cx);
+                }
+            }));
         this
     }
     fn report_startup_ready(&mut self, source_visible: bool, window: &mut Window, cx: &App) {
@@ -2922,10 +2928,12 @@ impl Shell {
                         doc.input.read(cx).focus_handle(cx).focus(window);
                     }
                 }
+                self.prepare_inactive_reading(window, cx);
             }
             "reading-retry" => {
                 self.io.cancel_reading();
                 self.reading_view = None;
+                self.prepare_inactive_reading(window, cx);
             }
             "reading-notices" => self.reading_notices(window, cx),
             "keep-tab" => {
