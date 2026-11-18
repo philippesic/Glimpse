@@ -2574,7 +2574,7 @@ impl Shell {
                         "Close with unsaved changes?"
                     }
                     .into(),
-                    format!("Full paths:\n{names}"),
+                    names,
                     vec![
                         "Cancel",
                         if finish {
@@ -3269,10 +3269,8 @@ impl Shell {
             .map(|button| {
                 if dirty_save {
                     button.primary()
-                } else if matches!(command, "open" | "toggle-navigator" | "read" | "save") {
-                    button.outline()
                 } else {
-                    button.ghost()
+                    button.outline()
                 }
             })
             .on_click(cx.listener(move |this, _, window, cx| this.command(command, window, cx)))

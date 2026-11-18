@@ -621,6 +621,7 @@ impl Render for Preferences {
                                 Button::new("reload-preferences")
                                     .small()
                                     .compact()
+                                    .outline()
                                     .label("Reload")
                                     .tooltip("Reload preferences from disk")
                                     .disabled(self.pending)
@@ -634,6 +635,7 @@ impl Render for Preferences {
                                 Button::new("cancel-preferences")
                                     .small()
                                     .compact()
+                                    .outline()
                                     .label("Cancel")
                                     .disabled(self.pending)
                                     .on_click(cx.listener(|_, _, _, cx| cx.emit(Event::Cancel))),

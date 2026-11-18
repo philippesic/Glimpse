@@ -16,7 +16,7 @@ use ropey::Rope;
 use crate::{
     ActiveTheme as _, Icon, IconName, StyledExt, h_flex,
     highlighter::{HighlightTheme, SyntaxHighlighter},
-    scroll::ScrollableElement,
+    scroll::{ScrollableElement, Scrollbar, ScrollbarShow},
     styled::FocusableExt,
     text::{
         CodeBlockActionsFn,
@@ -1749,6 +1749,8 @@ impl Node {
                 let (scroll, focus) = controls.read(cx).clone();
                 let input_scroll = scroll.clone();
                 let input_focus = focus.clone();
+                let scrollbar =
+                    Scrollbar::horizontal(&scroll).scrollbar_show(ScrollbarShow::Always);
                 div()
                 .id(id)
                 .relative()
@@ -1868,7 +1870,6 @@ impl Node {
                             }
                             rows
                         })
-                        .horizontal_scrollbar(&scroll)
                         .map(|rendered| {
                             let row_count = table.children.len();
                             let column_count = col_lens.len();
@@ -1906,6 +1907,15 @@ impl Node {
                                 true
                             })
                         }),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .bottom_0()
+                        .left_0()
+                        .right_0()
+                        .h(rems(1.))
+                        .child(scrollbar),
                 )
                 .into_any_element()
             }
