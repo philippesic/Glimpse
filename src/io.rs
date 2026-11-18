@@ -169,6 +169,15 @@ impl serde::Serialize for TextSnapshot {
         }
     }
 }
+impl storage::RecoveryText for TextSnapshot {
+    fn byte_len(&self) -> usize {
+        match self {
+            Self::Flat(text) => text.len(),
+            Self::Revision(text) => text.len(),
+        }
+    }
+}
+
 struct RecoveryStore {
     root: PathBuf,
     session: Mutex<Option<Arc<storage::Recovery>>>,
