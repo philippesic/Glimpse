@@ -48,6 +48,7 @@ impl Shell {
         }
         self.reading_request += 1;
         let request = self.reading_request;
+        let release_memory = doc.input.read(cx).text().len() >= 1024 * 1024;
         self.reading_view = Some(View {
             request,
             id: doc.id,
@@ -55,7 +56,7 @@ impl Shell {
             path: doc.disk.path.clone(),
             theme: theme.clone(),
             content: None,
-            release_memory: doc.input.read(cx).text().len() >= 1024 * 1024,
+            release_memory,
             notes: String::new(),
             error: None,
         });
@@ -64,6 +65,7 @@ impl Shell {
             source: doc.input.read(cx).text().clone(),
             path: doc.disk.path.clone(),
             theme,
+            reclaim: release_memory.then_some(platform::release_unused_memory),
         });
     }
     pub(super) fn reading_ready(

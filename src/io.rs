@@ -29,6 +29,7 @@ pub enum Job {
         source: Rope,
         path: PathBuf,
         theme: Arc<HighlightTheme>,
+        reclaim: Option<fn()>,
     },
     CompletePath(u64, String, PathBuf),
     Visit(PathBuf),
@@ -428,6 +429,7 @@ impl IoWorker {
                             source,
                             path,
                             theme,
+                            reclaim,
                         } => {
                             if reading.load(Ordering::Relaxed) != request {
                                 continue;
@@ -445,6 +447,11 @@ impl IoWorker {
                                 crate::reading::prepare(String::from(source), &path, &theme);
                             if reading.load(Ordering::Relaxed) != request {
                                 continue;
+                            }
+                            if let Some(reclaim) = reclaim {
+                                let _work =
+                                    gpui::work_trace::Span::new("reading_prepare_memory_release");
+                                reclaim();
                             }
                             Reply::Markdown(request, Ok(Box::new(prepared)))
                         }
