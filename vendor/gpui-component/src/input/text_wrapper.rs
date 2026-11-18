@@ -4,8 +4,8 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use gpui::{
-    App, BackgroundExecutor, Font, LineFragment, Pixels, Point, ShapedLine, Size, TextSystem,
-    Window, point, px, size,
+    App, BackgroundExecutor, Font, LineFragment, Pixels, Point, PreparedTextLines, ShapedLine,
+    Size, TextRun, TextSystem, Window, WindowTextSystem, point, px, size,
 };
 use ropey::{LineType, Rope, RopeSlice};
 use smallvec::SmallVec;
@@ -441,18 +441,35 @@ impl TextWrapper {
         (bytes + checkpoints <= MAX_LAYOUT_BYTES).then_some(self)
     }
 
+    pub(super) fn prepare_opening_lines(
+        &self,
+        cache: WindowTextSystem,
+        rows: usize,
+    ) -> PreparedTextLines {
+        self.prepare_first_rows(&self.text, cache, rows, 16 * 1024)
+    }
+
     pub(super) fn prepare_glyphs(
         &self,
         text: &Rope,
-        cache: gpui::WindowTextSystem,
+        cache: WindowTextSystem,
         rows: usize,
-    ) -> Option<gpui::PreparedTextLines> {
+    ) -> Option<PreparedTextLines> {
         if text.len() < 512 * 1024 || self.wrap_width.is_none() {
             return None;
         }
         let _work = gpui::work_trace::Span::new("editor_replacement_shape_worker");
+        Some(self.prepare_first_rows(text, cache, rows, 8 * 1024))
+    }
+
+    fn prepare_first_rows(
+        &self,
+        text: &Rope,
+        cache: WindowTextSystem,
+        rows: usize,
+        mut remaining_bytes: usize,
+    ) -> PreparedTextLines {
         let mut remaining_rows = rows.min(64);
-        let mut remaining_bytes = 8 * 1024;
         'lines: for (row, layout) in self.lines.iter().enumerate() {
             let line = text.slice_line(row);
             for index in 0..layout.lines_len().min(remaining_rows) {
@@ -468,7 +485,7 @@ impl TextWrapper {
                 cache.layout_line(
                     &value,
                     self.font_size,
-                    &[gpui::TextRun {
+                    &[TextRun {
                         len: value.len(),
                         font: self.font.clone(),
                         color: gpui::black(),
@@ -483,7 +500,7 @@ impl TextWrapper {
                 break;
             }
         }
-        Some(cache.into_prepared_lines())
+        cache.into_prepared_lines()
     }
 
     pub(super) fn prepare_replacement(&mut self, text: &Rope, text_system: &Arc<TextSystem>) {

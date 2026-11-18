@@ -9,8 +9,9 @@ use gpui::{
     Action, App, AppContext, Bounds, ClipboardItem, Context, Entity, EntityInputHandler,
     EventEmitter, FocusHandle, Focusable, InteractiveElement as _, IntoElement, KeyBinding,
     KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _,
-    Pixels, Point, Render, ScrollHandle, ScrollWheelEvent, SharedString, Styled as _, Subscription,
-    Task, UTF16Selection, Window, actions, div, point, prelude::FluentBuilder as _, px,
+    Pixels, Point, PreparedTextLines, Render, ScrollHandle, ScrollWheelEvent, SharedString,
+    Styled as _, Subscription, Task, UTF16Selection, Window, WindowTextSystem, actions, div, point,
+    prelude::FluentBuilder as _, px,
 };
 use ropey::{Rope, RopeSlice};
 use serde::Deserialize;
@@ -290,6 +291,7 @@ pub struct InputState {
     defer_large_layout: bool,
     requested_layout: Option<LayoutConfig>,
     layout_task: Option<Task<()>>,
+    pub(super) opening_lines: Option<PreparedTextLines>,
     history_layout: Option<TextWrapper>,
     pub(super) history: History<Change>,
     pub(super) blink_cursor: Entity<BlinkCursor>,
@@ -456,7 +458,12 @@ impl InputState {
             && bytes >= 512 * 1024
     }
 
-    pub(super) fn prepare_layout(&mut self, config: LayoutConfig, cx: &mut Context<Self>) -> bool {
+    pub(super) fn prepare_layout(
+        &mut self,
+        config: LayoutConfig,
+        opening: Option<(&WindowTextSystem, usize)>,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if !self.prepares_large_wrapped_layout() || self.text_wrapper.matches_config(&config) {
             self.requested_layout = None;
             self.text_wrapper.prepare(
@@ -472,6 +479,13 @@ impl InputState {
         self.requested_layout = Some(config.clone());
         if self.layout_task.is_none() {
             let reflow = self.last_layout.is_some();
+            let opening = opening
+                .filter(|_| {
+                    !reflow
+                        && !self.masked
+                        && self.external_highlights.as_ref().is_some_and(Vec::is_empty)
+                })
+                .map(|(layouts, rows)| (layouts.prepare_in_separate_cache(), rows));
             let old_offset = self.layout_scroll_offset();
             let old_caret_visible = self.caret_visible(old_offset);
             let text = self.text.clone();
@@ -481,16 +495,24 @@ impl InputState {
                 let text = text.clone();
                 let config = config.clone();
                 async move {
-                    let _wrap = gpui::work_trace::Span::new(if reflow {
+                    let wrap = gpui::work_trace::Span::new(if reflow {
                         "editor_reflow_worker"
                     } else {
                         "editor_wrap_worker"
                     });
-                    TextWrapper::prepare_full_on_worker(config, text, text_system, executor).await
+                    let layout =
+                        TextWrapper::prepare_full_on_worker(config, text, text_system, executor)
+                            .await;
+                    drop(wrap);
+                    let opening_lines = opening.map(|(layouts, rows)| {
+                        let _shape = gpui::work_trace::Span::new("editor_opening_shape_worker");
+                        layout.prepare_opening_lines(layouts, rows)
+                    });
+                    (layout, opening_lines)
                 }
             });
             self.layout_task = Some(cx.spawn(async move |this, cx| {
-                let layout = task.await;
+                let (layout, opening_lines) = task.await;
                 _ = this.update(cx, |state, cx| {
                     state.layout_task.take();
                     if state.requested_layout.as_ref() == Some(&config)
@@ -503,6 +525,7 @@ impl InputState {
                         let offset = state.reflow_scroll_offset(&layout, current, keep_caret);
                         let retired = std::mem::replace(&mut state.text_wrapper, layout);
                         cx.background_spawn(async move { drop(retired) }).detach();
+                        state.opening_lines = opening_lines;
                         state.deferred_scroll_offset = offset;
                         state.mode.update_auto_grow(&state.text_wrapper);
                     }
@@ -680,6 +703,7 @@ impl InputState {
             defer_large_layout: false,
             requested_layout: None,
             layout_task: None,
+            opening_lines: None,
             history_layout: None,
             blink_cursor,
             history,
@@ -2770,31 +2794,31 @@ mod revision_tests {
         cx.update(|window, cx| {
             editor.update(cx, |state, cx| {
                 assert!(state.initial_layout_pending());
-                assert!(!state.prepare_layout(config.clone(), cx));
+                assert!(!state.prepare_layout(config.clone(), None, cx));
                 state.set_external_highlights(Vec::new(), cx);
                 state.set_value(after.clone(), window, cx);
-                assert!(!state.prepare_layout(config.clone(), cx));
+                assert!(!state.prepare_layout(config.clone(), None, cx));
             });
         });
         cx.run_until_parked();
         cx.update(|_, cx| {
             editor.update(cx, |state, cx| {
                 assert!(!state.text_wrapper.matches_config(&config));
-                assert!(!state.prepare_layout(config.clone(), cx));
-                assert!(!state.prepare_layout(final_config.clone(), cx));
+                assert!(!state.prepare_layout(config.clone(), None, cx));
+                assert!(!state.prepare_layout(final_config.clone(), None, cx));
             });
         });
         cx.run_until_parked();
         cx.update(|_, cx| {
             editor.update(cx, |state, cx| {
                 assert!(!state.text_wrapper.matches_config(&config));
-                assert!(!state.prepare_layout(final_config.clone(), cx));
+                assert!(!state.prepare_layout(final_config.clone(), None, cx));
             });
         });
         cx.run_until_parked();
         cx.update(|_, cx| {
             editor.update(cx, |state, cx| {
-                assert!(state.prepare_layout(final_config.clone(), cx));
+                assert!(state.prepare_layout(final_config.clone(), None, cx));
                 assert_eq!(state.value().as_str(), after);
                 assert_eq!(state.line_endings, LineEndings::new(&after));
                 let exact = TextWrapper::prepare_full(final_config, &state.text, cx.text_system());
@@ -2844,7 +2868,7 @@ mod revision_tests {
                     line_number_width: px(0.),
                     cursor_bounds: None,
                 });
-                assert!(state.prepare_layout(newer.clone(), cx));
+                assert!(state.prepare_layout(newer.clone(), None, cx));
                 assert!(state.text_wrapper.matches_config(&config));
                 assert!(state.replace_text_checked(None, "✓", window, cx));
                 state.deferred_scroll_offset = Some(point(
@@ -2857,7 +2881,7 @@ mod revision_tests {
         cx.update(|_, cx| {
             editor.update(cx, |state, cx| {
                 assert!(state.text_wrapper.matches_config(&config));
-                assert!(state.prepare_layout(newer.clone(), cx));
+                assert!(state.prepare_layout(newer.clone(), None, cx));
             })
         });
         cx.run_until_parked();

@@ -943,6 +943,10 @@ impl Element for TextElement {
         let style = window.text_style();
         let font = style.font();
         let text_size = style.font_size.to_pixels(window.rem_size());
+        let line_height = window.line_height();
+        let opening_rows = ((f32::from(bounds.size.height) / f32::from(line_height)).ceil()
+            as usize)
+            .saturating_add(2);
 
         let state = self.state.read(cx);
         let (line_number_width, line_number_len) =
@@ -954,14 +958,19 @@ impl Element for TextElement {
         };
         let prepared = self.state.update(cx, |state, cx| {
             let _wrap = gpui::work_trace::Span::new("editor_wrap");
-            state.prepare_layout(
+            let prepared = state.prepare_layout(
                 LayoutConfig {
                     font,
                     font_size: text_size,
                     wrap_width,
                 },
+                Some((window.text_system(), opening_rows)),
                 cx,
-            )
+            );
+            if prepared && let Some(lines) = state.opening_lines.take() {
+                window.text_system().adopt_prepared_lines(&lines);
+            }
+            prepared
         });
         if !prepared {
             return None;
@@ -969,7 +978,6 @@ impl Element for TextElement {
 
         let state = self.state.read(cx);
         let wrap_width = state.text_wrapper.wrap_width();
-        let line_height = window.line_height();
 
         let (visible_range, visible_top) =
             self.calculate_visible_range(&state, line_height, bounds.size.height);
