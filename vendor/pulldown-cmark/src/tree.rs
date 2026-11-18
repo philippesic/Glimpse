@@ -6,23 +6,37 @@
 
 //! Paged storage for a tree structure.
 
-use std::num::NonZeroUsize;
+use std::num;
 use std::ops::{Add, Sub};
 
 use crate::parse::{Item, ItemBody};
 
 const PAGE_SIZE: usize = 32 * 1024;
 
+#[cfg(feature = "compact-tree")]
+type StoredIndex = num::NonZeroU32;
+#[cfg(not(feature = "compact-tree"))]
+type StoredIndex = num::NonZeroUsize;
+
 #[derive(Debug, Eq, PartialEq, Copy, Clone, PartialOrd)]
-pub(crate) struct TreeIndex(NonZeroUsize);
+pub(crate) struct TreeIndex(StoredIndex);
 
 impl TreeIndex {
     fn new(i: usize) -> Self {
-        TreeIndex(NonZeroUsize::new(i).unwrap())
+        #[cfg(feature = "compact-tree")]
+        let i = u32::try_from(i).expect("Markdown tree index exceeds the compact range");
+        TreeIndex(StoredIndex::new(i).unwrap())
     }
 
     pub fn get(self) -> usize {
-        self.0.get()
+        #[cfg(feature = "compact-tree")]
+        {
+            self.0.get() as usize
+        }
+        #[cfg(not(feature = "compact-tree"))]
+        {
+            self.0.get()
+        }
     }
 }
 
@@ -30,7 +44,7 @@ impl Add<usize> for TreeIndex {
     type Output = TreeIndex;
 
     fn add(self, rhs: usize) -> Self {
-        let inner = self.0.get() + rhs;
+        let inner = self.get() + rhs;
         TreeIndex::new(inner)
     }
 }
@@ -39,7 +53,7 @@ impl Sub<usize> for TreeIndex {
     type Output = TreeIndex;
 
     fn sub(self, rhs: usize) -> Self {
-        let inner = self.0.get().checked_sub(rhs).unwrap();
+        let inner = self.get().checked_sub(rhs).unwrap();
         TreeIndex::new(inner)
     }
 }

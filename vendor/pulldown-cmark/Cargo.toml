@@ -8,6 +8,7 @@ description = "A pull parser for CommonMark"
 repository = "https://github.com/pulldown-cmark/pulldown-cmark"
 
 [features]
+compact-tree = []
 default = ["html"]
 html = ["dep:pulldown-cmark-escape"]
 simd = ["pulldown-cmark-escape?/simd"]

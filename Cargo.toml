@@ -32,7 +32,7 @@ serde_json = "1"
 ignore = "0.4"
 notify = "8.2"
 unicode-segmentation = "1.12"
-pulldown-cmark = { version = "0.13", default-features = false }
+pulldown-cmark = { version = "0.13", default-features = false, features = ["compact-tree"] }
 
 image = {version="0.25",default-features=false,features=["png","jpeg","gif","webp"]}
 

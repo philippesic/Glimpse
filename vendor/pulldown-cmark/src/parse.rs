@@ -2482,7 +2482,12 @@ mod test {
     #[cfg(target_pointer_width = "64")]
     fn node_size() {
         let node_size = std::mem::size_of::<Node<Item>>();
-        assert_eq!(48, node_size);
+        let expected = if cfg!(feature = "compact-tree") {
+            40
+        } else {
+            48
+        };
+        assert_eq!(expected, node_size);
     }
 
     #[test]
