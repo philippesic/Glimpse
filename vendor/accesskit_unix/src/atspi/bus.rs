@@ -18,6 +18,7 @@ use atspi::{
     proxy::{bus::BusProxy, socket::SocketProxy},
 };
 use std::{
+    collections::HashMap,
     env::var,
     sync::{Arc, OnceLock},
 };
@@ -25,8 +26,29 @@ use zbus::{
     Address, Connection, Result,
     connection::Builder,
     names::{BusName, InterfaceName, MemberName, OwnedUniqueName},
-    zvariant::{Str, Value},
+    zvariant::{DynamicType, Str, Value, as_value},
 };
+
+#[derive(serde::Serialize, zbus::zvariant::Type)]
+struct TextChangeBody<'a> {
+    kind: &'static str,
+    detail1: i32,
+    detail2: i32,
+    any_data: as_value::Serialize<'a, TextReply>,
+    properties: HashMap<&'static str, Value<'static>>,
+}
+
+impl<'a> TextChangeBody<'a> {
+    fn new(kind: &'static str, start: i32, length: i32, content: &'a TextReply) -> Self {
+        Self {
+            kind,
+            detail1: start,
+            detail2: length,
+            any_data: as_value::Serialize(content),
+            properties: HashMap::new(),
+        }
+    }
+}
 
 pub(crate) struct Bus {
     conn: Connection,
@@ -369,11 +391,8 @@ impl Bus {
                 length,
                 content,
             } => {
-                let mut body = EventBodyBorrowed::default();
-                body.kind = "insert";
-                body.detail1 = start_index;
-                body.detail2 = length;
-                body.any_data = content.into();
+                let content = TextReply(content);
+                let body = TextChangeBody::new("insert", start_index, length, &content);
                 self.emit_event(target, interface, signal, body).await
             }
             ObjectEvent::TextRemoved {
@@ -381,11 +400,8 @@ impl Bus {
                 length,
                 content,
             } => {
-                let mut body = EventBodyBorrowed::default();
-                body.kind = "delete";
-                body.detail1 = start_index;
-                body.detail2 = length;
-                body.any_data = content.into();
+                let content = TextReply(content);
+                let body = TextChangeBody::new("delete", start_index, length, &content);
                 self.emit_event(target, interface, signal, body).await
             }
             ObjectEvent::TextSelectionChanged => {
@@ -484,7 +500,7 @@ impl Bus {
         target: ObjectId,
         interface: &str,
         signal_name: &str,
-        body: EventBodyBorrowed<'_>,
+        body: impl serde::Serialize + DynamicType,
     ) -> Result<()> {
         map_or_ignoring_recoverable_error(
             self.conn

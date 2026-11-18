@@ -18,6 +18,7 @@ pub struct Decision {
     comparison: Option<[Entity<InputState>; 2]>,
     detail_scroll: ScrollHandle,
     _subscription: Subscription,
+    _comparison_subscriptions: Vec<Subscription>,
 }
 pub struct Choice(pub usize);
 impl EventEmitter<Choice> for Decision {}
@@ -82,6 +83,7 @@ impl Decision {
             comparison: None,
             detail_scroll: ScrollHandle::new(),
             _subscription: subscription,
+            _comparison_subscriptions: Vec::new(),
         }
     }
     pub fn close_actions(&mut self) {
@@ -100,7 +102,7 @@ impl Decision {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.comparison = Some(
+        let comparison =
             [("Local text", local), ("Observed disk text", observed)].map(|(label, text)| {
                 cx.new(|cx| {
                     let mut input = InputState::new(window, cx)
@@ -110,8 +112,20 @@ impl Decision {
                     input.set_accessibility_label(label, cx);
                     input
                 })
-            }),
-        );
+            });
+        self._comparison_subscriptions = comparison
+            .iter()
+            .enumerate()
+            .map(|(index, input)| {
+                let focus = input.read(cx).focus_handle(cx);
+                cx.on_focus_in(&focus, window, move |this, window, cx| {
+                    this.detail_scroll
+                        .scroll_to_item(this.subjects.len() + index);
+                    cx.defer_in(window, |_, _, cx| cx.notify());
+                })
+            })
+            .collect();
+        self.comparison = Some(comparison);
         cx.notify();
     }
 }
@@ -201,7 +215,6 @@ impl Render for Decision {
                                             )
                                         },
                                     ))
-                                    .child(self.detail.clone())
                                     .when_some(self.comparison.as_ref(), |body, inputs| {
                                         body.children(inputs.iter().enumerate().map(
                                             |(i, input)| {
@@ -217,7 +230,8 @@ impl Render for Decision {
                                                     ))
                                             },
                                         ))
-                                    }),
+                                    })
+                                    .child(self.detail.clone()),
                             )
                             .child(
                                 div().absolute().inset_0().child(

@@ -96,7 +96,7 @@ impl Shell {
     pub(super) fn resolve_conflict(
         &mut self,
         snapshot: Snapshot,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(doc) = self.documents.iter_mut().find(|doc| doc.id == snapshot.id) else {
@@ -112,6 +112,13 @@ impl Shell {
         doc.deferred_external = None;
         doc.saving = true;
         self.checks.invalidate(doc.id);
+        if self.active == Some(doc.id) {
+            if self.reading {
+                window.focus(&self.reading_focus);
+            } else {
+                doc.input.update(cx, |input, cx| input.focus(window, cx));
+            }
+        }
         match snapshot.resolution {
             Resolution::Reload => self.io.send(Job::Reload(Box::new(glimpse::io::Reload {
                 id: doc.id,

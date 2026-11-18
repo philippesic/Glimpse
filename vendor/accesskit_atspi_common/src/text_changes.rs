@@ -419,7 +419,7 @@ mod tests {
                 } => {
                     let a = start_index as usize;
                     let b = a + length as usize;
-                    assert_eq!(text[a..b].iter().collect::<String>(), content);
+                    assert_eq!(text[a..b].iter().collect::<String>(), content.to_string());
                     text.drain(a..b);
                 }
                 ObjectEvent::TextInserted {
@@ -427,8 +427,12 @@ mod tests {
                     length,
                     content,
                 } => {
-                    assert_eq!(content.chars().count(), length as usize);
-                    text.splice(start_index as usize..start_index as usize, content.chars());
+                    let chars = content.fragments().flat_map(str::chars);
+                    assert_eq!(
+                        content.fragments().flat_map(str::chars).count(),
+                        length as usize
+                    );
+                    text.splice(start_index as usize..start_index as usize, chars);
                 }
                 ObjectEvent::CaretMoved(offset) => carets.push(offset),
                 _ => {}
@@ -641,7 +645,7 @@ mod tests {
             if let ObjectEvent::TextInserted { content, .. }
             | ObjectEvent::TextRemoved { content, .. } = event
             {
-                assert!(content.chars().all(|c| c == '•'));
+                assert!(content.fragments().flat_map(str::chars).all(|c| c == '•'));
             }
         }
         let (observed, _) = apply(&before, captured);

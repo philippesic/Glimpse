@@ -692,15 +692,17 @@ impl<T: alloc::fmt::Debug + PartialEq> RangePropertyValue<Option<T>> {
     }
 }
 
+#[derive(Debug)]
 pub struct TextSnapshot(TextSnapshotContent);
 
+#[derive(Debug)]
 enum TextSnapshotContent {
     Owned(String),
     Runs(Vec<(Node, core::ops::Range<usize>)>),
 }
 
 impl TextSnapshot {
-    pub fn fragments(&self) -> impl Iterator<Item = &str> + '_ {
+    pub fn fragments(&self) -> impl DoubleEndedIterator<Item = &str> + '_ {
         let (text, runs) = match &self.0 {
             TextSnapshotContent::Owned(text) => (Some(text.as_str()), &[][..]),
             TextSnapshotContent::Runs(runs) => (None, runs.as_slice()),
@@ -709,6 +711,54 @@ impl TextSnapshot {
             runs.iter()
                 .map(|(run, range)| &run.value().unwrap()[range.clone()]),
         )
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.fragments().map(str::len).sum()
+    }
+
+    pub fn into_byte_range(self, range: core::ops::Range<usize>) -> Option<Self> {
+        if range.start > range.end || range.end > self.byte_len() {
+            return None;
+        }
+        match self.0 {
+            TextSnapshotContent::Owned(mut text) => {
+                let selected = text.get(range.clone())?;
+                if selected.len() <= text.capacity() / 2 {
+                    return Some(String::from(selected).into());
+                }
+                text.truncate(range.end);
+                if range.start != 0 {
+                    text.drain(..range.start);
+                }
+                Some(text.into())
+            }
+            TextSnapshotContent::Runs(mut runs) => {
+                let mut skip = range.start;
+                let mut remaining = range.len();
+                let mut valid = true;
+                runs.retain_mut(|(node, span)| {
+                    if skip >= span.len() {
+                        skip -= span.len();
+                        return false;
+                    }
+                    let start = span.start + skip;
+                    skip = 0;
+                    let count = remaining.min(span.end - start);
+                    remaining -= count;
+                    *span = start..start + count;
+                    valid &= node.value().unwrap().get(span.clone()).is_some();
+                    count != 0
+                });
+                valid.then_some(Self(TextSnapshotContent::Runs(runs)))
+            }
+        }
+    }
+}
+
+impl From<String> for TextSnapshot {
+    fn from(text: String) -> Self {
+        Self(TextSnapshotContent::Owned(text))
     }
 }
 

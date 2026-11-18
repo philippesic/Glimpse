@@ -16,7 +16,9 @@ use crate::{
     util::WindowBounds,
 };
 use accesskit::{ActionHandler, Role, TreeUpdate};
-use accesskit_consumer::{FilterResult, FullNodeId, NodeRef, Tree, TreeChangeHandler, TreeState};
+use accesskit_consumer::{
+    FilterResult, FullNodeId, NodeRef, TextSnapshot, Tree, TreeChangeHandler, TreeState,
+};
 use atspi_common::{InterfaceSet, Politeness, State};
 use std::fmt::{Debug, Formatter};
 use std::{
@@ -27,21 +29,21 @@ use std::{
     },
 };
 
-fn text_change(mut text: String, prefix: usize, suffix: usize) -> Option<(i32, String)> {
-    let end = text.len() - suffix;
-    let changed = &text[prefix..end];
-    let length: i32 = changed.chars().count().try_into().ok()?;
-    if length == 0 {
+fn text_change(
+    snapshot: TextSnapshot,
+    range: std::ops::Range<usize>,
+) -> Option<(i32, TextSnapshot)> {
+    if range.is_empty() {
         return None;
     }
-    if changed.len() <= text.capacity() / 2 {
-        return Some((length, changed.to_owned()));
-    }
-    text.truncate(end);
-    if prefix > 0 {
-        text.drain(..prefix);
-    }
-    Some((length, text))
+    let content = snapshot.into_byte_range(range)?;
+    let length = content
+        .fragments()
+        .flat_map(str::chars)
+        .count()
+        .try_into()
+        .ok()?;
+    Some((length, content))
 }
 
 struct AdapterChangeHandler<'a> {
@@ -171,37 +173,53 @@ impl<'a> AdapterChangeHandler<'a> {
         {
             self.leaf_text_roots.insert(id);
         }
-        let (base_index, old_text, new_text) = change.unwrap_or_else(|| {
-            (
-                0,
-                old_node.document_range().text(),
-                new_node.document_range().text(),
-            )
-        });
+        let (base_index, old_text, new_text) = change.map_or_else(
+            || {
+                (
+                    0,
+                    old_node.document_range().snapshot_text(),
+                    new_node.document_range().snapshot_text(),
+                )
+            },
+            |(base, old, new)| (base, old.into(), new.into()),
+        );
 
-        let mut old_chars = old_text.chars();
-        let mut new_chars = new_text.chars();
         let mut prefix_usv_count = base_index;
         let mut prefix_byte_count = 0;
-        loop {
-            match (old_chars.next(), new_chars.next()) {
-                (Some(old_char), Some(new_char)) if old_char == new_char => {
-                    prefix_usv_count += 1;
-                    prefix_byte_count += new_char.len_utf8();
+        {
+            let mut old_chars = old_text.fragments().flat_map(str::chars);
+            let mut new_chars = new_text.fragments().flat_map(str::chars);
+            loop {
+                match (old_chars.next(), new_chars.next()) {
+                    (Some(old_char), Some(new_char)) if old_char == new_char => {
+                        prefix_usv_count += 1;
+                        prefix_byte_count += new_char.len_utf8();
+                    }
+                    (None, None) => return,
+                    _ => break,
                 }
-                (None, None) => return,
-                _ => break,
             }
         }
 
-        let suffix_byte_count = old_text[prefix_byte_count..]
-            .chars()
+        let old_bytes = old_text.byte_len();
+        let new_bytes = new_text.byte_len();
+        let max_suffix_bytes = old_bytes.min(new_bytes) - prefix_byte_count;
+        let mut suffix_bytes = 0;
+        for (old, new) in old_text
+            .fragments()
+            .flat_map(str::chars)
             .rev()
-            .zip(new_text[prefix_byte_count..].chars().rev())
-            .take_while(|(old_char, new_char)| old_char == new_char)
-            .fold(0, |count, (c, _)| count + c.len_utf8());
+            .zip(new_text.fragments().flat_map(str::chars).rev())
+        {
+            let length = old.len_utf8();
+            if old != new || suffix_bytes + length > max_suffix_bytes {
+                break;
+            }
+            suffix_bytes += length;
+        }
 
-        if let Some((length, content)) = text_change(old_text, prefix_byte_count, suffix_byte_count)
+        if let Some((length, content)) =
+            text_change(old_text, prefix_byte_count..old_bytes - suffix_bytes)
         {
             self.adapter.emit_object_event(
                 id,
@@ -213,7 +231,8 @@ impl<'a> AdapterChangeHandler<'a> {
             );
         }
 
-        if let Some((length, content)) = text_change(new_text, prefix_byte_count, suffix_byte_count)
+        if let Some((length, content)) =
+            text_change(new_text, prefix_byte_count..new_bytes - suffix_bytes)
         {
             self.adapter.emit_object_event(
                 id,

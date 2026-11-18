@@ -3,7 +3,7 @@
 // the LICENSE-APACHE file) or the MIT license (found in
 // the LICENSE-MIT file), at your option.
 
-use accesskit_consumer::FullNodeId;
+use accesskit_consumer::{FullNodeId, TextSnapshot};
 use atspi_common::{Politeness, Role, State};
 
 use crate::{NodeIdOrRoot, Rect};
@@ -56,12 +56,12 @@ pub enum ObjectEvent {
     TextInserted {
         start_index: i32,
         length: i32,
-        content: String,
+        content: TextSnapshot,
     },
     TextRemoved {
         start_index: i32,
         length: i32,
-        content: String,
+        content: TextSnapshot,
     },
     TextSelectionChanged,
 }

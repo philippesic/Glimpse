@@ -53,6 +53,9 @@ pub enum Action {
     Save,
     SaveAs,
     SaveCopy,
+    CompareConflict,
+    ReloadDiskVersion,
+    OverwriteDiskVersion,
     Close,
     Quit,
     Back,
@@ -116,6 +119,19 @@ commands![
     (Save, "save", "Save", "Cmd+S"),
     (SaveAs, "save-as", "Save As…", "Cmd+Shift+S"),
     (SaveCopy, "save-copy", "Save Copy…", "Cmd+Alt+S"),
+    (
+        CompareConflict,
+        "compare",
+        "Compare Local and Disk Text",
+        ""
+    ),
+    (ReloadDiskVersion, "reload", "Reload Disk Version…", ""),
+    (
+        OverwriteDiskVersion,
+        "overwrite",
+        "Overwrite Disk Version…",
+        ""
+    ),
     (Close, "close", "Close Document", "Cmd+W"),
     (Quit, "quit", "Quit", "Cmd+Q"),
     (Back, "back", "Back", "Cmd+Alt+ArrowLeft"),

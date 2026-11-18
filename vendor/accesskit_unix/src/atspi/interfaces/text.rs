@@ -17,7 +17,7 @@ use zbus::{
     zvariant::{OwnedValue, Signature, Type, Value},
 };
 
-struct TextReply(TextSnapshot);
+pub(crate) struct TextReply(pub(crate) TextSnapshot);
 
 impl Type for TextReply {
     const SIGNATURE: &'static Signature = &Signature::Str;
