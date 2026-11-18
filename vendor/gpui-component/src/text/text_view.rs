@@ -157,6 +157,17 @@ pub(crate) struct ParsedContent {
     links: Arc<Vec<(SharedString, SharedString)>>,
 }
 
+impl ParsedContent {
+    fn retire(self, executor: &gpui::BackgroundExecutor) {
+        executor
+            .spawn(async move {
+                let _work = gpui::work_trace::Span::new("reading_content_retire");
+                drop(self);
+            })
+            .detach();
+    }
+}
+
 /// The type of the text view.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TextViewType {
@@ -287,6 +298,12 @@ pub(crate) struct TextViewState {
 
 impl TextViewState {
     fn new(cx: &mut Context<TextViewState>) -> Self {
+        cx.on_release(|state, cx| {
+            if let Some(Ok(content)) = state.parsed_result.take() {
+                content.retire(cx.background_executor());
+            }
+        })
+        .detach();
         let focus_handle = cx.focus_handle();
         Self {
             parent_entity: None,
@@ -650,8 +667,10 @@ impl Element for TextView {
                 smol::channel::unbounded::<Result<ParsedContent, SharedString>>();
             self.state.update(cx, {
                 let tx = tx.clone();
-                |state, _| {
-                    state.parsed_result = None;
+                |state, cx| {
+                    if let Some(Ok(content)) = state.parsed_result.take() {
+                        content.retire(cx.background_executor());
+                    }
                     state.tx = Some(tx);
                 }
             });
@@ -662,7 +681,11 @@ impl Element for TextView {
                     while let Ok(parsed_result) = rx_result.recv().await {
                         if let Some(state) = state.upgrade() {
                             _ = state.update(cx, |state, cx| {
-                                state.parsed_result = Some(parsed_result);
+                                if let Some(Ok(content)) =
+                                    state.parsed_result.replace(parsed_result)
+                                {
+                                    content.retire(cx.background_executor());
+                                }
                                 if let Some(parent_entity) = state.parent_entity {
                                     let app = &mut **cx;
                                     app.notify(parent_entity);
@@ -671,7 +694,9 @@ impl Element for TextView {
                                 cx.notify();
                             });
                         } else {
-                            // state released, stopping processing
+                            if let Ok(content) = parsed_result {
+                                content.retire(cx.background_executor());
+                            }
                             break;
                         }
                     }
