@@ -3,14 +3,57 @@ use crate::{
     text::{
         TextViewStyle,
         node::{
-            self, CodeBlock, ImageNode, InlineNode, LinkMark, NodeContext, Paragraph, Span, Table,
-            TableCell, TableRow, TextMark,
+            self, CodeBlock, ImageNode, InlineMarks, InlineNode, LinkMark, NodeContext, Paragraph,
+            Span, Table, TableCell, TableRow, TextMark,
         },
     },
 };
 use gpui::SharedString;
 use linkify::{LinkFinder, LinkKind};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use std::collections::HashSet;
+
+const MAX_SHARED_INLINE_VALUES: usize = 256;
+
+#[derive(Default)]
+struct InlineContentCache {
+    enabled: bool,
+    texts: HashSet<SharedString>,
+    marks: HashSet<InlineMarks>,
+}
+
+impl InlineContentCache {
+    fn text(&mut self, text: String) -> SharedString {
+        if !self.enabled || text.len() > 8 * 1024 {
+            return text.into();
+        }
+        if let Some(text) = self.texts.get(text.as_str()) {
+            return text.clone();
+        }
+        let text = SharedString::from(text);
+        if self.texts.len() < MAX_SHARED_INLINE_VALUES {
+            self.texts.insert(text.clone());
+        }
+        text
+    }
+
+    fn marks(&mut self, marks: Vec<(std::ops::Range<usize>, TextMark)>) -> InlineMarks {
+        if marks.is_empty() {
+            return InlineMarks::default();
+        }
+        if !self.enabled || marks.len() > 32 {
+            return marks.into();
+        }
+        if let Some(marks) = self.marks.get(marks.as_slice()) {
+            return marks.clone();
+        }
+        let marks = InlineMarks::from(marks);
+        if self.marks.len() < MAX_SHARED_INLINE_VALUES {
+            self.marks.insert(marks.clone());
+        }
+        marks
+    }
+}
 
 enum Block {
     Root,
@@ -63,11 +106,11 @@ impl Frame {
                 .map(|mark| (start..self.text.len(), mark.clone())),
         );
     }
-    fn finish_text(&mut self) {
+    fn finish_text(&mut self, cache: &mut InlineContentCache) {
         if !self.text.is_empty() {
             self.paragraph.push(
-                InlineNode::new(std::mem::take(&mut self.text))
-                    .marks(std::mem::take(&mut self.text_marks)),
+                InlineNode::new(cache.text(std::mem::take(&mut self.text)))
+                    .marks(cache.marks(std::mem::take(&mut self.text_marks))),
             );
         }
     }
@@ -112,9 +155,14 @@ impl Frame {
             self.append(&text[offset..], marks);
         }
     }
-    fn finish_pending(&mut self, marks: &[TextMark], finder: &LinkFinder) {
+    fn finish_pending(
+        &mut self,
+        marks: &[TextMark],
+        finder: &LinkFinder,
+        cache: &mut InlineContentCache,
+    ) {
         self.flush(marks, finder);
-        self.finish_text();
+        self.finish_text(cache);
         if !self.paragraph.is_empty() {
             self.children
                 .push(node::Node::Paragraph(self.paragraph.take()));
@@ -127,9 +175,10 @@ impl Frame {
         finder: &LinkFinder,
         style: &TextViewStyle,
         theme: &HighlightTheme,
+        cache: &mut InlineContentCache,
     ) -> node::Node {
         self.flush(marks, finder);
-        self.finish_text();
+        self.finish_text(cache);
         self.paragraph.set_span(Span {
             start: self.start,
             end,
@@ -151,7 +200,7 @@ impl Frame {
                 column_aligns: alignments.into_iter().map(Into::into).collect(),
             }),
             _ => {
-                self.finish_pending(marks, finder);
+                self.finish_pending(marks, finder, cache);
                 match self.kind {
                     Block::Root => {
                         self.children.shrink_to_fit();
@@ -189,6 +238,10 @@ pub(crate) fn parse(
 ) -> Result<node::Node, SharedString> {
     let mut finder = LinkFinder::new();
     finder.url_must_have_scheme(false);
+    let mut cache = InlineContentCache {
+        enabled: raw.len() >= 64 * 1024,
+        ..Default::default()
+    };
     let mut frames = vec![Frame::new(Block::Root, 0)];
     let mut marks = Vec::new();
     let mut images: Vec<Image> = Vec::new();
@@ -220,7 +273,7 @@ pub(crate) fn parse(
                     } else {
                         image.image.alt = Some(image.alt.into());
                         let frame = frames.last_mut().unwrap();
-                        frame.finish_text();
+                        frame.finish_text(&mut cache);
                         frame.paragraph.push_image(image.image);
                     }
                 }
@@ -260,7 +313,10 @@ pub(crate) fn parse(
                 marks.pop();
             }
             Event::Start(tag) => {
-                frames.last_mut().unwrap().finish_pending(&marks, &finder);
+                frames
+                    .last_mut()
+                    .unwrap()
+                    .finish_pending(&marks, &finder, &mut cache);
                 let kind = match tag {
                     Tag::Paragraph => {
                         if matches!(frames.last().unwrap().kind, Block::Item) {
@@ -295,7 +351,7 @@ pub(crate) fn parse(
                     });
                 } else if tag == TagEnd::TableCell {
                     frame.flush(&marks, &finder);
-                    frame.finish_text();
+                    frame.finish_text(&mut cache);
                     frame.paragraph.set_span(Span {
                         start: frame.start,
                         end: range.end,
@@ -309,7 +365,7 @@ pub(crate) fn parse(
                         .last_mut()
                         .unwrap()
                         .children
-                        .push(frame.finish(range.end, &marks, &finder, style, theme));
+                        .push(frame.finish(range.end, &marks, &finder, style, theme, &mut cache));
                 }
             }
             Event::Text(text) => {
@@ -363,7 +419,7 @@ pub(crate) fn parse(
             }
             Event::Rule => {
                 let frame = frames.last_mut().unwrap();
-                frame.finish_pending(&marks, &finder);
+                frame.finish_pending(&marks, &finder, &mut cache);
                 frame.children.push(node::Node::Divider);
             }
             Event::FootnoteReference(label) => frames
@@ -377,7 +433,7 @@ pub(crate) fn parse(
     Ok(frames
         .pop()
         .unwrap()
-        .finish(raw.len(), &marks, &finder, style, theme))
+        .finish(raw.len(), &marks, &finder, style, theme, &mut cache))
 }
 
 #[cfg(test)]
@@ -471,12 +527,17 @@ mod tests {
             panic!("expected a document");
         };
         assert_eq!(children.len(), count + 2);
+        let mut first_inline: Option<&InlineNode> = None;
         for index in [0, count / 2, count - 1] {
             let node::Node::Paragraph(block) = &children[index + 1] else {
                 panic!("expected a paragraph at {index}");
             };
             let span = block.span.unwrap();
             assert_eq!(span.start, start.len() + index * paragraph.len());
+            let inline = &block.children[0];
+            let first = *first_inline.get_or_insert(inline);
+            assert_eq!(inline.text.as_ptr(), first.text.as_ptr());
+            assert_eq!(inline.marks.as_ptr(), first.marks.as_ptr());
             let marks = marks_for(block, "link");
             assert!(marks.iter().any(|mark| mark.bold));
             assert!(marks.iter().any(|mark| mark
@@ -610,14 +671,19 @@ mod tests {
     #[test]
     #[ignore = "release parser CPU and memory probe; excludes native rendering and presentation"]
     fn benchmark_supported_markdown() {
-        fn paragraph_storage(paragraph: &Paragraph) -> (usize, usize, usize) {
+        fn paragraph_storage(
+            paragraph: &Paragraph,
+            texts: &mut HashSet<usize>,
+            marks: &mut HashSet<usize>,
+        ) -> (usize, usize, usize) {
             let bytes = paragraph.children.capacity() * std::mem::size_of::<InlineNode>()
                 + paragraph
                     .children
                     .iter()
                     .map(|inline| {
-                        inline.text.len()
-                            + inline.marks.capacity()
+                        usize::from(texts.insert(inline.text.as_ptr() as usize)) * inline.text.len()
+                            + usize::from(marks.insert(inline.marks.as_ptr() as usize))
+                                * inline.marks.len()
                                 * std::mem::size_of::<(std::ops::Range<usize>, TextMark)>()
                             + usize::from(inline.has_render_state())
                                 * (std::mem::size_of::<
@@ -667,6 +733,8 @@ mod tests {
                 "FINAL SUPPORTED SIZE MARKER"
             );
             if samples.len() == 1 {
+                let mut texts = HashSet::new();
+                let mut marks = HashSet::new();
                 let storage: Vec<_> = children
                     .iter()
                     .filter_map(|node| match node {
@@ -674,7 +742,7 @@ mod tests {
                         | node::Node::Heading {
                             children: paragraph,
                             ..
-                        } => Some(paragraph_storage(paragraph)),
+                        } => Some(paragraph_storage(paragraph, &mut texts, &mut marks)),
                         _ => None,
                     })
                     .collect();
@@ -745,6 +813,10 @@ mod streaming_tests {
         for seed in 0..100usize {
             let mut expected = Paragraph::default();
             let mut frame = Frame::new(Block::Paragraph, 0);
+            let mut cache = InlineContentCache {
+                enabled: true,
+                ..Default::default()
+            };
             for index in 0..seed + 10 {
                 let text = ["café 🙂", "é中文", "\r\n", "", "plain"][index % 5];
                 let mut marks = Vec::new();
@@ -778,11 +850,11 @@ mod streaming_tests {
                         ..Default::default()
                     };
                     expected.push_image(image.clone());
-                    frame.finish_text();
+                    frame.finish_text(&mut cache);
                     frame.paragraph.push_image(image);
                 }
             }
-            frame.finish_text();
+            frame.finish_text(&mut cache);
             assert_eq!(atoms(&frame.paragraph), atoms(&expected));
             assert!(frame
                 .paragraph

@@ -27,7 +27,7 @@ use crate::{
 use super::{TextViewStyle, utils::list_item_prefix};
 
 #[allow(unused)]
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
 pub struct LinkMark {
     pub url: SharedString,
     /// Optional identifier for footnotes.
@@ -35,7 +35,7 @@ pub struct LinkMark {
     pub title: Option<SharedString>,
 }
 
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
 pub struct TextMark {
     pub bold: bool,
     pub italic: bool,
@@ -114,13 +114,15 @@ impl PartialEq for ImageNode {
     }
 }
 
+pub(crate) type InlineMarks = Arc<[(Range<usize>, TextMark)]>;
+
 #[derive(Default, Clone, Debug)]
 pub(crate) struct InlineNode {
     /// The text content.
     pub(crate) text: SharedString,
     pub(crate) image: Option<Box<ImageNode>>,
     /// The text styles, each tuple contains the range of the text and the style.
-    pub(crate) marks: Vec<(Range<usize>, TextMark)>,
+    pub(crate) marks: InlineMarks,
 
     state: OnceLock<Arc<Mutex<InlineState>>>,
 }
@@ -136,7 +138,7 @@ impl InlineNode {
         Self {
             text: text.into(),
             image: None,
-            marks: vec![],
+            marks: InlineMarks::default(),
             state: OnceLock::new(),
         }
     }
@@ -147,9 +149,8 @@ impl InlineNode {
         this
     }
 
-    pub(crate) fn marks(mut self, mut marks: Vec<(Range<usize>, TextMark)>) -> Self {
-        marks.shrink_to_fit();
-        self.marks = marks;
+    pub(crate) fn marks(mut self, marks: impl Into<InlineMarks>) -> Self {
+        self.marks = marks.into();
         self
     }
 
@@ -658,7 +659,7 @@ impl Paragraph {
                 offset = 0;
             } else {
                 let mut node_highlights = vec![];
-                for (range, style) in &inline_node.marks {
+                for (range, style) in inline_node.marks.iter() {
                     let inner_range = (offset + range.start)..(offset + range.end);
 
                     let mut highlight = HighlightStyle::default();
@@ -748,7 +749,7 @@ impl Paragraph {
             .iter()
             .map(|text_node| {
                 let mut text = text_node.text.to_string();
-                for (range, style) in &text_node.marks {
+                for (range, style) in text_node.marks.iter() {
                     if style.bold {
                         text = format!("**{}**", &text_node.text[range.clone()]);
                     }
@@ -793,7 +794,7 @@ impl Node {
     ) {
         let mut paragraph = |paragraph: &Paragraph| {
             for child in &paragraph.children {
-                for (range, mark) in &child.marks {
+                for (range, mark) in child.marks.iter() {
                     if let Some(link) = &mark.link {
                         let link = link
                             .identifier
