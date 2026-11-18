@@ -12,12 +12,12 @@ Native Linux checks use disposable files and isolated settings. Exact bytes, met
 | Editing | Grapheme movement/deletion, logical Undo/Redo, Unicode requested positions, selected replacement and supported-size end edits | Complete mouse selection, middle-edit responsiveness and wrap changes |
 | International input | Real libpinyin preedit, commit, cancellation, selection replacement and external-refresh deferral; US-intl dead key | Broader composition through focus and shortcut transitions |
 | Find | Case and whole-word Unicode matching, replacement, Replace All, Undo/Redo and dismissal focus; dense supported-size correctness | Resource bounds, frame work and adversarial cancellation |
-| Markdown | Current unsaved source, selected dialect structures, bounded local images, safe relative links, literal HTML, no automatic remote image fetch, source-position return | Full dialect, long tables/fences, spoken traversal and supported-size resources |
+| Markdown | Current unsaved source, selected dialect structures, bounded local images, safe relative links, literal HTML, no automatic remote image fetch, source-position return and stable complete Unicode reading text | Full dialect, long tables and fences, and supported-size resources |
 | Coexistence | Same-timestamp replacement, binding validation, clean refresh, dirty conflict and repeated watched saves | Complete delayed and concurrent lifecycle cases on each candidate |
 | Persistence | Staged failures, real permission loss, private-mount ENOSPC/read-only/detach, exact retry and Linux metadata | Broader destination races and disconnected-device behavior |
 | Recovery | Bound and untitled restart recovery, changed disk contents, live-session isolation and intentional discard | Complete concurrent-session and interrupted-decision matrix |
 | CLI and installation | Selected wait/Finish/cancel/cleanup outcomes; installed desktop/CLI launch, icon and MIME registration | Complete picker, independent caller and destination contracts |
-| Assistive access | Real Orca X11 navigation/editing and bounded native Wayland workflows using the host's legacy AT-SPI route | Full keyboard/screen-reader tour and host key-grab compatibility |
+| Assistive access | Orca navigation and source editing using the legacy keyboard route. Complete native Wayland Markdown speech through the legacy keyboard route and Orca's public Say All service | Default Wayland key transport and complete independent keyboard and screen-reader tours |
 | Layout | Selected source, Find, Preferences, reading and dirty-close tasks across themes, densities, text scales and actual window sizes | Rendered contrast, all menus/decisions, search variants and divider interaction |
 
 ## Performance
