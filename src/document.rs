@@ -347,15 +347,22 @@ fn file_io_error(operation: &str, error: io::Error) -> String {
 }
 
 fn supported_text(bytes: &[u8]) -> Result<&str> {
-    let text = std::str::from_utf8(bytes)
+    let text = simdutf8::basic::from_utf8(bytes)
         .map_err(|_| "Only UTF-8 text is supported; the file was not changed.")?;
-    if text
-        .chars()
-        .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
-    {
+    if contains_control_bytes(text.as_bytes()) {
         return Err("This file contains binary/control data and cannot be edited.".into());
     }
     Ok(text)
+}
+
+fn contains_control_bytes(bytes: &[u8]) -> bool {
+    let ascii = bytes.iter().fold(false, |found, &byte| {
+        found | (byte < 0x20 && !matches!(byte, b'\r' | b'\n' | b'\t')) | (byte == 0x7f)
+    });
+    ascii
+        || bytes.windows(2).fold(false, |found, pair| {
+            found | (pair[0] == 0xc2 && (0x80..=0x9f).contains(&pair[1]))
+        })
 }
 
 impl DiskFile {
@@ -724,6 +731,28 @@ mod tests {
         fs::write(&path, bytes).unwrap();
         (dir, path)
     }
+
+    #[test]
+    fn utf8_byte_validation_preserves_the_unicode_control_policy() {
+        for scalar in (0..=0x10ffff).filter_map(char::from_u32) {
+            let mut encoded = [0; 4];
+            let valid = !scalar.is_control() || matches!(scalar, '\n' | '\r' | '\t');
+            assert_eq!(
+                supported_text(scalar.encode_utf8(&mut encoded).as_bytes()).is_ok(),
+                valid,
+                "{scalar:?}"
+            );
+        }
+        for malformed in [&[0xff][..], &[0xc2], &[0xed, 0xa0, 0x80], &[0xe2, 0x82]] {
+            assert!(supported_text(malformed).unwrap_err().contains("UTF-8"));
+        }
+        assert!(
+            supported_text("hello\u{85}world".as_bytes())
+                .unwrap_err()
+                .contains("control")
+        );
+    }
+
     #[test]
     fn creating_a_file_never_adopts_a_post_publish_replacement_or_retarget() {
         let root = tempfile::tempdir().unwrap();
