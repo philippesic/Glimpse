@@ -27,12 +27,18 @@ fn contrast(a: [u8; 3], b: [u8; 3]) -> f64 {
     let (a, b) = (luminance(a), luminance(b));
     (a.max(b) + 0.05) / (a.min(b) + 0.05)
 }
-/// Retain a grammar's hue while meeting normal-text contrast on the actual canvas.
-pub fn readable_rgb(rgb: [u8; 3], canvas: [u8; 3]) -> [u8; 3] {
-    if contrast(rgb, canvas) >= 4.5 {
+pub fn readable_rgb(rgb: [u8; 3], canvases: &[[u8; 3]]) -> [u8; 3] {
+    const CONTRAST_TARGET: f64 = 4.6;
+    let minimum_contrast = |color| {
+        canvases
+            .iter()
+            .map(|canvas| contrast(color, *canvas))
+            .fold(f64::INFINITY, f64::min)
+    };
+    if minimum_contrast(rgb) >= CONTRAST_TARGET {
         return rgb;
     }
-    let target = if contrast([0; 3], canvas) >= contrast([255; 3], canvas) {
+    let target = if minimum_contrast([0; 3]) >= minimum_contrast([255; 3]) {
         [0; 3]
     } else {
         [255; 3]
@@ -45,7 +51,7 @@ pub fn readable_rgb(rgb: [u8; 3], canvas: [u8; 3]) -> [u8; 3] {
     let (mut low, mut high) = (0., 1.);
     for _ in 0..12 {
         let middle = (low + high) / 2.;
-        if contrast(mix(middle), canvas) >= 4.5 {
+        if minimum_contrast(mix(middle)) >= CONTRAST_TARGET {
             high = middle;
         } else {
             low = middle;
@@ -415,20 +421,34 @@ mod tests {
     }
     #[test]
     fn syntax_colors_remain_readable_on_light_and_dark_canvases() {
-        for canvas in [[255; 3], [250, 249, 247], [22, 25, 30], [0; 3]] {
+        let themes = [
+            [[255; 3]; 4],
+            [[250, 249, 247]; 4],
+            [[22, 25, 30]; 4],
+            [[0; 3]; 4],
+            [[255; 3], [240; 3], [184, 208, 238], [140, 174, 224]],
+            [[10; 3], [24; 3], [37, 53, 98], [49, 77, 147]],
+        ];
+        for canvases in themes {
             for rgb in [
                 [150, 163, 180],
                 [192, 197, 206],
                 [143, 161, 179],
                 [208, 135, 112],
+                [106, 120, 137],
+                [147, 158, 175],
+                [0, 77, 255],
+                [8, 115, 43],
                 [20, 80, 100],
             ] {
-                let adjusted = readable_rgb(rgb, canvas);
+                let adjusted = readable_rgb(rgb, &canvases);
                 assert!(
-                    contrast(adjusted, canvas) >= 4.5,
-                    "{adjusted:?} on {canvas:?}"
+                    canvases
+                        .iter()
+                        .all(|&canvas| contrast(adjusted, canvas) >= 4.5),
+                    "{adjusted:?} on {canvases:?}"
                 );
-                if contrast(rgb, canvas) >= 4.5 {
+                if canvases.iter().all(|&canvas| contrast(rgb, canvas) >= 4.6) {
                     assert_eq!(adjusted, rgb);
                 }
             }

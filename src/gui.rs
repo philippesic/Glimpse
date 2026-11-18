@@ -2240,14 +2240,15 @@ impl Shell {
                 .iter()
                 .find(|d| d.id == highlight.id && d.generation == highlight.generation)
         {
-            let canvas = theme::canvas(cx);
+            let canvases = theme::source_canvases(cx);
             let mut colors = HashMap::new();
             let spans = highlight
                 .spans
                 .into_iter()
                 .map(|span| {
                     let color = *colors.entry(span.rgb).or_insert_with(|| {
-                        let color = glimpse::syntax::readable_rgb(span.rgb, canvas);
+                        let color =
+                            glimpse::syntax::readable_rgb(span.rgb, canvases.as_flattened());
                         rgb(((color[0] as u32) << 16) | ((color[1] as u32) << 8) | color[2] as u32)
                             .into()
                     });

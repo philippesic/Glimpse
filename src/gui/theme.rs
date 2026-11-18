@@ -1,6 +1,6 @@
 use glimpse::storage::Settings;
 use gpui::{App, Window, px};
-use gpui_component::{ActiveTheme, Theme, ThemeMode};
+use gpui_component::{ActiveTheme, Colorize, Theme, ThemeMode};
 
 pub fn apply(settings: &Settings, window: &mut Window, cx: &mut App) -> Option<String> {
     let names = cx.text_system().all_font_names();
@@ -62,11 +62,32 @@ pub fn apply(settings: &Settings, window: &mut Window, cx: &mut App) -> Option<S
     warning
 }
 
-pub fn canvas(cx: &App) -> [u8; 3] {
-    let color = cx.theme().background.to_rgb();
-    [
-        (color.r * 255.).round() as u8,
-        (color.g * 255.).round() as u8,
-        (color.b * 255.).round() as u8,
-    ]
+pub fn source_canvases(cx: &App) -> [[[u8; 3]; 5]; 2] {
+    let theme = cx.theme();
+    let style = &theme.highlight_theme.style;
+    let canvas = style.editor_background.unwrap_or(theme.background).to_rgb();
+    let active_line = style
+        .editor_active_line
+        .map_or(canvas, |color| canvas.blend(color.to_rgb()));
+    let selection = theme.selection.to_rgb();
+    let matches = theme.selection.saturation(0.1).to_rgb();
+    let states = |base: gpui::Rgba| {
+        let other_match = base.blend(matches);
+        let current_match = other_match.blend(selection);
+        [
+            base,
+            base.blend(selection),
+            other_match,
+            current_match,
+            current_match.blend(selection),
+        ]
+        .map(|color| {
+            [
+                (color.r * 255.).round() as u8,
+                (color.g * 255.).round() as u8,
+                (color.b * 255.).round() as u8,
+            ]
+        })
+    };
+    [states(canvas), states(active_line)]
 }
