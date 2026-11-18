@@ -1267,6 +1267,7 @@ impl App {
                 break;
             }
 
+            let _work = crate::work_trace::Span::new("release_entities");
             for (entity_id, mut entity) in dropped {
                 self.observers.remove(&entity_id);
                 self.event_listeners.remove(&entity_id);

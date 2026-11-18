@@ -335,7 +335,7 @@ struct Shell {
     requested: Vec<(u64, PathBuf)>,
     finished: bool,
     validation_disks: HashMap<u64, DiskFile>,
-    cleanup_texts: HashMap<u64, (u64, String)>,
+    cleanup_texts: HashMap<u64, (u64, Rope)>,
     completed: HashSet<u64>,
     validated: HashSet<u64>,
     keep_after_cleanup: HashSet<u64>,
@@ -1632,22 +1632,26 @@ impl Shell {
                     }
                 }
                 Reply::Cleared(id, generation, result) => {
+                    let _work = gpui::work_trace::Span::new("close_cleanup_acknowledge");
                     if let Some((pending_generation, text)) = self.cleanup_texts.get(&id)
                         && *pending_generation == generation
                         && let Some(doc) = self.documents.iter_mut().find(|doc| doc.id == id)
-                        && doc.input.read(cx).value().as_str() != text
+                        && {
+                            let input = doc.input.read(cx);
+                            !input.has_text_revision(text) && input.text() != text
+                        }
                     {
                         doc.generation += 1;
-                        self.io.send(Job::Recover(
+                        self.io.recover_edit(
                             id,
                             storage::Draft {
                                 path: doc.disk.path.clone(),
                                 target: Some(doc.disk.target.clone()),
-                                text: doc.input.read(cx).value().into(),
+                                text: doc.input.read(cx).text().clone(),
                                 base: doc.disk.bytes.clone(),
                                 generation: doc.generation,
                             },
-                        ));
+                        );
                     }
                     let current = self
                         .documents
@@ -2593,6 +2597,7 @@ impl Shell {
         cx.notify();
     }
     fn commit_close(&mut self, discard: bool, cx: &mut Context<Self>) {
+        let _work = gpui::work_trace::Span::new("close_request");
         if let Some(decision) = self.close_pending.as_mut() {
             decision.discard = discard;
         }
@@ -2610,10 +2615,8 @@ impl Shell {
                 if decision.finish && !discard {
                     self.keep_after_cleanup.insert(doc.id);
                 }
-                self.cleanup_texts.insert(
-                    doc.id,
-                    (doc.generation, doc.input.read(cx).value().to_string()),
-                );
+                self.cleanup_texts
+                    .insert(doc.id, (doc.generation, doc.input.read(cx).text().clone()));
                 self.io.send(Job::ClearThrough(doc.id, doc.generation));
             }
         }
