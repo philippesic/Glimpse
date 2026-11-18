@@ -1,3 +1,4 @@
+mod document_text;
 mod format;
 mod inline;
 mod node;

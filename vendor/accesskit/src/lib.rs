@@ -854,12 +854,32 @@ pub struct TextDecoration {
 // The following is based on the technique described here:
 // https://viruta.org/reducing-memory-consumption-in-librsvg-2.html
 
+#[derive(Clone, Debug)]
+struct SharedValue {
+    text: Arc<str>,
+    range: core::ops::Range<u32>,
+}
+
+impl SharedValue {
+    fn as_str(&self) -> &str {
+        &self.text[self.range.start as usize..self.range.end as usize]
+    }
+}
+
+impl PartialEq for SharedValue {
+    fn eq(&self, other: &Self) -> bool {
+        (Arc::ptr_eq(&self.text, &other.text) && self.range == other.range)
+            || self.as_str() == other.as_str()
+    }
+}
+
 #[derive(Debug, PartialEq)]
 enum PropertyValue {
     None,
     NodeIdVec(Vec<NodeId>),
     NodeId(NodeId),
     String(String),
+    SharedValue(SharedValue),
     F64(f64),
     F32(f32),
     Usize(usize),
@@ -1010,6 +1030,8 @@ enum PropertyId {
     WideWordStarts,
     HardLineStarts,
 
+    TextContentRoot,
+
     // This MUST be last.
     Unset,
 }
@@ -1029,6 +1051,7 @@ impl Clone for PropertyValue {
             Self::NodeIdVec(v) => Self::NodeIdVec(v.clone()),
             Self::NodeId(v) => Self::NodeId(*v),
             Self::String(v) => Self::String(v.clone()),
+            Self::SharedValue(v) => Self::SharedValue(v.clone()),
             Self::F64(v) => Self::F64(*v),
             Self::F32(v) => Self::F32(*v),
             Self::Usize(v) => Self::Usize(*v),
@@ -1062,6 +1085,7 @@ impl Clone for PropertyValue {
         match (self, source) {
             (Self::NodeIdVec(dest), Self::NodeIdVec(source)) => dest.clone_from(source),
             (Self::String(dest), Self::String(source)) => dest.clone_from(source),
+            (Self::SharedValue(dest), Self::SharedValue(source)) => dest.clone_from(source),
             (Self::LengthVec(dest), Self::LengthVec(source)) => clone_shared_values(dest, source),
             (Self::WordIndexVec(dest), Self::WordIndexVec(source)) => {
                 clone_shared_values(dest, source)
@@ -1157,7 +1181,15 @@ impl PartialEq for Properties {
             if matches!(value, PropertyValue::None) {
                 continue;
             }
-            if value != value_at(&other.values, other.indices.index(id)) {
+            let other = value_at(&other.values, other.indices.index(id));
+            let equal = match (value, other) {
+                (PropertyValue::String(text), PropertyValue::SharedValue(shared))
+                | (PropertyValue::SharedValue(shared), PropertyValue::String(text)) => {
+                    text == shared.as_str()
+                }
+                _ => value == other,
+            };
+            if !equal {
                 return false;
             }
             matched += 1;
@@ -2097,9 +2129,43 @@ flag_methods! {
 
 option_ref_type_getters! {
     (get_affine_property, Affine, Affine),
-    (get_string_property, str, String),
     (get_coord_vec_property, [f32], CoordVec),
     (get_text_selection_property, TextSelection, TextSelection)
+}
+
+impl PropertyIndices {
+    fn get_string_property<'a>(
+        &self,
+        values: &'a [PropertyValue],
+        id: PropertyId,
+    ) -> Option<&'a str> {
+        match self.get(values, id) {
+            PropertyValue::String(value) => Some(value),
+            PropertyValue::SharedValue(value) => Some(value.as_str()),
+            _ => None,
+        }
+    }
+}
+
+impl Node {
+    /// Use a UTF-8 byte range in shared text as the value. An invalid range leaves the value unchanged.
+    pub fn set_shared_value(&mut self, text: Arc<str>, range: core::ops::Range<usize>) -> bool {
+        let Some(value) = text.get(range.clone()) else {
+            return false;
+        };
+        let (Ok(start), Ok(end)) = (u32::try_from(range.start), u32::try_from(range.end)) else {
+            self.set_value(value);
+            return true;
+        };
+        Arc::make_mut(&mut self.properties).set(
+            PropertyId::Value,
+            PropertyValue::SharedValue(SharedValue {
+                text,
+                range: start..end,
+            }),
+        );
+        true
+    }
 }
 
 slice_type_getters! {
@@ -2224,7 +2290,9 @@ node_id_property_methods! {
     /// [`Node::next_on_line`] should point back to this node.
     (PreviousOnLine, previous_on_line, set_previous_on_line, clear_previous_on_line),
     /// The node for which this node is a popup.
-    (PopupFor, popup_for, set_popup_for, clear_popup_for)
+    (PopupFor, popup_for, set_popup_for, clear_popup_for),
+    /// A child whose text runs define the text range independently of other descendants.
+    (TextContentRoot, text_content_root, set_text_content_root, clear_text_content_root)
 }
 
 string_property_methods! {
@@ -2953,6 +3021,9 @@ macro_rules! serialize_property {
     ($self:ident, $map:ident, $index:ident, $id:ident, { $($variant:ident),+ }) => {
         match &$self.values[$index as usize] {
             PropertyValue::None => (),
+            PropertyValue::SharedValue(value) => {
+                $map.serialize_entry(&$id, value.as_str())?;
+            }
             $(PropertyValue::$variant(value) => {
                 $map.serialize_entry(&$id, &value)?;
             })*
@@ -3066,7 +3137,8 @@ impl<'de> Visitor<'de> for PropertiesVisitor {
                     MemberOf,
                     NextOnLine,
                     PreviousOnLine,
-                    PopupFor
+                    PopupFor,
+                    TextContentRoot
                 },
                 String {
                     Label,
@@ -3221,7 +3293,8 @@ impl JsonSchema for Properties {
                 MemberOf,
                 NextOnLine,
                 PreviousOnLine,
-                PopupFor
+                PopupFor,
+                TextContentRoot
             },
             String {
                 Label,
@@ -3706,6 +3779,26 @@ mod tests {
         dest.clone_from(&source);
 
         assert_eq!(dest, source.clone());
+    }
+
+    #[test]
+    fn shared_value_keeps_the_original_utf8_slice() {
+        let text: Arc<str> = Arc::from("a café z");
+        let mut node = Node::new(Role::TextRun);
+        assert!(node.set_shared_value(text.clone(), 2..7));
+        assert_eq!(node.value(), Some("café"));
+        assert_eq!(node.value().unwrap().as_ptr(), text[2..].as_ptr());
+        assert!(!node.set_shared_value(text, 2..6));
+        let mut owned = Node::new(Role::TextRun);
+        owned.set_value("café");
+        assert_eq!(node, owned);
+        #[cfg(feature = "serde")]
+        {
+            let encoded = serde_json::to_value(&node).unwrap();
+            assert_eq!(encoded, serde_json::to_value(&owned).unwrap());
+            let decoded: Node = serde_json::from_value(encoded).unwrap();
+            assert_eq!(node, decoded);
+        }
     }
 
     #[test]

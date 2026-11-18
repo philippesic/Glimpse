@@ -15,6 +15,16 @@ fn complete_leaf_run(node: &Node) -> bool {
         })
 }
 
+fn text_owner<'a>(node: &NodeRef<'a>) -> Option<NodeRef<'a>> {
+    match node.data().text_content_root() {
+        Some(id) => node
+            .tree_state
+            .node_by_tree_local_id(id, node.locate().1)
+            .filter(|child| child.parent_id() == Some(node.id()) && !child.is_graft()),
+        None => Some(*node),
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct FlatText {
     children: Vec<NodeId>,
@@ -67,8 +77,9 @@ impl FlatText {
         if node.is_password_input() || node.is_graft() {
             return None;
         }
-        if self.children != node.data().children() || self.children.is_empty() {
-            self.initialize(node)?;
+        let owner = text_owner(node)?;
+        if self.children != owner.data().children() || self.children.is_empty() {
+            self.initialize(&owner)?;
         }
         let index = *self.indices.get(&position.node)?;
         let child = node
@@ -97,13 +108,20 @@ impl FlatText {
             || new.is_graft()
             || old.locate().1 != tree_id
             || new.locate().1 != tree_id
-            || old.data().children() != new.data().children()
         {
             *self = Self::default();
             return None;
         }
+        let (Some(old), Some(new)) = (text_owner(old), text_owner(new)) else {
+            *self = Self::default();
+            return None;
+        };
+        if old.id() != new.id() || old.data().children() != new.data().children() {
+            *self = Self::default();
+            return None;
+        }
         if self.children != old.data().children() || self.children.is_empty() {
-            self.initialize(old)?;
+            self.initialize(&old)?;
         }
         let mut changed = Vec::new();
         for (id, node) in updates {
@@ -209,6 +227,69 @@ mod tests {
     }
     fn build(values: &[String]) -> (Adapter, Arc<Mutex<Vec<ObjectEvent>>>) {
         build_with_role(values, Role::MultilineTextInput)
+    }
+
+    #[test]
+    fn separate_document_text_ignores_painted_changes_and_keeps_scalar_offsets() {
+        use super::FlatText;
+        use accesskit_consumer::Tree;
+
+        let id = NodeId(1);
+        let owner = NodeId(2);
+        let painted = NodeId(3);
+        let first = NodeId(4);
+        let last = NodeId(5);
+        let mut document = Node::new(Role::Document);
+        document.set_children([owner, painted]);
+        document.set_text_content_root(owner);
+        let mut content = Node::new(Role::GenericContainer);
+        content.set_hidden();
+        content.set_children([first, last]);
+        let tree = |paint: &str, ending: &str| {
+            Tree::new(
+                TreeUpdate {
+                    tree: Some(TreeInfo::new(id)),
+                    ..update(vec![
+                        (id, document.clone()),
+                        (owner, content.clone()),
+                        (painted, run(paint)),
+                        (first, run("🦀\n")),
+                        (last, run(ending)),
+                    ])
+                },
+                true,
+            )
+        };
+        let old = tree("viewport text", "é before");
+        let node = old.state().node_by_tree_local_id(id, TreeId::ROOT).unwrap();
+        let mut flat = FlatText::default();
+        assert_eq!(
+            flat.position(
+                &node,
+                TextPosition {
+                    node: last,
+                    character_index: 1
+                }
+            ),
+            Some(3)
+        );
+        let new = tree("another viewport", "é before");
+        let painted_only = vec![(painted, run("another viewport"))];
+        let new_document = new.state().node_by_tree_local_id(id, TreeId::ROOT).unwrap();
+        assert_eq!(
+            flat.extract(&node, &new_document, TreeId::ROOT, &painted_only),
+            Some((0, String::new(), String::new()))
+        );
+        let edit = vec![(last, run("é after"))];
+        let changed_tree = tree("another viewport", "é after");
+        let changed = changed_tree
+            .state()
+            .node_by_tree_local_id(id, TreeId::ROOT)
+            .unwrap();
+        assert_eq!(
+            flat.extract(&node, &changed, TreeId::ROOT, &edit),
+            Some((2, "é before".into(), "é after".into()))
+        );
     }
 
     #[test]

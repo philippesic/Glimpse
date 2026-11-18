@@ -819,6 +819,14 @@ impl<'a> Range<'a> {
 
     pub fn text(&self) -> String {
         let mut result = String::new();
+        if self.start.node.id() != self.end.node.id() && !self.node.text_runs_need_masking() {
+            let mut bytes = 0;
+            self.traverse_text(|_, text| {
+                bytes += text.len();
+                None::<()>
+            });
+            result.reserve_exact(bytes);
+        }
         self.write_text(&mut result).unwrap();
         result
     }
@@ -1026,11 +1034,30 @@ impl WeakRange {
     }
 }
 
-fn text_node_filter(root_id: FullNodeId, node: &NodeRef) -> FilterResult {
-    if node.id() == root_id || node.role() == Role::TextRun {
-        FilterResult::Include
-    } else {
-        FilterResult::ExcludeNode
+fn text_node_filter(root: &NodeRef<'_>) -> impl Fn(&NodeRef<'_>) -> FilterResult + use<> {
+    let root_id = root.id();
+    let content = root
+        .data()
+        .text_content_root()
+        .map(|id| root_id.with_same_tree(id));
+    move |node| {
+        if node.id() == root_id {
+            return FilterResult::Include;
+        }
+        if let Some(content) = content {
+            return if node.id() == content {
+                FilterResult::ExcludeNode
+            } else if node.parent_id() == Some(content) && node.role() == Role::TextRun {
+                FilterResult::Include
+            } else {
+                FilterResult::ExcludeSubtree
+            };
+        }
+        if node.role() == Role::TextRun {
+            FilterResult::Include
+        } else {
+            FilterResult::ExcludeNode
+        }
     }
 }
 
@@ -1512,8 +1539,7 @@ impl<'a> NodeRef<'a> {
     }
 
     pub(crate) fn text_runs(&self) -> impl DoubleEndedIterator<Item = NodeRef<'a>> + use<'a> {
-        let id = self.id();
-        self.filtered_children(move |node| text_node_filter(id, node))
+        self.filtered_children(text_node_filter(self))
     }
 
     fn characters(&self) -> impl Iterator<Item = &'a str> + use<'a> {
@@ -1535,16 +1561,14 @@ impl<'a> NodeRef<'a> {
         &self,
         root_node: &NodeRef,
     ) -> impl DoubleEndedIterator<Item = NodeRef<'a>> + use<'a> {
-        let id = root_node.id();
-        self.following_filtered_siblings(move |node| text_node_filter(id, node))
+        self.following_filtered_siblings(text_node_filter(root_node))
     }
 
     fn preceding_text_runs(
         &self,
         root_node: &NodeRef,
     ) -> impl DoubleEndedIterator<Item = NodeRef<'a>> + use<'a> {
-        let id = root_node.id();
-        self.preceding_filtered_siblings(move |node| text_node_filter(id, node))
+        self.preceding_filtered_siblings(text_node_filter(root_node))
     }
 
     pub fn supports_text_ranges(&self) -> bool {
@@ -1625,8 +1649,7 @@ impl<'a> NodeRef<'a> {
     /// Returns the nearest text position to the given point
     /// in this node's coordinate space.
     pub fn text_position_at_point(&self, point: Point) -> Position<'_> {
-        let id = self.id();
-        if let Some((node, point)) = self.hit_test(point, &move |node| text_node_filter(id, node)) {
+        if let Some((node, point)) = self.hit_test(point, &text_node_filter(self)) {
             if node.role() == Role::TextRun {
                 let pos = InnerPosition::at(node, character_index_at_point(&node, self, point));
                 return Position {
@@ -2374,6 +2397,72 @@ mod tests {
                 .node_by_id(nid(NodeId(1)))
                 .unwrap()
                 .supports_text_ranges()
+        );
+    }
+
+    #[test]
+    fn document_text_root_ignores_painted_text_and_preserves_paragraphs() {
+        use accesskit::{Node, TreeId, TreeInfo, TreeUpdate};
+        use alloc::{vec, vec::Vec};
+
+        fn run(value: &str) -> Node {
+            let mut run = Node::new(Role::TextRun);
+            run.set_value(value);
+            run.set_character_lengths(
+                value
+                    .chars()
+                    .map(|c| c.len_utf8() as u8)
+                    .collect::<Vec<_>>(),
+            );
+            run.set_word_starts([0]);
+            run
+        }
+
+        let document_id = NodeId(1);
+        let content_id = NodeId(2);
+        let painted_id = NodeId(3);
+        let mut document = Node::new(Role::Document);
+        document.set_children([content_id, painted_id]);
+        document.set_text_content_root(content_id);
+        let mut content = Node::new(Role::GenericContainer);
+        content.set_hidden();
+        content.set_children([NodeId(4), NodeId(5), NodeId(6)]);
+        let mut painted = Node::new(Role::Label);
+        painted.set_children([NodeId(7)]);
+        let mut opening = run("Café");
+        opening.set_text_run_continues_after();
+        let mut separator = run("\n");
+        separator.set_text_run_continues_before();
+        let tree = crate::Tree::new(
+            TreeUpdate {
+                tree_id: TreeId::ROOT,
+                tree: Some(TreeInfo::new(document_id)),
+                focus: document_id,
+                nodes: vec![
+                    (document_id, document),
+                    (content_id, content),
+                    (painted_id, painted),
+                    (NodeId(4), opening),
+                    (NodeId(5), separator),
+                    (NodeId(6), run("Final")),
+                    (NodeId(7), run("Café")),
+                ],
+            },
+            true,
+        );
+        let state = tree.state();
+        let document = state.node_by_id(nid(document_id)).unwrap();
+        assert_eq!(document.document_range().text(), "Café\nFinal");
+        assert_eq!(document.document_end().to_global_usv_index(), 10);
+        let first_line = document.document_start().forward_to_line_end();
+        assert_eq!(first_line.to_global_usv_index(), 5);
+        assert_eq!(
+            state
+                .node_by_id(nid(painted_id))
+                .unwrap()
+                .document_range()
+                .text(),
+            "Café"
         );
     }
 

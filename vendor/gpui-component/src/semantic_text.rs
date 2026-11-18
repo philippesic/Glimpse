@@ -149,21 +149,26 @@ pub(crate) fn text_run(value: &str, lengths: Vec<u8>, words: Vec<u16>) -> Node {
         _ => None,
     };
     let build = || {
-        let mut run = Node::new(Role::TextRun);
+        let mut run = text_run_with_boundaries(lengths, words);
         run.set_value(value);
-        run.set_character_lengths(lengths);
-        if words.last().is_none_or(|&word| word <= u8::MAX.into()) {
-            run.set_word_starts(words.into_iter().map(|word| word as u8).collect::<Vec<_>>());
-        } else {
-            run.set_wide_word_starts(words);
-        }
-        run.set_text_direction(TextDirection::LeftToRight);
         run
     };
     match shared {
         Some(shared) => shared.get_or_init(build).clone(),
         None => build(),
     }
+}
+
+pub(crate) fn text_run_with_boundaries(lengths: Vec<u8>, words: Vec<u16>) -> Node {
+    let mut run = Node::new(Role::TextRun);
+    run.set_character_lengths(lengths);
+    if words.last().is_none_or(|&word| word <= u8::MAX.into()) {
+        run.set_word_starts(words.into_iter().map(|word| word as u8).collect::<Vec<_>>());
+    } else {
+        run.set_wide_word_starts(words);
+    }
+    run.set_text_direction(TextDirection::LeftToRight);
+    run
 }
 
 pub(crate) fn text(

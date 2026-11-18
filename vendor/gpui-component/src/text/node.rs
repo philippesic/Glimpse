@@ -1,6 +1,6 @@
 use std::{
-    collections::HashMap,
-    ops::Range,
+    collections::{HashMap, HashSet},
+    ops::{Deref, Range},
     sync::{Arc, Mutex, OnceLock},
 };
 
@@ -116,10 +116,52 @@ impl PartialEq for ImageNode {
 
 pub(crate) type InlineMarks = Arc<[(Range<usize>, TextMark)]>;
 
+#[derive(Clone, Debug)]
+pub(crate) enum InlineText {
+    Owned(SharedString),
+    Shared { text: Arc<str>, range: Range<u32> },
+}
+
+impl InlineText {
+    pub(crate) fn as_str(&self) -> &str {
+        match self {
+            Self::Owned(text) => text.as_str(),
+            Self::Shared { text, range } => &text[range.start as usize..range.end as usize],
+        }
+    }
+
+    pub(super) fn shared(&self) -> Arc<str> {
+        match self {
+            Self::Owned(text) => text.clone().into(),
+            Self::Shared { .. } => Arc::from(self.as_str()),
+        }
+    }
+}
+
+impl Default for InlineText {
+    fn default() -> Self {
+        Self::Owned(SharedString::default())
+    }
+}
+
+impl Deref for InlineText {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl PartialEq for InlineText {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
 #[derive(Default, Clone, Debug)]
 pub(crate) struct InlineNode {
     /// The text content.
-    pub(crate) text: SharedString,
+    pub(crate) text: InlineText,
     pub(crate) image: Option<Box<ImageNode>>,
     /// The text styles, each tuple contains the range of the text and the style.
     pub(crate) marks: InlineMarks,
@@ -136,7 +178,7 @@ impl PartialEq for InlineNode {
 impl InlineNode {
     pub(crate) fn new(text: impl Into<SharedString>) -> Self {
         Self {
-            text: text.into(),
+            text: InlineText::Owned(text.into()),
             image: None,
             marks: InlineMarks::default(),
             state: OnceLock::new(),
@@ -790,12 +832,23 @@ impl Paragraph {
 }
 
 impl Node {
-    pub(crate) fn links(
-        &self,
-        context: &NodeContext,
-        links: &mut Vec<(SharedString, SharedString)>,
+    pub(crate) fn links(&self, context: &NodeContext) -> Vec<(SharedString, SharedString)> {
+        let mut links = Vec::new();
+        let mut seen = HashSet::new();
+        self.visit_links(context, &mut |label, url| {
+            if seen.insert((label, url)) {
+                links.push((label.to_owned().into(), url.clone()));
+            }
+        });
+        links
+    }
+
+    fn visit_links<'a>(
+        &'a self,
+        context: &'a NodeContext,
+        visit: &mut impl FnMut(&'a str, &'a SharedString),
     ) {
-        let mut paragraph = |paragraph: &Paragraph| {
+        let mut paragraph = |paragraph: &'a Paragraph| {
             for child in &paragraph.children {
                 for (range, mark) in child.marks.iter() {
                     if let Some(link) = &mark.link {
@@ -805,10 +858,7 @@ impl Node {
                             .and_then(|id| context.link_refs.get(id))
                             .unwrap_or(link);
                         if !link.url.is_empty() {
-                            links.push((
-                                child.text[range.clone()].to_owned().into(),
-                                link.url.clone(),
-                            ));
+                            visit(&child.text[range.clone()], &link.url);
                         }
                     }
                 }
@@ -820,7 +870,13 @@ impl Node {
                             .and_then(|id| context.link_refs.get(id))
                             .unwrap_or(link);
                         if !link.url.is_empty() {
-                            links.push((image.title().into(), link.url.clone()));
+                            let label = image
+                                .title
+                                .as_ref()
+                                .or(image.alt.as_ref())
+                                .map(SharedString::as_str)
+                                .unwrap_or_default();
+                            visit(label, &link.url);
                         }
                     }
                 }
@@ -829,14 +885,14 @@ impl Node {
         match self {
             Node::Root { children } => {
                 for child in children.iter() {
-                    child.links(context, links)
+                    child.visit_links(context, visit)
                 }
             }
             Node::List { children, .. }
             | Node::ListItem { children, .. }
             | Node::Blockquote { children } => {
                 for child in children {
-                    child.links(context, links)
+                    child.visit_links(context, visit)
                 }
             }
             Node::Paragraph(text) | Node::Heading { children: text, .. } => paragraph(text),

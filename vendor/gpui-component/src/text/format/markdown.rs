@@ -589,8 +589,7 @@ mod tests {
         let style = TextViewStyle::default();
         let mut context = NodeContext::default();
         let root = parse(source, &style, &mut context, &style.highlight_theme).unwrap();
-        let mut links = vec![];
-        root.links(&context, &mut links);
+        let links = root.links(&context);
         assert_eq!(
             links
                 .iter()

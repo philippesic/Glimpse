@@ -15,7 +15,10 @@ use smol::stream::StreamExt;
 
 use crate::highlighter::HighlightTheme;
 use crate::scroll::ScrollableElement;
-use crate::text::node::CodeBlock;
+use crate::text::{
+    document_text::{DocumentSource, DocumentText},
+    node::CodeBlock,
+};
 use crate::{ActiveTheme, StyledExt, v_flex};
 use crate::{
     global_state::GlobalState,
@@ -25,6 +28,7 @@ use crate::{
         node::{self, NodeContext},
     },
 };
+use gpui::accessibility::TextRunIds;
 
 const CONTEXT: &'static str = "TextView";
 
@@ -64,9 +68,9 @@ impl RenderOnce for TextViewElement {
                         if !content.links.is_empty() {
                             if let Some(handler) = node_cx.resources.on_link.clone() {
                                 use crate::{
-                                    menu::{DropdownMenu, PopupMenuItem},
-                                    button::Button,
                                     Sizable,
+                                    button::Button,
+                                    menu::{DropdownMenu, PopupMenuItem},
                                 };
                                 let links = content.links.clone();
                                 container = container.child(
@@ -150,6 +154,7 @@ pub struct TextView {
     selectable: bool,
     scrollable: bool,
     prose_width: Option<Pixels>,
+    stable_accessibility: bool,
     code_block_actions: Option<Arc<CodeBlockActionsFn>>,
 }
 
@@ -158,6 +163,8 @@ pub(crate) struct ParsedContent {
     pub(crate) root_node: node::Node,
     pub(crate) node_cx: node::NodeContext,
     links: Arc<Vec<(SharedString, SharedString)>>,
+    document_text: Option<DocumentText>,
+    document_source: Option<DocumentSource>,
 }
 
 impl ParsedContent {
@@ -190,11 +197,20 @@ impl ParsedMarkdown {
             on_image,
         ))
     }
+
+    pub fn share_reading_text_storage(&mut self) {
+        if let Ok(content) = &mut self.0 {
+            if content.document_source.is_none() {
+                content.document_source = Some(DocumentSource::new(&mut content.root_node));
+            }
+        }
+    }
 }
 
 pub struct MarkdownView {
     id: ElementId,
     state: Entity<TextViewState>,
+    stable_accessibility: bool,
 }
 
 impl MarkdownView {
@@ -206,8 +222,13 @@ impl MarkdownView {
         on_retired: Option<fn()>,
         cx: &mut App,
     ) -> Self {
+        let stable_accessibility = content
+            .0
+            .as_ref()
+            .is_ok_and(|content| content.document_source.is_some());
         Self {
             id: id.into(),
+            stable_accessibility,
             state: cx.new(|cx| {
                 let mut state = TextViewState::new(cx, on_retired);
                 state.parsed_result = Some(content.0);
@@ -228,6 +249,7 @@ impl MarkdownView {
             selectable: true,
             scrollable: true,
             prose_width: Some(prose_width),
+            stable_accessibility: self.stable_accessibility,
             code_block_actions: None,
         }
         .into_any_element()
@@ -350,6 +372,7 @@ pub(crate) struct TextViewState {
     parent_entity: Option<EntityId>,
     tx: Option<smol::channel::Sender<Update>>,
     parsed_result: Option<Result<ParsedContent, SharedString>>,
+    pending_document_text: Option<TextRunIds>,
     resources: Arc<super::TextViewResources>,
     focus_handle: Option<FocusHandle>,
     focus_after_parse: bool,
@@ -376,6 +399,7 @@ impl TextViewState {
             parent_entity: None,
             tx: None,
             parsed_result: None,
+            pending_document_text: None,
             resources: Arc::default(),
             focus_handle: Some(focus_handle),
             focus_after_parse: false,
@@ -389,6 +413,50 @@ impl TextViewState {
 }
 
 impl TextViewState {
+    fn prepared_content(&mut self) -> Option<&mut ParsedContent> {
+        self.parsed_result.as_mut()?.as_mut().ok()
+    }
+
+    fn prepare_document_text(&mut self, owner: TextRunIds, cx: &mut Context<Self>) {
+        if self.pending_document_text == Some(owner) {
+            return;
+        }
+        let Some(content) = self.prepared_content() else {
+            return;
+        };
+        if content
+            .document_text
+            .as_ref()
+            .is_some_and(|text| text.owner == owner)
+        {
+            return;
+        }
+        let Some(source) = content.document_source.clone() else {
+            return;
+        };
+        self.pending_document_text = Some(owner);
+        let task = cx.background_spawn(async move {
+            let _work = gpui::work_trace::Span::new("reading_accessible_text_worker");
+            DocumentText::new(&source, owner)
+        });
+        cx.spawn(async move |state, cx| {
+            let mut prepared = Some(task.await);
+            let _ = state.update(cx, |state, cx| {
+                if state.pending_document_text == Some(owner) {
+                    if let Some(content) = state.prepared_content() {
+                        std::mem::swap(&mut content.document_text, &mut prepared);
+                        cx.notify();
+                    }
+                    state.pending_document_text = None;
+                }
+            });
+            if let Some(retired) = prepared {
+                cx.background_spawn(async move { drop(retired) }).detach();
+            }
+        })
+        .detach();
+    }
+
     /// Save bounds and unselect if bounds changed.
     fn update_bounds(&mut self, bounds: Bounds<Pixels>) {
         if self.bounds.size != bounds.size {
@@ -571,6 +639,7 @@ impl TextView {
             selectable: false,
             scrollable: false,
             prose_width: None,
+            stable_accessibility: false,
             code_block_actions: None,
         }
     }
@@ -603,6 +672,7 @@ impl TextView {
             selectable: false,
             scrollable: false,
             prose_width: None,
+            stable_accessibility: false,
             code_block_actions: None,
         }
     }
@@ -871,42 +941,88 @@ impl Element for TextView {
             .into_any_element();
         let semantic_state = self.state.clone();
         let action_state = self.state.clone();
-        el = gpui::accessible("reading-document", el, move |_, window, cx| {
-            use gpui::accesskit::{Node, Role, Action};
-            let state = semantic_state.read(cx);
-            let mut node = Node::new(Role::Document);
-            node.set_label("Reading view");
-            node.set_read_only();
-            node.add_action(Action::Focus);
-            node.add_action(Action::ScrollDown);
-            node.add_action(Action::ScrollUp);
-            let mut info = gpui::AccessibilityInfo::new(node);
-            info.focused = state
-                .focus_handle
-                .as_ref()
-                .is_some_and(|focus| focus.is_focused(window));
-            info
+        let stable_accessibility = self.stable_accessibility;
+        el = gpui::accessible("reading-document", el, move |id, window, cx| {
+            use gpui::accesskit::{Action, Node, Role};
+            semantic_state.update(cx, |state, cx| {
+                let mut node = Node::new(Role::Document);
+                node.set_label("Reading view");
+                node.set_read_only();
+                node.add_action(Action::Focus);
+                node.add_action(Action::ScrollDown);
+                node.add_action(Action::ScrollUp);
+                let mut text = None;
+                if stable_accessibility {
+                    let owner = window.accessibility_text_run_ids(id);
+                    let content_id = owner.get(0);
+                    node.set_text_content_root(content_id);
+                    state.prepare_document_text(owner, cx);
+                    if let Some(content) = state.prepared_content() {
+                        if let Some(document) = content
+                            .document_text
+                            .as_ref()
+                            .filter(|doc| doc.owner == owner)
+                        {
+                            node.set_children([content_id]);
+                            node.set_text_revision(1);
+                            if let Some(selection) = document.selection {
+                                node.add_action(Action::SetTextSelection);
+                                node.set_text_selection(selection);
+                            }
+                            text = Some(document.nodes.clone());
+                        } else {
+                            node.set_busy();
+                        }
+                    } else if state.parsed_result.is_none() {
+                        node.set_busy();
+                    }
+                }
+                let mut info = gpui::AccessibilityInfo::new(node);
+                if let Some(text) = text {
+                    info.text = text;
+                }
+                info.focused = state
+                    .focus_handle
+                    .as_ref()
+                    .is_some_and(|focus| focus.is_focused(window));
+                info
+            })
         })
-        .on_action(move |request, _, window, cx| {
-            action_state.update(cx, |state, cx| {
-                use gpui::accesskit::Action;
-                match request.action {
-                    Action::Focus => {
+        .on_checked_action(move |request, _, window, cx| {
+            use gpui::accesskit::{Action, ActionData};
+            let applied = action_state.update(cx, |state, cx| {
+                match (request.action, request.data) {
+                    (Action::Focus, _) => {
                         if let Some(focus) = &state.focus_handle {
-                            focus.focus(window)
+                            focus.focus(window);
+                        } else {
+                            return false;
                         }
                     }
-                    Action::ScrollDown => state
+                    (Action::ScrollDown, _) => state
                         .list_state
                         .scroll_by(state.bounds.size.height.max(px(100.))),
-                    Action::ScrollUp => state
+                    (Action::ScrollUp, _) => state
                         .list_state
                         .scroll_by(-state.bounds.size.height.max(px(100.))),
-                    _ => return,
+                    (Action::SetTextSelection, Some(ActionData::SetTextSelection(selection))) => {
+                        if !state
+                            .prepared_content()
+                            .and_then(|content| content.document_text.as_mut())
+                            .is_some_and(|text| text.set_selection(selection))
+                        {
+                            return false;
+                        }
+                    }
+                    _ => return false,
                 }
                 cx.notify();
+                true
             });
-            window.refresh();
+            if applied {
+                window.refresh();
+            }
+            applied
         })
         .into_any_element();
         let layout_id = el.request_layout(window, cx);
@@ -1041,14 +1157,13 @@ fn parse_content(
         TextViewType::Html => super::format::html::parse(text, &mut node_cx),
     };
     res.map(move |root_node| {
-        let mut links = vec![];
-        root_node.links(&node_cx, &mut links);
-        let mut seen = std::collections::HashSet::new();
-        links.retain(|link| seen.insert(link.clone()));
+        let links = root_node.links(&node_cx);
         ParsedContent {
             root_node,
             node_cx,
             links: Arc::new(links),
+            document_text: None,
+            document_source: None,
         }
     })
 }

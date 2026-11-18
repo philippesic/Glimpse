@@ -54,12 +54,13 @@ fn decoded_path(value: &str) -> Option<PathBuf> {
 }
 pub fn prepare(source: String, path: &Path, theme: &HighlightTheme) -> Prepared {
     let mut destinations = Vec::new();
-    let markdown = ParsedMarkdown::new(&source, theme, |url| {
+    let mut markdown = ParsedMarkdown::new(&source, theme, |url| {
         if destinations.len() <= MAX_READ_IMAGES && !destinations.iter().any(|item| item == url) {
             destinations.push(url.to_owned());
         }
     });
     drop(source);
+    markdown.share_reading_text_storage();
     let mut images = HashMap::new();
     let mut notes = vec![];
     if destinations.len() > MAX_READ_IMAGES {
