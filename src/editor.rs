@@ -3,48 +3,31 @@ use egui::{
     self,
     text::{CCursor, CCursorRange},
 };
+use gpui_component::input::{LineType, Rope};
 use unicode_segmentation::UnicodeSegmentation;
 
-pub fn position(text: &str, line: usize, column: usize) -> (usize, bool) {
+pub fn source_position(text: &Rope, line: usize, column: usize) -> (usize, bool) {
     if line <= 1 && column <= 1 {
         return (0, false);
     }
-    let mut ranges = line_ranges(text);
-    let mut selected = 0..0;
-    let mut clamped = false;
-    for index in 0..line.max(1) {
-        if let Some(range) = ranges.next() {
-            selected = range;
-        } else {
-            clamped = true;
-            selected = text.len()..text.len();
-            break;
-        }
-        if index + 1 == line.max(1) {
-            break;
+    let row = line.saturating_sub(1);
+    if row >= text.len_lines(LineType::LF_CR) {
+        return (text.len(), true);
+    }
+
+    let start = text.line_to_byte_idx(row, LineType::LF_CR);
+    let mut end = text.line_to_byte_idx(row + 1, LineType::LF_CR);
+    for ending in [b'\n', b'\r'] {
+        if end > start && text.byte(end - 1) == ending {
+            end -= 1;
         }
     }
-    let offset = selected.start;
-    let value = &text[selected];
-    let requested = value
-        .char_indices()
-        .map(|(byte, _)| byte)
-        .chain(std::iter::once(value.len()))
-        .nth(column.saturating_sub(1))
-        .unwrap_or_else(|| {
-            clamped = true;
-            value.len()
-        });
-    let boundary = value
-        .grapheme_indices(true)
-        .map(|v| v.0)
-        .chain(std::iter::once(value.len()))
-        .take_while(|&v| v <= requested)
-        .last()
-        .unwrap_or(0);
-    clamped |= boundary != requested;
-    (text[..offset + boundary].chars().count(), clamped)
+    let line = text.slice(start..end);
+    let requested = column.saturating_sub(1);
+    let scalar = requested.min(line.len_chars());
+    (start + line.char_to_byte_idx(scalar), requested != scalar)
 }
+
 #[cfg(test)]
 pub fn replace(ctx: &egui::Context, id: egui::Id, old: &str, new: &str) {
     if let Some(mut state) = egui::TextEdit::load_state(ctx, id) {
@@ -79,13 +62,37 @@ mod tests {
         assert_eq!(metadata.starts, vec![0, 6]);
     }
     #[test]
-    fn positions_clamp_to_graphemes() {
-        assert_eq!(position("a👨‍👩‍👧b\nlast", 1, 4), (1, true));
-        assert_eq!(position("a\nlast", 2, 3), (4, false));
-        assert_eq!(position("a", 9, 9), (1, true));
-        assert_eq!(position("", 1, 1), (0, false));
-        assert_eq!(position("🦀", 1, 2), (1, false));
-        assert_eq!(position("🦀", 1, 3), (1, true));
+    fn source_positions_match_text_coordinates_across_rope_chunks() {
+        for text in [
+            String::new(),
+            "a👨‍👩‍👧b\nlast".into(),
+            "One 🦀 line\r\ntwo\rthree\n\r\n\r".into(),
+            format!("{}\ra\u{301}🦀\r\nz", "🌕".repeat(864)),
+            "é\u{2028}ç\u{0085}ä".into(),
+        ] {
+            let rope = Rope::from(text.as_str());
+            let lines: Vec<_> = line_ranges(&text).collect();
+            for row in 0..=lines.len() + 1 {
+                let range = lines.get(row.saturating_sub(1));
+                for column in [0usize, 1, 2, 3, 4, 5, 32, 864, 865, 866, usize::MAX] {
+                    let expected = range.map_or((text.len(), true), |range| {
+                        let line = &text[range.clone()];
+                        let requested = column.saturating_sub(1);
+                        let offset = line
+                            .char_indices()
+                            .map(|(offset, _)| offset)
+                            .chain([line.len()])
+                            .nth(requested);
+                        (range.start + offset.unwrap_or(line.len()), offset.is_none())
+                    });
+                    assert_eq!(
+                        source_position(&rope, row, column),
+                        expected,
+                        "{row}:{column}"
+                    );
+                }
+            }
+        }
     }
     #[test]
     fn reload_is_one_undoable_transition() {
@@ -386,6 +393,6 @@ mod find_tests {
         assert!(next_match(&r, "other", 0, false).is_none());
         let r = matcher("$1", true, false).unwrap();
         assert_eq!(r.replace_all("$1", regex::NoExpand("$2")), "$2");
-        assert_eq!(position("a\r\nb\rc", 3, 1), (5, false));
+        assert_eq!(source_position(&Rope::from("a\r\nb\rc"), 3, 1), (5, false));
     }
 }

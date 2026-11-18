@@ -1188,8 +1188,12 @@ impl InputState {
         cx: &mut Context<Self>,
     ) {
         let offset = self.text.position_to_offset(&position.into());
+        self.set_cursor_offset_unfocused(offset, cx);
+    }
+
+    pub fn set_cursor_offset_unfocused(&mut self, offset: usize, cx: &mut Context<Self>) -> usize {
         self.move_to(offset, None, cx);
-        self.update_preferred_column();
+        self.selected_range.start
     }
 
     /// Focus the input field.

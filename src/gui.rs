@@ -1270,25 +1270,14 @@ impl Shell {
         else {
             return;
         };
-        let (position, clamped) = if line <= 1 && column <= 1 {
-            (Position::new(0, 0), false)
-        } else {
-            let text = input.read(cx).value();
-            let (position, clamped) = glimpse::editor::position(&text, line, column);
-            let byte = text
-                .char_indices()
-                .nth(position)
-                .map_or(text.len(), |(byte, _)| byte);
-            let prefix = &text[..byte];
-            let row = prefix.bytes().filter(|&byte| byte == b'\n').count() as u32;
-            let column = prefix.rsplit('\n').next().unwrap_or("").chars().count() as u32;
-            (Position::new(row, column), clamped)
-        };
-        input.update(cx, |input, cx| {
-            input.set_cursor_position_unfocused(position, cx);
+        let clamped = input.update(cx, |input, cx| {
+            let _work = gpui::work_trace::Span::new("editor_position");
+            let (offset, clamped) = glimpse::editor::source_position(input.text(), line, column);
+            let cursor = input.set_cursor_offset_unfocused(offset, cx);
             if focus {
                 input.focus(window, cx);
             }
+            clamped || cursor != offset
         });
         if clamped {
             self.status = "Requested position clamped to a text boundary".into();
