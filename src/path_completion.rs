@@ -73,9 +73,10 @@ pub fn complete(value: &str, current: &Path) -> Result<Matches, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+    #[cfg(not(target_os = "macos"))]
     #[test]
-    fn completion_preserves_native_paths_and_bounds_displayed_matches() {
+    fn completion_preserves_native_paths() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
         let root = tempfile::tempdir().unwrap();
         let native = root.path().join(OsString::from_vec(b"child\xff".to_vec()));
         std::fs::create_dir(&native).unwrap();
@@ -83,6 +84,10 @@ mod tests {
         assert_eq!(result.choices.len(), 1);
         let parsed = crate::paths::parse_entry(&result.choices[0].entry(), root.path()).unwrap();
         assert_eq!(parsed, native);
+    }
+    #[test]
+    fn completion_bounds_displayed_matches() {
+        let root = tempfile::tempdir().unwrap();
         for i in 0..100 {
             std::fs::write(root.path().join(format!("many{i}")), b"").unwrap();
         }

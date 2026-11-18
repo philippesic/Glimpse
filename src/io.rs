@@ -1077,8 +1077,9 @@ mod tests {
     #[test]
     fn save_as_moves_newer_recovery_and_late_updates_to_the_new_binding() {
         let root = tempfile::tempdir().unwrap();
-        let original = root.path().join("original.txt");
-        let target = root.path().join("new.txt");
+        let base = std::fs::canonicalize(root.path()).unwrap();
+        let original = base.join("original.txt");
+        let target = base.join("new.txt");
         std::fs::write(&original, "original bytes\n").unwrap();
         let disk = DiskFile::open(original.clone()).unwrap().0;
         let recovery_root = root.path().join("recovery");
