@@ -225,6 +225,31 @@ fn identity(meta: &Metadata) -> (u64, u64) {
     (meta.dev(), meta.ino())
 }
 
+#[derive(Clone, Copy, Debug)]
+enum TextFileLimit {
+    RegularFile,
+    Size,
+    GrewWhileReading,
+}
+
+impl std::fmt::Display for TextFileLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::RegularFile => "Only regular text files can be opened.",
+            Self::Size => "Files larger than 10 MiB are not supported.",
+            Self::GrewWhileReading => "The file grew beyond 10 MiB while reading.",
+        })
+    }
+}
+
+impl std::error::Error for TextFileLimit {}
+
+impl From<TextFileLimit> for io::Error {
+    fn from(limit: TextFileLimit) -> Self {
+        Self::new(ErrorKind::InvalidData, limit)
+    }
+}
+
 fn open_regular(path: &Path) -> io::Result<(fs::File, Metadata)> {
     let file = OpenOptions::new()
         .read(true)
@@ -232,16 +257,10 @@ fn open_regular(path: &Path) -> io::Result<(fs::File, Metadata)> {
         .open(path)?;
     let meta = file.metadata()?;
     if !meta.is_file() {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            "Only regular text files can be opened.",
-        ));
+        return Err(TextFileLimit::RegularFile.into());
     }
     if meta.len() > MAX_BYTES {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            "Files larger than 10 MiB are not supported yet.",
-        ));
+        return Err(TextFileLimit::Size.into());
     }
     Ok((file, meta))
 }
@@ -262,10 +281,7 @@ fn read_chunks(
             return Ok(length);
         }
         if (length + read) as u64 > MAX_BYTES {
-            return Err(io::Error::new(
-                ErrorKind::InvalidData,
-                "File grew beyond 10 MiB while reading.",
-            ));
+            return Err(TextFileLimit::GrewWhileReading.into());
         }
         consume(&chunk[..read]);
         length += read;
@@ -293,6 +309,12 @@ fn file_io_error(operation: &str, error: io::Error) -> String {
     if std::env::var_os("GLIMPSE_TRACE").is_some() {
         eprintln!("GLIMPSE_FILE_IO {operation}: {error}");
     }
+    if let Some(limit) = error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<TextFileLimit>())
+    {
+        return format!("Could not {operation}. {limit}");
+    }
     let reason = match error.kind() {
         ErrorKind::PermissionDenied => "Permission was denied.",
         ErrorKind::ReadOnlyFilesystem => "The destination volume is read-only.",
@@ -303,12 +325,12 @@ fn file_io_error(operation: &str, error: io::Error) -> String {
         ErrorKind::ConnectionAborted | ErrorKind::ConnectionReset | ErrorKind::NotConnected => {
             "The storage device or network volume is unavailable."
         }
-        ErrorKind::NotFound => "The destination file or folder is unavailable.",
+        ErrorKind::NotFound => "The file or folder is unavailable.",
         ErrorKind::AlreadyExists => "A file with that name already exists.",
         ErrorKind::IsADirectory | ErrorKind::NotADirectory => {
-            "The destination is no longer a file in an accessible folder."
+            "The path no longer identifies a file in an accessible folder."
         }
-        ErrorKind::InvalidData => "The destination no longer meets the text editing limits.",
+        ErrorKind::InvalidData => "The file no longer meets the text editing limits.",
         _ if error.raw_os_error() == Some(libc::EIO) => {
             "The storage device reported an input/output error."
         }
@@ -319,7 +341,7 @@ fn file_io_error(operation: &str, error: io::Error) -> String {
         {
             "The storage device or network volume is unavailable."
         }
-        _ => "Check that the destination is available and try again.",
+        _ => "Check that the file and its folder are available and try again.",
     };
     format!("Could not {operation}. {reason}")
 }
@@ -992,13 +1014,40 @@ mod tests {
             assert!(DiskFile::open(path.clone()).is_err());
             assert_eq!(fs::read(path).unwrap(), bytes);
         }
-        let (_dir, path) = fixture(b"");
+        let (dir, path) = fixture(b"saved bytes");
+        let (disk, _) = DiskFile::open(path.clone()).unwrap();
+        let (reader, _) = open_regular(&path).unwrap();
         fs::File::options()
             .write(true)
             .open(&path)
             .unwrap()
             .set_len(MAX_BYTES + 1)
             .unwrap();
-        assert!(DiskFile::open(path).is_err());
+        assert_eq!(
+            DiskFile::open(path.clone()).err().unwrap(),
+            "Files larger than 10 MiB are not supported."
+        );
+        assert_eq!(
+            disk.observe().err().unwrap(),
+            "Could not check the file. Files larger than 10 MiB are not supported."
+        );
+        let error = read_chunks(reader, &|| false, |_| {}).unwrap_err();
+        assert_eq!(
+            file_io_error("read the file", error),
+            "Could not read the file. The file grew beyond 10 MiB while reading."
+        );
+        assert_eq!(
+            DiskFile::prepare_destination(dir.path().to_owned())
+                .err()
+                .unwrap(),
+            "Could not inspect the destination. Only regular text files can be opened."
+        );
+        let mut prefix = [0; 11];
+        fs::File::open(&path)
+            .unwrap()
+            .read_exact(&mut prefix)
+            .unwrap();
+        assert_eq!(&prefix, b"saved bytes");
+        assert_eq!(fs::metadata(path).unwrap().len(), MAX_BYTES + 1);
     }
 }

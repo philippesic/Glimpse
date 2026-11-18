@@ -1,5 +1,13 @@
 use super::*;
 
+pub(super) struct Failure {
+    pub(super) id: u64,
+    generation: u64,
+    path: PathBuf,
+    action: FailureAction,
+    destination: Option<(PathBuf, DestinationKind)>,
+}
+
 impl Shell {
     pub(super) fn confirm_destination(
         &mut self,
@@ -127,7 +135,38 @@ impl Shell {
                 "Choose Copy Destination Again",
             ),
         };
-        self.ask_decision(DecisionAction::FailureDetails(doc.id), title.into(), format!("File: {}\n{error}\nThe current text remains open. Retry checks this file again before continuing.", paths::display(destination)), vec!["Keep Editing", retry, "Save Copy Elsewhere…"], window, cx);
+        let failure = Failure {
+            id: doc.id,
+            generation: doc.generation,
+            path: doc.disk.path.clone(),
+            action: doc.failure_action,
+            destination: doc.failed_destination.clone(),
+        };
+        self.ask_decision(DecisionAction::FailureDetails(Box::new(failure)), title.into(), format!("File: {}\n{error}\nThe current text remains open. Retry checks this file again before continuing.", paths::display(destination)), vec!["Keep Editing", retry, "Save Copy Elsewhere…"], window, cx);
+    }
+
+    pub(super) fn retry_failure(
+        &mut self,
+        failure: Failure,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(doc) = self.documents.iter().find(|doc| doc.id == failure.id) else {
+            return;
+        };
+        if doc.generation != failure.generation
+            || doc.disk.path != failure.path
+            || doc.failed_destination != failure.destination
+        {
+            self.status = "The file changed while the dialog was open. Review its current status before retrying.".into();
+        } else if failure.action == FailureAction::Check {
+            self.observer.rearm();
+            self.check_document(doc.id);
+        } else if doc.error.is_some() && doc.failure_action == failure.action {
+            self.retry_operation(window, cx);
+        } else {
+            self.status = "The operation's status changed. Review the file before retrying.".into();
+        }
     }
     pub(super) fn retry_operation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.destination_busy {
@@ -137,7 +176,7 @@ impl Shell {
         let Some(doc) = self
             .documents
             .iter()
-            .find(|doc| Some(doc.id) == self.active)
+            .find(|doc| Some(doc.id) == self.active && doc.error.is_some())
         else {
             return;
         };

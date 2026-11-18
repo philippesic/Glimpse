@@ -210,7 +210,7 @@ enum DecisionAction {
     ReplaceDestination(Box<SaveDestination>),
     UnrecoveredSave(Box<recovery::UnrecoveredSave>),
     RecoveryOptions(u64),
-    FailureDetails(u64),
+    FailureDetails(Box<destination::Failure>),
     Warnings,
     Notice,
     FolderError,
@@ -822,12 +822,12 @@ impl Shell {
                                 _ => this.focus(window, cx),
                             }
                         }
-                        Some(DecisionAction::FailureDetails(id))
-                            if this.documents.iter().any(|doc| doc.id == id) =>
+                        Some(DecisionAction::FailureDetails(failure))
+                            if this.documents.iter().any(|doc| doc.id == failure.id) =>
                         {
-                            this.active = Some(id);
+                            this.active = Some(failure.id);
                             match choice.0 {
-                                1 => this.retry_operation(window, cx),
+                                1 => this.retry_failure(*failure, window, cx),
                                 2 => this.save_as(DestinationKind::Copy, window, cx),
                                 _ => this.focus(window, cx),
                             }
