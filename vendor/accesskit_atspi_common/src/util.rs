@@ -94,10 +94,13 @@ pub(crate) fn text_range_from_offset<'a>(
     Ok(range)
 }
 
-pub(crate) fn sentence_at_offset(node: &NodeRef, offset: i32) -> Result<(String, i32, i32), Error> {
+pub(crate) fn sentence_paragraph<'a>(
+    node: &'a NodeRef,
+    offset: i32,
+) -> Result<Option<TextRange<'a>>, Error> {
     let position = text_position_from_offset(node, offset).ok_or(Error::IndexOutOfRange)?;
     if position.is_document_end() {
-        return Ok((String::new(), offset, offset));
+        return Ok(None);
     }
     let paragraph_start = if position.is_paragraph_start() {
         position
@@ -106,7 +109,21 @@ pub(crate) fn sentence_at_offset(node: &NodeRef, offset: i32) -> Result<(String,
     };
     let mut paragraph = paragraph_start.to_degenerate_range();
     paragraph.set_end(paragraph_start.forward_to_paragraph_end());
-    let mut start = paragraph_start.to_global_usv_index();
+    Ok(Some(paragraph))
+}
+
+pub(crate) fn sentence_at_offset(node: &NodeRef, offset: i32) -> Result<(String, i32, i32), Error> {
+    let Some(paragraph) = sentence_paragraph(node, offset)? else {
+        return Ok((String::new(), offset, offset));
+    };
+    sentence_in_paragraph(&paragraph, paragraph.start().to_global_usv_index(), offset)
+}
+
+pub(crate) fn sentence_in_paragraph(
+    paragraph: &TextRange<'_>,
+    mut start: usize,
+    offset: i32,
+) -> Result<(String, i32, i32), Error> {
     for sentence in paragraph.text().split_sentence_bounds() {
         let end = start + sentence.chars().count();
         if (start..end).contains(&(offset as usize)) {

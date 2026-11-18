@@ -12,6 +12,7 @@ mod events;
 mod filters;
 mod node;
 mod rect;
+mod sentence_index;
 #[cfg(feature = "simplified-api")]
 pub mod simplified;
 mod text_attributes;

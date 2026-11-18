@@ -1458,10 +1458,10 @@ impl PlatformNode {
         offset: i32,
         granularity: Granularity,
     ) -> Result<(String, i32, i32)> {
+        if granularity == Granularity::Sentence {
+            return self.sentence_at_offset(offset);
+        }
         self.resolve_for_text(|node| {
-            if granularity == Granularity::Sentence {
-                return sentence_at_offset(&node, offset);
-            }
             let range = text_range_from_offset(&node, offset, granularity)?;
             let text = range.text();
             let start = range
@@ -1477,6 +1477,21 @@ impl PlatformNode {
 
             Ok((text, start, end))
         })
+    }
+
+    fn sentence_at_offset(&self, offset: i32) -> Result<(String, i32, i32)> {
+        use crate::sentence_index::{Lookup, lookup};
+        let context = self.upgrade_context()?;
+        let mut index = context.sentence_index.lock().unwrap();
+        let request = self.resolve_for_text(|node| lookup(&node, offset, index.as_ref()))?;
+        match request {
+            Lookup::Sentence(result) => Ok(result),
+            Lookup::Index(request) => {
+                let (built, result) = request.build(offset)?;
+                *index = Some(built);
+                Ok(result)
+            }
+        }
     }
 
     pub fn text(&self, start_offset: i32, end_offset: i32) -> Result<String> {
