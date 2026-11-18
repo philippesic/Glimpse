@@ -14,6 +14,7 @@ use super::node::{InlineText, Node as Block, Paragraph};
 use crate::semantic_text::{MAX_RUN_CHARACTERS, Segment, text_run_with_boundaries, visit_line_segments};
 
 const MAX_CACHED_RUNS: usize = 256;
+const MAX_CACHED_LAYOUTS: usize = 32;
 const MAX_CACHED_LINE_BYTES: usize = 1024;
 const PACKED_TEXT_BYTES: usize = 8 * 1024;
 
@@ -254,59 +255,20 @@ impl<'a> SourceBuilder<'a> {
 struct TextBuilder {
     runs: Vec<Node>,
     text: HashMap<Arc<str>, Arc<[Node]>>,
+    layouts: HashMap<u64, TextLayout>,
+    layout_key: Vec<u8>,
     boundaries: HashMap<u64, Node>,
     lines: LineBoundaries,
 }
 
+struct TextLayout {
+    sample: Arc<str>,
+    runs: Arc<[Node]>,
+}
+
 impl TextBuilder {
     fn emit(&mut self, value: Arc<str>) {
-        let templates = if let Some(cached) = self.text.get(&value) {
-            cached.clone()
-        } else {
-            let data = value.clone();
-            let mut templates = Vec::new();
-            let make_run =
-                |range: Range<usize>, lengths: Vec<u8>, words: Vec<u16>, lines: Vec<u16>| {
-                    let hash = self
-                        .boundaries
-                        .hasher()
-                        .hash_one((&lengths, &words, &lines));
-                    let cached = self.boundaries.get(&hash).filter(|run| {
-                        run.character_lengths() == lengths
-                            && run.hard_line_starts() == lines
-                            && if run.wide_word_starts().is_empty() {
-                                run.word_starts()
-                                    .iter()
-                                    .copied()
-                                    .map(u16::from)
-                                    .eq(words.iter().copied())
-                            } else {
-                                run.wide_word_starts() == words
-                            }
-                    });
-                    let mut run = if let Some(cached) = cached {
-                        cached.clone()
-                    } else {
-                        let mut run = text_run_with_boundaries(lengths, words);
-                        if !lines.is_empty() {
-                            run.set_hard_line_starts(lines);
-                        }
-                        if self.boundaries.len() < MAX_CACHED_RUNS {
-                            self.boundaries.entry(hash).or_insert_with(|| run.clone());
-                        }
-                        run
-                    };
-                    let assigned = run.set_shared_value(data.clone(), range);
-                    debug_assert!(assigned);
-                    templates.push(run);
-                };
-            self.lines.visit_packed_segments(&value, make_run);
-            let templates: Arc<[Node]> = templates.into();
-            if self.text.len() < MAX_CACHED_RUNS {
-                self.text.insert(value, templates.clone());
-            }
-            templates
-        };
+        let templates = self.templates(value);
         for mut run in templates.iter().cloned() {
             if let Some(previous) = self.runs.last_mut()
                 && previous.value().is_some_and(|text| !text.ends_with('\n'))
@@ -317,6 +279,120 @@ impl TextBuilder {
             self.runs.push(run);
         }
     }
+
+    fn templates(&mut self, value: Arc<str>) -> Arc<[Node]> {
+        if let Some(cached) = self.text.get(&value) {
+            return cached.clone();
+        }
+        let mut use_layout = (512..=2 * PACKED_TEXT_BYTES).contains(&value.len());
+        if use_layout {
+            normalize_digits(&mut self.layout_key, &value);
+            use_layout = self.layout_key != value.as_bytes();
+        }
+        if use_layout {
+            let key = self.layouts.hasher().hash_one(self.layout_key.as_slice());
+            if let Some(layout) = self.layouts.get(&key) {
+                if Arc::ptr_eq(&layout.sample, &value) {
+                    return layout.runs.clone();
+                }
+                if layout
+                    .sample
+                    .bytes()
+                    .map(normalize_digit)
+                    .eq(self.layout_key.iter().copied())
+                {
+                    return layout.for_text(&value);
+                }
+            }
+            let runs = self.build_templates(&value);
+            if self.layouts.len() < MAX_CACHED_LAYOUTS {
+                self.layouts.entry(key).or_insert_with(|| TextLayout {
+                    sample: value,
+                    runs: runs.clone(),
+                });
+            }
+            return runs;
+        }
+        let templates = self.build_templates(&value);
+        if self.text.len() < MAX_CACHED_RUNS {
+            self.text.insert(value, templates.clone());
+        }
+        templates
+    }
+
+    fn build_templates(&mut self, value: &Arc<str>) -> Arc<[Node]> {
+        let data = value.clone();
+        let mut templates = Vec::new();
+        let make_run = |range: Range<usize>, lengths: Vec<u8>, words: Vec<u16>, lines: Vec<u16>| {
+            let hash = self
+                .boundaries
+                .hasher()
+                .hash_one((&lengths, &words, &lines));
+            let cached = self.boundaries.get(&hash).filter(|run| {
+                run.character_lengths() == lengths
+                    && run.hard_line_starts() == lines
+                    && if run.wide_word_starts().is_empty() {
+                        run.word_starts()
+                            .iter()
+                            .copied()
+                            .map(u16::from)
+                            .eq(words.iter().copied())
+                    } else {
+                        run.wide_word_starts() == words
+                    }
+            });
+            let mut run = if let Some(cached) = cached {
+                cached.clone()
+            } else {
+                let mut run = text_run_with_boundaries(lengths, words);
+                if !lines.is_empty() {
+                    run.set_hard_line_starts(lines);
+                }
+                if self.boundaries.len() < MAX_CACHED_RUNS {
+                    self.boundaries.entry(hash).or_insert_with(|| run.clone());
+                }
+                run
+            };
+            let assigned = run.set_shared_value(data.clone(), range);
+            debug_assert!(assigned);
+            templates.push(run);
+        };
+        self.lines.visit_packed_segments(value, make_run);
+        templates.into()
+    }
+}
+
+impl TextLayout {
+    fn for_text(&self, value: &Arc<str>) -> Arc<[Node]> {
+        let mut offset = 0;
+        let runs = self
+            .runs
+            .iter()
+            .cloned()
+            .map(|mut run| {
+                let end = offset + run.value().unwrap().len();
+                let assigned = run.set_shared_value(value.clone(), offset..end);
+                debug_assert!(assigned);
+                offset = end;
+                run
+            })
+            .collect();
+        debug_assert_eq!(offset, value.len());
+        runs
+    }
+}
+
+fn normalize_digit(byte: u8) -> u8 {
+    if byte.is_ascii_digit() {
+        b'0'
+    } else {
+        byte
+    }
+}
+
+fn normalize_digits(key: &mut Vec<u8>, value: &str) {
+    key.clear();
+    key.extend(value.bytes().map(normalize_digit));
 }
 
 #[derive(Default)]
@@ -365,16 +441,7 @@ impl LineBoundaries {
         for (index, line) in text.split_inclusive('\n').enumerate() {
             let mut visit_at_offset = |segment: &Segment| visit(segment, offset, index);
             if line.len() <= MAX_CACHED_LINE_BYTES {
-                self.key.clear();
-                self.key.extend(line.bytes().map(
-                    |byte| {
-                        if byte.is_ascii_digit() {
-                            b'0'
-                        } else {
-                            byte
-                        }
-                    },
-                ));
+                normalize_digits(&mut self.key, line);
                 if let Some(segment) = self.templates.get(self.key.as_slice()) {
                     visit_at_offset(segment);
                 } else {
@@ -416,6 +483,24 @@ impl LineBoundaries {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reused_layouts_keep_exact_text_and_boundaries() {
+        let original: Arc<str> = "Café 1\u{301}.e1, 3.1 🇪🇺 1\u{fe0f}\u{20e3} العربية 1𐐀\r\n"
+            .repeat(100)
+            .into();
+        let changed: Arc<str> = original.replace('1', "8").into();
+        let mut builder = TextBuilder::default();
+        let expected = builder.build_templates(&changed);
+        builder.templates(original);
+        let reused = builder.templates(changed.clone());
+        assert_eq!(builder.layouts.len(), 1);
+        assert_eq!(expected, reused);
+        assert_eq!(
+            reused.iter().filter_map(Node::value).collect::<String>(),
+            changed.as_ref()
+        );
+    }
 
     #[test]
     fn cached_reading_line_boundaries_match_unicode_segmentation() {
