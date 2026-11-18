@@ -1,7 +1,7 @@
 use glimpse::storage::Settings;
 use gpui::{prelude::*, *};
 use gpui_component::{
-    ActiveTheme, Disableable, Selectable, Sizable,
+    ActiveTheme, Disableable, IconName, Selectable, Sizable,
     button::{Button, ButtonVariants},
     input::{Input, InputState},
 };
@@ -399,7 +399,7 @@ impl Render for Preferences {
                 .gap(px(8.))
                 .child(
                     Button::new("previous-category")
-                        .label("‹")
+                        .icon(IconName::ChevronLeft)
                         .small()
                         .tooltip("Previous category")
                         .disabled(self.pending)
@@ -424,7 +424,7 @@ impl Render for Preferences {
                 ))
                 .child(
                     Button::new("next-category")
-                        .label("›")
+                        .icon(IconName::ChevronRight)
                         .small()
                         .tooltip("Next category")
                         .disabled(self.pending)

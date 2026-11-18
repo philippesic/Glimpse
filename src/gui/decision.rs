@@ -41,8 +41,7 @@ impl Decision {
                 if super::modal::tab(&event.keystroke, &this.focus, window, cx) {
                     return;
                 }
-                if this.comparison.is_none()
-                    && !event.keystroke.modifiers.control
+                if !event.keystroke.modifiers.control
                     && !event.keystroke.modifiers.platform
                     && !event.keystroke.modifiers.alt
                 {
@@ -121,6 +120,10 @@ impl Decision {
 }
 impl Render for Decision {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let viewport = window.viewport_size();
+        let compact = viewport.height < px(480.);
+        let comparison_height = px(160.).min(viewport.height * 0.22);
+        let detail_fraction = if self.comparison.is_some() { 0.67 } else { 0.4 };
         let semantic_title = self.title.clone();
         let mut semantic_detail = self.summary.as_ref().map_or_else(
             || self.detail.clone(),
@@ -146,26 +149,31 @@ impl Render for Decision {
                     .id("decision")
                     .track_focus(&self.focus)
                     .occlude()
-                    .w(px(640.).min(window.viewport_size().width - px(32.)))
-                    .max_h(window.viewport_size().height - px(32.))
+                    .w(px(640.).min(viewport.width - px(32.)))
+                    .max_h(viewport.height - px(32.))
                     .flex()
                     .flex_col()
                     .gap_3()
                     .p_4()
+                    .when(compact, |panel| panel.gap_2().p_2())
                     .rounded_lg()
                     .border_1()
                     .border_color(cx.theme().border)
                     .bg(cx.theme().background)
                     .text_color(cx.theme().foreground)
-                    .child(div().flex_shrink_0().text_xl().child(self.title.clone()))
-                    .when_some(self.summary.as_ref(), |panel, summary| {
-                        panel.child(div().flex_shrink_0().text_sm().child(summary.clone()))
-                    })
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_xl()
+                            .when(compact, |title| title.text_lg().line_height(relative(1.2)))
+                            .child(self.title.clone()),
+                    )
                     .child(
                         div()
                             .relative()
-                            .h(window.viewport_size().height * 0.4)
+                            .h(viewport.height * detail_fraction)
                             .min_h_0()
+                            .flex_shrink()
                             .overflow_hidden()
                             .child(
                                 div()
@@ -174,6 +182,9 @@ impl Render for Decision {
                                     .overflow_y_scroll()
                                     .track_scroll(&self.detail_scroll)
                                     .pr_3()
+                                    .when_some(self.summary.as_ref(), |body, summary| {
+                                        body.child(div().pb_3().text_sm().child(summary.clone()))
+                                    })
                                     .children(self.subjects.iter().enumerate().map(
                                         |(index, label)| {
                                             let name = label.clone();
@@ -191,7 +202,23 @@ impl Render for Decision {
                                             )
                                         },
                                     ))
-                                    .child(self.detail.clone()),
+                                    .child(self.detail.clone())
+                                    .when_some(self.comparison.as_ref(), |body, inputs| {
+                                        body.children(inputs.iter().enumerate().map(
+                                            |(i, input)| {
+                                                div()
+                                                    .pt_3()
+                                                    .child(if i == 0 {
+                                                        "Local text (read only)"
+                                                    } else {
+                                                        "Observed disk text (read only)"
+                                                    })
+                                                    .child(div().h(comparison_height).child(
+                                                        Input::new(input).h_full().disabled(true),
+                                                    ))
+                                            },
+                                        ))
+                                    }),
                             )
                             .child(
                                 div().absolute().inset_0().child(
@@ -200,26 +227,7 @@ impl Render for Decision {
                                 ),
                             ),
                     )
-                    .when_some(self.comparison.as_ref(), |panel, inputs| {
-                        panel.children(inputs.iter().enumerate().map(|(i, input)| {
-                            div()
-                                .min_h_0()
-                                .flex()
-                                .flex_col()
-                                .child(if i == 0 {
-                                    "Local text (read only)"
-                                } else {
-                                    "Observed disk text (read only)"
-                                })
-                                .child(
-                                    div()
-                                        .h(px(160.).min(window.viewport_size().height * 0.22))
-                                        .min_h_0()
-                                        .child(Input::new(input).h_full().disabled(true)),
-                                )
-                        }))
-                    })
-                    .child(div().flex().flex_wrap().gap_2().children(
+                    .child(div().flex().flex_shrink_0().flex_wrap().gap_2().children(
                         self.actions.iter().enumerate().map(|(i, label)| {
                             Button::new(i)
                                 .label(*label)
