@@ -3254,21 +3254,27 @@ impl Shell {
         command: &'static str,
         cx: &Context<Self>,
     ) -> Button {
+        let enabled = self.command_enabled(command);
+        let dirty_save = command == "save"
+            && enabled
+            && self
+                .documents
+                .iter()
+                .any(|doc| Some(doc.id) == self.active && doc.dirty(cx));
         Button::new(id)
             .label(label)
             .small()
             .compact()
-            .ghost()
-            .disabled(!self.command_enabled(command))
-            .when(
-                command == "save"
-                    && self.command_enabled(command)
-                    && self
-                        .documents
-                        .iter()
-                        .any(|doc| Some(doc.id) == self.active && doc.dirty(cx)),
-                |button| button.primary(),
-            )
+            .disabled(!enabled)
+            .map(|button| {
+                if dirty_save {
+                    button.primary()
+                } else if matches!(command, "toggle-navigator" | "read" | "save") {
+                    button.outline()
+                } else {
+                    button.ghost()
+                }
+            })
             .on_click(cx.listener(move |this, _, window, cx| this.command(command, window, cx)))
     }
 }

@@ -183,7 +183,9 @@ impl Render for Decision {
                         div()
                             .flex_shrink_0()
                             .text_xl()
-                            .when(compact, |title| title.text_lg().line_height(relative(1.2)))
+                            .when(compact, |title| {
+                                title.text_base().line_height(relative(1.2))
+                            })
                             .child(self.title.clone()),
                     )
                     .child(
@@ -204,6 +206,9 @@ impl Render for Decision {
                                     .overflow_y_scroll()
                                     .track_scroll(&self.detail_scroll)
                                     .pr(px(18.))
+                                    .when(compact && self.comparison.is_none(), |body| {
+                                        body.text_sm().line_height(relative(1.25))
+                                    })
                                     .children(self.subjects.iter().enumerate().map(
                                         |(index, label)| {
                                             let name = label.clone();
