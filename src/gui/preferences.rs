@@ -444,6 +444,8 @@ impl Render for Preferences {
         }
         let compact_categories =
             self.draft.ui_scale > 1.25 || window.viewport_size().width < px(600.);
+        let short = window.viewport_size().height < px(480.);
+        let compact_header = short && compact_categories;
         let categories = if compact_categories {
             let selected = self.page;
             let view = cx.weak_entity();
@@ -452,7 +454,12 @@ impl Render for Preferences {
                 .items_center()
                 .child(
                     Button::new("preferences-category-menu")
-                        .label(format!("Category · {}", selected.label()))
+                        .label(if compact_header {
+                            selected.label().to_owned()
+                        } else {
+                            format!("Category · {}", selected.label())
+                        })
+                        .tooltip("Preferences category")
                         .small()
                         .outline()
                         .dropdown_caret(true)
@@ -507,6 +514,30 @@ impl Render for Preferences {
                 }))
                 .into_any_element()
         };
+        let title = div()
+            .flex_shrink_0()
+            .text_size(px(20. * self.draft.ui_scale))
+            .when(compact_header, |title| {
+                title.text_size(px(16. * self.draft.ui_scale))
+            })
+            .child("Preferences");
+        let header = div()
+            .flex()
+            .flex_shrink_0()
+            .gap(px(if short { 8. } else { 12. }))
+            .map(|header| {
+                if compact_header {
+                    header
+                        .flex_wrap()
+                        .items_center()
+                        .justify_between()
+                        .gap_y(px(4.))
+                } else {
+                    header.flex_col()
+                }
+            })
+            .child(title)
+            .child(categories);
         let semantic_title = "Preferences".to_owned();
         let semantic_detail = "Appearance, text, editing, search and keyboard settings".to_owned();
         let rendered = div()
@@ -515,9 +546,7 @@ impl Render for Preferences {
             .inset_0()
             .occlude()
             .bg(cx.theme().overlay)
-            .when(window.viewport_size().height < px(480.), |overlay| {
-                overlay.bg(cx.theme().background)
-            })
+            .when(short, |overlay| overlay.bg(cx.theme().background))
             .flex()
             .items_center()
             .justify_center()
@@ -532,20 +561,13 @@ impl Render for Preferences {
                     .flex_col()
                     .gap(px(12.))
                     .p(px(16.))
-                    .when(window.viewport_size().height < px(480.), |panel| {
-                        panel.gap(px(8.)).py(px(10.))
-                    })
+                    .when(short, |panel| panel.gap(px(8.)).py(px(10.)))
                     .rounded_lg()
                     .border_1()
                     .border_color(cx.theme().border)
                     .bg(cx.theme().background)
                     .text_color(cx.theme().foreground)
-                    .child(
-                        div()
-                            .text_size(px(20. * self.draft.ui_scale))
-                            .child("Preferences"),
-                    )
-                    .child(categories)
+                    .child(header)
                     .child(
                         div()
                             .relative()
