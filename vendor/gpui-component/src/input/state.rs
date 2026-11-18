@@ -238,6 +238,7 @@ pub(super) struct LastLayout {
     pub(super) visible_range: Range<usize>,
     /// The first visible line top position in scroll viewport.
     pub(super) visible_top: Pixels,
+    pub(super) viewport_height: Pixels,
     /// The range of byte offset of the visible lines.
     pub(super) visible_range_offset: Range<usize>,
     /// The last layout lines (Only have visible lines).
@@ -2821,6 +2822,7 @@ mod revision_tests {
                 state.last_layout = Some(LastLayout {
                     visible_range: row..row + 1,
                     visible_top: state.text_wrapper.soft_row_start(row) * line_height,
+                    viewport_height: px(200.),
                     visible_range_offset: state.text.line_start_offset(row)
                         ..state.text.line_end_offset(row),
                     lines: Rc::new(Vec::new()),

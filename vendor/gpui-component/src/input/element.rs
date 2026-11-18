@@ -335,7 +335,7 @@ impl TextElement {
         last_layout: &LastLayout,
         bounds: &Bounds<Pixels>,
         cx: &mut App,
-    ) -> SearchMatchPaths {
+    ) -> SearchMatchBounds {
         let search_panel = self.state.read(cx).search_panel.clone();
         let Some((ranges, current_match_ix)) = search_panel.and_then(|panel| {
             if let Some(matcher) = panel.read(cx).matcher() {
@@ -344,7 +344,7 @@ impl TextElement {
                 None
             }
         }) else {
-            return SearchMatchPaths::default();
+            return SearchMatchBounds::default();
         };
 
         let mut offset = last_layout.visible_range_offset.start;
@@ -357,33 +357,33 @@ impl TextElement {
             );
             offset += line.len() + 1;
         }
-        let mut paths = SearchMatchPaths::default();
+        let mut matches = SearchMatchBounds::default();
         for index in matching_indices(&ranges, &visible) {
             let range = ranges.get(index).unwrap();
             let current = current_match_ix == index;
-            if let Some(path) = Self::layout_search_range(&range, last_layout, bounds, px(0.)) {
-                paths.highlights.push((path, current));
+            Self::layout_search_range(&range, last_layout, bounds, |rect| {
+                matches.highlights.push((rect, current));
                 if current {
-                    let top = (last_layout.line_height - px(2.)).max(px(0.));
-                    paths.current_underline =
-                        Self::layout_search_range(&range, last_layout, bounds, top);
+                    let height = rect.size.height.min(px(2.));
+                    let origin = rect.origin + point(px(0.), rect.size.height - height);
+                    matches
+                        .current_underlines
+                        .push(Bounds::new(origin, size(rect.size.width, height)));
                 }
-            }
+            });
         }
 
-        paths
+        matches
     }
 
     fn layout_search_range(
         range: &Range<usize>,
         layout: &LastLayout,
         bounds: &Bounds<Pixels>,
-        inset_top: Pixels,
-    ) -> Option<Path<Pixels>> {
-        let mut builder = gpui::PathBuilder::fill();
+        mut push: impl FnMut(Bounds<Pixels>),
+    ) {
         let mut offset = layout.visible_range_offset.start;
         let mut top = layout.visible_top;
-        let mut painted = false;
         for line in layout.lines.iter() {
             for row in &line.wrapped_lines {
                 let start = offset + row.range.start;
@@ -398,17 +398,14 @@ impl TextElement {
                 let right = row.shaped.x_for_index(to.max(from) - start).max(x + px(6.));
                 let origin = bounds.origin
                     + point(layout.line_number_width, top + row.row * layout.line_height);
-                builder.move_to(origin + point(x, inset_top));
-                builder.line_to(origin + point(right, inset_top));
-                builder.line_to(origin + point(right, layout.line_height));
-                builder.line_to(origin + point(x, layout.line_height));
-                builder.close();
-                painted = true;
+                push(Bounds::new(
+                    origin + point(x, px(0.)),
+                    size(right - x, layout.line_height),
+                ));
             }
             offset += line.len() + 1;
             top += line.size(layout.line_height).height;
         }
-        painted.then(|| builder.build().ok()).flatten()
     }
 
     fn layout_hover_highlight(
@@ -684,10 +681,7 @@ impl TextElement {
             .deferred_scroll_offset
             .unwrap_or_else(|| state.scroll_handle.offset())
             .y;
-        let viewport_rows = (f32::from(window.viewport_size().height)
-            / f32::from(last_layout.line_height))
-        .ceil() as usize
-            + 2;
+        let scroll_bottom = scroll_top + last_layout.viewport_height;
         for row in visible_range.clone() {
             let Some(line_item) = text_wrapper.lines.get(row) else {
                 break;
@@ -697,11 +691,12 @@ impl TextElement {
                 / f32::from(last_layout.line_height))
             .floor()
             .max(0.)) as usize;
-            let mut needed: std::collections::BTreeSet<usize> = (first_row
-                ..first_row
-                    .saturating_add(viewport_rows)
-                    .min(line_item.lines_len()))
-                .collect();
+            let last_row = (f32::from(scroll_bottom - line_top)
+                / f32::from(last_layout.line_height))
+            .ceil()
+            .max(0.) as usize;
+            let end = last_row.saturating_add(2).min(line_item.lines_len());
+            let mut needed: std::collections::BTreeSet<usize> = (first_row..end).collect();
             for endpoint in [
                 state.cursor(),
                 state.selected_range.start,
@@ -824,9 +819,9 @@ impl TextElement {
 }
 
 #[derive(Default)]
-struct SearchMatchPaths {
-    highlights: Vec<(Path<Pixels>, bool)>,
-    current_underline: Option<Path<Pixels>>,
+struct SearchMatchBounds {
+    highlights: Vec<(Bounds<Pixels>, bool)>,
+    current_underlines: Vec<Bounds<Pixels>>,
 }
 
 pub(super) struct PrepaintState {
@@ -844,7 +839,7 @@ pub(super) struct PrepaintState {
     current_row: Option<usize>,
     selection_path: Option<Path<Pixels>>,
     hover_highlight_path: Option<Path<Pixels>>,
-    search_match_paths: SearchMatchPaths,
+    search_match_bounds: SearchMatchBounds,
     document_color_paths: Vec<(Path<Pixels>, Hsla)>,
     hover_definition_hitbox: Option<Hitbox>,
     indent_guides_path: Option<Path<Pixels>>,
@@ -1029,6 +1024,7 @@ impl Element for TextElement {
         let mut last_layout = LastLayout {
             visible_range,
             visible_top,
+            viewport_height: bounds.size.height,
             visible_range_offset: visible_start_offset..visible_end_offset,
             line_height,
             wrap_width,
@@ -1211,7 +1207,7 @@ impl Element for TextElement {
             self.layout_cursor(&last_layout, &mut bounds, window, cx);
         last_layout.cursor_bounds = cursor_bounds;
 
-        let search_match_paths = self.layout_search_matches(&last_layout, &mut bounds, cx);
+        let search_match_bounds = self.layout_search_matches(&last_layout, &mut bounds, cx);
         let selection_path = self.layout_selections(&last_layout, &mut bounds, cx);
         let hover_highlight_path = self.layout_hover_highlight(&last_layout, &mut bounds, cx);
         let document_color_paths =
@@ -1271,7 +1267,7 @@ impl Element for TextElement {
             cursor_scroll_offset,
             current_row,
             selection_path,
-            search_match_paths,
+            search_match_bounds,
             hover_highlight_path,
             hover_definition_hitbox,
             document_color_paths,
@@ -1399,11 +1395,11 @@ impl Element for TextElement {
         // Paint selections
         if window.is_window_active() {
             let secondary_selection = cx.theme().selection.saturation(0.1);
-            for (path, is_active) in &prepaint.search_match_paths.highlights {
-                window.paint_path(path.clone(), secondary_selection);
+            for &(rect, is_active) in &prepaint.search_match_bounds.highlights {
+                window.paint_quad(fill(rect, secondary_selection));
 
-                if *is_active {
-                    window.paint_path(path.clone(), cx.theme().selection);
+                if is_active {
+                    window.paint_quad(fill(rect, cx.theme().selection));
                 }
             }
 
@@ -1416,8 +1412,8 @@ impl Element for TextElement {
                 window.paint_path(path, secondary_selection);
             }
 
-            if let Some(path) = prepaint.search_match_paths.current_underline.take() {
-                window.paint_path(path, cx.theme().foreground);
+            for &rect in &prepaint.search_match_bounds.current_underlines {
+                window.paint_quad(fill(rect, cx.theme().foreground));
             }
         }
 
@@ -1726,7 +1722,7 @@ mod tests {
     }
 
     #[test]
-    fn search_paths_clip_matches_to_sparse_shaped_rows() {
+    fn search_bounds_cover_only_matching_shaped_rows() {
         let mut line = LineLayout::new();
         line.set_visible_lines(
             1000,
@@ -1747,6 +1743,7 @@ mod tests {
         let layout = LastLayout {
             visible_range: 0..1,
             visible_top: px(0.),
+            viewport_height: px(200.),
             visible_range_offset: 0..1000,
             lines: Rc::new(vec![line]),
             line_height: px(10.),
@@ -1755,11 +1752,21 @@ mod tests {
             cursor_bounds: None,
         };
         let bounds = Bounds::new(point(px(10.), px(30.)), size(px(300.), px(200.)));
-        for range in [300..500, 405..900, 0..1000] {
-            assert!(TextElement::layout_search_range(&range, &layout, &bounds, px(0.)).is_some());
-        }
-        for range in [0..100, 500..600, 900..1000] {
-            assert!(TextElement::layout_search_range(&range, &layout, &bounds, px(0.)).is_none());
+        for (range, tops) in [
+            (300..500, &[430.][..]),
+            (405..900, &[430., 830.][..]),
+            (0..1000, &[430., 830.][..]),
+            (0..100, &[][..]),
+            (500..600, &[][..]),
+            (900..1000, &[][..]),
+        ] {
+            let mut actual = Vec::new();
+            TextElement::layout_search_range(&range, &layout, &bounds, |rect| actual.push(rect));
+            let expected = tops
+                .iter()
+                .map(|&top| Bounds::new(point(px(30.), px(top)), size(px(6.), px(10.))))
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "{range:?}");
         }
     }
 
