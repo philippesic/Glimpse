@@ -13,7 +13,7 @@ use gpui::{
     InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Render, Styled,
     Subscription, WeakEntity, Window, actions, prelude::FluentBuilder as _, px, relative, rems,
 };
-use ropey::{Rope, RopeBuilder, extra::esoterica::ropes_are_instances};
+use ropey::{LineType, Rope, RopeBuilder, extra::esoterica::ropes_are_instances};
 
 use crate::{
     ActiveTheme, Disableable, IconName, Selectable, Sizable,
@@ -31,6 +31,7 @@ use crate::{
 use super::state::PreparedReplacement;
 
 const CONTEXT: &'static str = "SearchPanel";
+const MATCH_SCAN_BYTES: usize = 64 * 1024;
 
 actions!(input, [Tab]);
 
@@ -231,26 +232,67 @@ impl SearchMatcher {
     }
 
     fn update_matches(&mut self) {
-        if self
-            .cancellation
-            .as_ref()
-            .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
-        {
+        let cancelled = || {
+            self.cancellation
+                .as_ref()
+                .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
+        };
+        if cancelled() {
             return;
         }
         let mut new_ranges = MatchRanges::new(self.text.len());
         if let Some(query) = &self.query {
-            let text = String::from(&self.text);
-            for found in query.find_iter(&text) {
-                if new_ranges.len() % 1024 == 0
-                    && self
-                        .cancellation
-                        .as_ref()
-                        .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
-                {
+            let mut scan = |text: &str, offset: usize| {
+                for found in query.find_iter(text) {
+                    if new_ranges.len() % 1024 == 0 && cancelled() {
+                        return false;
+                    }
+                    new_ranges.push(offset + found.start()..offset + found.end());
+                }
+                true
+            };
+            if let Some(text) = self.text.as_str() {
+                if !scan(text, 0) {
                     return;
                 }
-                new_ranges.push(found.range());
+            } else if !query.as_str().contains('\n') && self.text.len_lines(LineType::LF) > 1 {
+                let mut buffer = String::with_capacity(MATCH_SCAN_BYTES);
+                let mut offset = 0;
+                let len = self.text.len();
+                while offset < len {
+                    if cancelled() {
+                        return;
+                    }
+                    let limit = offset.saturating_add(MATCH_SCAN_BYTES).min(len);
+                    let end = if limit == len {
+                        len
+                    } else {
+                        let line = self.text.byte_to_line_idx(limit, LineType::LF);
+                        let line_start = self.text.line_to_byte_idx(line, LineType::LF);
+                        if line_start == offset {
+                            self.text.line_to_byte_idx(line + 1, LineType::LF)
+                        } else {
+                            line_start
+                        }
+                    };
+                    let slice = self.text.slice(offset..end);
+                    let text = if let Some(text) = slice.as_str() {
+                        text
+                    } else {
+                        buffer.clear();
+                        buffer.reserve_exact(slice.len());
+                        for chunk in slice.chunks() {
+                            buffer.push_str(chunk);
+                        }
+                        &buffer
+                    };
+                    if !scan(text, offset) {
+                        return;
+                    }
+                    offset = end;
+                }
+            } else if !scan(&String::from(&self.text), 0) {
+                return;
             }
         }
         self.matched_ranges = Arc::new(new_ranges);
@@ -1263,6 +1305,36 @@ mod tests {
         assert_eq!(matcher.label(), "1/1");
         matcher.update_query("[", true, false);
         assert_eq!(matcher.len(), 0);
+    }
+
+    #[test]
+    fn bounded_scans_preserve_contiguous_regex_results() {
+        let short = "🙂 K K CAFÉ café_ é\r\na\nb aaabaa\n[ \r café\u{2028}one\n";
+        let long = "🌱café K\r".repeat(8500);
+        let text = format!("{}\n{long}\n{short}\n{long}", short.repeat(1800));
+        let mut matcher = SearchMatcher::new();
+        matcher.text = Rope::from(text.as_str());
+        for literal in [
+            "café", "K", "\r", "a\nb", "\n", "é\r\n", "\u{2028}", "[", "aa",
+        ] {
+            for case_insensitive in [false, true] {
+                for whole_word in [false, true] {
+                    matcher.update_query(literal, case_insensitive, whole_word);
+                    let expected: Vec<_> = matcher
+                        .query
+                        .as_ref()
+                        .unwrap()
+                        .find_iter(&text)
+                        .map(|found| found.range())
+                        .collect();
+                    assert_eq!(
+                        matcher.matched_ranges.iter().collect::<Vec<_>>(),
+                        expected,
+                        "{literal:?}, {case_insensitive}, {whole_word}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
