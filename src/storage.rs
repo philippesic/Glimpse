@@ -7,6 +7,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod revisions;
+
 pub fn data_dir() -> PathBuf {
     if let Some(path) = std::env::var_os("GLIMPSE_DATA_DIR") {
         return path.into();
@@ -490,18 +492,30 @@ pub fn inventory(root: &Path) -> Result<Inventory, String> {
                 result.usage.partial = true;
                 continue;
             };
+            let path = file.path();
+            let revision = !history && kind.is_dir() && revisions::is_revision(&path);
             // Do not follow symlinks out of private recovery storage.
-            if !kind.is_file() {
+            if !kind.is_file() && !revision {
                 continue;
             }
             let Ok(meta) = file.metadata() else {
                 result.usage.partial = true;
                 continue;
             };
-            result.usage.bytes = result.usage.bytes.saturating_add(meta.len());
-            result.usage.files += 1;
-            let path = file.path();
-            if !available || path.extension().is_none_or(|e| e != "json") {
+            let (files, bytes) = if revision {
+                match revisions::sizes(&path) {
+                    Ok(sizes) => sizes,
+                    Err(_) => {
+                        result.usage.partial = true;
+                        (0, 0)
+                    }
+                }
+            } else {
+                (1, meta.len())
+            };
+            result.usage.bytes = result.usage.bytes.saturating_add(bytes);
+            result.usage.files += files;
+            if !available || !revision && path.extension().is_none_or(|e| e != "json") {
                 continue;
             }
             if result.records.len() >= 256 {
@@ -510,7 +524,9 @@ pub fn inventory(root: &Path) -> Result<Inventory, String> {
             }
             let candidate =
                 !history && file.file_name().to_string_lossy().starts_with("candidate-");
-            let header = if meta.len() <= 70 * 1024 * 1024 {
+            let header = if revision {
+                revisions::header(&path).ok()
+            } else if bytes <= MAX_RECOVERY_RECORD_BYTES {
                 fs::File::open(&path).ok().and_then(|f| {
                     serde_json::from_reader::<_, Header>(std::io::BufReader::new(f)).ok()
                 })
@@ -523,7 +539,7 @@ pub fn inventory(root: &Path) -> Result<Inventory, String> {
             result.records.push(Record {
                 path,
                 original,
-                bytes: meta.len(),
+                bytes,
                 generation,
                 history,
                 candidate,
@@ -599,6 +615,12 @@ fn read_recovery_json<T: serde::de::DeserializeOwned>(path: &Path) -> std::io::R
 }
 
 fn read_draft(path: &Path) -> Result<Draft, String> {
+    if revisions::is_revision(path) {
+        if !fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir()) {
+            return Err("Recovery draft is not a directory".into());
+        }
+        return revisions::read(path);
+    }
     let bytes = read_recovery_bytes(path).map_err(|e| e.to_string())?;
     let draft: Draft = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
     validate_record_limits(draft.generation, draft.text.len(), draft.base.len())?;
@@ -755,6 +777,7 @@ pub struct Recovery {
     _lock: fs::File,
     io: std::sync::Mutex<std::collections::HashMap<u64, u64>>,
     recent: std::sync::Mutex<std::collections::VecDeque<(PathBuf, WrittenRecord)>>,
+    anchors: std::sync::Mutex<std::collections::HashMap<u64, revisions::Anchor>>,
 }
 impl Recovery {
     pub fn new(root: &Path) -> Result<Self, String> {
@@ -783,6 +806,7 @@ impl Recovery {
             _lock: lock,
             io: std::sync::Mutex::new(std::collections::HashMap::new()),
             recent: Default::default(),
+            anchors: Default::default(),
         })
     }
 
@@ -839,6 +863,24 @@ impl Recovery {
     }
 
     pub(crate) fn write(&self, id: u64, draft: &Draft<impl RecoveryText>) -> Result<(), String> {
+        self.write_draft(id, draft, None)
+    }
+
+    pub(crate) fn write_revision(
+        &self,
+        id: u64,
+        draft: &Draft<impl RecoveryText>,
+        text: &gpui_component::input::Rope,
+    ) -> Result<(), String> {
+        self.write_draft(id, draft, Some(text))
+    }
+
+    fn write_draft(
+        &self,
+        id: u64,
+        draft: &Draft<impl RecoveryText>,
+        text: Option<&gpui_component::input::Rope>,
+    ) -> Result<(), String> {
         let finished = self.io.lock().unwrap();
         if finished
             .get(&id)
@@ -847,6 +889,48 @@ impl Recovery {
             return Ok(());
         }
         let path = self.directory.join(format!("{id}.json"));
+        let revision_path = self.directory.join(format!("{id}.draft"));
+        let existing_revision = has_revision(&revision_path)?;
+        if existing_revision
+            || text.is_some_and(|text| text.len() >= revisions::MIN_SNAPSHOT_BYTES)
+                && !path.try_exists().map_err(|error| error.to_string())?
+        {
+            validate_record_limits(draft.generation, draft.text.byte_len(), draft.base.len())?;
+            let mut anchors = self.anchors.lock().unwrap();
+            let anchor = anchors.get(&id);
+            if existing_revision {
+                let generation = match anchor {
+                    Some(anchor) => anchor.generation(&revision_path)?,
+                    None => revisions::generation(&revision_path)?,
+                };
+                if generation >= draft.generation {
+                    return Ok(());
+                }
+                if let Some((anchor, text)) = anchor.zip(text)
+                    && anchor.write_edit(&revision_path, draft, text)?
+                {
+                    return Ok(());
+                }
+            }
+            anchors.remove(&id);
+            let digest = if existing_revision {
+                revisions::full(&revision_path, draft)?
+            } else {
+                revisions::create(&revision_path, draft)?
+            };
+            crate::metrics::event(
+                "recovery-checkpoint-bytes",
+                draft.generation,
+                (draft.text.byte_len() + draft.base.len()) as u64,
+            );
+            if let Some(text) = text {
+                anchors.insert(
+                    id,
+                    revisions::Anchor::capture(&revision_path, draft, text, digest)?,
+                );
+            }
+            return Ok(());
+        }
         match self.generation(&path) {
             Ok(existing) => {
                 if existing > draft.generation {
@@ -875,7 +959,12 @@ impl Recovery {
             return Err("This recovery session is active; nothing was imported.".into());
         }
         let draft = read_draft(source)?;
-        let destination = self.directory.join(format!("{id}.json"));
+        let extension = if revisions::is_revision(source) {
+            "draft"
+        } else {
+            "json"
+        };
+        let destination = self.directory.join(format!("{id}.{extension}"));
         crate::fileops::rename(source, &destination)?;
         let warning=fs::File::open(&destination).and_then(|f|f.sync_all()).err().map(|e|format!("Draft restored into this session, but its sync failed: {e}. Save a copy elsewhere."));
         Ok((draft, warning))
@@ -958,7 +1047,13 @@ impl Recovery {
         to: &crate::document::DiskFile,
     ) -> Result<(), String> {
         let _finished = self.io.lock().unwrap();
-        let path = self.directory.join(format!("{id}.json"));
+        let revision_path = self.directory.join(format!("{id}.draft"));
+        let revision = has_revision(&revision_path)?;
+        let path = if revision {
+            revision_path
+        } else {
+            self.directory.join(format!("{id}.json"))
+        };
         let mut draft = match read_draft(&path) {
             Ok(draft) => draft,
             Err(_) if !path.try_exists().map_err(|error| error.to_string())? => return Ok(()),
@@ -973,7 +1068,12 @@ impl Recovery {
             draft.path = to.path.clone();
             draft.target = Some(to.target.clone());
             draft.base = to.bytes.clone();
-            self.write_record(&path, &draft)?;
+            if revision {
+                self.anchors.lock().unwrap().remove(&id);
+                revisions::full(&path, &draft)?;
+            } else {
+                self.write_record(&path, &draft)?;
+            }
         }
         Ok(())
     }
@@ -983,6 +1083,18 @@ impl Recovery {
             .entry(id)
             .and_modify(|g| *g = (*g).max(generation))
             .or_insert(generation);
+        let revision_path = self.directory.join(format!("{id}.draft"));
+        if has_revision(&revision_path)? {
+            let mut anchors = self.anchors.lock().unwrap();
+            let recovered_generation = match anchors.get(&id) {
+                Some(anchor) => anchor.generation(&revision_path)?,
+                None => revisions::generation(&revision_path)?,
+            };
+            if recovered_generation <= generation {
+                revisions::retire(&revision_path)?;
+                anchors.remove(&id);
+            }
+        }
         let path = self.directory.join(format!("{id}.json"));
         match self.verified_header(&path, false) {
             Ok(recovered_generation) => {
@@ -1055,13 +1167,11 @@ impl Recovery {
             }
             if let Ok(entries) = fs::read_dir(session.path()) {
                 for entry in entries.flatten().filter(|e| {
-                    e.path().extension().is_some_and(|e| e == "json")
+                    (e.path().extension().is_some_and(|e| e == "json")
+                        || revisions::is_revision(&e.path()))
                         && !e.file_name().to_string_lossy().starts_with("candidate-")
                 }) {
-                    if let Ok(bytes) = fs::read(entry.path())
-                        && bytes.len() < 70 * 1024 * 1024
-                        && let Ok(draft) = serde_json::from_slice(&bytes)
-                    {
+                    if let Ok(draft) = read_draft(&entry.path()) {
                         drafts.push((entry.path(), draft));
                     }
                 }
@@ -1070,6 +1180,16 @@ impl Recovery {
         drafts
     }
 }
+
+fn has_revision(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(true),
+        Ok(_) => Err("Recovery draft is not a directory; the existing entry was retained".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 impl Drop for Recovery {
     fn drop(&mut self) {
         if fs::read_dir(&self.directory)

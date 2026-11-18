@@ -318,7 +318,10 @@ impl IoWorker {
                             .as_ref()
                             .as_ref()
                             .map_err(Clone::clone)
-                            .and_then(|r| r.write(id, &draft))
+                            .and_then(|r| match &draft.text {
+                                TextSnapshot::Flat(_) => r.write(id, &draft),
+                                TextSnapshot::Revision(text) => r.write_revision(id, &draft, text),
+                            })
                             .map_err(|error| format!("Recovery failed: {error}"));
                         crate::metrics::event("recovery-worker-done", id, draft.generation);
                         let _ = results.send(Reply::Recovered(id, draft.generation, result));

@@ -18,7 +18,7 @@ type Result<T> = std::result::Result<T, String>;
 pub enum FileBytes {
     Raw(Arc<[u8]>),
     WithBom(Arc<str>),
-    Revision { text: Rope, bom: bool },
+    Revision { text: Arc<Rope>, bom: bool },
 }
 
 impl FileBytes {
@@ -181,6 +181,24 @@ impl From<&[u8]> for FileBytes {
 
 impl PartialEq for FileBytes {
     fn eq(&self, other: &Self) -> bool {
+        let shared = match (self, other) {
+            (Self::Raw(left), Self::Raw(right)) => Arc::ptr_eq(left, right),
+            (Self::WithBom(left), Self::WithBom(right)) => Arc::ptr_eq(left, right),
+            (
+                Self::Revision {
+                    text: left,
+                    bom: left_bom,
+                },
+                Self::Revision {
+                    text: right,
+                    bom: right_bom,
+                },
+            ) => left_bom == right_bom && Arc::ptr_eq(left, right),
+            _ => false,
+        };
+        if shared {
+            return true;
+        }
         if self.len() != other.len() {
             return false;
         }
@@ -346,7 +364,7 @@ impl DiskFile {
     pub(crate) fn share_revision(mut self, text: Rope) -> Self {
         debug_assert!(self.matches_revision(&text));
         self.bytes = FileBytes::Revision {
-            text,
+            text: Arc::new(text),
             bom: self.bom,
         };
         self
@@ -564,7 +582,7 @@ impl DiskFile {
     pub(crate) fn save_revision(&self, text: Rope) -> Result<Self> {
         self.save_bytes(
             FileBytes::Revision {
-                text,
+                text: Arc::new(text),
                 bom: self.bom,
             },
             self.bom,
@@ -753,7 +771,7 @@ mod tests {
         assert_eq!(
             saved.bytes,
             FileBytes::Revision {
-                text: Rope::from(full_text.as_str()),
+                text: Arc::new(Rope::from(full_text.as_str())),
                 bom: false
             }
         );
