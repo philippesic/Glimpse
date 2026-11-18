@@ -161,11 +161,17 @@ pub(crate) struct ParsedContent {
 }
 
 impl ParsedContent {
-    fn retire(self, executor: &gpui::BackgroundExecutor) {
+    fn retire(self, executor: &gpui::BackgroundExecutor, on_retired: Option<fn()>) {
         executor
             .spawn(async move {
-                let _work = gpui::work_trace::Span::new("reading_content_retire");
-                drop(self);
+                {
+                    let _work = gpui::work_trace::Span::new("reading_content_retire");
+                    drop(self);
+                }
+                if let Some(on_retired) = on_retired {
+                    let _work = gpui::work_trace::Span::new("reading_memory_release");
+                    on_retired();
+                }
             })
             .detach();
     }
@@ -197,12 +203,13 @@ impl MarkdownView {
         content: ParsedMarkdown,
         resources: Arc<super::TextViewResources>,
         focus: FocusHandle,
+        on_retired: Option<fn()>,
         cx: &mut App,
     ) -> Self {
         Self {
             id: id.into(),
             state: cx.new(|cx| {
-                let mut state = TextViewState::new(cx);
+                let mut state = TextViewState::new(cx, on_retired);
                 state.parsed_result = Some(content.0);
                 state.resources = resources;
                 state.focus_handle = Some(focus);
@@ -357,10 +364,10 @@ pub(crate) struct TextViewState {
 }
 
 impl TextViewState {
-    fn new(cx: &mut Context<TextViewState>) -> Self {
-        cx.on_release(|state, cx| {
+    fn new(cx: &mut Context<TextViewState>, on_retired: Option<fn()>) -> Self {
+        cx.on_release(move |state, cx| {
             if let Some(Ok(content)) = state.parsed_result.take() {
-                content.retire(cx.background_executor());
+                content.retire(cx.background_executor(), on_retired);
             }
         })
         .detach();
@@ -543,7 +550,7 @@ impl TextView {
         let highlight_theme = cx.theme().highlight_theme.clone();
         let state =
             window.use_keyed_state(SharedString::from(format!("{}/state", id)), cx, |_, cx| {
-                TextViewState::new(cx)
+                TextViewState::new(cx, None)
             });
         let init_state = Self::create_init_state(
             TextViewType::Markdown,
@@ -580,7 +587,7 @@ impl TextView {
         let highlight_theme = cx.theme().highlight_theme.clone();
         let state =
             window.use_keyed_state(SharedString::from(format!("{}/state", id)), cx, |_, cx| {
-                TextViewState::new(cx)
+                TextViewState::new(cx, None)
             });
         let init_state =
             Self::create_init_state(TextViewType::Html, &html, &highlight_theme, &state, cx);
@@ -731,7 +738,7 @@ impl Element for TextView {
                 let tx = tx.clone();
                 |state, cx| {
                     if let Some(Ok(content)) = state.parsed_result.take() {
-                        content.retire(cx.background_executor());
+                        content.retire(cx.background_executor(), None);
                     }
                     state.tx = Some(tx);
                 }
@@ -746,7 +753,7 @@ impl Element for TextView {
                                 if let Some(Ok(content)) =
                                     state.parsed_result.replace(parsed_result)
                                 {
-                                    content.retire(cx.background_executor());
+                                    content.retire(cx.background_executor(), None);
                                 }
                                 if let Some(parent_entity) = state.parent_entity {
                                     let app = &mut **cx;
@@ -757,7 +764,7 @@ impl Element for TextView {
                             });
                         } else {
                             if let Ok(content) = parsed_result {
-                                content.retire(cx.background_executor());
+                                content.retire(cx.background_executor(), None);
                             }
                             break;
                         }

@@ -12,6 +12,7 @@ pub(super) struct View {
     path: PathBuf,
     theme: Arc<HighlightTheme>,
     content: Option<MarkdownView>,
+    release_memory: bool,
     notes: String,
     error: Option<String>,
 }
@@ -54,6 +55,7 @@ impl Shell {
             path: doc.disk.path.clone(),
             theme: theme.clone(),
             content: None,
+            release_memory: doc.input.read(cx).text().len() >= 1024 * 1024,
             notes: String::new(),
             error: None,
         });
@@ -136,6 +138,8 @@ impl Shell {
                     prepared.markdown,
                     resources,
                     self.reading_focus.clone(),
+                    view.release_memory
+                        .then_some(platform::release_unused_memory),
                     cx,
                 ));
                 view.notes = prepared.notes.join("\n\n");
