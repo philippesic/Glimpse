@@ -4,7 +4,7 @@ use std::os::fd::AsRawFd;
 use std::{
     borrow::Cow,
     fs::{self, Metadata, OpenOptions},
-    io::{BufWriter, Read, Write},
+    io::{self, BufWriter, ErrorKind, Read, Write},
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     sync::Arc,
@@ -207,18 +207,23 @@ fn identity(meta: &Metadata) -> (u64, u64) {
     (meta.dev(), meta.ino())
 }
 
-fn open_regular(path: &Path) -> Result<(fs::File, Metadata)> {
+fn open_regular(path: &Path) -> io::Result<(fs::File, Metadata)> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|e| e.to_string())?;
-    let meta = file.metadata().map_err(|e| e.to_string())?;
+        .open(path)?;
+    let meta = file.metadata()?;
     if !meta.is_file() {
-        return Err("Only regular text files can be opened.".into());
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "Only regular text files can be opened.",
+        ));
     }
     if meta.len() > MAX_BYTES {
-        return Err("Files larger than 10 MiB are not supported yet.".into());
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "Files larger than 10 MiB are not supported yet.",
+        ));
     }
     Ok((file, meta))
 }
@@ -227,33 +232,36 @@ fn read_chunks(
     mut file: fs::File,
     cancelled: &dyn Fn() -> bool,
     mut consume: impl FnMut(&[u8]),
-) -> Result<usize> {
+) -> io::Result<usize> {
     let mut length = 0;
     let mut chunk = [0u8; 64 * 1024];
     loop {
         if cancelled() {
-            return Err("Cancelled".into());
+            return Err(io::Error::new(ErrorKind::Interrupted, "Cancelled"));
         }
-        let read = file.read(&mut chunk).map_err(|e| e.to_string())?;
+        let read = file.read(&mut chunk)?;
         if read == 0 {
             return Ok(length);
         }
         if (length + read) as u64 > MAX_BYTES {
-            return Err("File grew beyond 10 MiB while reading.".into());
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "File grew beyond 10 MiB while reading.",
+            ));
         }
         consume(&chunk[..read]);
         length += read;
     }
 }
 
-fn read_cancellable(path: &Path, cancelled: &dyn Fn() -> bool) -> Result<(Vec<u8>, Metadata)> {
+fn read_cancellable(path: &Path, cancelled: &dyn Fn() -> bool) -> io::Result<(Vec<u8>, Metadata)> {
     let (file, meta) = open_regular(path)?;
     let mut bytes = Vec::with_capacity(meta.len() as usize + 1);
     read_chunks(file, cancelled, |chunk| bytes.extend_from_slice(chunk))?;
     Ok((bytes, meta))
 }
 
-fn compare_regular(path: &Path, expected: &FileBytes) -> Result<(bool, Metadata)> {
+fn compare_regular(path: &Path, expected: &FileBytes) -> io::Result<(bool, Metadata)> {
     let (file, meta) = open_regular(path)?;
     let mut cursor = ByteMatcher::new(expected.chunks());
     let mut equal = true;
@@ -261,6 +269,41 @@ fn compare_regular(path: &Path, expected: &FileBytes) -> Result<(bool, Metadata)
         equal = equal && cursor.consume(chunk);
     })?;
     Ok((equal && length == expected.len(), meta))
+}
+
+fn file_io_error(operation: &str, error: io::Error) -> String {
+    if std::env::var_os("GLIMPSE_TRACE").is_some() {
+        eprintln!("GLIMPSE_FILE_IO {operation}: {error}");
+    }
+    let reason = match error.kind() {
+        ErrorKind::PermissionDenied => "Permission was denied.",
+        ErrorKind::ReadOnlyFilesystem => "The destination volume is read-only.",
+        ErrorKind::StorageFull => {
+            "There is no space left on the destination volume. Free some space or save a copy elsewhere."
+        }
+        ErrorKind::QuotaExceeded => "The storage quota has been reached.",
+        ErrorKind::ConnectionAborted | ErrorKind::ConnectionReset | ErrorKind::NotConnected => {
+            "The storage device or network volume is unavailable."
+        }
+        ErrorKind::NotFound => "The destination file or folder is unavailable.",
+        ErrorKind::AlreadyExists => "A file with that name already exists.",
+        ErrorKind::IsADirectory | ErrorKind::NotADirectory => {
+            "The destination is no longer a file in an accessible folder."
+        }
+        ErrorKind::InvalidData => "The destination no longer meets the text editing limits.",
+        _ if error.raw_os_error() == Some(libc::EIO) => {
+            "The storage device reported an input/output error."
+        }
+        _ if matches!(
+            error.raw_os_error(),
+            Some(libc::ENOTCONN | libc::ESTALE | libc::ENODEV)
+        ) =>
+        {
+            "The storage device or network volume is unavailable."
+        }
+        _ => "Check that the destination is available and try again.",
+    };
+    format!("Could not {operation}. {reason}")
 }
 
 fn supported_text(bytes: &[u8]) -> Result<&str> {
@@ -349,11 +392,28 @@ impl DiskFile {
         path: PathBuf,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<(Self, Arc<str>)> {
+        Self::open_checked(path, cancelled, |error| error.to_string())
+    }
+
+    pub(crate) fn prepare_destination(path: PathBuf) -> Result<Option<Self>> {
+        let report_error = |error| file_io_error("inspect the destination", error);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => Self::open_checked(path, &|| false, report_error).map(|(disk, _)| Some(disk)),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(report_error(error)),
+        }
+    }
+
+    fn open_checked(
+        path: PathBuf,
+        cancelled: &dyn Fn() -> bool,
+        report_error: impl Fn(io::Error) -> String,
+    ) -> Result<(Self, Arc<str>)> {
         if cancelled() {
             return Err("Cancelled".into());
         }
-        let target = fs::canonicalize(&path).map_err(|e| e.to_string())?;
-        let (bytes, meta) = read_cancellable(&target, cancelled)?;
+        let target = fs::canonicalize(&path).map_err(&report_error)?;
+        let (bytes, meta) = read_cancellable(&target, cancelled).map_err(report_error)?;
         let bom = bytes.starts_with(BOM);
         let content = if bom { &bytes[3..] } else { &bytes };
         let text = supported_text(content)?;
@@ -371,16 +431,17 @@ impl DiskFile {
     }
 
     pub(crate) fn observe(mut self) -> Result<Observation> {
-        let target = fs::canonicalize(&self.path).map_err(|e| e.to_string())?;
+        let report_error = |error| file_io_error("check the file", error);
+        let target = fs::canonicalize(&self.path).map_err(report_error)?;
         if target == self.target {
-            let (equal, metadata) = compare_regular(&target, &self.bytes)?;
+            let (equal, metadata) = compare_regular(&target, &self.bytes).map_err(report_error)?;
             if equal && self.bom == self.bytes.has_bom() {
                 self.bytes.validate_text(self.bom)?;
                 self.identity = identity(&metadata);
                 return Ok(Observation::Unchanged(self));
             }
         }
-        let (disk, text) = Self::open(self.path)?;
+        let (disk, text) = Self::open_checked(self.path, &|| false, report_error)?;
         Ok(Observation::Changed(disk, text))
     }
 
@@ -397,32 +458,36 @@ impl DiskFile {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
-        let directory = fs::canonicalize(parent).map_err(|error| error.to_string())?;
+        let directory = fs::canonicalize(parent)
+            .map_err(|error| file_io_error("open the destination folder", error))?;
         let target = directory.join(path.file_name().ok_or("Choose a filename")?);
         let bytes = FileBytes::from_text(text.into(), bom);
         if bytes.len() as u64 > MAX_BYTES {
             return Err("The new file exceeds the 10 MiB editing limit".into());
         }
-        let mut staged =
-            tempfile::NamedTempFile::new_in(&directory).map_err(|error| error.to_string())?;
+        let mut staged = tempfile::NamedTempFile::new_in(&directory)
+            .map_err(|error| file_io_error("prepare the new file", error))?;
         bytes
-            .write_to(&mut staged)
+            .write_to(staged.as_file_mut())
             .and_then(|_| staged.as_file().sync_all())
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| file_io_error("write the new file", error))?;
         let expected_identity = identity(
             &staged
                 .as_file()
                 .metadata()
-                .map_err(|error| error.to_string())?,
+                .map_err(|error| file_io_error("verify the new file", error))?,
         );
-        if fs::canonicalize(parent).map_err(|error| error.to_string())? != directory {
+        if fs::canonicalize(parent)
+            .map_err(|error| file_io_error("check the destination folder", error))?
+            != directory
+        {
             return Err(
                 "The destination folder changed before creation; nothing was published".into(),
             );
         }
         staged
             .persist_noclobber(&target)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| file_io_error("create the destination", error.error))?;
         after_publish();
         let message = format!(
             "The destination changed after creating {}. The current buffer was retained; review the destination before saving again.",
@@ -453,7 +518,8 @@ impl DiskFile {
                 ));
             }
         }
-        let (equal, _) = compare_regular(&self.target, &self.bytes)?;
+        let (equal, _) =
+            compare_regular(&self.target, &self.bytes).map_err(|error| error.to_string())?;
         if !equal {
             return Err(
                 "Requested destination bytes changed after the last observed version".into(),
@@ -462,10 +528,14 @@ impl DiskFile {
         Ok(())
     }
     fn validate(&self) -> Result<Metadata> {
-        if fs::canonicalize(&self.path).map_err(|e| e.to_string())? != self.target {
+        if fs::canonicalize(&self.path)
+            .map_err(|error| file_io_error("check the destination", error))?
+            != self.target
+        {
             return Err("The file's destination changed. Your text is still in this tab.".into());
         }
-        let (equal, meta) = compare_regular(&self.target, &self.bytes)?;
+        let (equal, meta) = compare_regular(&self.target, &self.bytes)
+            .map_err(|error| file_io_error("verify the saved version", error))?;
         if identity(&meta) != self.identity || !equal {
             return Err(
                 "The file changed on disk. Saving was stopped; your text is still in this tab."
@@ -522,13 +592,19 @@ impl DiskFile {
             .target
             .parent()
             .ok_or("The file has no parent folder.")?;
-        let mut staged = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
+        let mut staged = tempfile::NamedTempFile::new_in(parent)
+            .map_err(|error| file_io_error("prepare the replacement", error))?;
         let source = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
             .open(&self.target)
-            .map_err(|e| e.to_string())?;
-        if identity(&source.metadata().map_err(|e| e.to_string())?) != self.identity {
+            .map_err(|error| file_io_error("open the saved version", error))?;
+        if identity(
+            &source
+                .metadata()
+                .map_err(|error| file_io_error("check the saved version", error))?,
+        ) != self.identity
+        {
             return Err("The file changed before saving.".into());
         }
         #[cfg(target_os = "macos")]
@@ -542,9 +618,9 @@ impl DiskFile {
                 )
             };
             if copied != 0 {
-                return Err(format!(
-                    "Cannot preserve file metadata: {}",
-                    std::io::Error::last_os_error()
+                return Err(file_io_error(
+                    "preserve file metadata",
+                    io::Error::last_os_error(),
                 ));
             }
         }
@@ -553,33 +629,42 @@ impl DiskFile {
             use std::os::fd::AsRawFd;
             use xattr::FileExt;
             if unsafe { libc::fchown(staged.as_file().as_raw_fd(), meta.uid(), meta.gid()) } != 0 {
-                return Err(format!(
-                    "Cannot preserve ownership: {}",
-                    std::io::Error::last_os_error()
+                return Err(file_io_error(
+                    "preserve file ownership",
+                    io::Error::last_os_error(),
                 ));
             }
             staged
                 .as_file()
                 .set_permissions(meta.permissions())
-                .map_err(|e| e.to_string())?;
-            for key in source.list_xattr().map_err(|e| e.to_string())? {
+                .map_err(|error| file_io_error("preserve file permissions", error))?;
+            for key in source
+                .list_xattr()
+                .map_err(|error| file_io_error("read file metadata", error))?
+            {
                 let value = source
                     .get_xattr(&key)
-                    .map_err(|e| e.to_string())?
+                    .map_err(|error| file_io_error("read file metadata", error))?
                     .ok_or("File metadata changed")?;
                 staged
                     .as_file()
                     .set_xattr(&key, &value)
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|error| file_io_error("preserve file metadata", error))?;
             }
         }
-        bytes.write_to(&mut staged).map_err(|e| e.to_string())?;
-        staged.as_file().sync_all().map_err(|e| e.to_string())?;
+        bytes
+            .write_to(staged.as_file_mut())
+            .map_err(|error| file_io_error("write the edits", error))?;
+        staged
+            .as_file()
+            .sync_all()
+            .map_err(|error| file_io_error("finish writing the edits", error))?;
         self.validate()?;
         staged
             .persist(&self.target)
-            .map_err(|e| e.error.to_string())?;
-        let saved_meta = fs::symlink_metadata(&self.target).map_err(|e| e.to_string())?;
+            .map_err(|error| file_io_error("replace the saved file", error.error))?;
+        let saved_meta = fs::symlink_metadata(&self.target)
+            .map_err(|error| file_io_error("verify the destination after writing", error))?;
         Ok(Self {
             bytes,
             bom,

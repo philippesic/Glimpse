@@ -523,15 +523,7 @@ impl IoWorker {
                         }
                         Job::Trash(path) => Reply::Changed(fileops::trash(&path)),
                         Job::Prepare(destination) => {
-                            let result = match std::fs::symlink_metadata(&destination.path) {
-                                Ok(_) => {
-                                    DiskFile::open(destination.path.clone()).map(|v| Some(v.0))
-                                }
-                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                                    Ok(None)
-                                }
-                                Err(error) => Err(error.to_string()),
-                            };
+                            let result = DiskFile::prepare_destination(destination.path.clone());
                             Reply::Prepared(Box::new(destination), result)
                         }
                         Job::SaveTo(destination) => {
