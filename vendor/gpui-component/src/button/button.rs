@@ -183,6 +183,7 @@ pub struct Button {
     style: StyleRefinement,
     icon: Option<Icon>,
     label: Option<SharedString>,
+    italic_label: bool,
     children: Vec<AnyElement>,
     disabled: bool,
     pub(crate) selected: bool,
@@ -227,6 +228,7 @@ impl Button {
             style: StyleRefinement::default(),
             icon: None,
             label: None,
+            italic_label: false,
             disabled: false,
             selected: false,
             variant: ButtonVariant::default(),
@@ -285,6 +287,11 @@ impl Button {
     /// Set label to the Button, if no label is set, the button will be in Icon Button mode.
     pub fn label(mut self, label: impl Into<SharedString>) -> Self {
         self.label = Some(label.into());
+        self
+    }
+
+    pub fn italic_label(mut self) -> Self {
+        self.italic_label = true;
         self
     }
 
@@ -468,6 +475,7 @@ impl RenderOnce for Button {
             .clone()
             .or_else(|| self.tooltip.as_ref().map(|(label, _)| label.clone()))
             .unwrap_or_else(|| "Button".into());
+        let italic_label = self.italic_label;
         let semantic_disabled = self.disabled || self.loading;
         let semantic_selected = self.selected;
         let semantic_handler = self.on_click.clone();
@@ -618,6 +626,7 @@ impl RenderOnce for Button {
                                 .min_w_0()
                                 .truncate()
                                 .line_height(relative(1.))
+                                .when(italic_label, |label| label.italic())
                                 .child(label),
                         )
                     })

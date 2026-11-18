@@ -25,7 +25,7 @@ use glimpse::{
 };
 use gpui::{prelude::*, *};
 use gpui_component::{
-    ActiveTheme, Disableable, Root, Selectable, Sizable,
+    ActiveTheme, Disableable, IconName, Root, Selectable, Sizable,
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState, Position, PreparedInput, Rope},
 };
@@ -75,7 +75,7 @@ pub fn run(request: cli::Request) {
                     let weak = view.downgrade();
                     window.on_window_should_close(cx, move |window, cx| {
                         weak.update(cx, |shell, cx| {
-                            shell.close(true, window, cx);
+                            shell.close(true, None, window, cx);
                             false
                         })
                         .unwrap_or(true)
@@ -1579,10 +1579,15 @@ impl Shell {
                                 self.watch();
                                 if self.active == Some(id) {
                                     self.active = self.documents.last().map(|d| d.id);
+                                    self.reading = false;
                                 }
                             }
                             self.complete_request();
-                            self.focus(window, cx);
+                            if self.reading {
+                                window.focus(&self.reading_focus);
+                            } else {
+                                self.focus(window, cx);
+                            }
                             self.finish_close(cx);
                         }
                         glimpse::closing::Outcome::Changed => {
@@ -2336,7 +2341,7 @@ impl Shell {
         })
         .detach();
     }
-    fn close(&mut self, quit: bool, window: &mut Window, cx: &mut Context<Self>) {
+    fn close(&mut self, quit: bool, tab: Option<u64>, window: &mut Window, cx: &mut Context<Self>) {
         if self.decision.is_some() {
             return;
         }
@@ -2360,7 +2365,7 @@ impl Shell {
         let documents = self
             .documents
             .iter()
-            .filter(|d| quit || Some(d.id) == self.active)
+            .filter(|d| quit || Some(d.id) == tab)
             .map(|d| d.id)
             .collect();
         self.close_pending = Some(CloseDecision {
@@ -2399,8 +2404,14 @@ impl Shell {
                     cx.notify();
                     return;
                 }
+                let retained = self.active.filter(|active| {
+                    !decision.quit && !decision.finish && !decision.documents.contains(active)
+                });
                 self.active = Some(id);
                 self.save(window, cx);
+                if let Some(retained) = retained {
+                    self.active = Some(retained);
+                }
             } else if self.decision.is_none() {
                 let paths = self
                     .documents
@@ -2913,8 +2924,8 @@ impl Shell {
                 self.search_ui.temporary = None;
                 self.reset_search("Search scope changed; press Enter to search");
             }
-            "close" => self.close(false, window, cx),
-            "quit" => self.close(true, window, cx),
+            "close" => self.close(false, self.active, window, cx),
+            "quit" => self.close(true, None, window, cx),
             "abort" => {
                 self.finishing.invalidate();
                 self.close_pending = None;
@@ -3532,12 +3543,12 @@ impl Render for Shell {
             .track_scroll(&self.tab_scroll)
             .children(self.documents.iter().map(|doc| {
                 let id = doc.id;
+                let name = paths::tab_label(
+                    &doc.disk.path,
+                    self.documents.iter().map(|doc| doc.disk.path.as_path()),
+                );
                 let title = format!(
-                    "{}{}{}{}",
-                    paths::tab_label(
-                        &doc.disk.path,
-                        self.documents.iter().map(|doc| doc.disk.path.as_path())
-                    ),
+                    "{name}{}{}{}",
                     if doc.dirty(cx) { " •" } else { "" },
                     if doc.preview { " (preview)" } else { "" },
                     if doc.external.is_some() {
@@ -3546,29 +3557,47 @@ impl Render for Shell {
                         ""
                     }
                 );
-                div().track_focus(&doc.tab_focus).flex_shrink_0().child(
-                    Button::new(("tab", id))
-                        .accessibility_role(gpui::accesskit::Role::Tab)
-                        .label(title)
-                        .tooltip(paths::display(&doc.disk.path))
-                        .small()
-                        .compact()
-                        .selected(Some(id) == self.active)
-                        .when(Some(id) == self.active, |tab| tab.primary())
-                        .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                            this.active = Some(id);
-                            if event.click_count() > 1
-                                && let Some(doc) =
-                                    this.documents.iter_mut().find(|doc| doc.id == id)
-                            {
-                                doc.preview = false;
-                            }
-                            this.reading = false;
-                            this.navigation_only = false;
-                            this.focus(window, cx);
-                            cx.notify();
-                        })),
-                )
+                div()
+                    .track_focus(&doc.tab_focus)
+                    .flex()
+                    .items_center()
+                    .flex_shrink_0()
+                    .child(
+                        Button::new(("tab", id))
+                            .accessibility_role(gpui::accesskit::Role::Tab)
+                            .label(title)
+                            .tooltip(paths::display(&doc.disk.path))
+                            .small()
+                            .compact()
+                            .selected(Some(id) == self.active)
+                            .when(doc.preview, |tab| tab.italic_label())
+                            .when(Some(id) == self.active, |tab| tab.primary())
+                            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                                this.active = Some(id);
+                                if event.click_count() > 1
+                                    && let Some(doc) =
+                                        this.documents.iter_mut().find(|doc| doc.id == id)
+                                {
+                                    doc.preview = false;
+                                }
+                                this.reading = false;
+                                this.navigation_only = false;
+                                this.focus(window, cx);
+                                cx.notify();
+                            })),
+                    )
+                    .when(!self.request.pick, |tab| {
+                        tab.child(
+                            Button::new(("close-tab", id))
+                                .icon(IconName::Close)
+                                .small()
+                                .ghost()
+                                .tooltip(format!("Close {name}"))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.close(false, Some(id), window, cx);
+                                })),
+                        )
+                    })
             }));
         let tabs = accessible("open-documents", tabs, |_, _, _| {
             let mut node = gpui::accesskit::Node::new(gpui::accesskit::Role::TabList);
@@ -3585,13 +3614,10 @@ impl Render for Shell {
         if !self.request.pick && !short {
             let actions = div().flex().flex_wrap().gap_2().p_1();
             content = content.child(if narrow {
-                actions
-                    .child(self.button("Save", "save", cx))
-                    .child(
-                        self.button(if self.reading { "Edit" } else { "Read" }, "read", cx)
-                            .selected(self.reading),
-                    )
-                    .child(self.button("Close", "close", cx))
+                actions.child(self.button("Save", "save", cx)).child(
+                    self.button(if self.reading { "Edit" } else { "Read" }, "read", cx)
+                        .selected(self.reading),
+                )
             } else {
                 actions
                     .child(self.button("New", "new", cx))
@@ -3603,7 +3629,6 @@ impl Render for Shell {
                             .selected(self.reading),
                     )
                     .child(self.button("Go to line", "line", cx))
-                    .child(self.button("Close tab", "close", cx))
                     .child(self.button("Reload disk", "reload", cx))
             });
         }
