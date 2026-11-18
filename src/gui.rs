@@ -3349,9 +3349,25 @@ impl Render for Shell {
         } else {
             toolbar = toolbar
                 .child(self.main_menu(cx))
-                .child(self.button("‹", "back", cx))
-                .child(self.button("›", "forward", cx))
-                .child(self.button("↑", "parent", cx))
+                .children(
+                    [
+                        ("back", "Back", IconName::ArrowLeft),
+                        ("forward", "Forward", IconName::ArrowRight),
+                        ("parent", "Parent Folder", IconName::ArrowUp),
+                    ]
+                    .into_iter()
+                    .map(|(command, label, icon)| {
+                        Button::new(command)
+                            .small()
+                            .outline()
+                            .icon(icon)
+                            .tooltip(label)
+                            .disabled(!self.command_enabled(command))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.command(command, window, cx)
+                            }))
+                    }),
+                )
                 .child(self.locations_menu(cx))
                 .child(self.button(
                     if self.navigator_visible {
