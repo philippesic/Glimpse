@@ -11,9 +11,10 @@ use gpui::{
 };
 
 use super::node::{InlineText, Node as Block, Paragraph};
-use crate::semantic_text::{MAX_RUN_CHARACTERS, Segment, text_run_with_boundaries, visit_segments};
+use crate::semantic_text::{MAX_RUN_CHARACTERS, Segment, text_run_with_boundaries, visit_line_segments};
 
 const MAX_CACHED_RUNS: usize = 256;
+const MAX_CACHED_LINE_BYTES: usize = 1024;
 const PACKED_TEXT_BYTES: usize = 8 * 1024;
 
 #[derive(PartialEq)]
@@ -253,6 +254,7 @@ struct TextBuilder {
     runs: Vec<Node>,
     text: HashMap<Arc<str>, Arc<[Node]>>,
     boundaries: HashMap<u64, Node>,
+    lines: LineBoundaries,
 }
 
 impl TextBuilder {
@@ -297,7 +299,7 @@ impl TextBuilder {
                     debug_assert!(assigned);
                     templates.push(run);
                 };
-            visit_packed_segments(&value, make_run);
+            self.lines.visit_packed_segments(&value, make_run);
             let templates: Arc<[Node]> = templates.into();
             if self.text.len() < MAX_CACHED_RUNS {
                 self.text.insert(value, templates.clone());
@@ -326,21 +328,21 @@ struct PackedSegment {
 }
 
 impl PackedSegment {
-    fn push(&mut self, segment: Segment) {
+    fn push(&mut self, segment: &Segment, offset: usize, line: usize) {
         let characters = self.lengths.len() as u16;
         if self.range.is_empty() {
-            self.range.start = segment.range.start;
-        } else if segment.line != self.last_line {
+            self.range.start = offset + segment.range.start;
+        } else if line != self.last_line {
             self.lines.push(characters);
             if segment.words.first() != Some(&0) {
                 self.words.push(characters);
             }
         }
-        self.last_line = segment.line;
-        self.range.end = segment.range.end;
-        self.lengths.extend(segment.lengths);
+        self.last_line = line;
+        self.range.end = offset + segment.range.end;
+        self.lengths.extend_from_slice(&segment.lengths);
         self.words
-            .extend(segment.words.into_iter().map(|word| characters + word));
+            .extend(segment.words.iter().map(|word| characters + word));
     }
 
     fn finish(self, emit: &mut impl FnMut(Range<usize>, Vec<u8>, Vec<u16>, Vec<u16>)) {
@@ -350,25 +352,102 @@ impl PackedSegment {
     }
 }
 
-fn visit_packed_segments(
-    text: &str,
-    mut emit: impl FnMut(Range<usize>, Vec<u8>, Vec<u16>, Vec<u16>),
-) {
-    let mut packed = PackedSegment::default();
-    visit_segments(text, |segment| {
-        if !segment.range.is_empty() {
+#[derive(Default)]
+struct LineBoundaries {
+    key: Vec<u8>,
+    templates: HashMap<Vec<u8>, Segment>,
+}
+
+impl LineBoundaries {
+    fn visit(&mut self, text: &str, mut visit: impl FnMut(&Segment, usize, usize)) {
+        let mut offset = 0;
+        for (index, line) in text.split_inclusive('\n').enumerate() {
+            let mut visit_at_offset = |segment: &Segment| visit(segment, offset, index);
+            if line.len() <= MAX_CACHED_LINE_BYTES {
+                self.key.clear();
+                self.key.extend(line.bytes().map(
+                    |byte| {
+                        if byte.is_ascii_digit() {
+                            b'0'
+                        } else {
+                            byte
+                        }
+                    },
+                ));
+                if let Some(segment) = self.templates.get(self.key.as_slice()) {
+                    visit_at_offset(segment);
+                } else {
+                    self.build(line, visit_at_offset);
+                }
+            } else {
+                visit_line_segments(line, index, |segment| visit_at_offset(&segment));
+            }
+            offset += line.len();
+        }
+    }
+
+    fn build(&mut self, line: &str, mut visit: impl FnMut(&Segment)) {
+        let cache = self.templates.len() < MAX_CACHED_RUNS;
+        visit_line_segments(line, 0, |segment| {
+            visit(&segment);
+            if cache {
+                self.templates.insert(self.key.clone(), segment);
+            }
+        });
+    }
+
+    fn visit_packed_segments(
+        &mut self,
+        text: &str,
+        mut emit: impl FnMut(Range<usize>, Vec<u8>, Vec<u16>, Vec<u16>),
+    ) {
+        let mut packed = PackedSegment::default();
+        self.visit(text, |segment, offset, line| {
             if packed.lengths.len() + segment.lengths.len() > MAX_RUN_CHARACTERS {
                 std::mem::take(&mut packed).finish(&mut emit);
             }
-            packed.push(segment);
-        }
-    });
-    packed.finish(&mut emit);
+            packed.push(segment, offset, line);
+        });
+        packed.finish(&mut emit);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_reading_line_boundaries_match_unicode_segmentation() {
+        use crate::semantic_text::visit_segments;
+
+        let mut cache = LineBoundaries::default();
+        let mut text = String::new();
+        for digit in 0..=9 {
+            text.push_str(&format!(
+                "Café {digit}\u{301}.e{digit}, 3.{digit} 🇪🇺 1\u{fe0f}\u{20e3} العربية {digit}𐐀\r\n"
+            ));
+        }
+        text.push_str(&"long text 🧑🏽‍🔬 a2.b3 ".repeat(250));
+        text.push_str("\n\nEnd 99");
+        for input in ["", "\n", text.as_str(), text.as_str()] {
+            let mut expected = Vec::new();
+            visit_segments(input, |segment| {
+                if !segment.range.is_empty() {
+                    expected.push((segment.range, segment.lengths, segment.words, segment.line));
+                }
+            });
+            let mut actual = Vec::new();
+            cache.visit(input, |segment, offset, index| {
+                actual.push((
+                    offset + segment.range.start..offset + segment.range.end,
+                    segment.lengths.clone(),
+                    segment.words.clone(),
+                    index,
+                ));
+            });
+            assert_eq!(actual, expected);
+        }
+    }
 
     #[test]
     fn large_unmeasured_list_keeps_offsets_across_splice_and_reset() {
