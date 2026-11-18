@@ -1081,7 +1081,12 @@ impl Element for TextView {
             .track_focus(focus_handle)
             .size_full()
             .relative()
-            .focus_ring(focus_handle.is_focused(window), px(0.), window, cx)
+            .focus_ring(
+                focus_handle.is_focused(window),
+                window.rem_size() / 8.,
+                window,
+                cx,
+            )
             .on_action({
                 let state = self.state.clone();
                 move |_: &input::Copy, _, cx| {

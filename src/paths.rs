@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn escaped(value: &std::ffi::OsStr) -> String {
     value
@@ -20,19 +20,19 @@ pub fn name(path: &Path) -> String {
     display(Path::new(name))
 }
 
-pub fn tab_label<'a>(path: &Path, others: impl IntoIterator<Item = &'a Path>) -> String {
-    let duplicates: Vec<_> = others
+fn same_named_paths<'a>(path: &Path, others: impl IntoIterator<Item = &'a Path>) -> Vec<&'a Path> {
+    others
         .into_iter()
         .filter(|other| *other != path && other.file_name() == path.file_name())
-        .collect();
-    if duplicates.is_empty() {
-        return name(path);
-    }
+        .collect()
+}
+
+fn distinguishing_parent(path: &Path, duplicates: &[&Path]) -> Option<PathBuf> {
     let suffix = |path: &Path, depth: usize| {
         let components: Vec<_> = path.parent().unwrap_or(path).components().collect();
         components[components.len().saturating_sub(depth)..]
             .iter()
-            .collect::<std::path::PathBuf>()
+            .collect::<PathBuf>()
     };
     for depth in 1..=path.components().count() {
         let parent = suffix(path, depth);
@@ -40,10 +40,29 @@ pub fn tab_label<'a>(path: &Path, others: impl IntoIterator<Item = &'a Path>) ->
             .iter()
             .all(|other| suffix(other, depth) != parent)
         {
-            return format!("{} — {}", name(path), display(&parent));
+            return Some(parent);
         }
     }
-    display(path)
+    None
+}
+
+pub fn tab_label<'a>(path: &Path, others: impl IntoIterator<Item = &'a Path>) -> String {
+    let duplicates = same_named_paths(path, others);
+    if duplicates.is_empty() {
+        return name(path);
+    }
+    distinguishing_parent(path, &duplicates).map_or_else(
+        || display(path),
+        |parent| format!("{} — {}", name(path), display(&parent)),
+    )
+}
+
+pub fn parent_label<'a>(path: &Path, others: impl IntoIterator<Item = &'a Path>) -> String {
+    let duplicates = same_named_paths(path, others);
+    distinguishing_parent(path, &duplicates).map_or_else(
+        || name(path.parent().unwrap_or(path)),
+        |parent| display(&parent),
+    )
 }
 #[cfg(test)]
 mod tests {
@@ -69,6 +88,9 @@ mod tests {
         ];
         assert_eq!(tab_label(paths[0], paths), "main.rs — alpha/src");
         assert_eq!(tab_label(paths[1], paths), "main.rs — beta/src");
+        assert_eq!(parent_label(paths[0], paths), "alpha/src");
+        assert_eq!(parent_label(paths[1], paths), "beta/src");
+        assert_eq!(parent_label(paths[2], paths), "beta");
         assert_eq!(tab_label(paths[2], paths), "other.txt");
         let parents = [
             Path::new("/work/alpha/main.rs"),

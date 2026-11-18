@@ -2556,11 +2556,8 @@ impl Shell {
                     .filter(|doc| decision.documents.contains(&doc.id) && doc.dirty(cx))
                     .map(|doc| doc.disk.path.as_path())
                     .collect::<Vec<_>>();
-                let labels = paths
-                    .iter()
-                    .map(|path| paths::tab_label(path, paths.iter().copied()))
-                    .collect::<Vec<_>>();
-                let names = paths
+                let subjects = decision::Decision::unsaved_subjects(&paths);
+                let details = paths
                     .iter()
                     .map(|path| paths::display(path))
                     .collect::<Vec<_>>()
@@ -2574,7 +2571,7 @@ impl Shell {
                         "Close with unsaved changes?"
                     }
                     .into(),
-                    names,
+                    details,
                     vec![
                         "Cancel",
                         if finish {
@@ -2588,7 +2585,7 @@ impl Shell {
                     cx,
                 );
                 if let Some(view) = &self.decision {
-                    view.update(cx, |view, cx| view.set_subjects(labels, cx));
+                    view.update(cx, |view, cx| view.set_subjects(subjects, cx));
                 }
             }
         } else {
@@ -3806,6 +3803,8 @@ impl Render for Shell {
                 .flex()
                 .items_center()
                 .flex_shrink_0()
+                .pr_2()
+                .gap_1()
                 .child(div().flex_1().min_w_0().child(tabs))
                 .child(self.button("Edit Source", "read", cx).flex_shrink_0())
                 .into_any_element()

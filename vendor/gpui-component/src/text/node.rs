@@ -1749,12 +1749,19 @@ impl Node {
                 let (scroll, focus) = controls.read(cx).clone();
                 let input_scroll = scroll.clone();
                 let input_focus = focus.clone();
+                let layout_scroll = scroll.clone();
+                let overflow = scroll.max_offset().width > px(0.);
                 let scrollbar =
                     Scrollbar::horizontal(&scroll).scrollbar_show(ScrollbarShow::Always);
                 div()
+                .on_children_prepainted(move |_, window, _| {
+                    if overflow != (layout_scroll.max_offset().width > px(0.)) {
+                        window.request_animation_frame();
+                    }
+                })
                 .id(id)
                 .relative()
-                .pb(rems(1.))
+                .when(overflow, |table| table.pb(rems(1.)))
                 .w_full()
                 .track_focus(&focus)
                 .focus_ring(focus.is_focused(window), px(0.), window, cx)
@@ -1908,15 +1915,17 @@ impl Node {
                             })
                         }),
                 )
-                .child(
-                    div()
-                        .absolute()
-                        .bottom_0()
-                        .left_0()
-                        .right_0()
-                        .h(rems(1.))
-                        .child(scrollbar),
-                )
+                .when(overflow, |table| {
+                    table.child(
+                        div()
+                            .absolute()
+                            .bottom_0()
+                            .left_0()
+                            .right_0()
+                            .h(rems(1.))
+                            .child(scrollbar),
+                    )
+                })
                 .into_any_element()
             }
             _ => div().into_any_element(),

@@ -705,7 +705,7 @@ impl SearchPanel {
         let panel = cx.entity().downgrade();
         Button::new("find-options")
             .small()
-            .ghost()
+            .outline()
             .icon(IconName::Ellipsis)
             .tooltip("Find options")
             .dropdown_menu(move |mut menu, window, _| {
@@ -954,7 +954,10 @@ impl Render for SearchPanel {
                                                 .selected(!self.case_insensitive)
                                                 .small()
                                                 .compact()
-                                                .ghost()
+                                                .outline()
+                                                .when(!self.case_insensitive, |button| {
+                                                    button.primary()
+                                                })
                                                 .icon(IconName::CaseSensitive)
                                                 .tooltip("Match case")
                                                 .on_click(cx.listener(|this, _, window, cx| {
@@ -993,7 +996,8 @@ impl Render for SearchPanel {
                                 .child(
                                     Button::new("whole-word")
                                         .small()
-                                        .ghost()
+                                        .outline()
+                                        .when(self.whole_word, |button| button.primary())
                                         .label("Word")
                                         .tooltip("Match whole words")
                                         .selected(self.whole_word)
@@ -1004,7 +1008,8 @@ impl Render for SearchPanel {
                                 .child(
                                     Button::new("replace-mode")
                                         .small()
-                                        .ghost()
+                                        .outline()
+                                        .when(self.replace_mode, |button| button.primary())
                                         .icon(IconName::Replace)
                                         .tooltip("Show replacement")
                                         .selected(self.replace_mode)
@@ -1015,7 +1020,7 @@ impl Render for SearchPanel {
                                 .child(
                                     Button::new("prev")
                                         .small()
-                                        .ghost()
+                                        .outline()
                                         .icon(IconName::ChevronLeft)
                                         .tooltip("Previous match")
                                         .disabled(!has_matches)
@@ -1026,7 +1031,7 @@ impl Render for SearchPanel {
                                 .child(
                                     Button::new("next")
                                         .small()
-                                        .ghost()
+                                        .outline()
                                         .icon(IconName::ChevronRight)
                                         .tooltip("Next match")
                                         .disabled(!has_matches)

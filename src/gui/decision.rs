@@ -1,3 +1,4 @@
+use glimpse::paths;
 use gpui::{prelude::*, *};
 use gpui_component::{
     ActiveTheme, Sizable, StyledExt,
@@ -5,11 +6,54 @@ use gpui_component::{
     input::{Input, InputState},
     scroll::{Scrollbar, ScrollbarShow},
 };
+use std::path::{MAIN_SEPARATOR, Path};
+
+pub(super) struct UnsavedSubject {
+    name: String,
+    folder: String,
+}
+
+impl UnsavedSubject {
+    fn label(&self) -> String {
+        format!("{} — {}", self.name, self.folder)
+    }
+
+    fn element(&self, index: usize, lines: Option<usize>, cx: &App) -> impl IntoElement {
+        let label = self.label();
+        gpui::accessible(
+            ("decision-subject", index),
+            div()
+                .min_w_0()
+                .pb_1()
+                .child(
+                    div()
+                        .font_semibold()
+                        .when(lines == Some(1), |name| name.truncate())
+                        .when_some(lines.filter(|&count| count > 1), |name, lines| {
+                            name.line_clamp(lines)
+                        })
+                        .child(self.name.clone()),
+                )
+                .child(
+                    div()
+                        .text_color(cx.theme().muted_foreground)
+                        .truncate()
+                        .child(self.folder.clone()),
+                ),
+            move |_, _, _| {
+                let mut node = gpui::accesskit::Node::new(gpui::accesskit::Role::Label);
+                node.set_value(label.clone());
+                node.set_read_only();
+                AccessibilityInfo::new(node)
+            },
+        )
+    }
+}
 
 pub struct Decision {
     title: String,
     detail: String,
-    subjects: Vec<String>,
+    subjects: Vec<UnsavedSubject>,
     summary: Option<String>,
     primary: Option<usize>,
     primary_focus: Option<FocusHandle>,
@@ -96,9 +140,42 @@ impl Decision {
         focus.focus(window);
         self.primary_focus = Some(focus);
     }
-    pub fn set_subjects(&mut self, subjects: Vec<String>, cx: &mut Context<Self>) {
+    pub(super) fn unsaved_subjects(paths: &[&Path]) -> Vec<UnsavedSubject> {
+        paths
+            .iter()
+            .map(|path| UnsavedSubject {
+                name: paths::name(path),
+                folder: paths::parent_label(path, paths.iter().copied()),
+            })
+            .collect()
+    }
+    pub(super) fn set_subjects(&mut self, subjects: Vec<UnsavedSubject>, cx: &mut Context<Self>) {
         self.subjects = subjects;
         cx.notify();
+    }
+    fn compact_paths(&self) -> Div {
+        div()
+            .pt_2()
+            .children(self.detail.lines().enumerate().map(|(index, path)| {
+                let full_path = path.to_owned();
+                div()
+                    .id(("decision-full-path", index))
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .flex_wrap()
+                    .pb_1()
+                    .children(path.split_inclusive(MAIN_SEPARATOR).map(|part| {
+                        div()
+                            .max_w_full()
+                            .flex_shrink_0()
+                            .truncate()
+                            .child(part.to_owned())
+                    }))
+                    .tooltip(move |window, cx| {
+                        gpui_component::tooltip::Tooltip::new(full_path.clone()).build(window, cx)
+                    })
+            }))
     }
     pub fn compare(
         &mut self,
@@ -141,6 +218,12 @@ impl Render for Decision {
         let narrow = viewport.width < px(400.) * (cx.theme().font_size / px(16.));
         let comparison_height = px(160.).min(viewport.height * 0.22);
         let detail_fraction = if self.comparison.is_some() { 0.67 } else { 0.4 };
+        let subject_lines = compact.then_some(if self.subjects.len() == 1 { 3 } else { 1 });
+        let detail = if compact && !self.subjects.is_empty() {
+            self.compact_paths().into_any_element()
+        } else {
+            self.detail.clone().into_any_element()
+        };
         let semantic_title = self.title.clone();
         let mut semantic_detail = self.summary.as_ref().map_or_else(
             || self.detail.clone(),
@@ -149,7 +232,11 @@ impl Render for Decision {
         if !self.subjects.is_empty() {
             semantic_detail = format!(
                 "Unsaved documents:\n{}\n\n{semantic_detail}",
-                self.subjects.join("\n")
+                self.subjects
+                    .iter()
+                    .map(UnsavedSubject::label)
+                    .collect::<Vec<_>>()
+                    .join("\n")
             );
         }
         let rendered = div()
@@ -210,20 +297,8 @@ impl Render for Decision {
                                         body.text_sm().line_height(relative(1.25))
                                     })
                                     .children(self.subjects.iter().enumerate().map(
-                                        |(index, label)| {
-                                            let name = label.clone();
-                                            gpui::accessible(
-                                                ("decision-subject", index),
-                                                div().pb_2().font_semibold().child(label.clone()),
-                                                move |_, _, _| {
-                                                    let mut node = gpui::accesskit::Node::new(
-                                                        gpui::accesskit::Role::Label,
-                                                    );
-                                                    node.set_value(name.clone());
-                                                    node.set_read_only();
-                                                    AccessibilityInfo::new(node)
-                                                },
-                                            )
+                                        |(index, subject)| {
+                                            subject.element(index, subject_lines, cx)
                                         },
                                     ))
                                     .when_some(self.comparison.as_ref(), |body, inputs| {
@@ -242,7 +317,7 @@ impl Render for Decision {
                                             },
                                         ))
                                     })
-                                    .child(self.detail.clone()),
+                                    .child(detail),
                             )
                             .child(
                                 div().absolute().inset_0().child(
