@@ -1,3 +1,4 @@
+use super::accessibility::message;
 use glimpse::storage::Settings;
 use gpui::{prelude::*, *};
 use gpui_component::{
@@ -402,6 +403,11 @@ impl Render for Preferences {
             }
         }
         let categories = if self.draft.ui_scale > 1.25 || window.viewport_size().width < px(600.) {
+            let index = Page::ALL
+                .iter()
+                .position(|page| *page == self.page)
+                .unwrap();
+            let category = format!("{} ({}/{})", self.page.label(), index + 1, Page::ALL.len());
             div()
                 .flex()
                 .items_center()
@@ -423,14 +429,10 @@ impl Render for Preferences {
                             cx.notify();
                         })),
                 )
-                .child(format!(
-                    "{} ({}/5)",
-                    self.page.label(),
-                    Page::ALL
-                        .iter()
-                        .position(|page| *page == self.page)
-                        .unwrap()
-                        + 1
+                .child(message(
+                    "preferences-category",
+                    category.clone(),
+                    div().child(category),
                 ))
                 .child(
                     Button::new("next-category")
