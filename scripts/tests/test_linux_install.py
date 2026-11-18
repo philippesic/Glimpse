@@ -87,6 +87,11 @@ class InstallSafety(unittest.TestCase):
                     INSTALLER.install(self.source, prefix)
                 self.assertFalse(prefix.exists())
 
+    def test_installed_desktop_launcher_preserves_restore_and_file_arguments(self):
+        prefix = self.root / "installed with spaces"
+        executable, desktop = INSTALLER.install(self.source, prefix)
+        self.assertIn(f'Exec="{executable}" --desktop -- %F', desktop.read_text().splitlines())
+
 
 if __name__ == "__main__":
     unittest.main()

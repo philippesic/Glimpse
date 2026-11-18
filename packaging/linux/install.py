@@ -49,7 +49,8 @@ def install(source, prefix):
     desktop = prefix / "share/applications/glimpse.desktop"
     entry = (source / "share/applications/glimpse.desktop").read_text()
     entry = entry.replace(
-        "Exec=glimpse %F\n", f"Exec={desktop_program(executable)} %F\n"
+        "Exec=glimpse --desktop -- %F\n",
+        f"Exec={desktop_program(executable)} --desktop -- %F\n",
     )
     entry = entry.replace(
         "TryExec=glimpse\n", f"TryExec={desktop_string(str(executable))}\n"

@@ -235,7 +235,10 @@ enum SettingsWrite {
     Preferences,
     Live,
     Pin,
-    Visits(Vec<PathBuf>),
+    Locations {
+        visits: Vec<PathBuf>,
+        last: Option<PathBuf>,
+    },
 }
 
 struct Shell {
@@ -275,6 +278,7 @@ struct Shell {
     listing_paused: bool,
     listing_id: u64,
     listing_done: bool,
+    restoring_location: bool,
     filter: String,
     documents: Vec<Document>,
     active: Option<u64>,
@@ -305,6 +309,7 @@ struct Shell {
     settings_loaded: bool,
     settings_reloading: bool,
     location_visits_pending: Vec<PathBuf>,
+    last_location_pending: Option<PathBuf>,
     preferences: Option<Entity<preferences::Preferences>>,
     preferences_subscription: Option<Subscription>,
     preferences_return: Option<FocusHandle>,
@@ -497,6 +502,7 @@ impl Shell {
             listing_paused: false,
             listing_id: 0,
             listing_done: false,
+            restoring_location: false,
             filter: String::new(),
             documents: vec![],
             active: None,
@@ -527,6 +533,7 @@ impl Shell {
             settings_loaded: false,
             settings_reloading: true,
             location_visits_pending: Vec::new(),
+            last_location_pending: None,
             preferences: None,
             preferences_subscription: None,
             preferences_return: None,
@@ -574,6 +581,7 @@ impl Shell {
     }
     fn report_startup_ready(&mut self, source_visible: bool, window: &mut Window, cx: &App) {
         if !self.ready
+            && (!self.request.desktop || self.settings_loaded)
             && self.listing_done
             && self.opening.is_empty()
             && self.startup_recovery.is_none()
@@ -583,7 +591,7 @@ impl Shell {
                 }))
         {
             self.ready = true;
-            let failed = self.startup_failed;
+            let failed = self.startup_failed || self.listing_error.is_some();
             let timing = std::env::var_os("GLIMPSE_TIMING").is_some();
             window.on_next_frame(move |window, _| {
                 if timing && !failed {
@@ -625,6 +633,7 @@ impl Shell {
                     settings.disk_base = this.settings.disk_base.clone();
                     settings.pins = this.settings.pins.clone();
                     settings.recents = this.settings.recents.clone();
+                    settings.last_location = this.settings.last_location.clone();
                     settings.location_visits = this.settings.location_visits.clone();
                     if let Err(error) = this.queue_settings(settings, SettingsWrite::Preferences)
                         && let Some(view) = &this.preferences
@@ -692,20 +701,28 @@ impl Shell {
         }
         if !self.settings.remember_locations {
             self.location_visits_pending.clear();
+            self.last_location_pending = None;
             return;
         }
         let visits = std::mem::take(&mut self.location_visits_pending);
         let mut settings = self.settings.clone();
+        let last = self
+            .last_location_pending
+            .take()
+            .filter(|path| settings.last_location.as_ref() != Some(path));
+        if let Some(path) = &last {
+            settings.last_location = Some(path.clone());
+        }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let mut changed = false;
+        let mut changed = last.is_some();
         for path in &visits {
             changed |= settings.record_location(path, now);
         }
         if changed {
-            let _ = self.queue_settings(settings, SettingsWrite::Visits(visits));
+            let _ = self.queue_settings(settings, SettingsWrite::Locations { visits, last });
         }
     }
 
@@ -715,6 +732,14 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if settings.remember_locations
+            && !self.settings.remember_locations
+            && self.listing_done
+            && self.listing_error.is_none()
+            && !self.request.pick
+        {
+            self.last_location_pending = Some(self.current.clone());
+        }
         self.settings = settings;
         if let Some(warning) = &self.settings.warning {
             self.status = warning.clone();
@@ -738,7 +763,6 @@ impl Shell {
                 }
             });
         }
-        self.refresh();
         self.focus(window, cx);
         cx.notify();
     }
@@ -947,7 +971,8 @@ impl Shell {
             Err(error) => {
                 self.listing_id = 0;
                 self.listing_done = true;
-                self.startup_failed |= !self.ready;
+                self.startup_failed |=
+                    !self.ready && (!self.request.desktop || self.settings_loaded);
                 self.listing_error = Some(error);
             }
         }
@@ -960,7 +985,16 @@ impl Shell {
             self.change_location(path);
         }
     }
+    fn set_initial_location(&mut self, path: PathBuf) {
+        self.current = path;
+        self.entries = Default::default();
+        self.entries_revision += 1;
+        self.selection = None;
+        self.last_location_pending = None;
+        self.refresh();
+    }
     fn change_location(&mut self, path: PathBuf) {
+        self.restoring_location = false;
         let old_scope = self.effective_scope().clone();
         if let Some(selection) = self.selection.take() {
             self.selections.insert(self.current.clone(), selection);
@@ -1428,8 +1462,21 @@ impl Shell {
                     );
                 }
                 if let Some(error) = batch.error {
-                    self.startup_failed |= !self.ready;
+                    if self.restoring_location {
+                        self.restoring_location = false;
+                        self.set_initial_location(std::env::home_dir().unwrap());
+                        self.status = "The last folder is unavailable. Showing Home.".into();
+                        listing_changed = false;
+                        continue;
+                    }
+                    self.startup_failed |=
+                        !self.ready && (!self.request.desktop || self.settings_loaded);
                     self.listing_error = Some(error);
+                } else if batch.done {
+                    self.restoring_location = false;
+                    if !self.request.pick && self.listing_error.is_none() {
+                        self.last_location_pending = Some(self.current.clone());
+                    }
                 }
             }
         }
@@ -1920,9 +1967,20 @@ impl Shell {
                 Reply::Reloaded(reload, result) => self.reloaded(*reload, result, window, cx),
                 Reply::SettingsLoaded(result) => {
                     self.settings_reloading = false;
+                    let restore_location =
+                        self.request.desktop && !self.settings_loaded && self.interaction == 0;
                     self.settings_loaded = true;
                     match result {
                         Ok(settings) => {
+                            if restore_location
+                                && settings.remember_locations
+                                && let Some(path) = settings.last_location.as_ref()
+                                && path.is_absolute()
+                                && path != &self.current
+                            {
+                                self.restoring_location = true;
+                                self.set_initial_location(path.clone());
+                            }
                             self.apply_settings(settings, window, cx);
                             if self.preferences.is_some() {
                                 self.open_preferences(self.settings.clone(), window, cx);
@@ -1956,7 +2014,7 @@ impl Shell {
                                     self.settings = settings;
                                     self.status = "Pinned locations saved".into();
                                 }
-                                SettingsWrite::Visits(_) => self.settings = settings,
+                                SettingsWrite::Locations { .. } => self.settings = settings,
                             }
                             self.flush_locations();
                         }
@@ -1967,7 +2025,10 @@ impl Shell {
                                         view.update(cx, |view, cx| view.failed(error.clone(), cx));
                                     }
                                 }
-                                SettingsWrite::Visits(visits) => {
+                                SettingsWrite::Locations { visits, last } => {
+                                    if self.last_location_pending.is_none() {
+                                        self.last_location_pending = last;
+                                    }
                                     let mut pending = visits;
                                     for path in std::mem::take(&mut self.location_visits_pending) {
                                         pending.retain(|older| *older != path);
@@ -2172,6 +2233,9 @@ impl Shell {
                 },
                 _ => {}
             }
+        }
+        if listing_changed && !self.restoring_location {
+            self.flush_locations();
         }
         while let Ok(result) = self.search.replies.try_recv() {
             if result.generation == self.search_id {

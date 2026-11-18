@@ -55,6 +55,8 @@ Settings and recovery use `$XDG_DATA_HOME/glimpse` or `~/.local/share/glimpse` o
 
 ## CLI
 
+Run `glimpse` without a path to open the terminal's working directory. The desktop launcher restores recoverable work. With location history enabled it also returns to the last available folder. Files opened from the desktop use their containing folder.
+
 ```sh
 glimpse /existing/folder /existing/file.txt
 glimpse open --scope /folder --line 12 --column 3 --wait -- /file.txt

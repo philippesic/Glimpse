@@ -124,6 +124,11 @@ pub struct Settings {
         deserialize_with = "native_path::deserialize_many"
     )]
     pub recents: Vec<PathBuf>,
+    #[serde(
+        serialize_with = "native_path::serialize_optional",
+        deserialize_with = "native_path::deserialize_optional"
+    )]
+    pub last_location: Option<PathBuf>,
     pub location_visits: Vec<LocationVisit>,
     pub keymaps: std::collections::BTreeMap<String, String>,
     pub font_family: String,
@@ -160,6 +165,7 @@ impl Default for Settings {
             search_ignored: false,
             pins: Vec::new(),
             recents: Vec::new(),
+            last_location: None,
             location_visits: Vec::new(),
             keymaps: Default::default(),
             font_family: String::new(),
@@ -1358,6 +1364,7 @@ mod tests {
 
     #[test]
     fn frequent_locations_coalesce_visits_and_decay_old_usage() {
+        use std::os::unix::ffi::OsStringExt;
         let mut settings = Settings::default();
         let a = Path::new("/projects/a");
         let b = Path::new("/projects/b");
@@ -1369,11 +1376,16 @@ mod tests {
         assert_eq!(settings.location_visits[0].path, a);
         assert!(settings.record_location(b, 12001 + 86400 * 28));
         assert_eq!(settings.location_visits[0].path, b);
+        let last = PathBuf::from(std::ffi::OsString::from_vec(
+            b"/projects/last-\xff".to_vec(),
+        ));
+        settings.last_location = Some(last.clone());
         settings.remember_locations = false;
         assert!(!settings.record_location(a, 9999999));
         let serialized = serde_json::to_vec(&settings).unwrap();
         let restored: Settings = serde_json::from_slice(&serialized).unwrap();
         assert_eq!(restored.location_visits.len(), 2);
+        assert_eq!(restored.last_location, Some(last));
     }
 
     #[test]
