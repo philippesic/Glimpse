@@ -331,7 +331,7 @@ struct Shell {
     importing: bool,
     startup_recovery: Option<recovery::Startup>,
     ready: bool,
-    startup_failed: bool,
+    startup_error: Option<String>,
     requested: Vec<(u64, PathBuf)>,
     finished: bool,
     validation_disks: HashMap<u64, DiskFile>,
@@ -558,7 +558,7 @@ impl Shell {
             importing: false,
             startup_recovery,
             ready: false,
-            startup_failed: false,
+            startup_error: None,
             requested: vec![],
             finished: false,
             validation_disks: HashMap::new(),
@@ -595,17 +595,22 @@ impl Shell {
                 }))
         {
             self.ready = true;
-            let failed = self.startup_failed || self.listing_error.is_some();
+            let error = self.startup_error.take().or_else(|| {
+                self.listing_error
+                    .as_ref()
+                    .map(|error| format!("{}: {error}", paths::display(&self.current)))
+            });
             let timing = std::env::var_os("GLIMPSE_TIMING").is_some();
             window.on_next_frame(move |window, _| {
-                if timing && !failed {
+                if timing && error.is_none() {
                     eprintln!("GLIMPSE_EDITABLE_FRAME");
                 }
                 window.on_next_frame(move |_, _| {
-                    let _ = lifecycle::notify(if failed { b'2' } else { b'0' });
-                    if failed {
+                    if let Some(error) = error {
+                        let _ = lifecycle::notify_startup_failure(&error);
                         eprintln!("GLIMPSE_STARTUP_FAILED");
                     } else {
+                        let _ = lifecycle::notify(b'0');
                         eprintln!("GLIMPSE_READY");
                     }
                 })
@@ -975,8 +980,11 @@ impl Shell {
             Err(error) => {
                 self.listing_id = 0;
                 self.listing_done = true;
-                self.startup_failed |=
-                    !self.ready && (!self.request.desktop || self.settings_loaded);
+                if !self.ready && (!self.request.desktop || self.settings_loaded) {
+                    self.startup_error.get_or_insert_with(|| {
+                        format!("{}: {error}", paths::display(&self.current))
+                    });
+                }
                 self.listing_error = Some(error);
             }
         }
@@ -1468,8 +1476,11 @@ impl Shell {
                         listing_changed = false;
                         continue;
                     }
-                    self.startup_failed |=
-                        !self.ready && (!self.request.desktop || self.settings_loaded);
+                    if !self.ready && (!self.request.desktop || self.settings_loaded) {
+                        self.startup_error.get_or_insert_with(|| {
+                            format!("{}: {error}", paths::display(&self.current))
+                        });
+                    }
                     self.listing_error = Some(error);
                 } else if batch.done {
                     self.restoring_location = false;
@@ -1515,11 +1526,12 @@ impl Shell {
                 Reply::OpenDirectory(path, token) => {
                     if let Some(intent) = self.opening.remove(&token) {
                         if !self.ready && self.request.files.contains(&path) {
-                            self.startup_failed = true;
                             self.status = format!(
                                 "Requested file became a directory: {}",
                                 paths::display(&path)
                             );
+                            self.startup_error
+                                .get_or_insert_with(|| self.status.clone());
                         } else if intent.interaction == self.interaction && token == self.open_token
                         {
                             if self.path_request == Some(token) {
@@ -1597,8 +1609,11 @@ impl Shell {
                                 )
                             }
                             Err(e) => {
-                                self.startup_failed |=
-                                    !self.ready && self.request.files.contains(&path);
+                                if !self.ready && self.request.files.contains(&path) {
+                                    self.startup_error.get_or_insert_with(|| {
+                                        format!("{}: {e}", paths::display(&path))
+                                    });
+                                }
                                 if expected
                                     .is_some_and(|(_, generation)| generation == self.search_id)
                                 {
@@ -2073,7 +2088,9 @@ impl Shell {
                             .is_some_and(|startup| startup.inventory_pending)
                         {
                             self.startup_recovery = None;
-                            self.startup_failed = true;
+                            self.startup_error.get_or_insert_with(|| {
+                                format!("Startup recovery could not be read: {error}")
+                            });
                             self.warnings.push(format!("Startup recovery could not be read: {error}. Open Recovery to retry."));
                         }
                         self.status = error;
@@ -2147,7 +2164,12 @@ impl Shell {
                             self.status = error;
                             if automatic && let Some(startup) = &mut self.startup_recovery {
                                 startup.failed += 1;
-                                self.startup_failed = true;
+                                self.startup_error.get_or_insert_with(|| {
+                                    format!(
+                                        "Startup recovery could not restore a document: {}",
+                                        self.status
+                                    )
+                                });
                             }
                         }
                     }
@@ -2969,7 +2991,14 @@ impl Shell {
                 self.listing_buffer.clear();
                 self.listing_error =
                     Some("Folder reading was cancelled. Refresh to read again.".into());
-                self.startup_failed |= !self.ready;
+                if !self.ready {
+                    self.startup_error.get_or_insert_with(|| {
+                        format!(
+                            "Folder reading was cancelled: {}",
+                            paths::display(&self.current)
+                        )
+                    });
+                }
             }
             "folder-error" => {
                 if let Some(error) = &self.listing_error {

@@ -116,7 +116,8 @@ pub fn parse(args: Vec<OsString>, cwd: PathBuf) -> Result<Request, String> {
     }
     if request.wait {
         for path in &request.files {
-            crate::document::DiskFile::open(path.clone())?;
+            crate::document::DiskFile::open(path.clone())
+                .map_err(|error| format!("{}: {error}", crate::paths::display(path)))?;
         }
     }
     Ok(request)
