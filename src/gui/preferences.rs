@@ -4,6 +4,7 @@ use gpui_component::{
     ActiveTheme, Disableable, IconName, Selectable, Sizable,
     button::{Button, ButtonVariants},
     input::{Input, InputState},
+    scroll::{Scrollbar, ScrollbarShow},
 };
 
 pub enum Event {
@@ -69,14 +70,14 @@ impl Field {
     fn label(self) -> &'static str {
         match self {
             Self::Font => "Source font family",
-            Self::Size => "Source font size",
-            Self::Height => "Line height",
-            Self::Scale => "Interface scale",
-            Self::Markdown => "Reading font size",
-            Self::Indent => "Indent width",
-            Self::FileLimit => "Search file limit",
-            Self::Exclusions => "Search exclusions",
-            Self::Keymaps => "Shortcut overrides",
+            Self::Size => "Source font size (10–32 px)",
+            Self::Height => "Line height (1.2–2.0)",
+            Self::Scale => "Interface scale (0.8–2.0)",
+            Self::Markdown => "Reading font size (12–28 px)",
+            Self::Indent => "Indent width (1–8 columns)",
+            Self::FileLimit => "Saved text limit (1–10 MiB)",
+            Self::Exclusions => "Exclude patterns",
+            Self::Keymaps => "Shortcut overrides (JSON)",
         }
     }
     fn value(self, settings: &Settings) -> String {
@@ -199,17 +200,17 @@ impl Preferences {
 
     fn candidate(&self, cx: &App) -> Result<Settings, String> {
         let value = |field: Field| self.fields[field as usize].read(cx).value().to_string();
-        let number = |field, label| {
+        let number = |field: Field| {
             value(field)
                 .trim()
                 .parse::<f32>()
-                .map_err(|_| format!("{label} must be a number."))
+                .map_err(|_| format!("Enter a number for {}.", field.label()))
         };
-        let integer = |field, label| {
+        let integer = |field: Field| {
             value(field)
                 .trim()
                 .parse::<usize>()
-                .map_err(|_| format!("{label} must be a whole number."))
+                .map_err(|_| format!("Enter a whole number for {}.", field.label()))
         };
         let mut settings = self.draft.clone();
         settings.font_family = value(Field::Font).trim().to_owned();
@@ -222,42 +223,51 @@ impl Preferences {
         {
             return Err("Source font family is unavailable. Enter an installed family or clear the field for system monospace.".into());
         }
-        settings.font_size = number(Field::Size, "Source font size")?;
-        settings.line_height = number(Field::Height, "Line height")?;
-        settings.ui_scale = number(Field::Scale, "Interface scale")?;
-        settings.markdown_font_size = number(Field::Markdown, "Reading font size")?;
-        settings.indent = integer(Field::Indent, "Indent width")?;
-        settings.search_file_mib = integer(Field::FileLimit, "Search file limit")?;
+        settings.font_size = number(Field::Size)?;
+        settings.line_height = number(Field::Height)?;
+        settings.ui_scale = number(Field::Scale)?;
+        settings.markdown_font_size = number(Field::Markdown)?;
+        settings.indent = integer(Field::Indent)?;
+        settings.search_file_mib = integer(Field::FileLimit)?;
         settings.search_exclude = value(Field::Exclusions);
         settings.keymaps = serde_json::from_str(&value(Field::Keymaps))
-            .map_err(|error| format!("Shortcut overrides: {error}"))?;
-        for (value, lower, upper, label) in [
-            (settings.font_size, 10., 32., "Source font size"),
-            (settings.line_height, 1.2, 2., "Line height"),
-            (settings.ui_scale, 0.8, 2., "Interface scale"),
-            (settings.markdown_font_size, 12., 28., "Reading font size"),
+            .map_err(|error| format!("Check {}. {error}", Field::Keymaps.label()))?;
+        for (value, lower, upper, field) in [
+            (settings.font_size, 10., 32., Field::Size),
+            (settings.line_height, 1.2, 2., Field::Height),
+            (settings.ui_scale, 0.8, 2., Field::Scale),
+            (settings.markdown_font_size, 12., 28., Field::Markdown),
         ] {
             if !(lower..=upper).contains(&value) {
-                return Err(format!("{label} must be between {lower} and {upper}."));
+                return Err(format!(
+                    "Choose a value in the indicated range for {}.",
+                    field.label()
+                ));
             }
         }
         if !(1..=8).contains(&settings.indent) {
-            return Err("Indent width must be between 1 and 8 columns.".into());
+            return Err(format!(
+                "Choose a value in the indicated range for {}.",
+                Field::Indent.label()
+            ));
         }
         if !(1..=10).contains(&settings.search_file_mib) {
-            return Err("Search file limit must be between 1 and 10 MiB.".into());
+            return Err(format!(
+                "Choose a value in the indicated range for {}.",
+                Field::FileLimit.label()
+            ));
         }
         settings.warning = None;
         settings.validate()?;
         Ok(settings)
     }
 
-    fn field(&self, label: &'static str, field: Field) -> AnyElement {
+    fn field(&self, field: Field) -> AnyElement {
         div()
             .flex()
             .flex_col()
             .gap(px(4.))
-            .child(label)
+            .child(field.label())
             .child(
                 Input::new(&self.fields[field as usize])
                     .disabled(self.pending)
@@ -342,20 +352,20 @@ impl Render for Preferences {
                         )
                         .into_any_element(),
                 );
-                rows.push(self.field("Interface scale (0.8–2.0)", Field::Scale));
+                rows.push(self.field(Field::Scale));
                 rows.push(self.toggle("Compact file rows", |s| &mut s.compact, cx));
                 rows.push(self.toggle("Reduce motion", |s| &mut s.reduce_motion, cx));
                 rows.push(self.toggle("Remember locations", |s| &mut s.remember_locations, cx));
             }
             Page::Text => {
-                rows.push(self.field("Source font family", Field::Font));
-                rows.push(self.field("Source font size (10–32 px)", Field::Size));
-                rows.push(self.field("Line height (1.2–2.0)", Field::Height));
-                rows.push(self.field("Reading font size (12–28 px)", Field::Markdown));
+                rows.push(self.field(Field::Font));
+                rows.push(self.field(Field::Size));
+                rows.push(self.field(Field::Height));
+                rows.push(self.field(Field::Markdown));
                 rows.push(self.toggle("Proportional plain text", |s| &mut s.proportional, cx));
             }
             Page::Editing => {
-                rows.push(self.field("Indent width (1–8 columns)", Field::Indent));
+                rows.push(self.field(Field::Indent));
                 rows.push(self.toggle("Use tabs for indentation", |s| &mut s.tabs, cx));
                 rows.push(self.toggle("Wrap long lines", |s| &mut s.wrap, cx));
                 rows.push(self.toggle("Line numbers", |s| &mut s.line_numbers, cx));
@@ -367,12 +377,12 @@ impl Render for Preferences {
                 rows.push(self.toggle("Show hidden files", |s| &mut s.show_hidden, cx));
                 rows.push(self.toggle("Search ignored files", |s| &mut s.search_ignored, cx));
                 rows.push(self.toggle("Search metadata folders", |s| &mut s.search_metadata, cx));
-                rows.push(self.field("Saved text limit (1–10 MiB)", Field::FileLimit));
-                rows.push(self.field("Exclude patterns", Field::Exclusions));
+                rows.push(self.field(Field::FileLimit));
+                rows.push(self.field(Field::Exclusions));
             }
             Page::Shortcuts => {
                 rows.push(div().child("Override commands with a JSON object. Cmd means Control on Linux and Command on macOS. An empty value disables a shortcut. Text editing keys remain reserved.").into_any_element());
-                rows.push(self.field("Shortcut overrides (JSON)", Field::Keymaps));
+                rows.push(self.field(Field::Keymaps));
                 rows.push(
                     div()
                         .text_size(px(12.))
@@ -498,24 +508,41 @@ impl Render for Preferences {
                     .child(categories)
                     .child(
                         div()
-                            .id("preference-fields")
+                            .relative()
                             .min_h_0()
                             .flex_1()
-                            .overflow_y_scroll()
-                            .track_scroll(&self.scroll)
-                            .children(rows.into_iter().enumerate().map(|(i, row)| {
-                                div().track_focus(&self.row_focus[i]).pb(px(12.)).child(row)
-                            })),
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .id("preference-fields")
+                                    .min_h_0()
+                                    .flex_1()
+                                    .overflow_y_scroll()
+                                    .track_scroll(&self.scroll)
+                                    .pr(px(18.))
+                                    .children(rows.into_iter().enumerate().map(|(i, row)| {
+                                        div().track_focus(&self.row_focus[i]).pb(px(12.)).child(row)
+                                    })),
+                            )
+                            .child(
+                                div().absolute().inset_0().child(
+                                    Scrollbar::vertical(&self.scroll)
+                                        .scrollbar_show(ScrollbarShow::Always),
+                                ),
+                            ),
                     )
                     .when(!self.error.is_empty(), |this| {
-                        this.child(
+                        this.child(super::accessibility::message(
+                            "preferences-error",
+                            self.error.clone(),
                             div()
-                                .id("preferences-error")
+                                .id("preferences-validation")
                                 .max_h(px(80.))
                                 .overflow_y_scroll()
                                 .text_color(cx.theme().danger)
                                 .child(self.error.clone()),
-                        )
+                        ))
                     })
                     .child(
                         div()
