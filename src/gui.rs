@@ -2731,6 +2731,8 @@ impl Shell {
                     self.navigation_only = !self.navigation_only;
                     if self.navigation_only {
                         window.focus(&self.nav_focus);
+                    } else if self.reading {
+                        self.reading_focus.focus(window);
                     } else {
                         self.focus(window, cx);
                     }
@@ -2981,6 +2983,7 @@ impl Shell {
             }
             "read" => {
                 self.reading = !self.reading;
+                self.navigation_only = false;
                 if self.reading {
                     self.reading_focus.focus(window);
                 } else {
@@ -3249,6 +3252,8 @@ impl Render for Shell {
         }
         let narrow = self.narrow(window);
         let short = narrow && window.viewport_size().height < px(280. * self.settings.ui_scale);
+        let compact_document =
+            short && !self.navigation_only && self.active.is_some() && !self.request.pick;
         let source_visible = !self.reading && (!narrow || !self.navigation_only);
         self.report_startup_ready(source_visible, window, cx);
         if !self.listing_done && self.listing_waiter.is_none() {
@@ -3279,7 +3284,9 @@ impl Render for Shell {
         if narrow {
             toolbar = toolbar
                 .child(self.button(
-                    if self.navigation_only && self.active.is_some() {
+                    if self.navigation_only && self.active.is_some() && self.reading {
+                        "Reading"
+                    } else if self.navigation_only && self.active.is_some() {
                         "Edit"
                     } else {
                         "Browse"
@@ -3374,7 +3381,10 @@ impl Render for Shell {
             .text_color(cx.theme().foreground)
             .text_size(px(14. * self.settings.ui_scale))
             .child(toolbar)
-            .child(self.path_bar(short, window, cx))
+            .when(
+                !compact_document || self.panel == Some(Panel::Path),
+                |root| root.child(self.path_bar(short, window, cx)),
+            )
             .when(self.request.pick, |root| {
                 let candidate = if self.request.directory {
                     Some(self.current.clone())
@@ -3720,6 +3730,17 @@ impl Render for Shell {
             node.set_label("Open documents");
             AccessibilityInfo::new(node)
         });
+        let tabs = if compact_document && self.reading {
+            div()
+                .flex()
+                .items_center()
+                .flex_shrink_0()
+                .child(div().flex_1().min_w_0().child(tabs))
+                .child(self.button("Edit Source", "read", cx).flex_shrink_0())
+                .into_any_element()
+        } else {
+            tabs.into_any_element()
+        };
         let mut content = div()
             .flex_1()
             .h_full()

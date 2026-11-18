@@ -14,13 +14,15 @@ use gpui::{
 use smol::stream::StreamExt;
 
 use crate::highlighter::HighlightTheme;
+use crate::button::Button;
+use crate::menu::{DropdownMenu, PopupMenuItem};
 use crate::scroll::ScrollableElement;
 use crate::text::{
     document_text::{DocumentSource, DocumentText},
     node::CodeBlock,
     utils::scroll_reading_list,
 };
-use crate::{ActiveTheme, StyledExt, v_flex};
+use crate::{ActiveTheme, Sizable, StyledExt, v_flex};
 use crate::{
     global_state::GlobalState,
     input::{self},
@@ -47,6 +49,49 @@ struct TextViewElement {
     list_state: Option<ListState>,
     prose_width: Option<Pixels>,
     state: Entity<TextViewState>,
+    show_links: bool,
+}
+
+fn links_menu(
+    links: Arc<Vec<(SharedString, SharedString)>>,
+    resources: &super::TextViewResources,
+) -> Option<AnyElement> {
+    if links.is_empty() {
+        return None;
+    }
+    let handler = resources.on_link.clone()?;
+    let link_label = resources.link_label.clone();
+    Some(
+        Button::new("reading-links")
+            .label("Links")
+            .small()
+            .outline()
+            .dropdown_caret(true)
+            .dropdown_menu(move |mut menu, window, _| {
+                menu = menu
+                    .scrollable(true)
+                    .max_h((window.viewport_size().height - px(96.)).max(px(100.)))
+                    .max_w((window.viewport_size().width - px(32.)).min(px(700.)));
+                for (label, url) in links.iter() {
+                    let target = link_label
+                        .as_ref()
+                        .map_or_else(|| url.to_string(), |label| label(url));
+                    let name = if label.is_empty() || label.as_str() == target {
+                        target
+                    } else {
+                        format!("{label} — {target}")
+                    };
+                    let handler = handler.clone();
+                    let url = url.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(name)
+                            .on_click(move |_, window, cx| handler(&url, window, cx)),
+                    );
+                }
+                menu
+            })
+            .into_any_element(),
+    )
 }
 
 impl RenderOnce for TextViewElement {
@@ -66,50 +111,12 @@ impl RenderOnce for TextViewElement {
                             cx,
                         );
                         let mut container = this;
-                        if !content.links.is_empty() {
-                            if let Some(handler) = node_cx.resources.on_link.clone() {
-                                use crate::{
-                                    Sizable,
-                                    button::Button,
-                                    menu::{DropdownMenu, PopupMenuItem},
-                                };
-                                let links = content.links.clone();
-                                container = container.child(
-                                    crate::h_flex().flex_shrink_0().mb_2().child(
-                                        Button::new("reading-links")
-                                            .label("Links")
-                                            .small()
-                                            .dropdown_caret(true)
-                                            .dropdown_menu(move |mut menu, window, _| {
-                                                menu = menu
-                                                    .scrollable(true)
-                                                    .max_h(
-                                                        (window.viewport_size().height - px(96.))
-                                                            .max(px(100.)),
-                                                    )
-                                                    .max_w(
-                                                        (window.viewport_size().width - px(32.))
-                                                            .min(px(700.)),
-                                                    );
-                                                for (label, url) in links.iter() {
-                                                    let handler = handler.clone();
-                                                    let url = url.clone();
-                                                    menu = menu.item(
-                                                        PopupMenuItem::new(if label.is_empty() {
-                                                            url.to_string()
-                                                        } else {
-                                                            format!("{label} — {url}")
-                                                        })
-                                                        .on_click(move |_, window, cx| {
-                                                            handler(&url, window, cx)
-                                                        }),
-                                                    );
-                                                }
-                                                menu
-                                            }),
-                                    ),
-                                );
-                            }
+                        if self.show_links
+                            && let Some(menu) =
+                                links_menu(content.links.clone(), &node_cx.resources)
+                        {
+                            container =
+                                container.child(crate::h_flex().flex_shrink_0().mb_2().child(menu));
                         }
                         container.child(div().flex_1().min_h_0().child(body))
                     }
@@ -155,6 +162,7 @@ pub struct TextView {
     selectable: bool,
     scrollable: bool,
     prose_width: Option<Pixels>,
+    show_links: bool,
     stable_accessibility: bool,
     code_block_actions: Option<Arc<CodeBlockActionsFn>>,
 }
@@ -307,6 +315,12 @@ impl MarkdownView {
         }
     }
 
+    pub fn links_menu(&self, cx: &App) -> Option<AnyElement> {
+        let state = self.state.read(cx);
+        let content = state.parsed_result.as_ref()?.as_ref().ok()?;
+        links_menu(content.links.clone(), &state.resources)
+    }
+
     pub fn element(&self, prose_width: Pixels) -> AnyElement {
         TextView {
             id: self.id.clone(),
@@ -317,6 +331,7 @@ impl MarkdownView {
             selectable: true,
             scrollable: true,
             prose_width: Some(prose_width),
+            show_links: false,
             stable_accessibility: self.stable_accessibility,
             code_block_actions: None,
         }
@@ -789,6 +804,7 @@ impl TextView {
             selectable: false,
             scrollable: false,
             prose_width: None,
+            show_links: true,
             stable_accessibility: false,
             code_block_actions: None,
         }
@@ -822,6 +838,7 @@ impl TextView {
             selectable: false,
             scrollable: false,
             prose_width: None,
+            show_links: true,
             stable_accessibility: false,
             code_block_actions: None,
         }
@@ -1077,6 +1094,7 @@ impl Element for TextView {
             })
             .child(TextViewElement {
                 prose_width: self.prose_width,
+                show_links: self.show_links,
                 list_state: if self.scrollable {
                     Some(list_state.clone())
                 } else {

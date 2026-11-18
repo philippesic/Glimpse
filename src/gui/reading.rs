@@ -1,6 +1,7 @@
 use super::*;
 use gpui_component::{
     highlighter::HighlightTheme,
+    menu::DropdownMenu,
     text::{MarkdownLayout, MarkdownView, TextViewResources},
 };
 use std::sync::Arc;
@@ -158,6 +159,7 @@ impl Shell {
                         .sum(),
                 );
                 let base = view.path.clone();
+                let label_base = base.clone();
                 let resources = Arc::new(TextViewResources {
                     restrict_images: true,
                     images: prepared
@@ -192,6 +194,18 @@ impl Shell {
                             }
                             cx.notify();
                         });
+                    })),
+                    link_label: Some(Arc::new(move |url| {
+                        match glimpse::reading::resolve_link(&label_base, url) {
+                            glimpse::reading::Link::Local(path) => {
+                                let relative = label_base
+                                    .parent()
+                                    .and_then(|folder| path.strip_prefix(folder).ok())
+                                    .unwrap_or(&path);
+                                paths::display(relative)
+                            }
+                            _ => url.to_owned(),
+                        }
                     })),
                 });
                 view.content = Some(MarkdownView::new(
@@ -288,39 +302,72 @@ impl Shell {
         let Some(content) = &view.content else {
             return area.child(self.reading_progress()).into_any_element();
         };
-        if !view.notes.is_empty() {
-            let label = view.notes.clone();
-            area = area.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .when(narrow, |row| row.gap_1())
-                    .w_full()
-                    .min_w_0()
-                    .flex_shrink_0()
-                    .child(div().flex_1().min_w_0().child(accessible(
-                        "reading-notices",
-                        div().w_full().truncate().text_sm().when(!narrow, |label| {
-                            label.child("Images omitted or unavailable")
-                        }),
-                        move |_, _, _| {
-                            let mut node = gpui::accesskit::Node::new(gpui::accesskit::Role::Note);
-                            node.set_label(label.clone());
-                            AccessibilityInfo::new(node)
-                        },
-                    )))
-                    .child(self.button(
-                        if narrow {
-                            "Images omitted…"
-                        } else {
-                            "Image details…"
-                        },
-                        "reading-notices",
-                        cx,
-                    ))
-                    .child(self.button("Reload images", "reading-retry", cx)),
-            );
+        let links = content.links_menu(cx);
+        if links.is_some() || !view.notes.is_empty() {
+            let mut controls = div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_2()
+                .w_full()
+                .min_w_0()
+                .flex_shrink_0()
+                .children(links);
+            if !view.notes.is_empty() {
+                if short {
+                    let shell = cx.entity().downgrade();
+                    let focus = self.reading_focus.clone();
+                    controls = controls.child(
+                        Button::new("reading-images")
+                            .label("Images omitted")
+                            .small()
+                            .compact()
+                            .outline()
+                            .dropdown_caret(true)
+                            .dropdown_menu(move |menu, _, _| {
+                                menu.action_context(focus.clone())
+                                    .item(super::menus::command_item(
+                                        shell.clone(),
+                                        "reading-notices",
+                                        "Image details…".into(),
+                                        false,
+                                    ))
+                                    .item(super::menus::command_item(
+                                        shell.clone(),
+                                        "reading-retry",
+                                        "Reload images".into(),
+                                        false,
+                                    ))
+                            }),
+                    );
+                } else {
+                    let label = view.notes.clone();
+                    controls = controls
+                        .child(div().flex_1().min_w_0().child(accessible(
+                            "reading-notices",
+                            div().w_full().truncate().text_sm().when(!narrow, |label| {
+                                label.child("Images omitted or unavailable")
+                            }),
+                            move |_, _, _| {
+                                let mut node =
+                                    gpui::accesskit::Node::new(gpui::accesskit::Role::Note);
+                                node.set_label(label.clone());
+                                AccessibilityInfo::new(node)
+                            },
+                        )))
+                        .child(self.button(
+                            if narrow {
+                                "Images omitted…"
+                            } else {
+                                "Image details…"
+                            },
+                            "reading-notices",
+                            cx,
+                        ))
+                        .child(self.button("Reload images", "reading-retry", cx));
+                }
+            }
+            area = area.child(controls);
         }
         area.child(content.element(font_size * 36.))
             .into_any_element()

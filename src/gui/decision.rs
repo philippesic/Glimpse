@@ -153,6 +153,7 @@ impl Render for Decision {
             .inset_0()
             .occlude()
             .bg(cx.theme().overlay)
+            .when(compact, |overlay| overlay.bg(cx.theme().background))
             .flex()
             .items_center()
             .justify_center()

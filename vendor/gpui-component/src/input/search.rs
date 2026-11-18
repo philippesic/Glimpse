@@ -662,7 +662,7 @@ impl SearchPanel {
         ];
         let panel = cx.entity().downgrade();
         Button::new("find-options")
-            .xsmall()
+            .small()
             .ghost()
             .icon(IconName::Ellipsis)
             .tooltip("Find options")
@@ -901,13 +901,14 @@ impl Render for SearchPanel {
                             .min_w_0()
                             .max_w_full()
                             .gap_2()
+                            .when(short, |query| query.gap_1())
                             .child(
                                 Input::new(&self.search_input)
                                     .when(!short, |input| {
                                         input.suffix(
                                             Button::new("case-insensitive")
                                                 .selected(!self.case_insensitive)
-                                                .xsmall()
+                                                .small()
                                                 .compact()
                                                 .ghost()
                                                 .icon(IconName::CaseSensitive)
@@ -928,7 +929,7 @@ impl Render for SearchPanel {
                             .child(
                                 Button::new("close")
                                     .tab_index(1)
-                                    .xsmall()
+                                    .small()
                                     .ghost()
                                     .flex_shrink_0()
                                     .icon(IconName::Close)
@@ -947,7 +948,7 @@ impl Render for SearchPanel {
                                 .gap_2()
                                 .child(
                                     Button::new("whole-word")
-                                        .xsmall()
+                                        .small()
                                         .ghost()
                                         .label("Word")
                                         .tooltip("Match whole words")
@@ -958,7 +959,7 @@ impl Render for SearchPanel {
                                 )
                                 .child(
                                     Button::new("replace-mode")
-                                        .xsmall()
+                                        .small()
                                         .ghost()
                                         .icon(IconName::Replace)
                                         .tooltip("Show replacement")
@@ -969,7 +970,7 @@ impl Render for SearchPanel {
                                 )
                                 .child(
                                     Button::new("prev")
-                                        .xsmall()
+                                        .small()
                                         .ghost()
                                         .icon(IconName::ChevronLeft)
                                         .tooltip("Previous match")
@@ -980,7 +981,7 @@ impl Render for SearchPanel {
                                 )
                                 .child(
                                     Button::new("next")
-                                        .xsmall()
+                                        .small()
                                         .ghost()
                                         .icon(IconName::ChevronRight)
                                         .tooltip("Next match")

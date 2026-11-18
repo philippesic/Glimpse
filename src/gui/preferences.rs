@@ -515,6 +515,9 @@ impl Render for Preferences {
             .inset_0()
             .occlude()
             .bg(cx.theme().overlay)
+            .when(window.viewport_size().height < px(480.), |overlay| {
+                overlay.bg(cx.theme().background)
+            })
             .flex()
             .items_center()
             .justify_center()

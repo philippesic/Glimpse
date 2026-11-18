@@ -8,7 +8,7 @@ use gpui_component::{
 };
 use std::path::PathBuf;
 
-fn command_item(
+pub(super) fn command_item(
     shell: WeakEntity<Shell>,
     id: &'static str,
     label: String,
