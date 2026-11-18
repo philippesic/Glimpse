@@ -32,12 +32,12 @@ use gpui_component::{
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
-pub fn run(request: cli::Request) {
+pub fn run(request: cli::Request, data_dir: PathBuf, launch_folder: PathBuf) {
     platform::configure_allocations();
-    let startup = StartupIo::new(&request);
+    let startup = StartupIo::new(&request, &data_dir);
     Application::new()
         .with_assets(gpui_component_assets::Assets)
         .run(move |cx| {
@@ -72,7 +72,7 @@ pub fn run(request: cli::Request) {
                 },
                 move |window, cx| {
                     window.set_window_title("Glimpse");
-                    let view = cx.new(|cx| Shell::new(request, startup, window, cx));
+                    let view = cx.new(|cx| Shell::new(request, startup, launch_folder, window, cx));
                     let weak = view.downgrade();
                     window.on_window_should_close(cx, move |window, cx| {
                         weak.update(cx, |shell, cx| {
@@ -254,6 +254,7 @@ struct Shell {
     search_ui: searching::State,
     scope: Option<PathBuf>,
     current: PathBuf,
+    launch_folder: PathBuf,
     history: Vec<PathBuf>,
     gesture: glimpse::gesture::Gesture,
     future: Vec<PathBuf>,
@@ -348,12 +349,12 @@ struct StartupIo {
 }
 
 impl StartupIo {
-    fn new(request: &cli::Request) -> Self {
+    fn new(request: &cli::Request, data_dir: &Path) -> Self {
         let (tx, replies_ready) = async_channel::bounded(1);
         let wake = wake::Context::new(move || {
             let _ = tx.try_send(());
         });
-        let io = IoWorker::new(wake.clone());
+        let io = IoWorker::new(wake.clone(), data_dir);
         io.send(Job::LoadSettings);
         io.send(Job::Volumes);
         if request.desktop {
@@ -386,6 +387,7 @@ impl Shell {
     fn new(
         request: cli::Request,
         startup: StartupIo,
+        launch_folder: PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -409,7 +411,8 @@ impl Shell {
                     .first()
                     .and_then(|p| p.parent().map(|p| p.to_owned()))
             })
-            .unwrap_or_else(|| std::env::home_dir().unwrap());
+            .or_else(std::env::home_dir)
+            .unwrap_or_else(|| launch_folder.clone());
         let query = cx.new(|cx| {
             let mut input = InputState::new(window, cx).placeholder("Enter a path");
             input.set_external_highlights(Vec::new(), cx);
@@ -478,6 +481,7 @@ impl Shell {
             search,
             syntax,
             current,
+            launch_folder,
             history: vec![],
             gesture: glimpse::gesture::Gesture::default(),
             future: vec![],
@@ -1464,8 +1468,14 @@ impl Shell {
                 if let Some(error) = batch.error {
                     if self.restoring_location {
                         self.restoring_location = false;
-                        self.set_initial_location(std::env::home_dir().unwrap());
-                        self.status = "The last folder is unavailable. Showing Home.".into();
+                        if let Some(home) = std::env::home_dir() {
+                            self.set_initial_location(home);
+                            self.status = "The last folder is unavailable. Showing Home.".into();
+                        } else {
+                            self.set_initial_location(self.launch_folder.clone());
+                            self.status =
+                                "The last folder is unavailable. Showing the launch folder.".into();
+                        }
                         listing_changed = false;
                         continue;
                     }
@@ -2931,7 +2941,20 @@ impl Shell {
                     self.navigate(path);
                 }
             }
-            "home" => self.navigate(std::env::home_dir().unwrap()),
+            "home" => {
+                if let Some(home) = std::env::home_dir() {
+                    self.navigate(home);
+                } else {
+                    self.ask_decision(
+                        DecisionAction::Notice,
+                        "Home folder is unavailable".into(),
+                        "Choose another folder from Locations or enter its path.".into(),
+                        vec!["Close"],
+                        window,
+                        cx,
+                    );
+                }
+            }
             "back" => {
                 if let Some(path) = self.history.pop() {
                     self.future.push(self.current.clone());

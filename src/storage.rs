@@ -9,23 +9,22 @@ use std::{
 
 mod revisions;
 
-pub fn data_dir() -> PathBuf {
+pub fn data_dir() -> Result<PathBuf, &'static str> {
     if let Some(path) = std::env::var_os("GLIMPSE_DATA_DIR") {
-        return path.into();
+        return Ok(path.into());
     }
     #[cfg(target_os = "linux")]
-    {
-        std::env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| std::env::home_dir().unwrap().join(".local/share"))
-            .join("glimpse")
+    if let Some(path) = std::env::var_os("XDG_DATA_HOME") {
+        return Ok(PathBuf::from(path).join("glimpse"));
     }
+    let home = std::env::home_dir().ok_or(
+        "Glimpse needs a home folder for settings and recovery. Set HOME or GLIMPSE_DATA_DIR and try again.",
+    )?;
+    #[cfg(target_os = "linux")]
+    let data = home.join(".local/share/glimpse");
     #[cfg(target_os = "macos")]
-    {
-        std::env::home_dir()
-            .unwrap()
-            .join("Library/Application Support/Glimpse")
-    }
+    let data = home.join("Library/Application Support/Glimpse");
+    Ok(data)
 }
 pub fn private_dir(path: &Path) -> Result<(), String> {
     fs::DirBuilder::new()
@@ -273,7 +272,7 @@ impl Settings {
         Ok(())
     }
     pub fn load() -> Result<Self, String> {
-        Self::load_in(&data_dir())
+        Self::load_in(&data_dir()?)
     }
     pub(crate) fn load_in(root: &Path) -> Result<Self, String> {
         use std::io::Read;

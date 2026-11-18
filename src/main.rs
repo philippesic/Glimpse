@@ -1,5 +1,5 @@
 mod gui;
-use glimpse::{cli, lifecycle};
+use glimpse::{cli, lifecycle, storage};
 
 static EXIT_STATUS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 fn main() {
@@ -17,7 +17,15 @@ fn main() {
         }
         _ => {}
     }
-    let request = cli::parse(args.clone(), std::env::current_dir().unwrap()).unwrap_or_else(|e| {
+    let launch_folder = std::env::current_dir().unwrap_or_else(|e| {
+        eprintln!("Cannot read the launch folder: {e}");
+        std::process::exit(2)
+    });
+    let request = cli::parse(args.clone(), launch_folder.clone()).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2)
+    });
+    let data_dir = storage::data_dir().unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(2)
     });
@@ -28,6 +36,6 @@ fn main() {
         eprintln!("{e}");
         std::process::exit(2);
     }
-    gui::run(request);
+    gui::run(request, data_dir, launch_folder);
     std::process::exit(EXIT_STATUS.load(std::sync::atomic::Ordering::Relaxed));
 }

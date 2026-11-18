@@ -9,7 +9,7 @@ use gpui_component::{
 };
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -221,8 +221,8 @@ fn tracked(job: &Job) -> bool {
     )
 }
 impl IoWorker {
-    pub fn new(ctx: wake::Context) -> Self {
-        Self::new_in(ctx, storage::data_dir().join("recovery"))
+    pub fn new(ctx: wake::Context, data_dir: &Path) -> Self {
+        Self::new_in(ctx, data_dir.join("recovery"))
     }
     fn new_in(ctx: wake::Context, root: PathBuf) -> Self {
         let (jobs, writes) = mpsc::sync_channel(16);
