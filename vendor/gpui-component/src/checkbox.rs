@@ -20,6 +20,7 @@ pub struct Checkbox {
     children: Vec<AnyElement>,
     checked: bool,
     disabled: bool,
+    animate: bool,
     size: Size,
     tab_stop: bool,
     tab_index: isize,
@@ -37,6 +38,7 @@ impl Checkbox {
             children: Vec::new(),
             checked: false,
             disabled: false,
+            animate: true,
             size: Size::default(),
             on_click: None,
             tab_stop: true,
@@ -53,6 +55,11 @@ impl Checkbox {
     /// Set the checked state for the checkbox.
     pub fn checked(mut self, checked: bool) -> Self {
         self.checked = checked;
+        self
+    }
+
+    pub fn animate(mut self, animate: bool) -> Self {
+        self.animate = animate;
         self
     }
 
@@ -137,6 +144,7 @@ pub(crate) fn checkbox_check_icon(
     size: Size,
     checked: bool,
     disabled: bool,
+    animate: bool,
     window: &mut Window,
     cx: &mut App,
 ) -> impl IntoElement {
@@ -164,7 +172,7 @@ pub(crate) fn checkbox_check_icon(
             _ => this,
         })
         .map(|this| {
-            if !disabled && checked != *toggle_state.read(cx) {
+            if animate && !disabled && checked != *toggle_state.read(cx) {
                 let duration = Duration::from_secs_f64(0.25);
                 cx.spawn({
                     let toggle_state = toggle_state.clone();
@@ -192,12 +200,21 @@ pub(crate) fn checkbox_check_icon(
 impl RenderOnce for Checkbox {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let checked = self.checked;
+        let disabled = self.disabled;
+        let id = self.id.clone();
+        let label = match &self.label {
+            Some(Text::String(label)) => Some(label.clone()),
+            _ => None,
+        };
+        let action = self.on_click.clone();
 
         let focus_handle = window
             .use_keyed_state(self.id.clone(), cx, |_, cx| cx.focus_handle())
             .read(cx)
             .clone();
         let is_focused = focus_handle.is_focused(window);
+        let semantic_focus = focus_handle.clone();
+        let action_focus = focus_handle.clone();
 
         let border_color = if checked {
             cx.theme().primary
@@ -211,7 +228,7 @@ impl RenderOnce for Checkbox {
         };
         let radius = cx.theme().radius.min(px(4.));
 
-        div().child(
+        let rendered = div().child(
             self.base
                 .id(self.id.clone())
                 .when(!self.disabled, |this| {
@@ -263,6 +280,7 @@ impl RenderOnce for Checkbox {
                             self.size,
                             checked,
                             self.disabled,
+                            self.animate,
                             window,
                             cx,
                         )),
@@ -305,6 +323,37 @@ impl RenderOnce for Checkbox {
                         }
                     })
                 }),
-        )
+        );
+        gpui::accessible(id, rendered, move |_, window, _| {
+            use gpui::accesskit::{Action, Node, Role, Toggled};
+            let mut node = Node::new(Role::CheckBox);
+            if let Some(label) = &label {
+                node.set_label(label.to_string());
+            }
+            node.set_toggled(if checked {
+                Toggled::True
+            } else {
+                Toggled::False
+            });
+            if disabled {
+                node.set_disabled();
+            } else {
+                node.add_action(Action::Focus);
+                node.add_action(Action::Click);
+            }
+            let mut info = gpui::AccessibilityInfo::new(node);
+            info.focused = !disabled && semantic_focus.is_focused(window);
+            info
+        })
+        .on_action(move |request, _, window, cx| {
+            if disabled {
+                return;
+            }
+            match request.action {
+                gpui::accesskit::Action::Focus => action_focus.focus(window),
+                gpui::accesskit::Action::Click => Self::handle_click(&action, checked, window, cx),
+                _ => {}
+            }
+        })
     }
 }

@@ -4,6 +4,7 @@ use gpui::{prelude::*, *};
 use gpui_component::{
     ActiveTheme, Disableable, Selectable, Sizable,
     button::{Button, ButtonVariants},
+    checkbox::Checkbox,
     input::{Input, InputState},
     menu::{DropdownMenu, PopupMenuItem},
     scroll::{Scrollbar, ScrollbarShow},
@@ -321,12 +322,13 @@ impl Preferences {
     ) -> AnyElement {
         let mut draft = self.draft.clone();
         let checked = *field(&mut draft);
-        Button::new(label)
+        Checkbox::new(label)
             .small()
-            .compact()
-            .label(format!("{}  {label}", if checked { "✓" } else { "○" }))
-            .selected(checked)
-            .outline()
+            .min_h(px(24. * self.draft.ui_scale))
+            .items_center()
+            .label(label)
+            .checked(checked)
+            .animate(!self.draft.reduce_motion)
             .disabled(self.pending)
             .on_click(cx.listener(move |this, _, _, cx| {
                 let value = field(&mut this.draft);
@@ -559,6 +561,8 @@ impl Render for Preferences {
                                     .flex_1()
                                     .overflow_y_scroll()
                                     .track_scroll(&self.scroll)
+                                    .pl(px(4.))
+                                    .pt(px(4.))
                                     .pr(px(18.))
                                     .children(rows.into_iter().enumerate().map(|(i, row)| {
                                         div().track_focus(&self.row_focus[i]).pb(px(12.)).child(row)

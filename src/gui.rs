@@ -3730,20 +3730,24 @@ impl Render for Shell {
         if !self.request.pick && !short {
             let actions = div().flex().flex_wrap().gap_2().p_1();
             content = content.child(if narrow {
-                actions.child(self.button("Save", "save", cx)).child(
-                    self.button(if self.reading { "Edit" } else { "Read" }, "read", cx)
-                        .selected(self.reading),
-                )
+                actions
+                    .child(self.button("Save", "save", cx))
+                    .child(self.button(
+                        if self.reading { "Edit Source" } else { "Read" },
+                        "read",
+                        cx,
+                    ))
             } else {
                 actions
                     .child(self.button("New", "new", cx))
                     .child(self.button("Save", "save", cx))
                     .child(self.button("Save As", "save-as", cx))
                     .child(self.button("Save Copy", "save-copy", cx))
-                    .child(
-                        self.button(if self.reading { "Edit" } else { "Read" }, "read", cx)
-                            .selected(self.reading),
-                    )
+                    .child(self.button(
+                        if self.reading { "Edit Source" } else { "Read" },
+                        "read",
+                        cx,
+                    ))
                     .child(self.button("Go to line", "line", cx))
                     .child(self.button("Reload disk", "reload", cx))
             });
