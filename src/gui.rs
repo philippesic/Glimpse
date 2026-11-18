@@ -2208,6 +2208,7 @@ impl Shell {
                         }
                     }
                 }
+                self.announce_search_when_quiet(cx);
             }
         }
         if let Some(change) = self.observer.changed() {

@@ -6,10 +6,21 @@ pub(super) fn message(
     label: String,
     child: impl IntoElement,
 ) -> impl IntoElement {
+    status(id, label, child, true)
+}
+
+pub(super) fn status(
+    id: &'static str,
+    label: String,
+    child: impl IntoElement,
+    announce: bool,
+) -> impl IntoElement {
     accessible(id, child, move |_, _, _| {
         let mut node = Node::new(Role::Status);
         node.set_label(label.clone());
-        node.set_live(gpui::accesskit::Live::Polite);
+        if announce {
+            node.set_live(gpui::accesskit::Live::Polite);
+        }
         AccessibilityInfo::new(node)
     })
 }

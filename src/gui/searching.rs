@@ -5,6 +5,8 @@ pub(super) struct State {
     pub temporary: Option<PathBuf>,
     pub suspended: Option<(Panel, String)>,
     pub status: String,
+    announce_status: bool,
+    announcement: Option<Task<()>>,
     pub started: bool,
     pub running: bool,
     pub building: bool,
@@ -20,6 +22,8 @@ impl State {
             temporary: None,
             suspended: None,
             status: "Enter a query, then press Enter to search".into(),
+            announce_status: true,
+            announcement: None,
             started: false,
             running: false,
             building: false,
@@ -87,6 +91,8 @@ impl Shell {
         self.search_ui.running = false;
         self.search_ui.building = false;
         self.search_ui.status = status.into();
+        self.search_ui.announcement.take();
+        self.search_ui.announce_status = true;
     }
     pub(super) fn start_search(&mut self, cx: &App) {
         let query = self.query.read(cx).value().to_string();
@@ -131,7 +137,18 @@ impl Shell {
         if update {
             self.start_search(cx);
         }
+        self.announce_search_when_quiet(cx);
         cx.notify();
+    }
+    pub(super) fn announce_search_when_quiet(&mut self, cx: &mut Context<Self>) {
+        self.search_ui.announce_status = false;
+        self.search_ui.announcement = Some(cx.spawn(async move |this, cx| {
+            Timer::after(std::time::Duration::from_millis(400)).await;
+            let _ = this.update(cx, |this, cx| {
+                this.search_ui.announce_status = true;
+                cx.notify();
+            });
+        }));
     }
     pub(super) fn build_index(&mut self) {
         self.reset_search("Building filename snapshot…");
@@ -374,10 +391,15 @@ impl Shell {
                     .gap_2()
                     .px_2()
                     .py_1()
-                    .child(accessibility::message(
-                        "search-result-status",
+                    .child(accessibility::status(
+                        if self.search_ui.announce_status {
+                            "search-result-announcement"
+                        } else {
+                            "search-result-status"
+                        },
                         status.clone(),
                         div().flex_1().min_w_0().text_sm().child(status),
+                        self.search_ui.announce_status,
                     ))
                     .when(count > 0, |row| {
                         row.child(self.button("Focus Results", "focus-results", cx))
