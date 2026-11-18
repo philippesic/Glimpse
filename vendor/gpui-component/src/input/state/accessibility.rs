@@ -7,10 +7,13 @@ use gpui::accessibility::TextRunIds;
 use gpui::WeakEntity;
 use ropey::{LineType, extra::esoterica::ropes_are_instances};
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 const PACKED_LINE_THRESHOLD: usize = 4096;
+const SHARE_RUNS_FROM_LINE_BYTES: usize = 64 * 1024;
+const MAX_SHARED_RUNS_PER_LINE: usize = 256;
 
 #[derive(Default)]
 pub(super) struct Mapping {
@@ -85,6 +88,33 @@ impl PackedLines {
     }
 }
 
+fn shared_text_run<'a>(
+    value: &'a str,
+    lengths: Vec<u8>,
+    words: Vec<u16>,
+    shared: &mut HashMap<&'a str, Node>,
+) -> Node {
+    if let Some(run) = shared.get(value)
+        && run.character_lengths() == lengths
+        && if run.wide_word_starts().is_empty() {
+            run.word_starts()
+                .iter()
+                .copied()
+                .map(u16::from)
+                .eq(words.iter().copied())
+        } else {
+            run.wide_word_starts() == words
+        }
+    {
+        return run.clone();
+    }
+    let run = text_run(value, lengths, words);
+    if shared.len() < MAX_SHARED_RUNS_PER_LINE {
+        shared.entry(value).or_insert_with(|| run.clone());
+    }
+    run
+}
+
 fn visit_source_runs(
     text: &Rope,
     range: Range<usize>,
@@ -100,6 +130,7 @@ fn visit_source_runs(
         let line = line
             .as_str()
             .map_or_else(|| Cow::Owned(String::from(line)), Cow::Borrowed);
+        let mut shared = (line.len() >= SHARE_RUNS_FROM_LINE_BYTES).then(HashMap::new);
         visit_line_segments(&line, line_index, |part| {
             if packed && !line.is_empty() && part.range.len() == line.len() {
                 if block.lengths.len() + part.lengths.len() > MAX_RUN_CHARACTERS {
@@ -109,8 +140,22 @@ fn visit_source_runs(
             } else {
                 block.flush(&mut emit);
                 let range = offset + part.range.start..offset + part.range.end;
-                let node = text_run(&line[part.range], part.lengths, part.words);
-                emit(range, Some(part.line), node);
+                if let Some(shared) = &mut shared {
+                    let continues_before = part.range.start != 0;
+                    let continues_after = part.range.end != line.len();
+                    let mut node =
+                        shared_text_run(&line[part.range], part.lengths, part.words, shared);
+                    if continues_before {
+                        node.set_text_run_continues_before();
+                    }
+                    if continues_after {
+                        node.set_text_run_continues_after();
+                    }
+                    emit(range, None, node);
+                } else {
+                    let node = text_run(&line[part.range], part.lengths, part.words);
+                    emit(range, Some(part.line), node);
+                }
             }
         });
         offset += line.len();
@@ -471,6 +516,44 @@ impl InputState {
 mod tests {
     use super::*;
     use crate::semantic_text::segments;
+
+    #[test]
+    fn repeated_long_runs_share_exact_metadata_without_sharing_positions() {
+        let text = "x ".repeat(64 * 1024);
+        let mut mapping = TextRuns::default();
+        mapping.update(Rope::from(text.as_str()), |index| NodeId(index as u64 + 1));
+        let first = &mapping.nodes[0];
+        let second = &mapping.nodes[1];
+        let third = &mapping.nodes[2];
+        let last = mapping.nodes.last().unwrap();
+        assert!(second.1.shares_data_with(&third.1));
+        assert_ne!(second.0, third.0);
+        assert!(!first.1.text_run_continues_before());
+        assert!(first.1.text_run_continues_after());
+        assert!(last.1.text_run_continues_before());
+        assert!(!last.1.text_run_continues_after());
+        assert_eq!(mapping.offset(&mapping.position(4097)), Some(4097));
+        assert_eq!(
+            mapping
+                .nodes
+                .iter()
+                .map(|(_, node)| node.value().unwrap())
+                .collect::<String>(),
+            text
+        );
+
+        let mut cache = HashMap::new();
+        let value = "a\u{301}b";
+        let original = shared_text_run(value, vec![3, 1], vec![0], &mut cache);
+        let same = shared_text_run(value, vec![3, 1], vec![0], &mut cache);
+        let words = shared_text_run(value, vec![3, 1], vec![1], &mut cache);
+        let scalars = shared_text_run(value, vec![1, 2, 1], vec![0], &mut cache);
+        assert!(original.shares_data_with(&same));
+        assert!(!original.shares_data_with(&words));
+        assert!(!original.shares_data_with(&scalars));
+        assert_eq!(words.word_starts(), [1]);
+        assert_eq!(scalars.character_lengths(), [1, 2, 1]);
+    }
 
     #[gpui::test]
     fn large_accessible_updates_reject_stale_text_and_owners(cx: &mut gpui::TestAppContext) {

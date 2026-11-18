@@ -817,6 +817,8 @@ enum Flag {
     IsGrammarError,
     IsSearchMatch,
     IsSuggestion,
+    TextRunContinuesBefore,
+    TextRunContinuesAfter,
 }
 
 impl Flag {
@@ -2074,7 +2076,13 @@ flag_methods! {
     /// Whether this node represents text matching the current search.
     (IsSearchMatch, is_search_match, set_is_search_match, clear_is_search_match),
     /// Whether this node's text is a suggested replacement.
-    (IsSuggestion, is_suggestion, set_is_suggestion, clear_is_suggestion)
+    (IsSuggestion, is_suggestion, set_is_suggestion, clear_is_suggestion),
+    /// This text run starts on the same line as the immediately preceding
+    /// sibling text run. An explicit previous-on-line link takes precedence.
+    (TextRunContinuesBefore, text_run_continues_before, set_text_run_continues_before, clear_text_run_continues_before),
+    /// This text run ends on the same line as the immediately following
+    /// sibling text run. An explicit next-on-line link takes precedence.
+    (TextRunContinuesAfter, text_run_continues_after, set_text_run_continues_after, clear_text_run_continues_after)
 }
 
 option_ref_type_getters! {
