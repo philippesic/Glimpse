@@ -586,7 +586,6 @@ impl InputState {
                 };
                 self.selected_range = (anchor.min(focus)..anchor.max(focus)).into();
                 self.selection_reversed = focus < anchor;
-                self.focus(window, cx);
                 self.update_preferred_column();
                 cx.notify();
                 true

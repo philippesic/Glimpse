@@ -793,7 +793,7 @@ impl Shell {
         let view = cx.new(|cx| {
             let mut decision = decision::Decision::new(title, detail, actions, window, cx);
             if closing {
-                decision.close_actions();
+                decision.close_actions(window, cx);
             }
             decision
         });

@@ -12,6 +12,7 @@ pub struct Decision {
     subjects: Vec<String>,
     summary: Option<String>,
     primary: Option<usize>,
+    primary_focus: Option<FocusHandle>,
     destructive: Option<usize>,
     actions: Vec<&'static str>,
     focus: FocusHandle,
@@ -77,6 +78,7 @@ impl Decision {
             subjects: Vec::new(),
             summary: None,
             primary: None,
+            primary_focus: None,
             destructive: None,
             actions,
             focus,
@@ -86,10 +88,13 @@ impl Decision {
             _comparison_subscriptions: Vec::new(),
         }
     }
-    pub fn close_actions(&mut self) {
+    pub fn close_actions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.summary = Some("Discard removes recovery drafts.".into());
         self.primary = Some(1);
         self.destructive = Some(2);
+        let focus = cx.focus_handle();
+        focus.focus(window);
+        self.primary_focus = Some(focus);
     }
     pub fn set_subjects(&mut self, subjects: Vec<String>, cx: &mut Context<Self>) {
         self.subjects = subjects;
@@ -284,6 +289,14 @@ impl Render for Decision {
                                             .when(self.primary == Some(i), |button| {
                                                 button.primary()
                                             })
+                                            .when_some(
+                                                self.primary_focus
+                                                    .as_ref()
+                                                    .filter(|_| self.primary == Some(i)),
+                                                |button, focus| {
+                                                    button.with_focus_handle(focus.clone())
+                                                },
+                                            )
                                             .when(self.destructive == Some(i), |button| {
                                                 button.danger()
                                             })

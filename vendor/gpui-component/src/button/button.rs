@@ -179,6 +179,7 @@ pub struct Button {
     id: ElementId,
     semantic_role: gpui::accesskit::Role,
     semantic_focus: Option<gpui::FocusHandle>,
+    focus_handle: Option<gpui::FocusHandle>,
     base: Stateful<Div>,
     style: StyleRefinement,
     icon: Option<Icon>,
@@ -222,6 +223,7 @@ impl Button {
             id: id.clone(),
             semantic_role: gpui::accesskit::Role::Button,
             semantic_focus: None,
+            focus_handle: None,
             // ID must be set after div is created;
             // `dropdown_menu` uses this id to create the popup menu.
             base: div().flex_shrink_0().id(id),
@@ -252,6 +254,11 @@ impl Button {
 
     pub fn accessibility_focus(mut self, focus: gpui::FocusHandle) -> Self {
         self.semantic_focus = Some(focus);
+        self
+    }
+
+    pub fn with_focus_handle(mut self, focus: gpui::FocusHandle) -> Self {
+        self.focus_handle = Some(focus);
         self
     }
 
@@ -454,10 +461,12 @@ impl RenderOnce for Button {
             _ => self.size,
         };
 
-        let focus_handle = window
-            .use_keyed_state(self.id.clone(), cx, |_, cx| cx.focus_handle())
-            .read(cx)
-            .clone();
+        let focus_handle = self.focus_handle.unwrap_or_else(|| {
+            window
+                .use_keyed_state(self.id.clone(), cx, |_, cx| cx.focus_handle())
+                .read(cx)
+                .clone()
+        });
         let is_focused = focus_handle.is_focused(window);
 
         let rounding = match self.rounded {
