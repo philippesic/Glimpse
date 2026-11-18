@@ -137,6 +137,7 @@ impl BladePipelines {
     fn new(gpu: &gpu::Context, surface_info: gpu::SurfaceInfo, path_sample_count: u32) -> Self {
         use gpu::ShaderData as _;
 
+        let _work = crate::work_trace::Span::new("blade_pipelines");
         log::info!(
             "Initializing Blade pipelines for surface {:?}",
             surface_info
@@ -513,6 +514,7 @@ impl BladeRenderer {
 
     pub fn update_transparency(&mut self, transparent: bool) {
         if transparent != self.surface_config.transparent {
+            let _work = crate::work_trace::Span::new("blade_transparency");
             self.wait_for_gpu();
             self.surface_config.transparent = transparent;
             self.gpu

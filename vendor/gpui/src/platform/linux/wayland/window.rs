@@ -137,6 +137,8 @@ impl WaylandWindowState {
         gpu_context: &BladeContext,
         options: WindowParams,
     ) -> anyhow::Result<Self> {
+        let decorations = options.window_decorations;
+        let background_appearance = options.window_background;
         let renderer = {
             let raw_window = RawWindow {
                 window: surface.id().as_ptr().cast::<c_void>(),
@@ -153,7 +155,8 @@ impl WaylandWindowState {
                     height: options.bounds.size.height.0 as u32,
                     depth: 1,
                 },
-                transparent: true,
+                transparent: decorations == WindowDecorations::Client
+                    || background_appearance != WindowBackgroundAppearance::Opaque,
             };
             BladeRenderer::new(gpu_context, &raw_window, config)?
         };
@@ -175,8 +178,8 @@ impl WaylandWindowState {
             bounds: options.bounds,
             scale: 1.0,
             input_handler: None,
-            decorations: WindowDecorations::Client,
-            background_appearance: WindowBackgroundAppearance::Opaque,
+            decorations,
+            background_appearance,
             fullscreen: false,
             maximized: false,
             tiling: Tiling::default(),

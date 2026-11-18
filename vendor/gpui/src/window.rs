@@ -972,6 +972,7 @@ impl Window {
         let bounds = window_bounds
             .map(|bounds| bounds.get_bounds())
             .unwrap_or_else(|| default_bounds(display_id, cx));
+        let window_decorations = window_decorations.unwrap_or(WindowDecorations::Server);
         let platform_open = crate::work_trace::Span::new("platform_window");
         let mut platform_window = cx.platform.open_window(
             handle,
@@ -986,6 +987,10 @@ impl Window {
                 show,
                 display_id,
                 window_min_size,
+                #[cfg(all(any(target_os = "linux", target_os = "freebsd"), feature = "wayland"))]
+                window_background,
+                #[cfg(all(any(target_os = "linux", target_os = "freebsd"), feature = "wayland"))]
+                window_decorations,
                 #[cfg(target_os = "macos")]
                 tabbing_identifier,
             },
@@ -1014,8 +1019,7 @@ impl Window {
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
         let last_input_timestamp = Rc::new(Cell::new(Instant::now()));
 
-        platform_window
-            .request_decorations(window_decorations.unwrap_or(WindowDecorations::Server));
+        platform_window.request_decorations(window_decorations);
         platform_window.set_background_appearance(window_background);
 
         if let Some(ref window_open_state) = window_bounds {
