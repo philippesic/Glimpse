@@ -3269,7 +3269,7 @@ impl Shell {
             .map(|button| {
                 if dirty_save {
                     button.primary()
-                } else if matches!(command, "toggle-navigator" | "read" | "save") {
+                } else if matches!(command, "open" | "toggle-navigator" | "read" | "save") {
                     button.outline()
                 } else {
                     button.ghost()
@@ -3332,18 +3332,22 @@ impl Render for Shell {
             .when(short, |toolbar| toolbar.py(px(3.)))
             .bg(cx.theme().muted);
         if narrow {
-            toolbar = toolbar
-                .child(self.button(
-                    if self.navigation_only && self.active.is_some() && self.reading {
+            if self.active.is_some() {
+                toolbar = toolbar.child(self.button(
+                    if self.navigation_only && self.reading {
                         "Reading"
-                    } else if self.navigation_only && self.active.is_some() {
+                    } else if self.navigation_only {
                         "Edit"
                     } else {
                         "Browse"
                     },
                     "toggle-navigator",
                     cx,
-                ))
+                ));
+            } else if !self.request.pick {
+                toolbar = toolbar.child(self.button("Open…", "open", cx));
+            }
+            toolbar = toolbar
                 .child(self.locations_menu(cx))
                 .child(self.main_menu(cx));
         } else {
@@ -3659,9 +3663,12 @@ impl Render for Shell {
                     div().p_2().text_sm()
                         .child(div().id("listing-state").truncate().child(message.clone())
                             .tooltip(move |window,cx| gpui_component::tooltip::Tooltip::new(message.clone()).build(window,cx)))
-                        .child(self.button("Refresh", "refresh", cx))
-                        .when(!self.listing_done, |row| row.child(self.button("Stop Reading", "stop-listing", cx)))
-                        .when(self.listing_error.is_some(), |row| row.child(self.button("Details…", "folder-error", cx)))
+                        .child(
+                            div().flex().flex_wrap().gap_1().mt_1()
+                                .child(self.button("Refresh", "refresh", cx))
+                                .when(!self.listing_done, |row| row.child(self.button("Stop Reading", "stop-listing", cx)))
+                                .when(self.listing_error.is_some(), |row| row.child(self.button("Details…", "folder-error", cx))),
+                        )
                 )
             })
             .when(!visible.is_empty(), |navigator| navigator.child(
