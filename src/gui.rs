@@ -3200,6 +3200,7 @@ impl Render for Shell {
             .flex_wrap()
             .gap(px(8.))
             .p(px(8.))
+            .when(short, |toolbar| toolbar.py(px(3.)))
             .bg(cx.theme().muted);
         if narrow {
             toolbar = toolbar
@@ -3578,6 +3579,7 @@ impl Render for Shell {
             .flex()
             .gap_1()
             .p(px(4.))
+            .when(short, |tabs| tabs.py_0())
             .overflow_x_scroll()
             .flex_shrink_0()
             .track_scroll(&self.tab_scroll)
@@ -3810,31 +3812,35 @@ impl Render for Shell {
         } else {
             content.into_any_element()
         };
+        let has_status = !self.status.is_empty() || self.font_warning.is_some();
+        let stacked_footer = narrow && !short && (has_status || !self.warnings.is_empty());
+        let footer_height = if stacked_footer {
+            48.
+        } else if short && self.warnings.is_empty() {
+            20.
+        } else if narrow {
+            28.
+        } else {
+            36.
+        };
         root.child(div().flex_1().min_h_0().child(body))
             .child(
                 div()
-                    .h(px((if short {
-                        28.
-                    } else if narrow {
-                        48.
-                    } else {
-                        36.
-                    }) * self.settings.ui_scale))
+                    .h(px(footer_height * self.settings.ui_scale))
                     .flex_shrink_0()
                     .px_2()
                     .flex()
                     .items_center()
                     .gap_2()
                     .text_size(px(12. * self.settings.ui_scale))
-                    .when(narrow && !short, |footer| {
+                    .when(stacked_footer, |footer| {
                         footer.flex_col().items_start().justify_center().gap_0()
                     })
                     .when(!self.warnings.is_empty(), |footer| {
                         footer.child(self.button("Warnings…", "warnings", cx))
                     })
                     .when(
-                        self.warnings.is_empty()
-                            && (!short || !self.status.is_empty() || self.font_warning.is_some()),
+                        self.warnings.is_empty() && (!narrow || has_status),
                         |footer| {
                             let message = match &self.font_warning {
                                 Some(warning) if self.status.is_empty() => warning.clone(),

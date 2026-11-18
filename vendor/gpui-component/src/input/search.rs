@@ -11,7 +11,7 @@ use std::{
 use gpui::{
     App, AppContext as _, Context, Empty, Entity, FocusHandle, Focusable, Half,
     InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Render, Styled,
-    Subscription, WeakEntity, Window, actions, prelude::FluentBuilder as _, rems,
+    Subscription, WeakEntity, Window, actions, prelude::FluentBuilder as _, px, relative, rems,
 };
 use ropey::{Rope, extra::esoterica::ropes_are_instances};
 
@@ -819,6 +819,7 @@ impl Render for SearchPanel {
         };
 
         let short = window.viewport_size().height < window.rem_size() * 16.;
+        let narrow = window.viewport_size().width <= px(600.);
         let count = |compact| {
             crate::semantic_text::text(
                 "match-count",
@@ -845,7 +846,7 @@ impl Render for SearchPanel {
             .on_action(cx.listener(Self::on_action_tab_prev))
             .font_family(cx.theme().font_family.clone())
             .items_center()
-            .when(short, |panel| panel.py_1().px_2())
+            .when(short, |panel| panel.py(px(2.)).px_2())
             .when(!short, |panel| panel.py_2().px_3())
             .w_full()
             .gap_1()
@@ -862,6 +863,7 @@ impl Render for SearchPanel {
                         h_flex()
                             .flex_1()
                             .flex_basis(rems(14.))
+                            .when(narrow && !short, |query| query.flex_basis(relative(0.65)))
                             .min_w_0()
                             .max_w_full()
                             .gap_2()
