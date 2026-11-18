@@ -750,35 +750,30 @@ impl PopupMenu {
     }
 
     fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
-        match self.selected_index {
-            Some(index) => {
-                let item = self.menu_items.get(index);
-                match item {
-                    Some(PopupMenuItem::Item {
-                        handler, action, ..
-                    }) => {
-                        if let Some(handler) = handler {
-                            handler(&ClickEvent::default(), window, cx);
-                        } else if let Some(action) = action.as_ref() {
-                            self.dispatch_confirm_action(action, window, cx);
-                        }
-
-                        self.dismiss(&Cancel, window, cx)
-                    }
-                    Some(PopupMenuItem::ElementItem {
-                        handler, action, ..
-                    }) => {
-                        if let Some(handler) = handler {
-                            handler(&ClickEvent::default(), window, cx);
-                        } else if let Some(action) = action.as_ref() {
-                            self.dispatch_confirm_action(action, window, cx);
-                        }
-                        self.dismiss(&Cancel, window, cx)
-                    }
-                    _ => {}
-                }
+        let item = self
+            .selected_index
+            .and_then(|index| self.menu_items.get(index));
+        let Some(
+            PopupMenuItem::Item {
+                handler, action, ..
             }
-            _ => {}
+            | PopupMenuItem::ElementItem {
+                handler, action, ..
+            },
+        ) = item
+        else {
+            return;
+        };
+        if let Some(handler) = handler.clone() {
+            self.dismiss(&Cancel, window, cx);
+            window.defer(cx, move |window, cx| {
+                handler(&ClickEvent::default(), window, cx);
+            });
+        } else {
+            if let Some(action) = action.as_ref() {
+                self.dispatch_confirm_action(action, window, cx);
+            }
+            self.dismiss(&Cancel, window, cx);
         }
     }
 
