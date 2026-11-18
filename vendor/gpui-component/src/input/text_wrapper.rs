@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::hash::BuildHasher;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -281,7 +283,9 @@ impl TextWrapper {
             || text.len() < 2 * 1024 * 1024
             || rows > 8 * 1024 * 1024 / std::mem::size_of::<LineItem>()
         {
-            return Self::prepare_full(config, &text, &text_system);
+            let mut layout = Self::prepare_full(config, &text, &text_system);
+            layout.share_line_wraps();
+            return layout;
         }
 
         let mut boundaries = vec![0];
@@ -292,7 +296,9 @@ impl TextWrapper {
             }
         }
         if boundaries.len() == 1 {
-            return Self::prepare_full(config, &text, &text_system);
+            let mut layout = Self::prepare_full(config, &text, &text_system);
+            layout.share_line_wraps();
+            return layout;
         }
         boundaries.push(rows);
 
@@ -335,7 +341,34 @@ impl TextWrapper {
             );
         }
         layout.rebuild_index_from(0);
+        layout.share_line_wraps();
         layout
+    }
+
+    fn share_line_wraps(&mut self) {
+        const MAX_SHARED_WRAPS: usize = 256;
+        if self.lines.len() < 4096 || self.wrap_width.is_none() {
+            return;
+        }
+        let mut shared = HashMap::<u64, Arc<LineWraps>>::new();
+        for wraps in self.lines.iter_mut().filter_map(|line| line.wraps.as_mut()) {
+            if wraps.ranges.len() > 8 {
+                continue;
+            }
+            let key = shared.hasher().hash_one((
+                wraps.indent,
+                wraps.word_columns,
+                f32::from(wraps.word_width).to_bits(),
+                wraps.ranges.as_slice(),
+            ));
+            if let Some(existing) = shared.get(&key) {
+                if existing.as_ref() == wraps.as_ref() {
+                    wraps.clone_from(existing);
+                }
+            } else if shared.len() < MAX_SHARED_WRAPS {
+                shared.insert(key, wraps.clone());
+            }
+        }
     }
 
     /// Update the text wrapper and recalculate the wrapped lines.
