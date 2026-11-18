@@ -376,8 +376,13 @@ pub struct PreparedInput {
 impl PreparedInput {
     pub fn new(value: impl Into<SharedString>) -> Self {
         let value = value.into();
+        let text = if value.len() >= 1024 * 1024 {
+            Rope::from_shared_str(value.clone().into())
+        } else {
+            Rope::from(value.as_str())
+        };
         let revision = Revision {
-            text: Rope::from(value.as_str()),
+            text,
             endings: LineEndings::new(&value),
         };
         Self { value, revision }
@@ -1133,7 +1138,12 @@ impl InputState {
     pub fn value(&self) -> SharedString {
         self.value_cache
             .borrow_mut()
-            .get_or_insert_with(|| SharedString::new(String::from(&self.text)))
+            .get_or_insert_with(|| {
+                self.text.shared_str().map_or_else(
+                    || SharedString::new(String::from(&self.text)),
+                    |text| SharedString::from(text.clone()),
+                )
+            })
             .clone()
     }
 

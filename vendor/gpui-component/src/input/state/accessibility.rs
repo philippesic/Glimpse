@@ -1,5 +1,7 @@
 use super::*;
-use crate::semantic_text::{MAX_RUN_CHARACTERS, Segment, text_run, visit_line_segments};
+use crate::semantic_text::{
+    MAX_RUN_CHARACTERS, Segment, text_run, text_run_with_boundaries, visit_line_segments,
+};
 use gpui::accesskit::{
     Action, ActionData, ActionRequest, Node, NodeId, Role, TextPosition, TextSelection,
 };
@@ -48,6 +50,7 @@ struct Run {
 
 #[derive(Default)]
 struct PackedLines {
+    backing: Option<Arc<str>>,
     start: usize,
     text: String,
     lengths: Vec<u8>,
@@ -121,7 +124,7 @@ impl PackedLines {
             });
         if let Some(template) = template {
             let mut run = template.clone();
-            run.set_value(self.text.as_str());
+            self.set_value(&mut run);
             self.lengths.clear();
             self.words.clear();
             self.line_starts.clear();
@@ -130,11 +133,15 @@ impl PackedLines {
 
         self.lengths.shrink_to_fit();
         self.words.shrink_to_fit();
-        let mut run = text_run(
-            &self.text,
-            std::mem::take(&mut self.lengths),
-            std::mem::take(&mut self.words),
-        );
+        let lengths = std::mem::take(&mut self.lengths);
+        let words = std::mem::take(&mut self.words);
+        let mut run = if self.backing.is_some() {
+            let mut run = text_run_with_boundaries(lengths, words);
+            self.set_value(&mut run);
+            run
+        } else {
+            text_run(&self.text, lengths, words)
+        };
         if !self.line_starts.is_empty() {
             self.line_starts.shrink_to_fit();
             run.set_hard_line_starts(std::mem::take(&mut self.line_starts));
@@ -149,6 +156,17 @@ impl PackedLines {
             });
         }
         run
+    }
+
+    fn set_value(&self, run: &mut Node) {
+        let range = self.start..self.start + self.text.len();
+        if let Some(backing) = &self.backing
+            && backing.get(range.clone()) == Some(self.text.as_str())
+        {
+            run.set_shared_value(backing.clone(), range);
+        } else {
+            run.set_value(self.text.as_str());
+        }
     }
 }
 
@@ -189,7 +207,9 @@ fn visit_source_runs(
     packed: bool,
     mut emit: impl FnMut(Range<usize>, Option<usize>, Node),
 ) {
+    let backing = packed.then(|| text.shared_str()).flatten();
     let mut block = PackedLines {
+        backing: backing.cloned(),
         shared: (packed && range.len() >= SHARE_RUNS_FROM_BYTES).then(HashMap::new),
         ..Default::default()
     };
@@ -198,8 +218,9 @@ fn visit_source_runs(
         if line.len() == 0 && range.end < text.len() {
             break;
         }
-        let line = line
-            .as_str()
+        let line = backing
+            .map(|source| &source[offset..offset + line.len()])
+            .or_else(|| line.as_str())
             .map_or_else(|| Cow::Owned(String::from(line)), Cow::Borrowed);
         let mut shared = (line.len() >= SHARE_RUNS_FROM_BYTES).then(HashMap::new);
         visit_line_segments(&line, line_index, |part| {
@@ -587,6 +608,30 @@ impl InputState {
 mod tests {
     use super::*;
     use crate::semantic_text::segments;
+
+    #[test]
+    fn packed_source_shares_exact_utf8_bytes_until_edited() {
+        let backing: Arc<str> = "🙂 café é\r\n日本語 word\n".repeat(2000).into();
+        let mut text = Rope::from_shared_str(backing.clone());
+        let mut restored = String::new();
+        visit_source_runs(&text, 0..text.len(), true, |range, _, node| {
+            let value = node.value().unwrap();
+            assert_eq!(value, &backing[range.clone()]);
+            if range.start == 0 {
+                assert_eq!(value.as_ptr(), backing.as_ptr());
+            }
+            restored.push_str(value);
+        });
+        assert_eq!(restored, backing.as_ref());
+
+        text.insert(4, " changed");
+        restored.clear();
+        visit_source_runs(&text, 0..text.len(), true, |_, _, node| {
+            restored.push_str(node.value().unwrap());
+        });
+        assert_eq!(restored, String::from(&text));
+        assert!(backing.starts_with("🙂 café é\r\n"));
+    }
 
     #[test]
     fn distinct_text_reuses_only_equal_grapheme_word_and_line_boundaries() {

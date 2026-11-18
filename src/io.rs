@@ -464,8 +464,12 @@ impl IoWorker {
                                     gpui::work_trace::Span::new("reading_source_memory_release");
                                 reclaim();
                             }
-                            let mut prepared =
-                                crate::reading::prepare(String::from(source), &path, &theme);
+                            let mut prepared = match source.shared_str() {
+                                Some(text) => crate::reading::prepare(text.clone(), &path, &theme),
+                                None => {
+                                    crate::reading::prepare(String::from(source), &path, &theme)
+                                }
+                            };
                             if reading.load(Ordering::Relaxed) != request {
                                 continue;
                             }

@@ -52,9 +52,9 @@ fn decoded_path(value: &str) -> Option<PathBuf> {
     let bytes: Vec<_> = percent_encoding::percent_decode_str(value).collect();
     (!bytes.contains(&0)).then(|| PathBuf::from(std::ffi::OsString::from_vec(bytes)))
 }
-pub fn prepare(source: String, path: &Path, theme: &HighlightTheme) -> Prepared {
+pub fn prepare(source: impl AsRef<str>, path: &Path, theme: &HighlightTheme) -> Prepared {
     let mut destinations = Vec::new();
-    let mut markdown = ParsedMarkdown::new(&source, theme, |url| {
+    let mut markdown = ParsedMarkdown::new(source.as_ref(), theme, |url| {
         if destinations.len() <= MAX_READ_IMAGES && !destinations.iter().any(|item| item == url) {
             destinations.push(url.to_owned());
         }
@@ -179,7 +179,7 @@ mod tests {
             "![local](local.png)\n![remote](http://127.0.0.1:1/trap.png)\n<script>raw</script>\n";
         let path = dir.path().join("read.md");
         std::fs::write(&path, source).unwrap();
-        let prepared = prepare(source.to_owned(), &path, &HighlightTheme::default_light());
+        let prepared = prepare(source, &path, &HighlightTheme::default_light());
         assert_eq!(std::fs::read_to_string(path).unwrap(), source);
         assert_eq!(
             (

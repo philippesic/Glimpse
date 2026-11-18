@@ -1,7 +1,7 @@
 [workspace]
 members = ["vendor/gpui-component", "vendor/accesskit", "vendor/accesskit_atspi_common", "vendor/accesskit_consumer"]
 default-members = ["."]
-exclude = ["vendor/accesskit_unix", "vendor/gpui", "vendor/pulldown-cmark", "vendor/zvariant", "vendor/zbus"]
+exclude = ["vendor/accesskit_unix", "vendor/gpui", "vendor/pulldown-cmark", "vendor/ropey", "vendor/zvariant", "vendor/zbus"]
 resolver = "3"
 
 [package]
@@ -56,6 +56,7 @@ gpui = { path = "vendor/gpui" }
 xattr = { path = "vendor/xattr" }
 gpui-component = { path = "vendor/gpui-component" }
 pulldown-cmark = { path = "vendor/pulldown-cmark" }
+ropey = { path = "vendor/ropey" }
 zvariant = { path = "vendor/zvariant" }
 zbus = { path = "vendor/zbus" }
 
