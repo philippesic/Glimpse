@@ -758,6 +758,14 @@ impl SearchPanel {
         }
         let original = state.text.clone();
         let layout = state.replacement_layout();
+        let viewport = state.last_layout.as_ref().map(|layout| {
+            let rows =
+                (f32::from(layout.viewport_height) / f32::from(layout.line_height)).ceil() as usize;
+            (
+                window.text_system().prepare_in_separate_cache(),
+                rows.saturating_add(2),
+            )
+        });
         let editor = self.editor.clone();
         let cancellation = self.cancellation.clone();
         let worker_cancel = cancellation.clone();
@@ -770,8 +778,13 @@ impl SearchPanel {
             let output: gpui::SharedString =
                 replace_matches(&worker_original, &ranges, new_text.as_str(), &worker_cancel)?
                     .into();
-            let prepared =
-                layout.map(|layout| PreparedReplacement::new(output.clone(), layout, &text_system));
+            if worker_cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            let prepared = layout.map(|layout| {
+                PreparedReplacement::new(output.clone(), layout, &text_system)
+                    .with_viewport(viewport)
+            });
             (!worker_cancel.load(Ordering::Relaxed)).then_some((output, prepared))
         });
         cx.spawn_in(window, async move |_, cx| {

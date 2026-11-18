@@ -403,6 +403,51 @@ impl TextWrapper {
         (self._initialized && lines + wraps + checkpoints <= MAX_LAYOUT_BYTES).then_some(self)
     }
 
+    pub(super) fn prepare_glyphs(
+        &self,
+        text: &Rope,
+        cache: gpui::WindowTextSystem,
+        rows: usize,
+    ) -> Option<gpui::PreparedTextLines> {
+        if text.len() < 512 * 1024 || self.wrap_width.is_none() {
+            return None;
+        }
+        let _work = gpui::work_trace::Span::new("editor_replacement_shape_worker");
+        let mut remaining_rows = rows.min(64);
+        let mut remaining_bytes = 8 * 1024;
+        'lines: for (row, layout) in self.lines.iter().enumerate() {
+            let line = text.slice_line(row);
+            for index in 0..layout.lines_len().min(remaining_rows) {
+                let Some(range) = layout.range(index) else {
+                    break 'lines;
+                };
+                if range.len() > remaining_bytes {
+                    break 'lines;
+                }
+                remaining_bytes -= range.len();
+                remaining_rows -= 1;
+                let value = line.slice(range).to_string();
+                cache.layout_line(
+                    &value,
+                    self.font_size,
+                    &[gpui::TextRun {
+                        len: value.len(),
+                        font: self.font.clone(),
+                        color: gpui::black(),
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    }],
+                    None,
+                );
+            }
+            if remaining_rows == 0 {
+                break;
+            }
+        }
+        Some(cache.into_prepared_lines())
+    }
+
     pub(super) fn prepare_replacement(&mut self, text: &Rope, text_system: &Arc<TextSystem>) {
         self.set_default_text(text);
         self.update_with_text_system(text, &(0..text.len()), text, text_system);

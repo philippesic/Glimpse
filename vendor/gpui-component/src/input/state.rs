@@ -394,6 +394,7 @@ pub(super) struct PreparedReplacement {
     value: SharedString,
     revision: Revision,
     layout: TextWrapper,
+    glyphs: Option<gpui::PreparedTextLines>,
 }
 
 impl PreparedReplacement {
@@ -408,7 +409,18 @@ impl PreparedReplacement {
             value,
             revision,
             layout,
+            glyphs: None,
         }
+    }
+
+    pub(super) fn with_viewport(
+        mut self,
+        viewport: Option<(gpui::WindowTextSystem, usize)>,
+    ) -> Self {
+        if let Some((cache, rows)) = viewport {
+            self.glyphs = self.layout.prepare_glyphs(&self.revision.text, cache, rows);
+        }
+        self
     }
 }
 
@@ -553,6 +565,9 @@ impl InputState {
     ) -> bool {
         if !self.can_install_revision() || !self.text_wrapper.uses_same_layout(&prepared.layout) {
             return false;
+        }
+        if let Some(glyphs) = &prepared.glyphs {
+            window.text_system().adopt_prepared_lines(glyphs);
         }
         if !self.history.ignore {
             self.history.clear_redo();
