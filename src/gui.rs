@@ -123,14 +123,16 @@ impl Document {
     }
     fn information(&self, cx: &App, reading: bool) -> String {
         let input = self.input.read(cx);
-        let position = input.cursor_position();
         let endings = input.line_endings();
+        let encoding = if self.disk.bom { "UTF-8 BOM" } else { "UTF-8" };
+        if reading {
+            return format!("Read · {encoding} · {endings}");
+        }
+        let position = input.cursor_position();
         format!(
-            "{}Ln {}, Col {} · UTF-8{} · {endings}",
-            if reading { "Read · " } else { "" },
+            "Ln {}, Col {} · {encoding} · {endings}",
             position.line + 1,
             position.character + 1,
-            if self.disk.bom { " BOM" } else { "" }
         )
     }
     fn dirty(&self, cx: &App) -> bool {

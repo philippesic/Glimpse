@@ -5,7 +5,7 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, App, DefiniteLength, Div, Element, ElementId, FontStyle, FontWeight, Half,
+    Pixels, AnyElement, App, DefiniteLength, Div, Element, ElementId, FontStyle, FontWeight, Half,
     HighlightStyle, InteractiveElement as _, IntoElement, ListState, ObjectFit, ParentElement,
     SharedString, SharedUri, StatefulInteractiveElement, Styled, StyledImage as _, Window, div,
     img, prelude::FluentBuilder as _, px, relative, rems,
@@ -409,6 +409,7 @@ pub(crate) struct NodeContext {
     pub(crate) link_refs: HashMap<SharedString, LinkMark>,
     pub(crate) resources: Arc<super::TextViewResources>,
     pub(crate) style: TextViewStyle,
+    pub(crate) prose_width: Option<Pixels>,
     pub(crate) code_block_actions: Option<Arc<CodeBlockActionsFn>>,
 }
 
@@ -420,7 +421,9 @@ impl NodeContext {
 
 impl PartialEq for NodeContext {
     fn eq(&self, other: &Self) -> bool {
-        self.link_refs == other.link_refs && self.style == other.style
+        self.link_refs == other.link_refs
+            && self.style == other.style
+            && self.prose_width == other.prose_width
         // Note: code_block_buttons is intentionally not compared (closures can't be compared)
     }
 }
@@ -1278,8 +1281,9 @@ impl Node {
 
         gpui::list(list_state, move |ix, window, cx| {
             let is_last = ix + 1 == children.len();
-            children[ix]
-                .render_block(options.is_last(is_last), &node_cx, window, cx)
+            div()
+                .id(("block", ix))
+                .child(children[ix].render_block(options.is_last(is_last), &node_cx, window, cx))
                 .into_any_element()
         })
         .size_full()
@@ -1311,6 +1315,9 @@ impl Node {
             Node::Paragraph(paragraph) => div()
                 .id("p")
                 .pb(mb)
+                .when_some(node_cx.prose_width, |paragraph, width| {
+                    paragraph.max_w(width)
+                })
                 .child(paragraph.render(node_cx, window, cx))
                 .into_any_element(),
             Node::Heading { level, children } => {

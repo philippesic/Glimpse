@@ -169,6 +169,7 @@ impl Shell {
     }
 
     pub(super) fn reading_element(&self, cx: &mut Context<Self>) -> AnyElement {
+        let font_size = px(self.settings.markdown_font_size * self.settings.ui_scale);
         let mut area = div()
             .id("reading")
             .flex_1()
@@ -180,7 +181,7 @@ impl Shell {
             .flex()
             .flex_col()
             .p_4()
-            .text_size(px(self.settings.markdown_font_size * self.settings.ui_scale));
+            .text_size(font_size);
         let Some(view) = &self.reading_view else {
             return area.child("Preparing reading view…").into_any_element();
         };
@@ -221,7 +222,7 @@ impl Shell {
             );
         }
         if let Some(content) = &view.content {
-            area = area.child(content.element());
+            area = area.child(content.element(font_size * 36.));
         } else {
             area = area.child("Preparing reading view…")
         }

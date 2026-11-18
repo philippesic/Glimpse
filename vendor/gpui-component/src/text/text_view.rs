@@ -40,6 +40,7 @@ pub(crate) fn init(cx: &mut App) {
 #[derive(IntoElement, Clone)]
 struct TextViewElement {
     list_state: Option<ListState>,
+    prose_width: Option<Pixels>,
     state: Entity<TextViewState>,
 }
 
@@ -52,6 +53,7 @@ impl RenderOnce for TextViewElement {
                     Some(Ok(content)) => {
                         let mut node_cx = content.node_cx.clone();
                         node_cx.resources = state.resources.clone();
+                        node_cx.prose_width = self.prose_width;
                         let body = content.root_node.render_root(
                             self.list_state.clone(),
                             &node_cx,
@@ -147,6 +149,7 @@ pub struct TextView {
     style: StyleRefinement,
     selectable: bool,
     scrollable: bool,
+    prose_width: Option<Pixels>,
     code_block_actions: Option<Arc<CodeBlockActionsFn>>,
 }
 
@@ -208,7 +211,7 @@ impl MarkdownView {
         }
     }
 
-    pub fn element(&self) -> AnyElement {
+    pub fn element(&self, prose_width: Pixels) -> AnyElement {
         TextView {
             id: self.id.clone(),
             init_state: None,
@@ -217,6 +220,7 @@ impl MarkdownView {
             style: StyleRefinement::default(),
             selectable: true,
             scrollable: true,
+            prose_width: Some(prose_width),
             code_block_actions: None,
         }
         .into_any_element()
@@ -559,6 +563,7 @@ impl TextView {
             state,
             selectable: false,
             scrollable: false,
+            prose_width: None,
             code_block_actions: None,
         }
     }
@@ -590,6 +595,7 @@ impl TextView {
             raw: html,
             selectable: false,
             scrollable: false,
+            prose_width: None,
             code_block_actions: None,
         }
     }
@@ -845,6 +851,7 @@ impl Element for TextView {
                 }
             })
             .child(TextViewElement {
+                prose_width: self.prose_width,
                 list_state: if self.scrollable {
                     Some(list_state.clone())
                 } else {
