@@ -335,7 +335,7 @@ impl TextElement {
         last_layout: &LastLayout,
         bounds: &Bounds<Pixels>,
         cx: &mut App,
-    ) -> Vec<(Path<Pixels>, bool)> {
+    ) -> SearchMatchPaths {
         let search_panel = self.state.read(cx).search_panel.clone();
         let Some((ranges, current_match_ix)) = search_panel.and_then(|panel| {
             if let Some(matcher) = panel.read(cx).matcher() {
@@ -344,7 +344,7 @@ impl TextElement {
                 None
             }
         }) else {
-            return vec![];
+            return SearchMatchPaths::default();
         };
 
         let mut offset = last_layout.visible_range_offset.start;
@@ -357,12 +357,17 @@ impl TextElement {
             );
             offset += line.len() + 1;
         }
-        let mut paths = Vec::new();
+        let mut paths = SearchMatchPaths::default();
         for index in matching_indices(&ranges, &visible) {
-            if let Some(path) =
-                Self::layout_search_range(&ranges.get(index).unwrap(), last_layout, bounds)
-            {
-                paths.push((path, current_match_ix == index));
+            let range = ranges.get(index).unwrap();
+            let current = current_match_ix == index;
+            if let Some(path) = Self::layout_search_range(&range, last_layout, bounds, px(0.)) {
+                paths.highlights.push((path, current));
+                if current {
+                    let top = (last_layout.line_height - px(2.)).max(px(0.));
+                    paths.current_underline =
+                        Self::layout_search_range(&range, last_layout, bounds, top);
+                }
             }
         }
 
@@ -373,6 +378,7 @@ impl TextElement {
         range: &Range<usize>,
         layout: &LastLayout,
         bounds: &Bounds<Pixels>,
+        inset_top: Pixels,
     ) -> Option<Path<Pixels>> {
         let mut builder = gpui::PathBuilder::fill();
         let mut offset = layout.visible_range_offset.start;
@@ -392,8 +398,8 @@ impl TextElement {
                 let right = row.shaped.x_for_index(to.max(from) - start).max(x + px(6.));
                 let origin = bounds.origin
                     + point(layout.line_number_width, top + row.row * layout.line_height);
-                builder.move_to(origin + point(x, px(0.)));
-                builder.line_to(origin + point(right, px(0.)));
+                builder.move_to(origin + point(x, inset_top));
+                builder.line_to(origin + point(right, inset_top));
                 builder.line_to(origin + point(right, layout.line_height));
                 builder.line_to(origin + point(x, layout.line_height));
                 builder.close();
@@ -817,6 +823,12 @@ impl TextElement {
     }
 }
 
+#[derive(Default)]
+struct SearchMatchPaths {
+    highlights: Vec<(Path<Pixels>, bool)>,
+    current_underline: Option<Path<Pixels>>,
+}
+
 pub(super) struct PrepaintState {
     /// The lines of entire lines.
     last_layout: LastLayout,
@@ -832,7 +844,7 @@ pub(super) struct PrepaintState {
     current_row: Option<usize>,
     selection_path: Option<Path<Pixels>>,
     hover_highlight_path: Option<Path<Pixels>>,
-    search_match_paths: Vec<(Path<Pixels>, bool)>,
+    search_match_paths: SearchMatchPaths,
     document_color_paths: Vec<(Path<Pixels>, Hsla)>,
     hover_definition_hitbox: Option<Hitbox>,
     indent_guides_path: Option<Path<Pixels>>,
@@ -1387,7 +1399,7 @@ impl Element for TextElement {
         // Paint selections
         if window.is_window_active() {
             let secondary_selection = cx.theme().selection.saturation(0.1);
-            for (path, is_active) in prepaint.search_match_paths.iter() {
+            for (path, is_active) in &prepaint.search_match_paths.highlights {
                 window.paint_path(path.clone(), secondary_selection);
 
                 if *is_active {
@@ -1402,6 +1414,10 @@ impl Element for TextElement {
             // Paint hover highlight
             if let Some(path) = prepaint.hover_highlight_path.take() {
                 window.paint_path(path, secondary_selection);
+            }
+
+            if let Some(path) = prepaint.search_match_paths.current_underline.take() {
+                window.paint_path(path, cx.theme().foreground);
             }
         }
 
@@ -1740,10 +1756,10 @@ mod tests {
         };
         let bounds = Bounds::new(point(px(10.), px(30.)), size(px(300.), px(200.)));
         for range in [300..500, 405..900, 0..1000] {
-            assert!(TextElement::layout_search_range(&range, &layout, &bounds).is_some());
+            assert!(TextElement::layout_search_range(&range, &layout, &bounds, px(0.)).is_some());
         }
         for range in [0..100, 500..600, 900..1000] {
-            assert!(TextElement::layout_search_range(&range, &layout, &bounds).is_none());
+            assert!(TextElement::layout_search_range(&range, &layout, &bounds, px(0.)).is_none());
         }
     }
 
