@@ -50,12 +50,16 @@ pub const MONOSPACE_FAMILIES: &[&str] = &[
 
 pub(super) fn configure_allocations() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    for (option, variable) in [
-        (libc::M_MMAP_THRESHOLD, "MALLOC_MMAP_THRESHOLD_"),
-        (libc::M_TRIM_THRESHOLD, "MALLOC_TRIM_THRESHOLD_"),
+    for (option, variable, bytes) in [
+        (libc::M_MMAP_THRESHOLD, "MALLOC_MMAP_THRESHOLD_", 512 * 1024),
+        (
+            libc::M_TRIM_THRESHOLD,
+            "MALLOC_TRIM_THRESHOLD_",
+            1024 * 1024,
+        ),
     ] {
         if std::env::var_os(variable).is_none() {
-            unsafe { libc::mallopt(option, 1024 * 1024) };
+            unsafe { libc::mallopt(option, bytes) };
         }
     }
 }
