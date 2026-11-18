@@ -966,7 +966,7 @@ impl Element for TextElement {
         let (line_number_width, line_number_len) =
             Self::layout_line_numbers(state, &state.text, text_size, &style, window);
         let wrap_width = if state.mode.is_multi_line() && state.soft_wrap {
-            Some(bounds.size.width - line_number_width - RIGHT_MARGIN)
+            Some(state.wrap_layout_width(bounds.size.width - line_number_width - RIGHT_MARGIN))
         } else {
             None
         };

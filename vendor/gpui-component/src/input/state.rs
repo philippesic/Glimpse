@@ -425,6 +425,15 @@ impl InputState {
         self.defers_wrap_for(self.text.len())
     }
 
+    pub(super) fn wrap_layout_width(&self, available: Pixels) -> Pixels {
+        if self.prepares_large_wrapped_layout() {
+            let step = 4.;
+            px((f32::from(available) / step).floor() * step)
+        } else {
+            available
+        }
+    }
+
     fn defers_wrap_for(&self, bytes: usize) -> bool {
         self.defer_large_layout
             && self.mode.is_multi_line()

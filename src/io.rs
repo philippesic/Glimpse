@@ -561,17 +561,17 @@ impl IoWorker {
                         {
                             Reply::OpenDirectory(path, token)
                         }
-                        Job::Open(path, token, transient) => Reply::Open(
-                            path.clone(),
-                            token,
-                            DiskFile::open_cancellable(path, &|| {
+                        Job::Open(path, token, transient) => {
+                            let _work = gpui::work_trace::Span::new("open_document_worker");
+                            let result = DiskFile::open_cancellable(path.clone(), &|| {
                                 transient && preview.load(Ordering::Relaxed) != token
                             })
                             .map(|(disk, text)| {
                                 let input = PreparedInput::new(text);
                                 (disk.share_revision(input.text_revision().clone()), input)
-                            }),
-                        ),
+                            });
+                            Reply::Open(path, token, result)
+                        }
                         Job::Reload(reload) => {
                             crate::metrics::event("reload-worker", reload.id, reload.generation);
                             #[cfg(feature = "test-support")]

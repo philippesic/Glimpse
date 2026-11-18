@@ -37,6 +37,7 @@ use std::{
 
 pub fn run(request: cli::Request) {
     platform::configure_allocations();
+    let startup = StartupIo::new(&request);
     Application::new()
         .with_assets(gpui_component_assets::Assets)
         .run(move |cx| {
@@ -71,7 +72,7 @@ pub fn run(request: cli::Request) {
                 },
                 move |window, cx| {
                     window.set_window_title("Glimpse");
-                    let view = cx.new(|cx| Shell::new(request, window, cx));
+                    let view = cx.new(|cx| Shell::new(request, startup, window, cx));
                     let weak = view.downgrade();
                     window.on_window_should_close(cx, move |window, cx| {
                         weak.update(cx, |shell, cx| {
@@ -334,13 +335,62 @@ struct Shell {
     keep_after_cleanup: HashSet<u64>,
     finishing: glimpse::validation::Validations,
 }
-impl Shell {
-    fn new(request: cli::Request, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let (tx, rx) = async_channel::bounded(1);
+struct StartupIo {
+    wake: wake::Context,
+    replies_ready: async_channel::Receiver<()>,
+    io: IoWorker,
+    opening: HashMap<u64, OpenIntent>,
+}
+
+impl StartupIo {
+    fn new(request: &cli::Request) -> Self {
+        let (tx, replies_ready) = async_channel::bounded(1);
         let wake = wake::Context::new(move || {
             let _ = tx.try_send(());
         });
         let io = IoWorker::new(wake.clone());
+        io.send(Job::LoadSettings);
+        io.send(Job::Volumes);
+        if request.desktop {
+            io.send(Job::Inventory);
+        }
+        let mut opening = HashMap::with_capacity(request.files.len());
+        for (index, path) in request.files.iter().enumerate() {
+            let token = index as u64 + 1;
+            let position = (index == 0).then_some((request.line, request.column));
+            opening.insert(
+                token,
+                OpenIntent {
+                    preview: false,
+                    position,
+                    interaction: 0,
+                },
+            );
+            io.send(Job::Open(path.clone(), token, false));
+        }
+        Self {
+            wake,
+            replies_ready,
+            io,
+            opening,
+        }
+    }
+}
+
+impl Shell {
+    fn new(
+        request: cli::Request,
+        startup: StartupIo,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let StartupIo {
+            wake,
+            replies_ready,
+            io,
+            opening,
+        } = startup;
+        let open_token = request.files.len() as u64;
         let directories = directory::Directories::new(wake.clone());
         let observer = observe::Observer::new(wake.clone());
         let syntax = glimpse::syntax::Syntax::new(wake.clone());
@@ -402,7 +452,7 @@ impl Shell {
             }
         });
         cx.spawn_in(window, async move |this, cx| {
-            while rx.recv().await.is_ok() {
+            while replies_ready.recv().await.is_ok() {
                 if this
                     .update_in(cx, |this, window, cx| this.receive(window, cx))
                     .is_err()
@@ -452,12 +502,12 @@ impl Shell {
             active: None,
             tab_scroll: ScrollHandle::new(),
             next_id: 1,
-            open_token: 0,
+            open_token,
             interaction: 0,
             path_request: None,
             path_completion_token: 0,
             path_completions: None,
-            opening: HashMap::new(),
+            opening,
             hit_versions: HashMap::new(),
             panel: None,
             query,
@@ -514,16 +564,6 @@ impl Shell {
         this.refresh();
         this.subscriptions
             .push(cx.observe(&this.pane_state, |_, _, cx| cx.notify()));
-        this.io.send(Job::LoadSettings);
-        this.io.send(Job::Volumes);
-        if this.startup_recovery.is_some() {
-            this.io.send(Job::Inventory);
-        }
-        let files = this.request.files.clone();
-        for (index, path) in files.into_iter().enumerate() {
-            let position = (index == 0).then_some((this.request.line, this.request.column));
-            this.open(path, false, position);
-        }
         this
     }
     fn report_startup_ready(&mut self, source_visible: bool, window: &mut Window, cx: &App) {
