@@ -335,7 +335,7 @@ impl TextElement {
         last_layout: &LastLayout,
         bounds: &Bounds<Pixels>,
         cx: &mut App,
-    ) -> SearchMatchBounds {
+    ) -> Vec<(Bounds<Pixels>, bool)> {
         let search_panel = self.state.read(cx).search_panel.clone();
         let Some((ranges, current_match_ix)) = search_panel.and_then(|panel| {
             if let Some(matcher) = panel.read(cx).matcher() {
@@ -344,7 +344,7 @@ impl TextElement {
                 None
             }
         }) else {
-            return SearchMatchBounds::default();
+            return Vec::new();
         };
 
         let mut offset = last_layout.visible_range_offset.start;
@@ -357,19 +357,12 @@ impl TextElement {
             );
             offset += line.len() + 1;
         }
-        let mut matches = SearchMatchBounds::default();
+        let mut matches = Vec::new();
         for index in matching_indices(&ranges, &visible) {
             let range = ranges.get(index).unwrap();
             let current = current_match_ix == index;
             Self::layout_search_range(&range, last_layout, bounds, |rect| {
-                matches.highlights.push((rect, current));
-                if current {
-                    let height = rect.size.height.min(px(2.));
-                    let origin = rect.origin + point(px(0.), rect.size.height - height);
-                    matches
-                        .current_underlines
-                        .push(Bounds::new(origin, size(rect.size.width, height)));
-                }
+                matches.push((rect, current));
             });
         }
 
@@ -818,12 +811,6 @@ impl TextElement {
     }
 }
 
-#[derive(Default)]
-struct SearchMatchBounds {
-    highlights: Vec<(Bounds<Pixels>, bool)>,
-    current_underlines: Vec<Bounds<Pixels>>,
-}
-
 pub(super) struct PrepaintState {
     /// The lines of entire lines.
     last_layout: LastLayout,
@@ -839,7 +826,7 @@ pub(super) struct PrepaintState {
     current_row: Option<usize>,
     selection_path: Option<Path<Pixels>>,
     hover_highlight_path: Option<Path<Pixels>>,
-    search_match_bounds: SearchMatchBounds,
+    search_match_bounds: Vec<(Bounds<Pixels>, bool)>,
     document_color_paths: Vec<(Path<Pixels>, Hsla)>,
     hover_definition_hitbox: Option<Hitbox>,
     indent_guides_path: Option<Path<Pixels>>,
@@ -1395,7 +1382,7 @@ impl Element for TextElement {
         // Paint selections
         if window.is_window_active() {
             let secondary_selection = cx.theme().selection.saturation(0.1);
-            for &(rect, is_active) in &prepaint.search_match_bounds.highlights {
+            for &(rect, is_active) in &prepaint.search_match_bounds {
                 window.paint_quad(fill(rect, secondary_selection));
 
                 if is_active {
@@ -1412,8 +1399,16 @@ impl Element for TextElement {
                 window.paint_path(path, secondary_selection);
             }
 
-            for &rect in &prepaint.search_match_bounds.current_underlines {
-                window.paint_quad(fill(rect, cx.theme().foreground));
+            for &(rect, current) in &prepaint.search_match_bounds {
+                let height = rect.size.height.min(px(if current { 2. } else { 1. }));
+                let origin = rect.origin + point(px(0.), rect.size.height - height);
+                let underline = Bounds::new(origin, size(rect.size.width, height));
+                let ink = if current {
+                    cx.theme().foreground
+                } else {
+                    cx.theme().muted_foreground
+                };
+                window.paint_quad(fill(underline, ink));
             }
         }
 

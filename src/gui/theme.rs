@@ -81,13 +81,17 @@ pub fn source_canvases(cx: &App) -> [[[u8; 3]; 5]; 2] {
             current_match,
             current_match.blend(selection),
         ]
-        .map(|color| {
-            [
-                (color.r * 255.).round() as u8,
-                (color.g * 255.).round() as u8,
-                (color.b * 255.).round() as u8,
-            ]
-        })
+        .map(rgb_bytes)
     };
     [states(canvas), states(active_line)]
+}
+
+pub(super) fn reading_code_canvases(cx: &App) -> [[u8; 3]; 2] {
+    let theme = cx.theme();
+    let code = theme.muted.to_rgb();
+    [code, code.blend(theme.selection.to_rgb())].map(rgb_bytes)
+}
+
+fn rgb_bytes(color: gpui::Rgba) -> [u8; 3] {
+    [color.r, color.g, color.b].map(|channel| (channel * 255.).round() as u8)
 }

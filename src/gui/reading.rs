@@ -84,6 +84,7 @@ impl Shell {
             source: doc.input.read(cx).text().clone(),
             path: doc.disk.path.clone(),
             theme,
+            code_canvases: super::theme::reading_code_canvases(cx),
             layout,
             reclaim: release_memory.then_some(platform::release_unused_memory),
         };

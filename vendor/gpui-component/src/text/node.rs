@@ -505,6 +505,25 @@ pub(crate) enum Node {
 }
 
 impl Node {
+    pub(super) fn map_code_colors(&mut self, map: &impl Fn(gpui::Hsla) -> gpui::Hsla) {
+        let children = match self {
+            Self::Root { children } => Arc::make_mut(children),
+            Self::Blockquote { children }
+            | Self::List { children, .. }
+            | Self::ListItem { children, .. } => children,
+            Self::CodeBlock(block) => {
+                for (_, style) in &mut block.styles {
+                    style.color = style.color.map(map);
+                }
+                return;
+            }
+            _ => return,
+        };
+        for child in children {
+            child.map_code_colors(map);
+        }
+    }
+
     pub(super) fn is_list_item(&self) -> bool {
         matches!(self, Self::ListItem { .. })
     }

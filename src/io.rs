@@ -29,6 +29,7 @@ pub enum Job {
         source: Rope,
         path: PathBuf,
         theme: Arc<HighlightTheme>,
+        code_canvases: [[u8; 3]; 2],
         layout: Box<gpui_component::text::MarkdownLayout>,
         reclaim: Option<fn()>,
     },
@@ -442,6 +443,7 @@ impl IoWorker {
                             source,
                             path,
                             theme,
+                            code_canvases,
                             layout,
                             reclaim,
                         } => {
@@ -467,6 +469,14 @@ impl IoWorker {
                             if reading.load(Ordering::Relaxed) != request {
                                 continue;
                             }
+                            prepared.markdown.map_code_colors(|color| {
+                                let color = color.to_rgb();
+                                let channels = [color.r, color.g, color.b]
+                                    .map(|channel| (channel * 255.).round() as u8);
+                                let [red, green, blue] =
+                                    crate::syntax::readable_rgb(channels, &code_canvases);
+                                gpui::rgb(u32::from_be_bytes([0, red, green, blue])).into()
+                            });
                             layout.prepare(&mut prepared.markdown);
                             if reading.load(Ordering::Relaxed) != request {
                                 continue;

@@ -211,6 +211,12 @@ impl ParsedMarkdown {
             }
         }
     }
+
+    pub fn map_code_colors(&mut self, map: impl Fn(gpui::Hsla) -> gpui::Hsla) {
+        if let Ok(content) = &mut self.0 {
+            content.root_node.map_code_colors(&map);
+        }
+    }
 }
 
 pub struct MarkdownLayout {
