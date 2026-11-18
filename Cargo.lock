@@ -23,6 +23,7 @@ dependencies = [
  "atspi-common",
  "phf 0.14.0",
  "serde",
+ "unicode-segmentation",
  "zvariant",
 ]
 

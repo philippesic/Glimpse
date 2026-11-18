@@ -212,6 +212,24 @@ impl Shell {
         px(self.settings.markdown_font_size * self.settings.ui_scale)
     }
 
+    fn reading_progress(&self) -> AnyElement {
+        let message = "Preparing reading view…";
+        let focus = self.reading_focus.clone();
+        accessible(
+            "reading-progress",
+            div().track_focus(&focus).child(message),
+            move |_, window, _| {
+                let mut node = gpui::accesskit::Node::new(gpui::accesskit::Role::Status);
+                node.set_label(message);
+                node.set_busy();
+                let mut info = AccessibilityInfo::new(node);
+                info.focused = focus.is_focused(window);
+                info
+            },
+        )
+        .into_any_element()
+    }
+
     pub(super) fn reading_element(&self, cx: &mut Context<Self>) -> AnyElement {
         let font_size = self.reading_font_size();
         let mut area = div()
@@ -227,7 +245,7 @@ impl Shell {
             .p_4()
             .text_size(font_size);
         let Some(view) = &self.reading_view else {
-            return area.child("Preparing reading view…").into_any_element();
+            return area.child(self.reading_progress()).into_any_element();
         };
         if let Some(error) = &view.error {
             return area
@@ -235,6 +253,9 @@ impl Shell {
                 .child(self.button("Retry reading view", "reading-retry", cx))
                 .into_any_element();
         }
+        let Some(content) = &view.content else {
+            return area.child(self.reading_progress()).into_any_element();
+        };
         if !view.notes.is_empty() {
             let label = view.notes.clone();
             area = area.child(
@@ -265,11 +286,7 @@ impl Shell {
                     .child(self.button("Reload images", "reading-retry", cx)),
             );
         }
-        if let Some(content) = &view.content {
-            area = area.child(content.element(font_size * 36.));
-        } else {
-            area = area.child("Preparing reading view…")
-        }
-        area.into_any_element()
+        area.child(content.element(font_size * 36.))
+            .into_any_element()
     }
 }

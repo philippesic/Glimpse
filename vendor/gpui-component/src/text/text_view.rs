@@ -1081,9 +1081,7 @@ impl Element for TextView {
             use gpui::accesskit::{Action, Node, Role};
             semantic_state.update(cx, |state, cx| {
                 let mut node = Node::new(Role::Document);
-                node.set_label("Reading view");
                 node.set_read_only();
-                node.add_action(Action::Focus);
                 node.add_action(Action::ScrollDown);
                 node.add_action(Action::ScrollUp);
                 let mut text = None;
@@ -1112,14 +1110,24 @@ impl Element for TextView {
                         node.set_busy();
                     }
                 }
+                let ready = !node.is_busy();
+                if ready {
+                    node.add_action(Action::Focus);
+                }
+                node.set_label(if ready {
+                    "Reading view"
+                } else {
+                    "Preparing accessible reading text…"
+                });
                 let mut info = gpui::AccessibilityInfo::new(node);
                 if let Some(text) = text {
                     info.text = text;
                 }
-                info.focused = state
-                    .focus_handle
-                    .as_ref()
-                    .is_some_and(|focus| focus.is_focused(window));
+                info.focused = ready
+                    && state
+                        .focus_handle
+                        .as_ref()
+                        .is_some_and(|focus| focus.is_focused(window));
                 info
             })
         })

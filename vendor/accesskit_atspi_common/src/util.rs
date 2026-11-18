@@ -6,6 +6,7 @@
 use accesskit::{Point, Rect, ScrollHint};
 use accesskit_consumer::{NodeRef, TextPosition, TextRange};
 use atspi_common::{CoordType, Granularity, ScrollType};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::Error;
 
@@ -93,6 +94,33 @@ pub(crate) fn text_range_from_offset<'a>(
     Ok(range)
 }
 
+pub(crate) fn sentence_at_offset(node: &NodeRef, offset: i32) -> Result<(String, i32, i32), Error> {
+    let position = text_position_from_offset(node, offset).ok_or(Error::IndexOutOfRange)?;
+    if position.is_document_end() {
+        return Ok((String::new(), offset, offset));
+    }
+    let paragraph_start = if position.is_paragraph_start() {
+        position
+    } else {
+        position.backward_to_paragraph_start()
+    };
+    let mut paragraph = paragraph_start.to_degenerate_range();
+    paragraph.set_end(paragraph_start.forward_to_paragraph_end());
+    let mut start = paragraph_start.to_global_usv_index();
+    for sentence in paragraph.text().split_sentence_bounds() {
+        let end = start + sentence.chars().count();
+        if (start..end).contains(&(offset as usize)) {
+            return Ok((
+                sentence.to_owned(),
+                start.try_into().map_err(|_| Error::TooManyCharacters)?,
+                end.try_into().map_err(|_| Error::TooManyCharacters)?,
+            ));
+        }
+        start = end;
+    }
+    Err(Error::IndexOutOfRange)
+}
+
 pub(crate) fn text_range_from_offsets<'a>(
     node: &'a NodeRef,
     start_offset: i32,
@@ -130,5 +158,69 @@ pub(crate) fn atspi_scroll_type_to_scroll_hint(scroll_type: ScrollType) -> Optio
         ScrollType::LeftEdge => Some(ScrollHint::LeftEdge),
         ScrollType::RightEdge => Some(ScrollHint::RightEdge),
         ScrollType::Anywhere => None,
+    }
+}
+
+#[cfg(test)]
+mod sentence_tests {
+    use super::*;
+    use accesskit::{Node, NodeId, Role, TreeId, TreeInfo, TreeUpdate};
+    use accesskit_consumer::Tree;
+
+    #[test]
+    fn sentences_preserve_unicode_offsets_and_paragraph_boundaries() {
+        let paragraphs = [
+            "Opening prose\r\n",
+            "Cafe\u{301}! Next 👍.\n",
+            "日本語。終わり。",
+        ];
+        let mut document = Node::new(Role::Document);
+        document.set_children([NodeId(2), NodeId(3), NodeId(4)]);
+        let mut nodes = vec![(NodeId(1), document)];
+        for (index, paragraph) in paragraphs.into_iter().enumerate() {
+            let mut run = Node::new(Role::TextRun);
+            run.set_value(paragraph);
+            run.set_character_lengths(
+                paragraph
+                    .graphemes(true)
+                    .map(|cluster| cluster.len() as u8)
+                    .collect::<Vec<_>>(),
+            );
+            nodes.push((NodeId(index as u64 + 2), run));
+        }
+        let tree = Tree::new(
+            TreeUpdate {
+                nodes,
+                tree: Some(TreeInfo::new(NodeId(1))),
+                tree_id: TreeId::ROOT,
+                focus: NodeId(1),
+            },
+            true,
+        );
+        let document = tree.state().root();
+        let mut start = 0;
+        for sentence in [
+            paragraphs[0],
+            "Cafe\u{301}! ",
+            "Next 👍.\n",
+            "日本語。",
+            "終わり。",
+        ] {
+            let end = start + sentence.chars().count() as i32;
+            for offset in start..end {
+                assert_eq!(
+                    sentence_at_offset(&document, offset).unwrap(),
+                    (sentence.to_owned(), start, end),
+                    "offset {offset}",
+                );
+            }
+            start = end;
+        }
+        assert_eq!(
+            sentence_at_offset(&document, start).unwrap(),
+            (String::new(), start, start),
+        );
+        assert!(sentence_at_offset(&document, -1).is_err());
+        assert!(sentence_at_offset(&document, start + 1).is_err());
     }
 }

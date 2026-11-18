@@ -1445,6 +1445,9 @@ impl PlatformNode {
         granularity: Granularity,
     ) -> Result<(String, i32, i32)> {
         self.resolve_for_text(|node| {
+            if granularity == Granularity::Sentence {
+                return sentence_at_offset(&node, offset);
+            }
             let range = text_range_from_offset(&node, offset, granularity)?;
             let text = range.text();
             let start = range
