@@ -477,6 +477,7 @@ pub(crate) enum Node {
         children: Arc<Vec<Node>>,
     },
     Paragraph(Paragraph),
+    ParagraphPage(Paragraph),
     Heading {
         level: u8,
         children: Paragraph,
@@ -502,6 +503,126 @@ pub(crate) enum Node {
     },
     Divider,
     Unknown,
+}
+
+const READING_PAGE_BYTES: usize = 2048;
+const LONG_READING_PARAGRAPH_BYTES: usize = 16 * 1024;
+
+impl Paragraph {
+    fn needs_reading_pages(&self) -> bool {
+        self.text_len() > LONG_READING_PARAGRAPH_BYTES
+    }
+
+    fn into_reading_pages(self, rows: &mut Vec<Node>) {
+        let span = self.span;
+        let mut page = Paragraph {
+            span,
+            ..Default::default()
+        };
+        let mut bytes = 0;
+        for inline in self.children {
+            let len = inline.text.len();
+            let space = if len <= READING_PAGE_BYTES { len } else { 256 };
+            if bytes + space > READING_PAGE_BYTES {
+                rows.push(Node::ParagraphPage(page.take()));
+                page.span = span;
+                bytes = 0;
+            }
+            if len <= READING_PAGE_BYTES {
+                bytes += len;
+                page.children.push(inline);
+                continue;
+            }
+
+            let (text, absolute_start) = match inline.text {
+                InlineText::Owned(text) => (text.into(), 0),
+                InlineText::Shared { text, range } => (text, range.start as usize),
+            };
+            let value = &text[absolute_start..absolute_start + len];
+            let mut start = 0;
+            while start < len {
+                let end = start + reading_page_end(&value[start..], READING_PAGE_BYTES - bytes);
+                let from = inline
+                    .marks
+                    .partition_point(|(range, _)| range.end <= start);
+                let marks = inline.marks[from..]
+                    .iter()
+                    .take_while(|(range, _)| range.start < end)
+                    .map(|(range, mark)| {
+                        (
+                            range.start.max(start) - start..range.end.min(end) - start,
+                            mark.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                page.children.push(InlineNode {
+                    text: InlineText::Shared {
+                        text: text.clone(),
+                        range: (absolute_start + start) as u32..(absolute_start + end) as u32,
+                    },
+                    marks: marks.into(),
+                    ..Default::default()
+                });
+                bytes += end - start;
+                start = end;
+                if start < len {
+                    rows.push(Node::ParagraphPage(page.take()));
+                    page.span = span;
+                    bytes = 0;
+                }
+            }
+        }
+        rows.push(Node::Paragraph(page.compact()));
+    }
+}
+
+fn reading_page_end(text: &str, budget: usize) -> usize {
+    use unicode_segmentation::UnicodeSegmentation;
+
+    if text.len() <= budget {
+        return text.len();
+    }
+    let limit = text.floor_char_boundary(budget);
+    let mut end = 0;
+    let mut whitespace = None;
+    let lookahead = text.ceil_char_boundary((limit + 128).min(text.len()));
+    for (start, grapheme) in text[..lookahead].grapheme_indices(true) {
+        let next = start + grapheme.len();
+        if next > limit {
+            break;
+        }
+        end = next;
+        if next >= limit - limit / 4 && grapheme.chars().all(char::is_whitespace) {
+            whitespace = Some(next);
+        }
+    }
+    whitespace.unwrap_or(if end > 0 { end } else { limit })
+}
+
+impl Node {
+    pub(super) fn paginate_reading_paragraphs(&mut self) {
+        let Self::Root { children } = self else {
+            return;
+        };
+        if !children
+            .iter()
+            .any(|node| matches!(node, Self::Paragraph(p) if p.needs_reading_pages()))
+        {
+            return;
+        }
+        let children = Arc::make_mut(children);
+        let previous = std::mem::take(children);
+        children.reserve(previous.len());
+        for node in previous {
+            match node {
+                Self::Paragraph(paragraph) if paragraph.needs_reading_pages() => {
+                    paragraph.into_reading_pages(children);
+                }
+                node => children.push(node),
+            }
+        }
+        children.shrink_to_fit();
+    }
 }
 
 impl Node {
@@ -549,6 +670,7 @@ impl Node {
                     text.push('\n');
                 }
             }
+            Node::ParagraphPage(paragraph) => text.push_str(&paragraph.selected_text()),
             Node::Paragraph(paragraph) => {
                 let mut block_text = String::new();
                 block_text.push_str(&paragraph.selected_text());
@@ -896,7 +1018,9 @@ impl ShapeBuilder<'_> {
         }
         self.remaining_nodes -= 1;
         match node {
-            Node::Paragraph(paragraph) => self.paragraph(paragraph, style),
+            Node::Paragraph(paragraph) | Node::ParagraphPage(paragraph) => {
+                self.paragraph(paragraph, style)
+            }
             Node::Heading { level, children } => {
                 let (size, weight) = heading_style(*level, &self.request.view_style);
                 let mut style = style.clone();
@@ -1040,7 +1164,9 @@ impl Node {
                     child.visit_links(context, visit)
                 }
             }
-            Node::Paragraph(text) | Node::Heading { children: text, .. } => paragraph(text),
+            Node::Paragraph(text)
+            | Node::ParagraphPage(text)
+            | Node::Heading { children: text, .. } => paragraph(text),
             Node::Table(table) => {
                 for row in &table.children {
                     for cell in &row.children {
@@ -1063,7 +1189,7 @@ impl Node {
                 .map(|child| child.to_markdown())
                 .collect::<Vec<_>>()
                 .join("\n\n"),
-            Node::Paragraph(paragraph) => paragraph.to_markdown(),
+            Node::Paragraph(paragraph) | Node::ParagraphPage(paragraph) => paragraph.to_markdown(),
             Node::Heading { level, children } => {
                 let hashes = "#".repeat(*level as usize);
                 format!("{} {}", hashes, children.to_markdown())
@@ -1513,9 +1639,9 @@ impl Node {
                         .child(node.render_block(options, node_cx, window, cx))
                 }))
                 .into_any_element(),
-            Node::Paragraph(paragraph) => div()
+            Node::Paragraph(paragraph) | Node::ParagraphPage(paragraph) => div()
                 .id("p")
-                .pb(mb)
+                .when(matches!(self, Node::Paragraph(_)), |row| row.pb(mb))
                 .when_some(node_cx.prose_width, |paragraph, width| {
                     paragraph.max_w(width)
                 })
@@ -1609,5 +1735,75 @@ impl Node {
                 div().into_any_element()
             }
         }
+    }
+}
+#[cfg(test)]
+mod reading_page_tests {
+    use super::*;
+
+    #[test]
+    fn long_paragraph_pages_share_text_and_preserve_marks_and_copy() {
+        let prefix = "A\u{301} 🪴 Café signal. ".repeat(1_000);
+        let text: Arc<str> = format!("{prefix}Last signal.").into();
+        let marked = "A\u{301} 🪴 ".len()..text.len() - 4;
+        let link = TextMark::default().bold().link(LinkMark {
+            url: "https://example.test".into(),
+            ..Default::default()
+        });
+        let inline = InlineNode {
+            text: InlineText::Shared {
+                text: text.clone(),
+                range: 0..text.len() as u32,
+            },
+            marks: vec![(marked.clone(), link.clone())].into(),
+            ..Default::default()
+        };
+        let original = Paragraph {
+            children: vec![inline],
+            ..Default::default()
+        };
+        let mut root = Node::Root {
+            children: Arc::new(vec![Node::Paragraph(original)]),
+        };
+        root.paginate_reading_paragraphs();
+        let Node::Root { children } = &root else {
+            panic!()
+        };
+        assert!(children.len() > 4);
+        let mut offset = 0;
+        for (index, row) in children.iter().enumerate() {
+            let paragraph = match row {
+                Node::ParagraphPage(paragraph) if index + 1 != children.len() => paragraph,
+                Node::Paragraph(paragraph) if index + 1 == children.len() => paragraph,
+                _ => panic!("unexpected paragraph page"),
+            };
+            assert!(paragraph.text_len() <= READING_PAGE_BYTES);
+            let [inline] = paragraph.children.as_slice() else {
+                panic!()
+            };
+            let InlineText::Shared { text: source, .. } = &inline.text else {
+                panic!()
+            };
+            assert!(Arc::ptr_eq(source, &text));
+            let end = offset + inline.text.len();
+            assert_eq!(inline.text.as_str(), &text[offset..end]);
+            let start = marked.start.max(offset);
+            let mark_end = marked.end.min(end);
+            if start < mark_end {
+                assert_eq!(
+                    &*inline.marks,
+                    &[(start - offset..mark_end - offset, link.clone())]
+                );
+            } else {
+                assert!(inline.marks.is_empty());
+            }
+            let state = paragraph.state.get_or_init(Arc::default);
+            let mut state = state.lock().unwrap();
+            state.set_text(inline.text.as_str().to_owned().into());
+            state.selection = Some(crate::input::Selection::new(0, inline.text.len()));
+            offset = end;
+        }
+        assert_eq!(offset, text.len());
+        assert_eq!(root.selected_text(), format!("{text}\n\n"));
     }
 }

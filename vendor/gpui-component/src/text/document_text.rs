@@ -115,6 +115,7 @@ impl<'a> SourceBuilder<'a> {
             Block::Blockquote { children }
             | Block::List { children, .. }
             | Block::ListItem { children, .. } => self.blocks(children),
+            Block::ParagraphPage(p) => self.paragraph(p),
             Block::Paragraph(p) | Block::Heading { children: p, .. } => {
                 self.paragraph_break();
                 self.paragraph(p);

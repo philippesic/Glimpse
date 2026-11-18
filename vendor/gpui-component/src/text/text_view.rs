@@ -208,6 +208,7 @@ impl ParsedMarkdown {
         if let Ok(content) = &mut self.0 {
             if content.document_source.is_none() {
                 content.document_source = Some(DocumentSource::new(&mut content.root_node));
+                content.root_node.paginate_reading_paragraphs();
             }
         }
     }
