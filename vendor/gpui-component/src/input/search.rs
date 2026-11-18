@@ -893,8 +893,10 @@ impl Render for SearchPanel {
             self.matcher.label()
         };
 
-        let short = window.viewport_size().height < window.rem_size() * 16.;
-        let narrow = window.viewport_size().width <= px(600.);
+        let viewport = window.viewport_size();
+        let rem = window.rem_size();
+        let compact = viewport.height < rem * 16. || viewport.width < rem * 28.;
+        let narrow = viewport.width <= px(600.);
         let count = |compact| {
             crate::semantic_text::text(
                 "match-count",
@@ -922,8 +924,8 @@ impl Render for SearchPanel {
             .on_action(cx.listener(Self::on_action_tab_prev))
             .font_family(cx.theme().font_family.clone())
             .items_center()
-            .when(short, |panel| panel.py(px(2.)).px_2())
-            .when(!short, |panel| panel.py_2().px_3())
+            .when(compact, |panel| panel.py(px(2.)).px_2())
+            .when(!compact, |panel| panel.py_2().px_3())
             .w_full()
             .gap_1()
             .bg(cx.theme().popover)
@@ -939,14 +941,14 @@ impl Render for SearchPanel {
                         h_flex()
                             .flex_1()
                             .flex_basis(rems(14.))
-                            .when(narrow && !short, |query| query.flex_basis(relative(0.65)))
+                            .when(narrow && !compact, |query| query.flex_basis(relative(0.65)))
                             .min_w_0()
                             .max_w_full()
                             .gap_2()
-                            .when(short, |query| query.gap_1())
+                            .when(compact, |query| query.gap_1())
                             .child(
                                 Input::new(&self.search_input)
-                                    .when(!short, |input| {
+                                    .when(!compact, |input| {
                                         input.suffix(
                                             Button::new("case-insensitive")
                                                 .selected(!self.case_insensitive)
@@ -965,7 +967,7 @@ impl Render for SearchPanel {
                                     .min_w_0()
                                     .shadow_none(),
                             )
-                            .when(short, |row| {
+                            .when(compact, |row| {
                                 row.child(count(true)).child(self.compact_options(cx))
                             })
                             .child(
@@ -981,7 +983,7 @@ impl Render for SearchPanel {
                                     })),
                             ),
                     )
-                    .when(!short, |row| {
+                    .when(!compact, |row| {
                         row.child(
                             h_flex()
                                 .min_w_0()
@@ -1046,7 +1048,7 @@ impl Render for SearchPanel {
                             Input::new(&self.replace_input)
                                 .small()
                                 .flex_1()
-                                .flex_basis(rems(if short { 5. } else { 12. }))
+                                .flex_basis(rems(if compact { 5. } else { 12. }))
                                 .min_w_0()
                                 .max_w_full()
                                 .shadow_none(),
@@ -1059,8 +1061,8 @@ impl Render for SearchPanel {
                                 .gap_2()
                                 .child(
                                     Button::new("replace-one")
-                                        .when(short, |button| button.xsmall())
-                                        .when(!short, |button| button.small())
+                                        .when(compact, |button| button.xsmall())
+                                        .when(!compact, |button| button.small())
                                         .label(t!("Input.Replace"))
                                         .disabled(!has_matches)
                                         .on_click(cx.listener(|this, _, window, cx| {
@@ -1069,8 +1071,8 @@ impl Render for SearchPanel {
                                 )
                                 .child(
                                     Button::new("replace-all")
-                                        .when(short, |button| button.xsmall())
-                                        .when(!short, |button| button.small())
+                                        .when(compact, |button| button.xsmall())
+                                        .when(!compact, |button| button.small())
                                         .label(t!("Input.Replace All"))
                                         .disabled(!has_matches)
                                         .on_click(cx.listener(|this, _, window, cx| {
