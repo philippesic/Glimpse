@@ -454,6 +454,11 @@ impl IoWorker {
                                     continue;
                                 }
                             }
+                            if let Some(reclaim) = reclaim {
+                                let _work =
+                                    gpui::work_trace::Span::new("reading_source_memory_release");
+                                reclaim();
+                            }
                             let mut prepared =
                                 crate::reading::prepare(String::from(source), &path, &theme);
                             if reading.load(Ordering::Relaxed) != request {

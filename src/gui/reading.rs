@@ -79,14 +79,28 @@ impl Shell {
         text_style.font_size = self.reading_font_size().into();
         text_style.color = cx.theme().foreground;
         let layout = Box::new(MarkdownLayout::new(window, text_style, cx.theme().colors));
-        self.io.send(Job::ReadMarkdown {
+        let job = Job::ReadMarkdown {
             request,
             source: doc.input.read(cx).text().clone(),
             path: doc.disk.path.clone(),
             theme,
             layout,
             reclaim: release_memory.then_some(platform::release_unused_memory),
-        });
+        };
+        if release_memory {
+            cx.on_next_frame(window, move |this, _, _| {
+                if this.reading
+                    && this
+                        .reading_view
+                        .as_ref()
+                        .is_some_and(|view| this.active == Some(view.id) && view.request == request)
+                {
+                    this.io.send(job);
+                }
+            });
+        } else {
+            self.io.send(job);
+        }
     }
     pub(super) fn reading_ready(
         &mut self,
