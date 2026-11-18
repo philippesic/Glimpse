@@ -1,7 +1,7 @@
 [workspace]
 members = ["vendor/gpui-component", "vendor/accesskit", "vendor/accesskit_atspi_common", "vendor/accesskit_consumer"]
 default-members = ["."]
-exclude = ["vendor/gpui"]
+exclude = ["vendor/gpui", "vendor/pulldown-cmark"]
 resolver = "3"
 
 [package]
@@ -53,6 +53,7 @@ accesskit_consumer = { path = "vendor/accesskit_consumer" }
 gpui = { path = "vendor/gpui" }
 xattr = { path = "vendor/xattr" }
 gpui-component = { path = "vendor/gpui-component" }
+pulldown-cmark = { path = "vendor/pulldown-cmark" }
 
 [dev-dependencies]
 egui = "0.37.0"

@@ -455,6 +455,42 @@ mod tests {
     }
 
     #[test]
+    fn large_document_retains_forward_links_and_source_spans() {
+        let start = "# First heading\r\n\r\n";
+        let paragraph = "café é **bold [link][target]**\r\n\r\n";
+        let count = 20_000;
+        let source = format!(
+            "{start}{}# Final heading\r\n\r\n[target]: sibling.md\r\n",
+            paragraph.repeat(count),
+        );
+        let mut context = NodeContext::default();
+        let style = TextViewStyle::default();
+        let node::Node::Root { children } =
+            parse(&source, &style, &mut context, &style.highlight_theme).unwrap()
+        else {
+            panic!("expected a document");
+        };
+        assert_eq!(children.len(), count + 2);
+        for index in [0, count / 2, count - 1] {
+            let node::Node::Paragraph(block) = &children[index + 1] else {
+                panic!("expected a paragraph at {index}");
+            };
+            let span = block.span.unwrap();
+            assert_eq!(span.start, start.len() + index * paragraph.len());
+            let marks = marks_for(block, "link");
+            assert!(marks.iter().any(|mark| mark.bold));
+            assert!(marks.iter().any(|mark| mark
+                .link
+                .as_ref()
+                .is_some_and(|link| link.url.as_str() == "sibling.md")));
+        }
+        let node::Node::Heading { children, .. } = children.last().unwrap() else {
+            panic!("expected the final heading");
+        };
+        assert_eq!(children.children[0].text.as_str(), "Final heading");
+    }
+
+    #[test]
     fn declared_dialect_keeps_html_literal() {
         let style = TextViewStyle::default();
         let mut context = NodeContext::default();
