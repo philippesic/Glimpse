@@ -692,6 +692,27 @@ impl<T: alloc::fmt::Debug + PartialEq> RangePropertyValue<Option<T>> {
     }
 }
 
+pub struct TextSnapshot(TextSnapshotContent);
+
+enum TextSnapshotContent {
+    Owned(String),
+    Runs(Vec<(Node, core::ops::Range<usize>)>),
+}
+
+impl fmt::Display for TextSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            TextSnapshotContent::Owned(text) => formatter.write_str(text),
+            TextSnapshotContent::Runs(runs) => {
+                for (run, range) in runs {
+                    formatter.write_str(&run.value().unwrap()[range.clone()])?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Range<'a> {
     pub(crate) node: NodeRef<'a>,
@@ -764,6 +785,13 @@ impl<'a> Range<'a> {
     where
         F: FnMut(&NodeRef<'a>, &str) -> Option<T>,
     {
+        self.traverse_text_slices(|node, text, _| f(node, text))
+    }
+
+    fn traverse_text_slices<F, T>(&self, mut f: F) -> Option<T>
+    where
+        F: FnMut(&NodeRef<'a>, &str, core::ops::Range<usize>) -> Option<T>,
+    {
         let is_masked = self.node.text_runs_need_masking();
         let mut masked_text = String::new();
         self.walk(|node| {
@@ -784,13 +812,13 @@ impl<'a> Range<'a> {
                     PASSWORD_MASKING_CHARACTER,
                     end_index - start_index,
                 ));
-                return f(node, &masked_text);
+                return f(node, &masked_text, 0..masked_text.len());
             }
             let value = node.data().value().unwrap();
-            let s = if start_index == end_index {
-                ""
+            let range = if start_index == end_index {
+                0..0
             } else if start_index == 0 && end_index == character_lengths.len() {
-                value
+                0..value.len()
             } else {
                 let slice_start = character_lengths[..start_index]
                     .iter()
@@ -803,10 +831,24 @@ impl<'a> Range<'a> {
                         .copied()
                         .map(usize::from)
                         .sum::<usize>();
-                &value[slice_start..slice_end]
+                slice_start..slice_end
             };
-            f(node, s)
+            f(node, &value[range.clone()], range)
         })
+    }
+
+    pub fn snapshot_text(&self) -> TextSnapshot {
+        if self.start.node.id() == self.end.node.id() || self.node.text_runs_need_masking() {
+            return TextSnapshot(TextSnapshotContent::Owned(self.text()));
+        }
+        let mut runs = Vec::new();
+        self.traverse_text_slices(|node, _, range| {
+            if !range.is_empty() {
+                runs.push((node.data().clone(), range));
+            }
+            None::<()>
+        });
+        TextSnapshot(TextSnapshotContent::Runs(runs))
     }
 
     pub fn write_text<W: fmt::Write>(&self, mut writer: W) -> fmt::Result {
@@ -1835,7 +1877,7 @@ mod tests {
     use accesskit::{
         Color, NodeId, Point, Rect, Role, TextDecoration, TextDecorationStyle, TextSelection,
     };
-    use alloc::vec;
+    use alloc::{string::ToString, vec};
 
     #[test]
     fn neighboring_text_runs_match_explicit_links() {
@@ -3435,6 +3477,18 @@ mod tests {
     }
 
     #[test]
+    fn text_snapshot_outlives_its_tree_and_preserves_utf8_subranges() {
+        let snapshot = {
+            let tree = password_tree(Role::MultilineTextInput, ("éa", [2, 1]), ("🙂", [4]));
+            let node = tree.state().node_by_id(nid(NodeId(1))).unwrap();
+            let mut range = node.document_range();
+            range.set_start(node.text_position_from_global_usv_index(1).unwrap());
+            range.snapshot_text()
+        };
+        assert_eq!(snapshot.to_string(), "a🙂");
+    }
+
+    #[test]
     fn masked_password_text_is_exposed_as_is() {
         let tree = password_tree(Role::PasswordInput, ("**", [1, 1]), ("*", [1]));
         let state = tree.state();
@@ -3449,6 +3503,10 @@ mod tests {
         let state = tree.state();
         let node = state.node_by_id(nid(NodeId(1))).unwrap();
         assert_eq!(node.document_range().text(), "\u{2022}\u{2022}\u{2022}");
+        assert_eq!(
+            node.document_range().snapshot_text().to_string(),
+            "\u{2022}\u{2022}\u{2022}"
+        );
         assert_eq!(node.value().as_deref(), Some("\u{2022}\u{2022}\u{2022}"));
         let end = node.document_range().end();
         assert_eq!(end.to_global_usv_index(), 3);

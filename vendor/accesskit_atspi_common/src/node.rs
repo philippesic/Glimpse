@@ -1470,6 +1470,14 @@ impl PlatformNode {
         })
     }
 
+    pub fn text_snapshot(&self, start_offset: i32, end_offset: i32) -> Result<crate::TextSnapshot> {
+        self.resolve_for_text(|node| {
+            let range = text_range_from_offsets(&node, start_offset, end_offset)
+                .ok_or(Error::IndexOutOfRange)?;
+            Ok(range.snapshot_text())
+        })
+    }
+
     pub fn set_caret_offset(&self, offset: i32) -> Result<bool> {
         let outcome = self.resolve_for_text_with_context(|node, tree, context| {
             if node.data().is_busy() {

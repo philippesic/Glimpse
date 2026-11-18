@@ -18,7 +18,7 @@ mod text_attributes;
 mod text_changes;
 mod util;
 
-pub use accesskit_consumer::FullNodeId;
+pub use accesskit_consumer::{FullNodeId, TextSnapshot};
 pub use atspi_common::{
     CoordType, Granularity, InterfaceSet, Layer, RelationType, Role, ScrollType, State, StateSet,
 };
