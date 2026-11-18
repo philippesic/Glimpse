@@ -205,9 +205,30 @@ impl Syntax {
         let (input, output, current) = (pending.clone(), ready.clone(), token.clone());
         thread::spawn(move || {
             let mut assets = None;
+            let mut superseded = false;
             while rx.recv().is_ok() {
-                let work = std::mem::take(&mut *input.lock().unwrap());
-                if let Some(request) = work.request {
+                let mut work = std::mem::take(&mut *input.lock().unwrap());
+                while superseded
+                    && work.after_retirement.is_none()
+                    && work.request.as_ref().is_some_and(|request| {
+                        request.generation != 0 && request.text.len() >= 1024 * 1024
+                    })
+                {
+                    match rx.recv_timeout(Duration::from_millis(24)) {
+                        Ok(()) => {
+                            let next = std::mem::take(&mut *input.lock().unwrap());
+                            work.request = next.request.or(work.request);
+                            work.after_retirement = next.after_retirement;
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => break,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                    }
+                }
+                superseded = false;
+                if let Some(request) = work
+                    .request
+                    .filter(|request| current.load(Ordering::Relaxed) == request.token)
+                {
                     let _work = gpui::work_trace::Span::new("syntax_worker");
                     let syntaxes = assets.get_or_insert_with(two_face::syntax::extra_newlines);
                     let syntax = syntaxes
@@ -277,6 +298,8 @@ impl Syntax {
                             state,
                         });
                         ctx.request_repaint();
+                    } else {
+                        superseded = true;
                     }
                 }
                 if let Some(after_retirement) = work.after_retirement {
@@ -411,6 +434,53 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn large_edit_burst_publishes_the_latest_syntax() {
+        let syntax = Syntax::new(wake::Context::default());
+        let reference = Syntax::new(wake::Context::default());
+        let path = std::path::Path::new("notes.rs");
+        let source = Rope::from("let earlier = 0; // comment\r\n".repeat(50_000));
+        let wait_for = |syntax: &Syntax, generation| {
+            let until = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(result) = syntax.take()
+                    && result.generation == generation
+                {
+                    break result;
+                }
+                assert!(Instant::now() < until);
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+
+        syntax.request(1, 0, source.clone(), path, true);
+        assert!(!wait_for(&syntax, 0).spans.is_empty());
+        for generation in 1..12 {
+            let mut revision = source.clone();
+            revision.insert(0, &format!("// pending {generation}\n"));
+            syntax.request(1, generation, revision, path, true);
+            thread::sleep(Duration::from_millis(2));
+        }
+        let prefix = "fn newest() { let value = \"café\"; }\r\n";
+        let mut latest = source;
+        latest.insert(0, prefix);
+        syntax.request(1, 12, latest, path, true);
+        reference.request(1, 12, Rope::from(prefix), path, true);
+        let result = wait_for(&syntax, 12);
+        let expected = wait_for(&reference, 12);
+        let spans = |highlight: Highlight| {
+            highlight
+                .spans
+                .into_iter()
+                .take_while(|span| span.start < prefix.len())
+                .map(|span| (span.start, span.length, span.italic, span.rgb))
+                .collect::<Vec<_>>()
+        };
+        let expected = spans(expected);
+        assert!(!expected.is_empty());
+        assert_eq!(spans(result), expected);
+    }
+
     #[test]
     fn latest_generation_has_matching_byte_ranges() {
         let syntax = Syntax::new(wake::Context::default());
