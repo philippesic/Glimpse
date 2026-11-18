@@ -1,5 +1,6 @@
 use std::{
-    collections::hash_map::DefaultHasher,
+    cmp::Reverse,
+    collections::{BinaryHeap, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
     io::Read,
     os::unix::fs::OpenOptionsExt,
@@ -12,6 +13,8 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+const MAX_RESULTS: usize = 1000;
+
 #[derive(Clone)]
 pub struct Hit {
     pub path: PathBuf,
@@ -120,12 +123,6 @@ fn excerpt(value: &str, query: &str) -> String {
     )
 }
 fn rank(path: &Path, scope: &Path, query: &str) -> Option<i64> {
-    let value = path
-        .strip_prefix(scope)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .to_lowercase();
-    let query = query.to_lowercase();
     let basename = path
         .file_name()
         .unwrap_or_default()
@@ -134,13 +131,18 @@ fn rank(path: &Path, scope: &Path, query: &str) -> Option<i64> {
     if basename == query {
         return Some(10000);
     }
-    if basename.starts_with(&query) {
+    if basename.starts_with(query) {
         return Some(8000 - basename.len() as i64);
     }
-    if let Some(index) = basename.find(&query) {
+    if let Some(index) = basename.find(query) {
         return Some(6000 - index as i64);
     }
-    if let Some(index) = value.find(&query) {
+    let value = path
+        .strip_prefix(scope)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .to_lowercase();
+    if let Some(index) = value.find(query) {
         return Some(4000 - index as i64);
     }
     let mut chars = query.chars();
@@ -167,6 +169,57 @@ fn ordered(hits: &[Hit]) -> Vec<Hit> {
             .then(a.line.cmp(&b.line))
     });
     hits
+}
+fn indexed_hits(
+    paths: &[PathBuf],
+    scope: &Path,
+    query: &str,
+    folded_query: &str,
+    cancelled: impl Fn() -> bool,
+) -> Result<(Vec<Hit>, bool), usize> {
+    #[derive(Eq, Ord, PartialEq, PartialOrd)]
+    struct RankedPath<'a> {
+        score: Reverse<i64>,
+        path: &'a Path,
+    }
+
+    let mut best = BinaryHeap::with_capacity(MAX_RESULTS);
+    let mut truncated = false;
+    for (processed, path) in paths.iter().enumerate() {
+        if cancelled() {
+            return Err(processed);
+        }
+        let Some(score) = rank(path, scope, folded_query) else {
+            continue;
+        };
+        let ranked = RankedPath {
+            score: Reverse(score),
+            path,
+        };
+        if best.len() < MAX_RESULTS {
+            best.push(ranked);
+        } else if let Some(mut worst) = best.peek_mut() {
+            truncated = true;
+            if ranked < *worst {
+                *worst = ranked;
+            }
+        }
+    }
+    if cancelled() {
+        return Err(paths.len());
+    }
+    let hits = best
+        .into_iter()
+        .map(|ranked| Hit {
+            path: ranked.path.to_path_buf(),
+            line: 1,
+            excerpt: String::new(),
+            query: query.to_owned(),
+            fingerprint: None,
+            score: ranked.score.0,
+        })
+        .collect();
+    Ok((hits, truncated))
 }
 impl Search {
     pub fn new(ctx: crate::wake::Context) -> Self {
@@ -212,6 +265,7 @@ impl Search {
                     }
                 };
                 let building = query.is_empty() && !content;
+                let folded_query = query.to_lowercase();
                 if !content && !building {
                     let cached = worker_index
                         .lock()
@@ -220,36 +274,31 @@ impl Search {
                         .filter(|index| index.scope == scope && index.filters == filters)
                         .map(|index| (index.paths.clone(), index.partial, index.stale.clone()));
                     if let Some((paths, partial, stale)) = cached {
-                        let mut hits = Vec::new();
-                        for path in paths.iter() {
-                            if cancelled() {
-                                break;
+                        crate::metrics::event("search-indexed-start", id, paths.len() as u64);
+                        let report_abandoned = |processed| {
+                            crate::metrics::event("search-indexed-abandoned", id, processed as u64);
+                        };
+                        let (hits, truncated) =
+                            match indexed_hits(&paths, &scope, &query, &folded_query, cancelled) {
+                                Ok(hits) => hits,
+                                Err(processed) => {
+                                    report_abandoned(processed);
+                                    continue;
+                                }
+                            };
+                        let state = match (stale.load(Ordering::Relaxed), partial || truncated) {
+                            (true, true) => {
+                                "Indexed snapshot stale · partial results · rebuild for current results"
                             }
-                            if let Some(score) = rank(path, &scope, &query) {
-                                hits.push(Hit {
-                                    path: path.clone(),
-                                    line: 1,
-                                    excerpt: String::new(),
-                                    query: query.clone(),
-                                    fingerprint: None,
-                                    score,
-                                });
-                            }
-                        }
-                        hits = ordered(&hits);
-                        let truncated = hits.len() > 1000;
-                        hits.truncate(1000);
-                        send(
-                            &hits,
-                            if stale.load(Ordering::Relaxed) {
-                                "Indexed snapshot stale · rebuild for current results"
-                            } else if partial || truncated {
+                            (true, false) => "Indexed snapshot stale · rebuild for current results",
+                            (false, true) => {
                                 "Indexed snapshot · partial results · rebuild for changes"
-                            } else {
-                                "Indexed snapshot · rebuild for changes"
-                            },
-                            true,
-                        );
+                            }
+                            (false, false) => "Indexed snapshot · rebuild for changes",
+                        };
+                        if !send(&hits, state, true) && cancelled() {
+                            report_abandoned(paths.len());
+                        }
                         continue;
                     }
                 }
@@ -361,7 +410,7 @@ impl Search {
                         break;
                     }
                     count += 1;
-                    if count > 100_000 || hits.len() >= 1000 {
+                    if count > 100_000 || hits.len() >= MAX_RESULTS {
                         partial = true;
                         break;
                     }
@@ -448,13 +497,13 @@ impl Search {
                                     fingerprint: Some(version),
                                     score: 0,
                                 });
-                                if hits.len() >= 1000 {
+                                if hits.len() >= MAX_RESULTS {
                                     partial = true;
                                     break;
                                 }
                             }
                         }
-                    } else if let Some(score) = rank(entry.path(), &scope, &query) {
+                    } else if let Some(score) = rank(entry.path(), &scope, &folded_query) {
                         hits.push(Hit {
                             path: entry.path().to_owned(),
                             line: 1,
@@ -528,12 +577,11 @@ impl Search {
                     format!(
                         "{} filenames · {}snapshot",
                         index.paths.len(),
-                        if index.stale.load(Ordering::Relaxed) {
-                            "stale · rebuild "
-                        } else if index.partial {
-                            "partial "
-                        } else {
-                            ""
+                        match (index.stale.load(Ordering::Relaxed), index.partial) {
+                            (true, true) => "partial · stale · rebuild ",
+                            (true, false) => "stale · rebuild ",
+                            (false, true) => "partial ",
+                            (false, false) => "",
                         }
                     )
                 })
@@ -587,6 +635,32 @@ impl Drop for Search {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn indexed_hits_keep_the_best_paths_and_abandon_work() {
+        let scope = Path::new("/fixtures");
+        let paths: Vec<_> = (0..1024)
+            .rev()
+            .map(|index| scope.join(format!("Item{index:04}.rs")))
+            .collect();
+        let (hits, truncated) = indexed_hits(&paths, scope, "ITEM", "item", || false).unwrap();
+        assert!(truncated);
+        let hits = ordered(&hits);
+        assert_eq!(hits.len(), MAX_RESULTS);
+        assert_eq!(hits[0].path, scope.join("Item0000.rs"));
+        assert_eq!(hits[MAX_RESULTS - 1].path, scope.join("Item0999.rs"));
+        assert_eq!(hits[0].query, "ITEM");
+
+        let checks = std::cell::Cell::new(0);
+        assert!(matches!(
+            indexed_hits(&paths, scope, "ITEM", "item", || {
+                checks.set(checks.get() + 1);
+                checks.get() == 10
+            }),
+            Err(9)
+        ));
+        assert_eq!(checks.get(), 10);
+    }
+
     #[test]
     #[ignore = "release search CPU benchmark; excludes UI presentation"]
     fn benchmark_indexed_hundred_thousand_paths() {
