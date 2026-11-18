@@ -3840,7 +3840,7 @@ impl Render for Shell {
                 );
             }
             if self.reading {
-                content = content.child(self.reading_element(cx));
+                content = content.child(self.reading_element(narrow, short, cx));
             } else {
                 content = content.child(
                     div()

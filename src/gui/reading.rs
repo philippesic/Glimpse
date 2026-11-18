@@ -255,7 +255,12 @@ impl Shell {
         .into_any_element()
     }
 
-    pub(super) fn reading_element(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn reading_element(
+        &self,
+        narrow: bool,
+        short: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let font_size = self.reading_font_size();
         let mut area = div()
             .id("reading")
@@ -268,6 +273,8 @@ impl Shell {
             .flex()
             .flex_col()
             .p_4()
+            .when(narrow, |area| area.px_3())
+            .when(short, |area| area.py_2())
             .text_size(font_size);
         let Some(view) = &self.reading_view else {
             return area.child(self.reading_progress()).into_any_element();
@@ -288,26 +295,30 @@ impl Shell {
                     .flex()
                     .items_center()
                     .gap_2()
+                    .when(narrow, |row| row.gap_1())
                     .w_full()
                     .min_w_0()
                     .flex_shrink_0()
-                    .child(
-                        div().flex_1().min_w_0().child(accessible(
-                            "reading-notices",
-                            div()
-                                .w_full()
-                                .truncate()
-                                .text_sm()
-                                .child("Images omitted or unavailable"),
-                            move |_, _, _| {
-                                let mut node =
-                                    gpui::accesskit::Node::new(gpui::accesskit::Role::Note);
-                                node.set_label(label.clone());
-                                AccessibilityInfo::new(node)
-                            },
-                        )),
-                    )
-                    .child(self.button("Image details…", "reading-notices", cx))
+                    .child(div().flex_1().min_w_0().child(accessible(
+                        "reading-notices",
+                        div().w_full().truncate().text_sm().when(!narrow, |label| {
+                            label.child("Images omitted or unavailable")
+                        }),
+                        move |_, _, _| {
+                            let mut node = gpui::accesskit::Node::new(gpui::accesskit::Role::Note);
+                            node.set_label(label.clone());
+                            AccessibilityInfo::new(node)
+                        },
+                    )))
+                    .child(self.button(
+                        if narrow {
+                            "Images omitted…"
+                        } else {
+                            "Image details…"
+                        },
+                        "reading-notices",
+                        cx,
+                    ))
                     .child(self.button("Reload images", "reading-retry", cx)),
             );
         }
