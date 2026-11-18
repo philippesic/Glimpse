@@ -8,12 +8,13 @@ use gpui::WeakEntity;
 use ropey::{LineType, extra::esoterica::ropes_are_instances};
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::hash::BuildHasher;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 const PACKED_LINE_THRESHOLD: usize = 4096;
-const SHARE_RUNS_FROM_LINE_BYTES: usize = 64 * 1024;
-const MAX_SHARED_RUNS_PER_LINE: usize = 256;
+const SHARE_RUNS_FROM_BYTES: usize = 64 * 1024;
+const MAX_SHARED_RUNS: usize = 256;
 
 #[derive(Default)]
 pub(super) struct Mapping {
@@ -52,6 +53,7 @@ struct PackedLines {
     lengths: Vec<u8>,
     words: Vec<u16>,
     line_starts: Vec<u16>,
+    shared: Option<HashMap<u64, Node>>,
 }
 
 impl PackedLines {
@@ -75,27 +77,48 @@ impl PackedLines {
         if self.text.is_empty() {
             return;
         }
-        let mut node = text_run(
-            &self.text,
-            std::mem::take(&mut self.lengths),
-            std::mem::take(&mut self.words),
-        );
-        if !self.line_starts.is_empty() {
-            node.set_hard_line_starts(std::mem::take(&mut self.line_starts));
-        }
+        let fingerprint = self
+            .shared
+            .as_ref()
+            .map(|shared| shared.hasher().hash_one(self.text.as_str()));
+        let cached = fingerprint
+            .and_then(|hash| self.shared.as_ref()?.get(&hash))
+            .filter(|run| {
+                run.value() == Some(self.text.as_str())
+                    && run.hard_line_starts() == self.line_starts
+                    && has_text_boundaries(run, &self.lengths, &self.words)
+            });
+        let node = if let Some(run) = cached {
+            self.lengths.clear();
+            self.words.clear();
+            self.line_starts.clear();
+            run.clone()
+        } else {
+            self.lengths.shrink_to_fit();
+            self.words.shrink_to_fit();
+            let mut run = text_run(
+                &self.text,
+                std::mem::take(&mut self.lengths),
+                std::mem::take(&mut self.words),
+            );
+            if !self.line_starts.is_empty() {
+                self.line_starts.shrink_to_fit();
+                run.set_hard_line_starts(std::mem::take(&mut self.line_starts));
+            }
+            if let (Some(shared), Some(hash)) = (&mut self.shared, fingerprint)
+                && shared.len() < MAX_SHARED_RUNS
+            {
+                shared.entry(hash).or_insert_with(|| run.clone());
+            }
+            run
+        };
         emit(self.start..self.start + self.text.len(), None, node);
         self.text.clear();
     }
 }
 
-fn shared_text_run<'a>(
-    value: &'a str,
-    lengths: Vec<u8>,
-    words: Vec<u16>,
-    shared: &mut HashMap<&'a str, Node>,
-) -> Node {
-    if let Some(run) = shared.get(value)
-        && run.character_lengths() == lengths
+fn has_text_boundaries(run: &Node, lengths: &[u8], words: &[u16]) -> bool {
+    run.character_lengths() == lengths
         && if run.wide_word_starts().is_empty() {
             run.word_starts()
                 .iter()
@@ -105,11 +128,21 @@ fn shared_text_run<'a>(
         } else {
             run.wide_word_starts() == words
         }
+}
+
+fn shared_text_run<'a>(
+    value: &'a str,
+    lengths: Vec<u8>,
+    words: Vec<u16>,
+    shared: &mut HashMap<&'a str, Node>,
+) -> Node {
+    if let Some(run) = shared.get(value)
+        && has_text_boundaries(run, &lengths, &words)
     {
         return run.clone();
     }
     let run = text_run(value, lengths, words);
-    if shared.len() < MAX_SHARED_RUNS_PER_LINE {
+    if shared.len() < MAX_SHARED_RUNS {
         shared.entry(value).or_insert_with(|| run.clone());
     }
     run
@@ -121,7 +154,10 @@ fn visit_source_runs(
     packed: bool,
     mut emit: impl FnMut(Range<usize>, Option<usize>, Node),
 ) {
-    let mut block = PackedLines::default();
+    let mut block = PackedLines {
+        shared: (packed && range.len() >= SHARE_RUNS_FROM_BYTES).then(HashMap::new),
+        ..Default::default()
+    };
     let mut offset = range.start;
     for (line_index, line) in text.slice(range.clone()).lines(LineType::LF).enumerate() {
         if line.len() == 0 && range.end < text.len() {
@@ -130,7 +166,7 @@ fn visit_source_runs(
         let line = line
             .as_str()
             .map_or_else(|| Cow::Owned(String::from(line)), Cow::Borrowed);
-        let mut shared = (line.len() >= SHARE_RUNS_FROM_LINE_BYTES).then(HashMap::new);
+        let mut shared = (line.len() >= SHARE_RUNS_FROM_BYTES).then(HashMap::new);
         visit_line_segments(&line, line_index, |part| {
             if packed && !line.is_empty() && part.range.len() == line.len() {
                 if block.lengths.len() + part.lengths.len() > MAX_RUN_CHARACTERS {
@@ -516,6 +552,36 @@ impl InputState {
 mod tests {
     use super::*;
     use crate::semantic_text::segments;
+
+    #[test]
+    fn equal_packed_runs_share_properties_and_keep_distinct_positions() {
+        let stanza = "café 🙂 é é\r\n\n日本語 word\n";
+        let text = stanza.repeat(8_000);
+        let mut mapping = TextRuns::default();
+        mapping.update(Rope::from(text.as_str()), |index| NodeId(index as u64 + 1));
+        let mut by_text = HashMap::new();
+        let mut shared = 0;
+        for (index, (id, run)) in mapping.nodes.iter().enumerate() {
+            if let Some(previous) = by_text.insert(run.value().unwrap(), index) {
+                let (previous_id, previous_run) = &mapping.nodes[previous];
+                assert_ne!(previous_id, id);
+                assert!(!run.hard_line_starts().is_empty());
+                assert!(run.shares_data_with(previous_run));
+                let start = mapping.runs[index].range.start;
+                assert_eq!(mapping.offset(&mapping.position(start)), Some(start));
+                shared += 1;
+            }
+        }
+        assert!(shared > 10);
+        assert_eq!(
+            mapping
+                .nodes
+                .iter()
+                .map(|(_, node)| node.value().unwrap())
+                .collect::<String>(),
+            text
+        );
+    }
 
     #[test]
     fn repeated_long_runs_share_exact_metadata_without_sharing_positions() {
