@@ -18,7 +18,7 @@ use crate::button::Button;
 use crate::menu::{DropdownMenu, PopupMenuItem};
 use crate::scroll::ScrollableElement;
 use crate::text::{
-    document_text::{DocumentSource, DocumentText},
+    document_text::{DocumentSource, DocumentSourceBuilder, DocumentText},
     node::CodeBlock,
     utils::scroll_reading_list,
 };
@@ -193,37 +193,51 @@ impl ParsedContent {
     }
 }
 
-pub struct ParsedMarkdown(
-    Result<ParsedContent, SharedString>,
-    Option<gpui::PreparedTextLines>,
-);
+pub struct ParsedMarkdown {
+    content: Result<ParsedContent, SharedString>,
+    lines: Option<gpui::PreparedTextLines>,
+    prepared_text: Option<DocumentSource>,
+}
 
 impl ParsedMarkdown {
     pub fn new(raw: &str, theme: &HighlightTheme, on_image: impl FnMut(&str)) -> Self {
-        Self(
-            parse_content(
-                TextViewType::Markdown,
-                raw,
-                TextViewStyle::default(),
-                theme,
-                &None,
-                on_image,
-            ),
-            None,
-        )
+        let mut reading_text = (raw.len() >= 1024 * 1024).then(DocumentSourceBuilder::default);
+        let content = parse_content(
+            TextViewType::Markdown,
+            raw,
+            TextViewStyle::default(),
+            theme,
+            &None,
+            on_image,
+            reading_text.as_mut(),
+        );
+        let prepared_text = if content.is_ok() {
+            reading_text.and_then(DocumentSourceBuilder::finish_if_started)
+        } else {
+            None
+        };
+        Self {
+            content,
+            lines: None,
+            prepared_text,
+        }
     }
 
     pub fn share_reading_text_storage(&mut self) {
-        if let Ok(content) = &mut self.0 {
+        if let Ok(content) = &mut self.content {
             if content.document_source.is_none() {
-                content.document_source = Some(DocumentSource::new(&mut content.root_node));
+                content.document_source = Some(
+                    self.prepared_text
+                        .take()
+                        .unwrap_or_else(|| DocumentSource::new(&mut content.root_node)),
+                );
                 content.root_node.paginate_reading_blocks();
             }
         }
     }
 
     pub fn map_code_colors(&mut self, map: impl Fn(gpui::Hsla) -> gpui::Hsla) {
-        if let Ok(content) = &mut self.0 {
+        if let Ok(content) = &mut self.content {
             content.root_node.map_code_colors(&map);
         }
     }
@@ -250,7 +264,7 @@ impl MarkdownLayout {
     }
 
     pub fn prepare(self, markdown: &mut ParsedMarkdown) {
-        let Ok(content) = &mut markdown.0 else {
+        let Ok(content) = &mut markdown.content else {
             return;
         };
         let node::Node::Root { children } = &content.root_node else {
@@ -278,7 +292,7 @@ impl MarkdownLayout {
                 .chain(children.iter().skip(last).take(first - last)),
             &self.layouts,
         );
-        markdown.1 = Some(self.layouts.into_prepared_lines());
+        markdown.lines = Some(self.layouts.into_prepared_lines());
     }
 }
 
@@ -298,7 +312,7 @@ impl MarkdownView {
         cx: &mut App,
     ) -> Self {
         let stable_accessibility = content
-            .0
+            .content
             .as_ref()
             .is_ok_and(|content| content.document_source.is_some());
         Self {
@@ -306,8 +320,8 @@ impl MarkdownView {
             stable_accessibility,
             state: cx.new(|cx| {
                 let mut state = TextViewState::new(cx, on_retired);
-                state.parsed_result = Some(content.0);
-                state.prepared_lines = content.1;
+                state.parsed_result = Some(content.content);
+                state.prepared_lines = content.lines;
                 state.resources = resources;
                 state.focus_handle = Some(focus);
                 state
@@ -428,6 +442,7 @@ impl Future for UpdateFuture {
                         &self.highlight_theme,
                         &self.code_block_actions.clone(),
                         |_| {},
+                        None,
                     );
                     _ = self.tx_result.try_send(res);
                     continue;
@@ -1317,6 +1332,7 @@ fn parse_content(
     highlight_theme: &HighlightTheme,
     code_block_actions: &Option<Arc<CodeBlockActionsFn>>,
     on_image: impl FnMut(&str),
+    reading_text: Option<&mut DocumentSourceBuilder>,
 ) -> Result<ParsedContent, SharedString> {
     let mut node_cx = NodeContext {
         style: style.clone(),
@@ -1325,9 +1341,14 @@ fn parse_content(
     };
 
     let res = match type_ {
-        TextViewType::Markdown => {
-            super::format::markdown::parse(text, &style, &mut node_cx, highlight_theme, on_image)
-        }
+        TextViewType::Markdown => super::format::markdown::parse(
+            text,
+            &style,
+            &mut node_cx,
+            highlight_theme,
+            on_image,
+            reading_text,
+        ),
         TextViewType::Html => super::format::html::parse(text, &mut node_cx),
     };
     res.map(move |root_node| {

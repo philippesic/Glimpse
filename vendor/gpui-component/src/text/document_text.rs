@@ -93,23 +93,50 @@ pub(super) struct DocumentSource(Arc<[Arc<str>]>);
 
 impl DocumentSource {
     pub(super) fn new(root: &mut Block) -> Self {
-        let mut builder = SourceBuilder::default();
-        builder.block(root);
-        builder.flush();
-        Self(builder.chunks.into())
+        let mut source = DocumentSourceBuilder::default();
+        let mut batch = SourceBuilder {
+            source: &mut source,
+            inlines: Vec::new(),
+        };
+        batch.block(root);
+        batch.flush();
+        source.finish()
     }
 }
 
 #[derive(Default)]
-struct SourceBuilder<'a> {
+pub(crate) struct DocumentSourceBuilder {
     chunks: Vec<Arc<str>>,
     shared: HashSet<Arc<str>>,
     buffer: String,
-    inlines: Vec<(Range<u32>, &'a mut InlineText)>,
     last: Option<char>,
 }
 
-impl<'a> SourceBuilder<'a> {
+impl DocumentSourceBuilder {
+    pub(crate) fn append_blocks(&mut self, blocks: &mut [Block]) {
+        let mut batch = SourceBuilder {
+            source: self,
+            inlines: Vec::new(),
+        };
+        batch.blocks(blocks);
+        batch.flush();
+    }
+
+    pub(super) fn finish(self) -> DocumentSource {
+        DocumentSource(self.chunks.into())
+    }
+
+    pub(super) fn finish_if_started(self) -> Option<DocumentSource> {
+        (!self.chunks.is_empty()).then(|| self.finish())
+    }
+}
+
+struct SourceBuilder<'a, 'storage> {
+    source: &'storage mut DocumentSourceBuilder,
+    inlines: Vec<(Range<u32>, &'a mut InlineText)>,
+}
+
+impl<'a> SourceBuilder<'a, '_> {
     fn block(&mut self, node: &'a mut Block) {
         match node {
             Block::Root { children } => self.blocks(Arc::make_mut(children).as_mut_slice()),
@@ -160,6 +187,7 @@ impl<'a> SourceBuilder<'a> {
                     && !alt.is_empty()
                 {
                     if self
+                        .source
                         .last
                         .is_some_and(|character| !character.is_whitespace())
                     {
@@ -183,10 +211,10 @@ impl<'a> SourceBuilder<'a> {
     }
 
     fn paragraph_break(&mut self) {
-        if self.last.is_some_and(|character| character != '\n') {
+        if self.source.last.is_some_and(|character| character != '\n') {
             self.write("\n");
         }
-        if self.buffer.len() >= PACKED_TEXT_BYTES {
+        if self.source.buffer.len() >= PACKED_TEXT_BYTES {
             self.flush();
         }
     }
@@ -198,8 +226,8 @@ impl<'a> SourceBuilder<'a> {
 
     fn append(&mut self, value: &str) {
         if let Some(last) = value.chars().next_back() {
-            self.last = Some(last);
-            self.buffer.push_str(value);
+            self.source.last = Some(last);
+            self.source.buffer.push_str(value);
         }
     }
 
@@ -207,47 +235,47 @@ impl<'a> SourceBuilder<'a> {
         if value.len() >= PACKED_TEXT_BYTES {
             self.push_chunk(value.shared());
         } else {
-            let start = self.buffer.len() as u32;
+            let start = self.source.buffer.len() as u32;
             self.append(value.as_str());
-            let end = self.buffer.len() as u32;
+            let end = self.source.buffer.len() as u32;
             self.inlines.push((start..end, value));
             self.flush_full_buffer();
         }
     }
 
     fn flush_full_buffer(&mut self) {
-        if self.buffer.len() >= 2 * PACKED_TEXT_BYTES {
+        if self.source.buffer.len() >= 2 * PACKED_TEXT_BYTES {
             self.flush();
         }
     }
 
     fn push_chunk(&mut self, value: Arc<str>) {
         self.flush();
-        self.last = value.chars().next_back();
-        self.chunks.push(value);
+        self.source.last = value.chars().next_back();
+        self.source.chunks.push(value);
     }
 
     fn flush(&mut self) {
-        if self.buffer.is_empty() {
+        if self.source.buffer.is_empty() {
             return;
         }
-        let text = if let Some(text) = self.shared.get(self.buffer.as_str()) {
+        let text = if let Some(text) = self.source.shared.get(self.source.buffer.as_str()) {
             text.clone()
         } else {
-            let text: Arc<str> = self.buffer.as_str().into();
-            if self.shared.len() < MAX_CACHED_RUNS {
-                self.shared.insert(text.clone());
+            let text: Arc<str> = self.source.buffer.as_str().into();
+            if self.source.shared.len() < MAX_CACHED_RUNS {
+                self.source.shared.insert(text.clone());
             }
             text
         };
-        self.buffer.clear();
+        self.source.buffer.clear();
         for (range, inline) in self.inlines.drain(..) {
             *inline = InlineText::Shared {
                 text: text.clone(),
                 range,
             };
         }
-        self.chunks.push(text);
+        self.source.chunks.push(text);
     }
 }
 
@@ -483,6 +511,52 @@ impl LineBoundaries {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packed_parser_batches_preserve_rendered_blocks_and_text() {
+        use crate::text::{TextViewStyle, format::markdown::parse, node::NodeContext};
+
+        let mut source = concat!(
+            "# Title café\r\n\r\n",
+            "Text **with a mark** and ![a raster](image.png) beside [a link][late].\n\n",
+            "> Quoted العربية text with a hard break  \n> here.\n\n",
+            "1. Code `mix`\n2. **Other** 🧪\n\n",
+            "| Head | Body |\n| - | - |\n| 𐐀 | Note |\n\n",
+            "```text\ncode before the next section\n```\n\n",
+        )
+        .repeat(300);
+        for index in 0..400 {
+            use std::fmt::Write;
+            writeln!(source, "Distinct {index} café with **text**.\n").unwrap();
+        }
+        source.push_str("[late]: link.md \"Later title\"\n");
+        let style = TextViewStyle::default();
+        let parse = |builder| {
+            parse(
+                &source,
+                &style,
+                &mut NodeContext::default(),
+                &style.highlight_theme,
+                |_| {},
+                builder,
+            )
+            .unwrap()
+        };
+        let mut original = parse(None);
+        let original_text = DocumentSource::new(&mut original);
+        let mut builder = DocumentSourceBuilder::default();
+        let packed = parse(Some(&mut builder));
+        let packed_text = builder.finish_if_started().unwrap();
+        assert_eq!(original, packed);
+        assert_eq!(
+            original_text
+                .0
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<String>(),
+            packed_text.0.iter().map(AsRef::as_ref).collect::<String>()
+        );
+    }
 
     #[test]
     fn reused_layouts_keep_exact_text_and_boundaries() {

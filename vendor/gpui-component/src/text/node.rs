@@ -124,6 +124,7 @@ pub(crate) type InlineMarks = Arc<[(Range<usize>, TextMark)]>;
 #[derive(Clone, Debug)]
 pub(crate) enum InlineText {
     Owned(SharedString),
+    Pending(Box<str>),
     Shared { text: Arc<str>, range: Range<u32> },
 }
 
@@ -131,6 +132,7 @@ impl InlineText {
     pub(crate) fn as_str(&self) -> &str {
         match self {
             Self::Owned(text) => text.as_str(),
+            Self::Pending(text) => text,
             Self::Shared { text, range } => &text[range.start as usize..range.end as usize],
         }
     }
@@ -138,7 +140,7 @@ impl InlineText {
     pub(super) fn shared(&self) -> Arc<str> {
         match self {
             Self::Owned(text) => text.clone().into(),
-            Self::Shared { .. } => Arc::from(self.as_str()),
+            Self::Pending(_) | Self::Shared { .. } => Arc::from(self.as_str()),
         }
     }
 }
@@ -748,6 +750,7 @@ impl Paragraph {
 
             let (text, absolute_start) = match inline.text {
                 InlineText::Owned(text) => (text.into(), 0),
+                InlineText::Pending(text) => (Arc::from(text), 0),
                 InlineText::Shared { text, range } => (text, range.start as usize),
             };
             let value = &text[absolute_start..absolute_start + len];

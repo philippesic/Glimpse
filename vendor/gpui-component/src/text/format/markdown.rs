@@ -2,9 +2,10 @@ use crate::{
     highlighter::HighlightTheme,
     text::{
         TextViewStyle,
+        document_text::DocumentSourceBuilder,
         node::{
-            self, CodeBlock, ImageNode, InlineMarks, InlineNode, LinkMark, NodeContext, Paragraph,
-            Span, Table, TableCell, TableRow, TextMark,
+            self, CodeBlock, ImageNode, InlineMarks, InlineNode, InlineText, LinkMark, NodeContext,
+            Paragraph, Span, Table, TableCell, TableRow, TextMark,
         },
     },
 };
@@ -14,27 +15,35 @@ use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use std::collections::HashSet;
 
 const MAX_SHARED_INLINE_VALUES: usize = 256;
+const READING_TEXT_BATCH_BLOCKS: usize = 64;
 
 #[derive(Default)]
 struct InlineContentCache {
     enabled: bool,
+    pack_reading: bool,
     texts: HashSet<SharedString>,
     marks: HashSet<InlineMarks>,
 }
 
 impl InlineContentCache {
-    fn text(&mut self, text: String) -> SharedString {
+    fn text(&mut self, text: String) -> InlineText {
         if !self.enabled || text.len() > 8 * 1024 {
-            return text.into();
+            return InlineText::Owned(text.into());
         }
         if let Some(text) = self.texts.get(text.as_str()) {
-            return text.clone();
+            return InlineText::Owned(text.clone());
+        }
+        if self.pack_reading
+            && text.len() < 8 * 1024
+            && self.texts.len() >= MAX_SHARED_INLINE_VALUES
+        {
+            return InlineText::Pending(text.into_boxed_str());
         }
         let text = SharedString::from(text);
         if self.texts.len() < MAX_SHARED_INLINE_VALUES {
             self.texts.insert(text.clone());
         }
-        text
+        InlineText::Owned(text)
     }
 
     fn marks(&mut self, marks: Vec<(std::ops::Range<usize>, TextMark)>) -> InlineMarks {
@@ -108,10 +117,10 @@ impl Frame {
     }
     fn finish_text(&mut self, cache: &mut InlineContentCache) {
         if !self.text.is_empty() {
-            self.paragraph.push(
-                InlineNode::new(cache.text(std::mem::take(&mut self.text)))
-                    .marks(cache.marks(std::mem::take(&mut self.text_marks))),
-            );
+            let mut inline =
+                InlineNode::new("").marks(cache.marks(std::mem::take(&mut self.text_marks)));
+            inline.text = cache.text(std::mem::take(&mut self.text));
+            self.paragraph.push(inline);
         }
     }
     fn flush(&mut self, marks: &[TextMark], finder: &LinkFinder) {
@@ -122,7 +131,13 @@ impl Frame {
         if marks.iter().any(|mark| mark.code || mark.link.is_some())
             || !text.contains([':', '@']) && !text.contains("www.")
         {
-            self.append(&text, marks);
+            if self.text.is_empty() {
+                self.text_marks
+                    .extend(marks.iter().map(|mark| (0..text.len(), mark.clone())));
+                self.text = text;
+            } else {
+                self.append(&text, marks);
+            }
             return;
         }
         let mut offset = 0;
@@ -236,16 +251,19 @@ pub(crate) fn parse(
     cx: &mut NodeContext,
     theme: &HighlightTheme,
     mut on_image: impl FnMut(&str),
+    mut reading_text: Option<&mut DocumentSourceBuilder>,
 ) -> Result<node::Node, SharedString> {
     let mut finder = LinkFinder::new();
     finder.url_must_have_scheme(false);
     let mut cache = InlineContentCache {
         enabled: raw.len() >= 64 * 1024,
+        pack_reading: reading_text.is_some(),
         ..Default::default()
     };
     let mut frames = vec![Frame::new(Block::Root, 0)];
     let mut marks = Vec::new();
     let mut images: Vec<Image> = Vec::new();
+    let mut packed_blocks = 0;
     let options =
         Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS | Options::ENABLE_STRIKETHROUGH;
     for (event, range) in Parser::new_ext(raw, options).into_offset_iter() {
@@ -431,11 +449,28 @@ pub(crate) fn parse(
                 .push_str(&format!("[^{label}]")),
             Event::DisplayMath(text) => frames.last_mut().unwrap().buffer.push_str(&text),
         }
+        if frames.len() == 1
+            && let Some(reading_text) = reading_text.as_deref_mut()
+        {
+            let children = &mut frames[0].children;
+            if children.len() - packed_blocks >= READING_TEXT_BATCH_BLOCKS {
+                reading_text.append_blocks(&mut children[packed_blocks..]);
+                packed_blocks = children.len();
+            }
+        }
     }
-    Ok(frames
-        .pop()
-        .unwrap()
-        .finish(raw.len(), &marks, &finder, style, theme, &mut cache))
+    let mut root =
+        frames
+            .pop()
+            .unwrap()
+            .finish(raw.len(), &marks, &finder, style, theme, &mut cache);
+    if packed_blocks != 0
+        && let Some(reading_text) = reading_text
+        && let node::Node::Root { children } = &mut root
+    {
+        reading_text.append_blocks(&mut std::sync::Arc::make_mut(children)[packed_blocks..]);
+    }
+    Ok(root)
 }
 
 #[cfg(test)]
@@ -448,7 +483,7 @@ mod tests {
         cx: &mut NodeContext,
         theme: &HighlightTheme,
     ) -> Result<node::Node, SharedString> {
-        super::parse(raw, style, cx, theme, |_| {})
+        super::parse(raw, style, cx, theme, |_| {}, None)
     }
 
     fn paragraph(source: &str) -> Paragraph {

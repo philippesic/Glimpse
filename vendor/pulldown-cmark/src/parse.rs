@@ -2062,11 +2062,20 @@ pub(crate) struct AlignmentIndex(ItemField);
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub(crate) struct HeadingIndex(NonZeroField);
 
+type LinkData<'a> = (LinkType, CowStr<'a>, CowStr<'a>, CowStr<'a>);
+
+#[derive(Clone)]
+enum LinkSlot<'a> {
+    Live(LinkData<'a>),
+    Vacant(Option<LinkIndex>),
+}
+
 #[derive(Clone)]
 pub(crate) struct Allocations<'a> {
     pub refdefs: RefDefs<'a>,
     pub footdefs: FootnoteDefs<'a>,
-    links: Vec<(LinkType, CowStr<'a>, CowStr<'a>, CowStr<'a>)>,
+    links: Vec<LinkSlot<'a>>,
+    next_free_link: Option<LinkIndex>,
     cows: Vec<CowStr<'a>>,
     alignments: Vec<Vec<Alignment>>,
     headings: Vec<HeadingAttributes<'a>>,
@@ -2123,6 +2132,7 @@ impl<'a> Allocations<'a> {
             refdefs: RefDefs::default(),
             footdefs: FootnoteDefs::default(),
             links: Vec::with_capacity(128),
+            next_free_link: None,
             cows: Vec::new(),
             alignments: Vec::new(),
             headings: Vec::new(),
@@ -2142,9 +2152,20 @@ impl<'a> Allocations<'a> {
         title: CowStr<'a>,
         id: CowStr<'a>,
     ) -> LinkIndex {
-        let ix = self.links.len();
-        self.links.push((ty, url, title, id));
-        LinkIndex(item_field(ix))
+        let link = LinkSlot::Live((ty, url, title, id));
+        if let Some(ix) = self.next_free_link {
+            let slot = &mut self.links[field_index(ix.0)];
+            let LinkSlot::Vacant(next) = slot else {
+                unreachable!("link slot is already in use");
+            };
+            self.next_free_link = *next;
+            *slot = link;
+            ix
+        } else {
+            let ix = LinkIndex(item_field(self.links.len()));
+            self.links.push(link);
+            ix
+        }
     }
 
     pub fn allocate_alignment(&mut self, alignment: Vec<Alignment>) -> AlignmentIndex {
@@ -2166,9 +2187,14 @@ impl<'a> Allocations<'a> {
         std::mem::replace(&mut self.cows[field_index(ix.0)], "".into())
     }
 
-    pub fn take_link(&mut self, ix: LinkIndex) -> (LinkType, CowStr<'a>, CowStr<'a>, CowStr<'a>) {
-        let default_link = (LinkType::ShortcutUnknown, "".into(), "".into(), "".into());
-        std::mem::replace(&mut self.links[field_index(ix.0)], default_link)
+    pub fn take_link(&mut self, ix: LinkIndex) -> LinkData<'a> {
+        let slot = &mut self.links[field_index(ix.0)];
+        let link = std::mem::replace(slot, LinkSlot::Vacant(self.next_free_link));
+        let LinkSlot::Live(link) = link else {
+            unreachable!("link slot was already consumed");
+        };
+        self.next_free_link = Some(ix);
+        link
     }
 
     pub fn take_alignment(&mut self, ix: AlignmentIndex) -> Vec<Alignment> {
@@ -2181,14 +2207,6 @@ impl<'a> Index<CowIndex> for Allocations<'a> {
 
     fn index(&self, ix: CowIndex) -> &Self::Output {
         self.cows.index(field_index(ix.0))
-    }
-}
-
-impl<'a> Index<LinkIndex> for Allocations<'a> {
-    type Output = (LinkType, CowStr<'a>, CowStr<'a>, CowStr<'a>);
-
-    fn index(&self, ix: LinkIndex) -> &Self::Output {
-        self.links.index(field_index(ix.0))
     }
 }
 
@@ -2548,6 +2566,35 @@ mod test {
             },
             body_size
         );
+    }
+
+    #[test]
+    fn finished_link_events_release_parser_slots() {
+        let mut source = "[![Alt](image.png)](outer.html) and [Target][late]\r\n\r\n".repeat(1024);
+        source.push_str("[late]: café.html \"Title\"\r\n");
+        let mut parser = Parser::new(&source);
+        let mut links = 0;
+        for event in parser.by_ref() {
+            match event {
+                Event::Start(Tag::Link {
+                    dest_url, title, ..
+                }) => {
+                    let expected = if links % 2 == 0 {
+                        ("outer.html", "")
+                    } else {
+                        ("café.html", "Title")
+                    };
+                    assert_eq!((dest_url.as_ref(), title.as_ref()), expected);
+                    links += 1;
+                }
+                Event::Start(Tag::Image { dest_url, .. }) => {
+                    assert_eq!(dest_url.as_ref(), "image.png")
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(links, 2048);
+        assert!(parser.allocs.links.len() <= 3);
     }
 
     #[test]
