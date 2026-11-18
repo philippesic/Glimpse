@@ -115,6 +115,13 @@ struct Request {
     dark: bool,
     token: u64,
 }
+
+#[derive(Default)]
+struct Work {
+    request: Option<Request>,
+    after_retirement: Option<fn()>,
+}
+
 pub fn grammar_extension(path: &std::path::Path, text: &str) -> Option<&'static str> {
     let extension = path.extension().and_then(|s| s.to_str()).unwrap_or("");
     let extension = match extension.to_ascii_lowercase().as_str() {
@@ -184,14 +191,14 @@ pub fn grammar_for_text(path: &std::path::Path, text: &Rope) -> Option<&'static 
     grammar_extension(path, &String::from_utf8_lossy(&prefix))
 }
 pub struct Syntax {
-    pending: Arc<Mutex<Option<Request>>>,
+    pending: Arc<Mutex<Work>>,
     ready: Arc<Mutex<Option<Highlight>>>,
     wake: Option<mpsc::SyncSender<()>>,
     token: Arc<AtomicU64>,
 }
 impl Syntax {
     pub fn new(ctx: wake::Context) -> Self {
-        let pending = Arc::new(Mutex::new(None::<Request>));
+        let pending = Arc::new(Mutex::new(Work::default()));
         let ready = Arc::new(Mutex::new(None));
         let token = Arc::new(AtomicU64::new(0));
         let (wake, rx) = mpsc::sync_channel(1);
@@ -199,77 +206,86 @@ impl Syntax {
         thread::spawn(move || {
             let mut assets = None;
             while rx.recv().is_ok() {
-                let Some(request) = input.lock().unwrap().take() else {
-                    continue;
-                };
-                let syntaxes = assets.get_or_insert_with(two_face::syntax::extra_newlines);
-                let syntax = syntaxes
-                    .find_syntax_by_extension(request.extension)
-                    .unwrap_or_else(|| syntaxes.find_syntax_plain_text());
-                let theme = source_theme(request.dark);
-                let mut parser = HighlightLines::new(syntax, &theme);
-                let mut spans = Vec::new();
-                let mut offset = 0;
-                let started = Instant::now();
-                let mut state = syntax.name.clone();
-                for line in request
-                    .text
-                    .lines(LineType::LF)
-                    .filter(|line| line.len() != 0)
-                {
-                    if current.load(Ordering::Relaxed) != request.token {
-                        break;
-                    }
-                    if line.len() > 32768
-                        || started.elapsed() > Duration::from_millis(200)
-                        || spans.len() >= 30000
+                let work = std::mem::take(&mut *input.lock().unwrap());
+                if let Some(request) = work.request {
+                    let _work = gpui::work_trace::Span::new("syntax_worker");
+                    let syntaxes = assets.get_or_insert_with(two_face::syntax::extra_newlines);
+                    let syntax = syntaxes
+                        .find_syntax_by_extension(request.extension)
+                        .unwrap_or_else(|| syntaxes.find_syntax_plain_text());
+                    let theme = source_theme(request.dark);
+                    let mut parser = HighlightLines::new(syntax, &theme);
+                    let mut spans = Vec::new();
+                    let mut offset = 0;
+                    let started = Instant::now();
+                    let mut state = syntax.name.clone();
+                    for line in request
+                        .text
+                        .lines(LineType::LF)
+                        .filter(|line| line.len() != 0)
                     {
-                        state.push_str(" · partial highlighting (work limit)");
-                        break;
-                    }
-                    let line = line.as_str().map_or_else(
-                        || std::borrow::Cow::Owned(line.to_string()),
-                        std::borrow::Cow::Borrowed,
-                    );
-                    match parser.highlight_line(&line, syntaxes) {
-                        Ok(parts) => {
-                            for (style, part) in parts {
-                                if spans.len() == 30000 {
-                                    state.push_str(" · partial highlighting (span limit)");
-                                    break;
-                                }
-                                let length = part.len();
-                                spans.push(Span {
-                                    start: offset,
-                                    length,
-                                    italic: style
-                                        .font_style
-                                        .contains(syntect::highlighting::FontStyle::ITALIC),
-                                    rgb: [
-                                        style.foreground.r,
-                                        style.foreground.g,
-                                        style.foreground.b,
-                                    ],
-                                });
-                                offset += length;
-                            }
-                        }
-                        Err(_) => {
-                            state.push_str(" · plain fallback (grammar failed)");
+                        if current.load(Ordering::Relaxed) != request.token {
                             break;
                         }
+                        if line.len() > 32768
+                            || started.elapsed() > Duration::from_millis(200)
+                            || spans.len() >= 30000
+                        {
+                            state.push_str(" · partial highlighting (work limit)");
+                            break;
+                        }
+                        let line = line.as_str().map_or_else(
+                            || std::borrow::Cow::Owned(line.to_string()),
+                            std::borrow::Cow::Borrowed,
+                        );
+                        match parser.highlight_line(&line, syntaxes) {
+                            Ok(parts) => {
+                                for (style, part) in parts {
+                                    if spans.len() == 30000 {
+                                        state.push_str(" · partial highlighting (span limit)");
+                                        break;
+                                    }
+                                    let length = part.len();
+                                    spans.push(Span {
+                                        start: offset,
+                                        length,
+                                        italic: style
+                                            .font_style
+                                            .contains(syntect::highlighting::FontStyle::ITALIC),
+                                        rgb: [
+                                            style.foreground.r,
+                                            style.foreground.g,
+                                            style.foreground.b,
+                                        ],
+                                    });
+                                    offset += length;
+                                }
+                            }
+                            Err(_) => {
+                                state.push_str(" · plain fallback (grammar failed)");
+                                break;
+                            }
+                        }
+                    }
+                    let mut ready = output.lock().unwrap();
+                    if current.load(Ordering::Relaxed) == request.token {
+                        *ready = Some(Highlight {
+                            id: request.id,
+                            generation: request.generation,
+                            revision: request.token,
+                            spans,
+                            state,
+                        });
+                        ctx.request_repaint();
                     }
                 }
-                let mut ready = output.lock().unwrap();
-                if current.load(Ordering::Relaxed) == request.token {
-                    *ready = Some(Highlight {
-                        id: request.id,
-                        generation: request.generation,
-                        revision: request.token,
-                        spans,
-                        state,
-                    });
-                    ctx.request_repaint();
+                if let Some(after_retirement) = work.after_retirement {
+                    {
+                        let _work = gpui::work_trace::Span::new("syntax_assets_retire");
+                        assets = None;
+                    }
+                    let _work = gpui::work_trace::Span::new("syntax_memory_release");
+                    after_retirement();
                 }
             }
         });
@@ -290,7 +306,7 @@ impl Syntax {
     ) {
         let token = self.token.fetch_add(1, Ordering::Relaxed) + 1;
         let Some(extension) = grammar_for_text(path, &text) else {
-            self.pending.lock().unwrap().take();
+            self.pending.lock().unwrap().request.take();
             *self.ready.lock().unwrap() = Some(Highlight {
                 id,
                 generation,
@@ -300,14 +316,24 @@ impl Syntax {
             });
             return;
         };
-        *self.pending.lock().unwrap() = Some(Request {
-            id,
-            generation,
-            text,
-            extension,
-            dark,
-            token,
-        });
+        *self.pending.lock().unwrap() = Work {
+            request: Some(Request {
+                id,
+                generation,
+                text,
+                extension,
+                dark,
+                token,
+            }),
+            after_retirement: None,
+        };
+        self.signal();
+    }
+    pub fn retire_assets(&self, after_retirement: fn()) {
+        self.pending.lock().unwrap().after_retirement = Some(after_retirement);
+        self.signal();
+    }
+    fn signal(&self) {
         if let Some(wake) = &self.wake {
             let _ = wake.try_send(());
         }
@@ -346,7 +372,7 @@ mod tests {
         assert_eq!(result.generation, 2);
         assert_eq!(result.state, "Plain text");
         assert!(result.spans.is_empty());
-        assert!(syntax.pending.lock().unwrap().is_none());
+        assert!(syntax.pending.lock().unwrap().request.is_none());
         assert_eq!(
             grammar_extension(std::path::Path::new(".zshrc"), ""),
             Some("sh")

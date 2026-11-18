@@ -49,6 +49,9 @@ impl Shell {
         self.reading_request += 1;
         let request = self.reading_request;
         let release_memory = doc.input.read(cx).text().len() >= 1024 * 1024;
+        if release_memory {
+            self.syntax.retire_assets(platform::release_unused_memory);
+        }
         self.reading_view = Some(View {
             request,
             id: doc.id,
