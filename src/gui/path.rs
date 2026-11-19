@@ -318,7 +318,9 @@ impl Shell {
                     window.viewport_size().width
                 } - px(48. * scale);
                 let measure = |text: &SharedString| Self::path_label_width(window, text);
-                list.child(
+                list.child(accessibility::listbox(
+                    "path-completion-list",
+                    "Path completions".into(),
                     div()
                         .id("path-completions")
                         .track_scroll(&self.path_scroll)
@@ -359,7 +361,7 @@ impl Shell {
                                     }))
                             },
                         )),
-                )
+                ))
             })
             .map(|list| {
                 if floating {

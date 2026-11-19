@@ -508,6 +508,10 @@ impl RenderOnce for Button {
             ButtonRounded::None => Pixels::ZERO,
         };
 
+        let label_start = matches!(
+            self.style.justify_content,
+            Some(gpui::JustifyContent::Start | gpui::JustifyContent::FlexStart)
+        );
         let semantic_id = self.id.clone();
         let semantic_role = self.semantic_role;
         let semantic_label = self
@@ -645,7 +649,14 @@ impl RenderOnce for Button {
                     .max_w_full()
                     .overflow_hidden()
                     .items_center()
-                    .justify_center()
+                    .map(|this| {
+                        // The label area fills the button, so it carries the button's alignment.
+                        if label_start {
+                            this.justify_start()
+                        } else {
+                            this.justify_center()
+                        }
+                    })
                     .button_text_size(self.size)
                     .map(|this| match self.size {
                         Size::XSmall => this.gap_1(),
