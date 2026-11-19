@@ -103,6 +103,7 @@ pub enum Action {
     Line,
     Filter,
     KeepPreview,
+    OpenDocuments,
     RefreshVolumes,
 }
 pub struct Command {
@@ -157,6 +158,12 @@ commands![
     (Line, "line", "Go to Line…", "Cmd+G"),
     (Filter, "filter", "Filter This Folder", ""),
     (KeepPreview, "keep-tab", "Keep Preview Tab", ""),
+    (
+        OpenDocuments,
+        "open-documents",
+        "Focus Open Documents",
+        "Cmd+Alt+O"
+    ),
     (
         RefreshVolumes,
         "refresh-volumes",

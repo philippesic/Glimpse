@@ -259,6 +259,7 @@ struct Shell {
     gesture: glimpse::gesture::Gesture,
     future: Vec<PathBuf>,
     nav_focus: FocusHandle,
+    open_documents_focus: FocusHandle,
     reading_focus: FocusHandle,
     pane_state: Entity<panes::Divider>,
     navigation_only: bool,
@@ -486,6 +487,7 @@ impl Shell {
             gesture: glimpse::gesture::Gesture::default(),
             future: vec![],
             nav_focus: cx.focus_handle().tab_stop(true),
+            open_documents_focus: cx.focus_handle(),
             reading_focus: cx.focus_handle().tab_stop(true),
             pane_state: cx.new(panes::Divider::new),
             navigation_only: false,
@@ -2728,6 +2730,11 @@ impl Shell {
             return;
         }
         match command {
+            "open-documents" if self.documents.len() > 1 && !self.request.pick => {
+                self.navigation_only = false;
+                window.focus(&self.open_documents_focus);
+            }
+            "open-documents" => {}
             "cancel" if self.request.pick => {
                 crate::EXIT_STATUS.store(1, std::sync::atomic::Ordering::Relaxed);
                 cx.quit();
@@ -3215,6 +3222,7 @@ impl Shell {
             return false;
         }
         match command {
+            "open-documents" => self.documents.len() > 1 && !self.request.pick,
             "save" => document.is_some_and(|doc| !doc.saving && doc.external.is_none()),
             "save-as" | "save-copy" => {
                 document.is_some_and(|doc| !doc.saving) && !self.destination_busy
@@ -3271,6 +3279,19 @@ impl Shell {
                 }
             })
             .on_click(cx.listener(move |this, _, window, cx| this.command(command, window, cx)))
+    }
+    fn select_tab(&mut self, id: u64, keep: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(document) = self.documents.iter_mut().find(|doc| doc.id == id) else {
+            return;
+        };
+        if keep {
+            document.preview = false;
+        }
+        self.active = Some(id);
+        self.reading = false;
+        self.navigation_only = false;
+        self.focus(window, cx);
+        cx.notify();
     }
 }
 impl Render for Shell {
@@ -3767,17 +3788,7 @@ impl Render for Shell {
                             .when(doc.preview, |tab| tab.italic_label())
                             .when(Some(id) == self.active, |tab| tab.primary())
                             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                                this.active = Some(id);
-                                if event.click_count() > 1
-                                    && let Some(doc) =
-                                        this.documents.iter_mut().find(|doc| doc.id == id)
-                                {
-                                    doc.preview = false;
-                                }
-                                this.reading = false;
-                                this.navigation_only = false;
-                                this.focus(window, cx);
-                                cx.notify();
+                                this.select_tab(id, event.click_count() > 1, window, cx);
                             })),
                     )
                     .when(!self.request.pick, |tab| {
@@ -3798,7 +3809,9 @@ impl Render for Shell {
             node.set_label("Open documents");
             AccessibilityInfo::new(node)
         });
-        let tabs = if compact_document && self.reading {
+        let edit_source = compact_document && self.reading;
+        let show_documents_menu = self.documents.len() > 1 && !self.request.pick;
+        let tabs = if edit_source || show_documents_menu {
             div()
                 .flex()
                 .items_center()
@@ -3806,7 +3819,12 @@ impl Render for Shell {
                 .pr_2()
                 .gap_1()
                 .child(div().flex_1().min_w_0().child(tabs))
-                .child(self.button("Edit Source", "read", cx).flex_shrink_0())
+                .when(show_documents_menu, |row| {
+                    row.child(self.open_documents_menu(cx))
+                })
+                .when(edit_source, |row| {
+                    row.child(self.button("Edit Source", "read", cx).flex_shrink_0())
+                })
                 .into_any_element()
         } else {
             tabs.into_any_element()
