@@ -309,6 +309,7 @@ pub struct PopupMenu {
     min_width: Option<Pixels>,
     max_width: Option<Pixels>,
     max_height: Option<Pixels>,
+    available_height: Option<Pixels>,
     bounds: Bounds<Pixels>,
     size: Size,
     check_side: Side,
@@ -336,6 +337,7 @@ impl PopupMenu {
             min_width: None,
             max_width: None,
             max_height: None,
+            available_height: None,
             check_side: Side::Left,
             bounds: Bounds::default(),
             scrollable: false,
@@ -410,6 +412,17 @@ impl PopupMenu {
     pub fn max_h(mut self, height: impl Into<Pixels>) -> Self {
         self.max_height = Some(height.into());
         self
+    }
+
+    pub(crate) fn limit_available_height(&mut self, height: Pixels, cx: &mut Context<Self>) {
+        let height = Some(height.max(px(24.)));
+        if self.available_height != height {
+            self.available_height = height;
+            if let Some(index) = self.selected_index {
+                self.scroll_handle.scroll_to_item(index);
+            }
+            cx.notify();
+        }
     }
 
     /// Set the menu to be scrollable to show vertical scrollbar.
@@ -1368,6 +1381,9 @@ impl Render for PopupMenu {
                 window_half_height.min(px(450.))
             })
             .min((window.viewport_size().height - px(24.)).max(px(72.)));
+        let max_height = self
+            .available_height
+            .map_or(max_height, |height| height.min(max_height));
 
         let has_left_icon = self
             .menu_items

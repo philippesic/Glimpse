@@ -3809,6 +3809,18 @@ impl Render for Shell {
             node.set_label("Open documents");
             AccessibilityInfo::new(node)
         });
+        let has_status = !self.status.is_empty() || self.font_warning.is_some();
+        let stacked_footer = narrow && !short && (has_status || !self.warnings.is_empty());
+        let footer_height = if stacked_footer {
+            48.
+        } else if short && self.warnings.is_empty() {
+            20.
+        } else if narrow {
+            28.
+        } else {
+            36.
+        };
+        let footer_height = px(footer_height * self.settings.ui_scale);
         let edit_source = compact_document && self.reading;
         let show_documents_menu = self.documents.len() > 1 && !self.request.pick;
         let open_documents_requested = std::mem::take(&mut self.open_documents_requested);
@@ -3821,7 +3833,7 @@ impl Render for Shell {
                 .gap_2()
                 .child(div().flex_1().min_w_0().child(tabs))
                 .when(show_documents_menu, |row| {
-                    row.child(self.open_documents_menu(open_documents_requested, cx))
+                    row.child(self.open_documents_menu(open_documents_requested, footer_height, cx))
                 })
                 .when(edit_source, |row| {
                     row.child(self.button("Edit Source", "read", cx).flex_shrink_0())
@@ -4000,21 +4012,10 @@ impl Render for Shell {
         } else {
             content.into_any_element()
         };
-        let has_status = !self.status.is_empty() || self.font_warning.is_some();
-        let stacked_footer = narrow && !short && (has_status || !self.warnings.is_empty());
-        let footer_height = if stacked_footer {
-            48.
-        } else if short && self.warnings.is_empty() {
-            20.
-        } else if narrow {
-            28.
-        } else {
-            36.
-        };
         root.child(div().flex_1().min_h_0().child(body))
             .child(
                 div()
-                    .h(px(footer_height * self.settings.ui_scale))
+                    .h(footer_height)
                     .flex_shrink_0()
                     .px_2()
                     .flex()

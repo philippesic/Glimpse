@@ -36,6 +36,7 @@ pub struct Popover {
     mouse_button: MouseButton,
     appearance: bool,
     overlay_closable: bool,
+    wait_for_anchor: bool,
     on_open_change: Option<Rc<dyn Fn(&bool, &mut Window, &mut App)>>,
 }
 
@@ -54,6 +55,7 @@ impl Popover {
             mouse_button: MouseButton::Left,
             appearance: true,
             overlay_closable: true,
+            wait_for_anchor: false,
             default_open: false,
             open: None,
             on_open_change: None,
@@ -63,6 +65,11 @@ impl Popover {
     /// Set the anchor corner of the popover, default is `Corner::TopLeft`.
     pub fn anchor(mut self, anchor: Corner) -> Self {
         self.anchor = anchor;
+        self
+    }
+
+    pub(crate) fn wait_for_anchor(mut self, wait: bool) -> Self {
+        self.wait_for_anchor = wait;
         self
     }
 
@@ -192,7 +199,7 @@ impl Styled for Popover {
 pub struct PopoverState {
     focus_handle: FocusHandle,
     pub(crate) tracked_focus_handle: Option<FocusHandle>,
-    trigger_bounds: Option<Bounds<Pixels>>,
+    pub(crate) trigger_bounds: Option<Bounds<Pixels>>,
     open: bool,
     on_open_change: Option<Rc<dyn Fn(&bool, &mut Window, &mut App)>>,
 
@@ -308,6 +315,7 @@ impl RenderOnce for Popover {
         };
 
         let parent_view_id = window.current_view();
+        let wait_for_anchor = self.wait_for_anchor;
 
         let el = div()
             .id(self.id)
@@ -328,10 +336,15 @@ impl RenderOnce for Popover {
                 canvas(
                     {
                         let state = state.clone();
-                        move |bounds, _, cx| {
-                            state.update(cx, |state, _| {
+                        move |bounds, window, cx| {
+                            let moved_while_open = state.update(cx, |state, _| {
+                                let moved = state.open && state.trigger_bounds != Some(bounds);
                                 state.trigger_bounds = Some(bounds);
-                            })
+                                moved
+                            });
+                            if wait_for_anchor && moved_while_open {
+                                window.request_animation_frame();
+                            }
                         }
                     },
                     |_, _, _, _| {},
@@ -340,7 +353,7 @@ impl RenderOnce for Popover {
                 .size_full(),
             );
 
-        if !open {
+        if !open || wait_for_anchor && trigger_bounds.is_none() {
             return el;
         }
 

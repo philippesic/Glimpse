@@ -46,6 +46,7 @@ impl Shell {
     pub(super) fn open_documents_menu(
         &self,
         requested: bool,
+        footer_height: Pixels,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let shell = cx.entity().downgrade();
@@ -110,6 +111,7 @@ impl Shell {
                 }
             })
             .request_open(requested)
+            .keep_clear_of_bottom(footer_height)
     }
 
     pub(super) fn locations_menu(&self, cx: &Context<Self>) -> impl IntoElement {

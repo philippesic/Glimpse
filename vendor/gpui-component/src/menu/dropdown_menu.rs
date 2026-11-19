@@ -3,7 +3,7 @@ use std::rc::Rc;
 use gpui::{
     Context, Corner, DismissEvent, ElementId, Entity, FocusHandle, Focusable, InteractiveElement,
     IntoElement, KeyDownEvent, KeyUpEvent, MouseButton, RenderOnce, SharedString, StyleRefinement,
-    Styled, Window,
+    Styled, Window, Pixels, px,
 };
 
 use crate::{button::Button, menu::PopupMenu, popover::Popover, Selectable};
@@ -40,6 +40,7 @@ pub struct DropdownMenuPopover<T: Selectable + InteractiveElement + IntoElement 
     anchor: Corner,
     trigger: T,
     open_requested: bool,
+    bottom_inset: Option<Pixels>,
     builder: Rc<dyn Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu>,
 }
 
@@ -59,12 +60,18 @@ where
             anchor: anchor.into(),
             trigger,
             open_requested: false,
+            bottom_inset: None,
             builder: Rc::new(builder),
         }
     }
 
     pub fn request_open(mut self, requested: bool) -> Self {
         self.open_requested = requested;
+        self
+    }
+
+    pub fn keep_clear_of_bottom(mut self, inset: Pixels) -> Self {
+        self.bottom_inset = Some(inset);
         self
     }
 
@@ -166,7 +173,8 @@ where
             .trigger(trigger)
             .trigger_style(self.style)
             .anchor(self.anchor)
-            .content(move |_, window, cx| {
+            .wait_for_anchor(self.bottom_inset.is_some())
+            .content(move |popover, window, cx| {
                 // Here is special logic to only create the PopupMenu once and reuse it.
                 // Because this `content` will called in every time render, so we need to store the menu
                 // in state to avoid recreating at every render.
@@ -205,7 +213,13 @@ where
                     }
                 };
 
-                menu.clone()
+                if let Some(inset) = self.bottom_inset
+                    && let Some(bounds) = popover.trigger_bounds
+                {
+                    let height = window.viewport_size().height - bounds.bottom() - inset - px(8.);
+                    menu.update(cx, |menu, cx| menu.limit_available_height(height, cx));
+                }
+                menu
             })
     }
 }
