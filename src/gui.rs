@@ -2587,7 +2587,7 @@ impl Shell {
                     cx,
                 );
                 if let Some(view) = &self.decision {
-                    view.update(cx, |view, cx| view.set_subjects(subjects, cx));
+                    view.update(cx, |view, cx| view.set_subjects(subjects, window, cx));
                 }
             }
         } else {

@@ -117,7 +117,10 @@ pub struct Decision {
     focus: FocusHandle,
     comparison: Option<[Entity<InputState>; 2]>,
     detail_scroll: ScrollHandle,
+    path_focus: Vec<FocusHandle>,
+    revealed_path: Option<usize>,
     _subscription: Subscription,
+    _path_subscriptions: Vec<Subscription>,
     _comparison_subscriptions: Vec<Subscription>,
 }
 pub struct Choice(pub usize);
@@ -184,7 +187,10 @@ impl Decision {
             focus,
             comparison: None,
             detail_scroll: ScrollHandle::new(),
+            path_focus: Vec::new(),
+            revealed_path: None,
             _subscription: subscription,
+            _path_subscriptions: Vec::new(),
             _comparison_subscriptions: Vec::new(),
         }
     }
@@ -205,7 +211,26 @@ impl Decision {
             })
             .collect()
     }
-    pub(super) fn set_subjects(&mut self, subjects: Vec<UnsavedSubject>, cx: &mut Context<Self>) {
+    pub(super) fn set_subjects(
+        &mut self,
+        subjects: Vec<UnsavedSubject>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.revealed_path = None;
+        self.path_focus.clear();
+        self._path_subscriptions.clear();
+        if subjects.len() > 1 {
+            for index in 0..subjects.len() {
+                let focus = cx.focus_handle();
+                self._path_subscriptions
+                    .push(cx.on_focus(&focus, window, move |this, _, cx| {
+                        this.detail_scroll.scroll_to_top_of_item(index);
+                        cx.notify();
+                    }));
+                self.path_focus.push(focus);
+            }
+        }
         self.subjects = subjects;
         cx.notify();
     }
@@ -303,40 +328,38 @@ impl Decision {
             .any(|(subject, folder)| !seen.insert((&subject.name, folder)));
         (captions, numbered)
     }
-    fn close_paths(&self, numbered: bool) -> Div {
-        div()
-            .pt_2()
+    fn close_path(path: &str) -> impl IntoElement {
+        let full_path = path.to_owned();
+        let label = format!("Full path: {path}");
+        let filename_offset = path
+            .rmatch_indices(MAIN_SEPARATOR)
+            .next()
+            .map_or(0, |(offset, separator)| offset + separator.len());
+        let (folder, filename) = path.split_at(filename_offset);
+        let rendered = div()
+            .w_full()
+            .min_w_0()
             .flex()
             .flex_col()
-            .gap_2()
-            .children(self.detail.lines().enumerate().map(|(index, path)| {
-                let full_path = path.to_owned();
-                let filename_offset = path
-                    .rmatch_indices(MAIN_SEPARATOR)
-                    .next()
-                    .map_or(0, |(offset, separator)| offset + separator.len());
-                let (folder, filename) = path.split_at(filename_offset);
+            .pt_1()
+            .pb_2()
+            .child(
                 div()
-                    .id(("decision-full-path", index))
-                    .w_full()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .font_semibold()
-                            .whitespace_normal()
-                            .child(if numbered {
-                                format!("{}. {filename}", index + 1)
-                            } else {
-                                filename.to_owned()
-                            }),
-                    )
-                    .child(div().w_full().whitespace_normal().child(folder.to_owned()))
-                    .tooltip(move |window, cx| {
-                        gpui_component::tooltip::Tooltip::new(full_path.clone()).build(window, cx)
-                    })
-            }))
+                    .font_semibold()
+                    .whitespace_normal()
+                    .child(filename.to_owned()),
+            )
+            .child(div().w_full().whitespace_normal().child(folder.to_owned()))
+            .id("decision-full-path")
+            .tooltip(move |window, cx| {
+                gpui_component::tooltip::Tooltip::new(full_path.clone()).build(window, cx)
+            });
+        gpui::accessible("revealed-close-path", rendered, move |_, _, _| {
+            let mut node = gpui::accesskit::Node::new(gpui::accesskit::Role::Label);
+            node.set_value(label.clone());
+            node.set_read_only();
+            AccessibilityInfo::new(node)
+        })
     }
     pub fn compare(
         &mut self,
@@ -386,9 +409,19 @@ impl Render for Decision {
             rem
         };
         let text_style = window.text_style();
+        let reveal_controls = self.subjects.len() > 1;
+        let paths: Vec<_> = if reveal_controls {
+            self.detail.lines().collect()
+        } else {
+            Vec::new()
+        };
         let (folder_captions, numbered) = Self::folder_captions(
             &self.subjects,
-            panel_width - px(2.) - horizontal_padding - scroll_inset,
+            panel_width
+                - px(2.)
+                - horizontal_padding
+                - scroll_inset
+                - if reveal_controls { rem * 3. } else { px(0.) },
             |text| {
                 let run = text_style.to_run(text.len());
                 window
@@ -401,10 +434,12 @@ impl Render for Decision {
         let comparison_height = px(160.).min(viewport.height * 0.22);
         let detail_fraction = if self.comparison.is_some() { 0.67 } else { 0.4 };
         let subject_lines = compact.then_some(if self.subjects.len() == 1 { 3 } else { 1 });
-        let detail = if !self.subjects.is_empty() {
-            self.close_paths(numbered).into_any_element()
+        let detail = if reveal_controls {
+            None
+        } else if !self.subjects.is_empty() {
+            Some(Self::close_path(&self.detail).into_any_element())
         } else {
-            self.detail.clone().into_any_element()
+            Some(self.detail.clone().into_any_element())
         };
         let semantic_title = self.title.clone();
         let mut semantic_detail = self.summary.as_ref().map_or_else(
@@ -481,13 +516,47 @@ impl Render for Decision {
                                     .children(
                                         self.subjects.iter().zip(folder_captions).enumerate().map(
                                             |(index, (subject, folder))| {
-                                                subject.element(
-                                                    index,
-                                                    subject_lines,
-                                                    folder,
-                                                    numbered,
-                                                    cx,
-                                                )
+                                                let open = self.revealed_path == Some(index);
+                                                div()
+                                                    .flex()
+                                                    .flex_col()
+                                                    .child(
+                                                        div()
+                                                            .flex()
+                                                            .items_start()
+                                                            .gap_2()
+                                                            .child(div().min_w_0().flex_1().child(
+                                                                subject.element(
+                                                                    index,
+                                                                    subject_lines,
+                                                                    folder,
+                                                                    numbered,
+                                                                    cx,
+                                                                ),
+                                                            ))
+                                                            .when(reveal_controls, |row| {
+                                                                let verb = if open { "Hide" } else { "Show" };
+                                                                row.child(
+                                                                    Button::new(("show-close-path", index))
+                                                                        .label(format!("{verb} full path for {}", subject.label()))
+                                                                        .display_label(if open { "Hide" } else { "Path" })
+                                                                        .outline()
+                                                                        .small()
+                                                                        .compact()
+                                                                        .with_focus_handle(self.path_focus[index].clone())
+                                                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                                                            window.focus(&this.path_focus[index]);
+                                                                            this.revealed_path = (this.revealed_path != Some(index)).then_some(index);
+                                                                            this.detail_scroll.scroll_to_top_of_item(index);
+                                                                            cx.notify();
+                                                                        })),
+                                                                )
+                                                            }),
+                                                    )
+                                                    .when_some(
+                                                        paths.get(index).filter(|_| open),
+                                                        |row, path| row.child(Self::close_path(path)),
+                                                    )
                                             },
                                         ),
                                     )
@@ -507,7 +576,7 @@ impl Render for Decision {
                                             },
                                         ))
                                     })
-                                    .child(detail),
+                                    .when_some(detail, |body, detail| body.child(detail)),
                             )
                             .child(
                                 div().absolute().inset_0().child(
