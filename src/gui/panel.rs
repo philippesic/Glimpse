@@ -159,6 +159,7 @@ impl Shell {
         };
         let section = div()
             .id("panel-section")
+            .track_focus(&self.palette.overlay)
             .flex()
             .flex_col()
             .min_h_0()
@@ -196,7 +197,6 @@ impl Shell {
         let element = accessibility::group("panel-section", title.into(), section);
         if takeover {
             div()
-                .track_focus(&self.palette.overlay)
                 .flex_1()
                 .min_h_0()
                 .flex()

@@ -1535,11 +1535,16 @@ impl Shell {
                             self.status = "Close the file before renaming".into();
                         } else {
                             let destination = source.with_file_name(&value);
+                            self.selection = Some(destination.clone());
+                            self.reveal_pending = Some(destination.clone());
                             self.io.send(Job::Rename(source, destination));
                             self.panel = None;
                         }
                     }
                 } else {
+                    // The navigator selects the new entry once the folder is listed again.
+                    self.selection = Some(path.clone());
+                    self.reveal_pending = Some(path.clone());
                     self.io.send(Job::Create(
                         path,
                         self.panel == Some(Panel::NewFolder),
@@ -2386,7 +2391,10 @@ impl Shell {
                         self.refresh();
                         window.focus(&self.nav_focus);
                     }
-                    Err(e) => self.status = e,
+                    Err(e) => {
+                        self.reveal_pending = None;
+                        self.status = e;
+                    }
                 },
                 _ => {}
             }
@@ -3858,6 +3866,8 @@ impl Render for Shell {
         // A focused list always has a current row, so screen readers announce a file rather
         // than only the list.
         if self.nav_focus.is_focused(window)
+            && self.listing_done
+            && self.reveal_pending.is_none()
             && !visible
                 .iter()
                 .any(|&i| Some(&entries[i].path) == self.selection.as_ref())
@@ -3872,11 +3882,12 @@ impl Render for Shell {
             .or_default()
             .clone();
         if self.listing_done
-            && let Some(path) = self.reveal_pending.take()
+            && let Some(path) = self.reveal_pending.as_ref()
             && let Some(index) = visible
                 .iter()
-                .position(|&index| entries[index].path == path)
+                .position(|&index| &entries[index].path == path)
         {
+            self.reveal_pending = None;
             scroll.scroll_to_item(index, ScrollStrategy::Top);
         }
         let nav_width = if narrow {
