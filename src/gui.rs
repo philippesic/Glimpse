@@ -34,6 +34,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
+use unicode_segmentation::UnicodeSegmentation;
 
 pub fn run(request: cli::Request, data_dir: PathBuf, launch_folder: PathBuf) {
     platform::configure_allocations();
@@ -3747,6 +3748,18 @@ impl Render for Shell {
             navigator,
             self.nav_focus.clone(),
         );
+        let edit_source = compact_document && self.reading;
+        let show_documents_menu = self.documents.len() > 1 && !self.request.pick;
+        let tab_width = (narrow && !edit_source).then(|| {
+            let rem = window.rem_size();
+            let menu_width = if show_documents_menu {
+                Self::path_label_width(window, &"Documents".into()) + rem * 3. + px(2.)
+            } else {
+                px(0.)
+            };
+            let close_width = if self.request.pick { px(0.) } else { rem * 1.5 };
+            (window.viewport_size().width - menu_width - close_width - px(10.)).max(rem * 1.5)
+        });
         let tabs = div()
             .id("tabs")
             .w_full()
@@ -3773,25 +3786,47 @@ impl Render for Shell {
                         ""
                     }
                 );
+                let tab = Button::new(("tab", id))
+                    .accessibility_role(gpui::accesskit::Role::Tab)
+                    .label(title.clone())
+                    .tooltip(paths::display(&doc.disk.path))
+                    .small()
+                    .compact()
+                    .when_some(tab_width, |tab, width| {
+                        let text_width = (width - window.rem_size() * 0.75 - px(2.)).max(px(0.));
+                        let measure = |text: &SharedString| Self::path_label_width(window, text);
+                        let mut caption = decision::abbreviate_folder(&title, text_width, &measure);
+                        if caption.as_ref() != title {
+                            let filename = paths::name(&doc.disk.path);
+                            if let Some(folder) = name
+                                .strip_prefix(&filename)
+                                .and_then(|suffix| suffix.strip_prefix(" — "))
+                            {
+                                let suffix = format!("… {folder}{}", &title[name.len()..]);
+                                for (offset, _) in filename.grapheme_indices(true).skip(1) {
+                                    let candidate =
+                                        format!("{}{suffix}", &filename[..offset]).into();
+                                    if measure(&candidate) > text_width {
+                                        break;
+                                    }
+                                    caption = candidate;
+                                }
+                            }
+                        }
+                        tab.max_w(width).display_label(caption)
+                    })
+                    .selected(Some(id) == self.active)
+                    .when(doc.preview, |tab| tab.italic_label())
+                    .when(Some(id) == self.active, |tab| tab.primary())
+                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                        this.select_tab(id, event.click_count() > 1, window, cx);
+                    }));
                 div()
                     .track_focus(&doc.tab_focus)
                     .flex()
                     .items_center()
                     .flex_shrink_0()
-                    .child(
-                        Button::new(("tab", id))
-                            .accessibility_role(gpui::accesskit::Role::Tab)
-                            .label(title)
-                            .tooltip(paths::display(&doc.disk.path))
-                            .small()
-                            .compact()
-                            .selected(Some(id) == self.active)
-                            .when(doc.preview, |tab| tab.italic_label())
-                            .when(Some(id) == self.active, |tab| tab.primary())
-                            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                                this.select_tab(id, event.click_count() > 1, window, cx);
-                            })),
-                    )
+                    .child(tab)
                     .when(!self.request.pick, |tab| {
                         tab.child(
                             Button::new(("close-tab", id))
@@ -3822,8 +3857,6 @@ impl Render for Shell {
             36.
         };
         let footer_height = px(footer_height * self.settings.ui_scale);
-        let edit_source = compact_document && self.reading;
-        let show_documents_menu = self.documents.len() > 1 && !self.request.pick;
         let open_documents_requested = std::mem::take(&mut self.open_documents_requested);
         let tabs = if edit_source || show_documents_menu {
             div()

@@ -236,7 +236,7 @@ impl Shell {
             .into_any_element()
     }
 
-    fn path_label_width(window: &Window, text: &SharedString) -> Pixels {
+    pub(super) fn path_label_width(window: &Window, text: &SharedString) -> Pixels {
         let run = window.text_style().to_run(text.len());
         window
             .text_system()
