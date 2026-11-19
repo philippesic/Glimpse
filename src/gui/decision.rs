@@ -6,7 +6,10 @@ use gpui_component::{
     input::{Input, InputState},
     scroll::{Scrollbar, ScrollbarShow},
 };
-use std::path::{MAIN_SEPARATOR, Path};
+use std::{
+    collections::HashMap,
+    path::{MAIN_SEPARATOR, Path},
+};
 use unicode_segmentation::UnicodeSegmentation;
 
 pub(super) struct UnsavedSubject {
@@ -57,9 +60,14 @@ impl UnsavedSubject {
     }
 }
 
-fn abbreviate_folder(folder: &str, width: Pixels, window: &Window) -> SharedString {
+fn abbreviate_folder(
+    folder: &str,
+    width: Pixels,
+    font_size: Pixels,
+    keep_start: bool,
+    window: &Window,
+) -> SharedString {
     let style = window.text_style();
-    let font_size = window.rem_size() * 0.875;
     let text_width = |text: SharedString| {
         let run = style.to_run(text.len());
         window
@@ -83,7 +91,7 @@ fn abbreviate_folder(folder: &str, width: Pixels, window: &Window) -> SharedStri
     let mut longest = count.saturating_sub(1);
     while shortest <= longest {
         let kept = shortest + (longest - shortest) / 2;
-        let prefix = kept * 2 / 5;
+        let prefix = if keep_start { kept } else { kept * 2 / 5 };
         let suffix = kept - prefix;
         let candidate = SharedString::from(format!(
             "{}…{}",
@@ -203,6 +211,49 @@ impl Decision {
         self.subjects = subjects;
         cx.notify();
     }
+    fn folder_captions(
+        &self,
+        width: Pixels,
+        font_size: Pixels,
+        window: &Window,
+    ) -> Vec<SharedString> {
+        let mut captions = Vec::with_capacity(self.subjects.len());
+        let mut groups: HashMap<_, Vec<usize>> = HashMap::new();
+        for (index, subject) in self.subjects.iter().enumerate() {
+            let caption = abbreviate_folder(&subject.folder, width, font_size, false, window);
+            groups
+                .entry((subject.name.as_str(), caption.clone()))
+                .or_default()
+                .push(index);
+            captions.push(caption);
+        }
+        for group in groups.values().filter(|group| group.len() > 1) {
+            for &index in group {
+                let folder = &self.subjects[index].folder;
+                let common = group
+                    .iter()
+                    .filter(|&&other| other != index)
+                    .map(|&other| {
+                        folder
+                            .graphemes(true)
+                            .zip(self.subjects[other].folder.graphemes(true))
+                            .take_while(|(a, b)| a == b)
+                            .count()
+                    })
+                    .max()
+                    .unwrap_or_default();
+                if let Some((start, _)) =
+                    folder.grapheme_indices(true).nth(common.saturating_sub(3))
+                {
+                    let prefix = if start == 0 { "" } else { "…" };
+                    let distinguishing = format!("{prefix}{}", &folder[start..]);
+                    captions[index] =
+                        abbreviate_folder(&distinguishing, width, font_size, true, window);
+                }
+            }
+        }
+        captions
+    }
     fn compact_paths(&self) -> Div {
         div()
             .pt_2()
@@ -267,7 +318,18 @@ impl Render for Decision {
         let compact = viewport.height < px(480.);
         let panel_width = px(640.).min(viewport.width - px(32.));
         let scroll_inset = px(18.);
-        let compact_text_width = panel_width - px(2.) - window.rem_size() - scroll_inset;
+        let rem = window.rem_size();
+        let horizontal_padding = if compact { rem } else { rem * 2. };
+        let caption_size = if compact && self.comparison.is_none() {
+            rem * 0.875
+        } else {
+            rem
+        };
+        let folder_captions = self.folder_captions(
+            panel_width - px(2.) - horizontal_padding - scroll_inset,
+            caption_size,
+            window,
+        );
         let narrow = viewport.width < px(400.) * (cx.theme().font_size / px(16.));
         let comparison_height = px(160.).min(viewport.height * 0.22);
         let detail_fraction = if self.comparison.is_some() { 0.67 } else { 0.4 };
@@ -349,20 +411,13 @@ impl Render for Decision {
                                     .when(compact && self.comparison.is_none(), |body| {
                                         body.text_sm().line_height(relative(1.25))
                                     })
-                                    .children(self.subjects.iter().enumerate().map(
-                                        |(index, subject)| {
-                                            let folder = if compact {
-                                                abbreviate_folder(
-                                                    &subject.folder,
-                                                    compact_text_width,
-                                                    window,
-                                                )
-                                            } else {
-                                                subject.folder.clone().into()
-                                            };
-                                            subject.element(index, subject_lines, folder, cx)
-                                        },
-                                    ))
+                                    .children(
+                                        self.subjects.iter().zip(folder_captions).enumerate().map(
+                                            |(index, (subject, folder))| {
+                                                subject.element(index, subject_lines, folder, cx)
+                                            },
+                                        ),
+                                    )
                                     .when_some(self.comparison.as_ref(), |body, inputs| {
                                         body.children(inputs.iter().enumerate().map(
                                             |(i, input)| {
