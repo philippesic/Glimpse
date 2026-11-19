@@ -94,6 +94,7 @@ struct DropdownMenuState {
     open: bool,
     return_focus: Option<FocusHandle>,
     keyboard_armed: bool,
+    keyboard_opened: bool,
 }
 
 impl<T> RenderOnce for DropdownMenuPopover<T>
@@ -110,6 +111,7 @@ where
             menu_state.update(cx, |state, _| {
                 state.return_focus = return_focus;
                 state.open = true;
+                state.keyboard_opened = true;
             });
         }
         let open = menu_state.read(cx).open;
@@ -118,7 +120,10 @@ where
             .on_mouse_down(MouseButton::Left, {
                 let state = menu_state.clone();
                 move |_, window, cx| {
-                    state.update(cx, |state, cx| state.return_focus = window.focused(cx));
+                    state.update(cx, |state, cx| {
+                        state.return_focus = window.focused(cx);
+                        state.keyboard_opened = false;
+                    });
                 }
             })
             .on_key_down({
@@ -141,6 +146,7 @@ where
                             if std::mem::take(&mut state.keyboard_armed) {
                                 state.return_focus = window.focused(cx);
                                 state.open = true;
+                                state.keyboard_opened = true;
                             }
                         });
                         window.refresh();
@@ -188,9 +194,13 @@ where
                         let menu = PopupMenu::build(window, cx, move |menu, window, cx| {
                             builder(menu, window, cx)
                         });
-                        menu_state.update(cx, |state, _| {
+                        let keyboard = menu_state.update(cx, |state, _| {
                             state.menu = Some(menu.clone());
+                            std::mem::take(&mut state.keyboard_opened)
                         });
+                        if keyboard {
+                            menu.update(cx, |menu, cx| menu.highlight_first_item(cx));
+                        }
                         menu.focus_handle(cx).focus(window);
 
                         // Listen for dismiss events from the PopupMenu to close the popover.

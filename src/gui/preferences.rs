@@ -105,6 +105,7 @@ pub struct Preferences {
     focus: FocusHandle,
     row_focus: Vec<FocusHandle>,
     theme_focus: [FocusHandle; 3],
+    page_focus: [FocusHandle; 5],
     scroll: ScrollHandle,
     _subscriptions: Vec<Subscription>,
     error: String,
@@ -178,6 +179,32 @@ impl Preferences {
                 {
                     return;
                 }
+                // Categories are one Tab stop; arrow keys, Home and End choose among them.
+                if let Some(index) = this
+                    .page_focus
+                    .iter()
+                    .position(|focus| focus.is_focused(window))
+                    && !modifiers.control
+                    && !modifiers.platform
+                    && !modifiers.alt
+                    && !this.pending
+                {
+                    let last = Page::ALL.len() - 1;
+                    let next = match key.key.as_str() {
+                        "left" | "up" => Some(index.checked_sub(1).unwrap_or(last)),
+                        "right" | "down" => Some(if index == last { 0 } else { index + 1 }),
+                        "home" => Some(0),
+                        "end" => Some(last),
+                        _ => None,
+                    };
+                    if let Some(next) = next {
+                        this.select_page(Page::ALL[next], cx);
+                        this.page_focus[next].focus(window);
+                        window.prevent_default();
+                        cx.stop_propagation();
+                        return;
+                    }
+                }
                 if let Some(index) = this
                     .theme_focus
                     .iter()
@@ -223,6 +250,7 @@ impl Preferences {
             focus,
             row_focus,
             theme_focus: [cx.focus_handle(), cx.focus_handle(), cx.focus_handle()],
+            page_focus: std::array::from_fn(|_| cx.focus_handle()),
             scroll,
             _subscriptions: subscriptions,
             pending: false,
@@ -554,10 +582,12 @@ impl Render for Preferences {
                 .flex()
                 .flex_wrap()
                 .gap_1()
-                .children(Page::ALL.into_iter().map(|page| {
+                .children(Page::ALL.into_iter().enumerate().map(|(index, page)| {
                     Button::new(page.label())
                         .label(page.label())
                         .small()
+                        .with_focus_handle(self.page_focus[index].clone())
+                        .tab_stop(page == self.page)
                         .accessibility_role(gpui::accesskit::Role::Tab)
                         .selected(page == self.page)
                         .map(|button| {

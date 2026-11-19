@@ -4,6 +4,7 @@ mod conflict;
 mod decision;
 mod destination;
 mod external;
+mod keyboard;
 mod menus;
 mod modal;
 mod open_failure;
@@ -321,7 +322,7 @@ struct Shell {
     hit_versions: HashMap<u64, (u64, u64)>,
     panel: Option<Panel>,
     query: Entity<InputState>,
-    reading: bool,
+    reading_documents: HashSet<u64>,
     reading_view: Option<reading::View>,
     reading_request: u64,
     memory_release: Option<Task<()>>,
@@ -477,6 +478,20 @@ impl Shell {
             }
             if matches!(event, InputEvent::Change) && this.panel == Some(Panel::Filter) {
                 this.filter = this.query.read(cx).value().to_string();
+                // Keep the row Enter opens visible and selected while the filter narrows.
+                let visible = this.visible_rows();
+                let rows = this.entries.clone();
+                if !visible
+                    .iter()
+                    .any(|&i| Some(&rows[i].path) == this.selection.as_ref())
+                    && let Some(&first) = visible.first()
+                {
+                    this.selection = Some(rows[first].path.clone());
+                    this.search_ui.picker_selection = this.selection.clone();
+                    if let Some(scroll) = this.scrolls.get(&this.current) {
+                        scroll.scroll_to_item(0, ScrollStrategy::Top);
+                    }
+                }
                 cx.notify();
             }
         });
@@ -486,7 +501,7 @@ impl Shell {
             if window.window_handle() == shortcut_window {
                 let _ = shortcut_view.update(cx, |this: &mut Self, cx| {
                     this.interaction += 1;
-                    this.shortcut(&event.keystroke, window, cx)
+                    this.route_key(event, window, cx)
                 });
             }
         });
@@ -561,7 +576,7 @@ impl Shell {
             hit_versions: HashMap::new(),
             panel: None,
             query,
-            reading: false,
+            reading_documents: HashSet::new(),
             reading_view: None,
             reading_request: 0,
             memory_release: None,
@@ -618,7 +633,7 @@ impl Shell {
             .push(cx.observe(&this.pane_state, |_, _, cx| cx.notify()));
         this.subscriptions
             .push(cx.observe_window_activation(window, |this, window, cx| {
-                if this.reading {
+                if this.reading() {
                     this.prepare_inactive_reading(window, cx);
                 }
             }));
@@ -1204,7 +1219,7 @@ impl Shell {
         let subscription = cx.subscribe_in(&input, window, move |this, _, event, window, cx| {
             if matches!(event, InputEvent::InitialLayoutReady) {
                 let source_visible =
-                    !this.reading && (!this.narrow(window) || !this.navigation_only);
+                    !this.reading() && (!this.narrow(window) || !this.navigation_only);
                 this.report_startup_ready(source_visible, window, cx);
                 cx.notify();
                 return;
@@ -1315,7 +1330,7 @@ impl Shell {
         self.watch();
         if activate {
             self.active = Some(id);
-            self.reading = false;
+            self.set_reading(false);
             self.navigation_only = false;
         }
         if activate || position.is_some() {
@@ -1369,6 +1384,35 @@ impl Shell {
             }
         }));
     }
+    /// Whether the active document is shown in Reading; each document keeps its own view.
+    fn reading(&self) -> bool {
+        self.active
+            .is_some_and(|id| self.reading_documents.contains(&id))
+    }
+    fn set_reading(&mut self, reading: bool) {
+        if let Some(id) = self.active {
+            if reading {
+                self.reading_documents.insert(id);
+            } else {
+                self.reading_documents.remove(&id);
+            }
+        }
+    }
+    /// Whether a focus target is still on screen: hidden documents' editors and tabs, and the
+    /// Reading view of a document shown as source, are not.
+    fn shown(&self, handle: &FocusHandle, cx: &App) -> bool {
+        let hidden_document = self.documents.iter().any(|doc| {
+            Some(doc.id) != self.active
+                && (&doc.tab_focus == handle || &doc.input.focus_handle(cx) == handle)
+        });
+        let hidden_reading = handle == &self.reading_focus && !self.reading();
+        let hidden_source = self.reading()
+            && self
+                .documents
+                .iter()
+                .any(|doc| Some(doc.id) == self.active && &doc.input.focus_handle(cx) == handle);
+        !(hidden_document || hidden_reading || hidden_source)
+    }
     fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(index) = self
             .documents
@@ -1385,7 +1429,11 @@ impl Shell {
                 &doc.disk.path,
                 cx.theme().is_dark(),
             );
-            doc.input.update(cx, |input, cx| input.focus(window, cx));
+            if self.reading() {
+                window.focus(&self.reading_focus);
+            } else {
+                doc.input.update(cx, |input, cx| input.focus(window, cx));
+            }
         } else {
             window.focus(&self.nav_focus);
         }
@@ -1463,6 +1511,20 @@ impl Shell {
                 Err(error) => self.status = error,
             },
             Some(Panel::Files | Panel::Text) => self.start_search(cx),
+            Some(Panel::Filter) => {
+                let visible = self.visible_rows();
+                let rows = self.entries.clone();
+                let path = visible
+                    .iter()
+                    .map(|&i| &rows[i].path)
+                    .find(|path| Some(*path) == self.selection.as_ref())
+                    .or_else(|| visible.first().map(|&i| &rows[i].path))
+                    .cloned();
+                if let Some(path) = path {
+                    self.selection = Some(path.clone());
+                    self.open(path, false, None);
+                }
+            }
             Some(Panel::NewFile | Panel::NewFolder | Panel::Rename) => {
                 let path = self.current.join(&value);
                 if !paths::single_name(&value) {
@@ -1754,13 +1816,13 @@ impl Shell {
                                 }
                                 self.checks.invalidate(id);
                                 self.watch();
+                                self.reading_documents.remove(&id);
                                 if self.active == Some(id) {
                                     self.active = self.documents.last().map(|d| d.id);
-                                    self.reading = false;
                                 }
                             }
                             self.complete_request();
-                            if self.reading {
+                            if self.reading() {
                                 window.focus(&self.reading_focus);
                             } else {
                                 self.focus(window, cx);
@@ -2704,145 +2766,6 @@ impl Shell {
             cx.quit();
         }
     }
-    fn shortcut(&mut self, key: &Keystroke, window: &mut Window, cx: &mut Context<Self>) {
-        if matches!(self.panel, Some(Panel::Files | Panel::Text))
-            && self.preferences.is_none()
-            && self.decision.is_none()
-            && self.query.focus_handle(cx).is_focused(window)
-            && key.key == "down"
-            && !key.modifiers.control
-            && !key.modifiers.platform
-            && !self.hits.is_empty()
-        {
-            self.focus_results(window, cx);
-            window.prevent_default();
-            cx.stop_propagation();
-            return;
-        }
-        if self.panel == Some(Panel::Palette)
-            && self.palette.floating
-            && self.preferences.is_none()
-            && self.decision.is_none()
-            && !key.modifiers.control
-            && !key.modifiers.platform
-            && modal::tab(key, &self.palette.overlay, window, cx)
-        {
-            return;
-        }
-        if self.panel == Some(Panel::Palette)
-            && self.preferences.is_none()
-            && self.decision.is_none()
-            && self.query.focus_handle(cx).is_focused(window)
-            && matches!(key.key.as_str(), "down" | "up")
-            && !key.modifiers.control
-            && !key.modifiers.platform
-        {
-            self.focus_palette(key.key == "up", window, cx);
-            window.prevent_default();
-            cx.stop_propagation();
-            return;
-        }
-        if self.panel == Some(Panel::Path)
-            && self.preferences.is_none()
-            && self.decision.is_none()
-            && self.query.focus_handle(cx).is_focused(window)
-            && key.key == "tab"
-            && !key.modifiers.control
-            && !key.modifiers.platform
-        {
-            self.complete_path(key.modifiers.shift, window, cx);
-            window.prevent_default();
-            cx.stop_propagation();
-            return;
-        }
-        if self.decision.is_none()
-            && self.preferences.is_none()
-            && !key.modifiers.control
-            && !key.modifiers.platform
-            && !key.modifiers.alt
-        {
-            let handled = match key.key.as_str() {
-                "f10" if !key.modifiers.shift => {
-                    self.main_menu_requested = true;
-                    cx.notify();
-                    true
-                }
-                "f6" => {
-                    self.cycle_focus(key.modifiers.shift, window, cx);
-                    true
-                }
-                _ => false,
-            };
-            if handled {
-                window.prevent_default();
-                cx.stop_propagation();
-                return;
-            }
-        }
-        if self.decision.is_none()
-            && self.preferences.is_none()
-            && key.modifiers.control
-            && !key.modifiers.alt
-            && !key.modifiers.platform
-            && key.key == "tab"
-        {
-            self.command(
-                if key.modifiers.shift {
-                    "previous-document"
-                } else {
-                    "next-document"
-                },
-                window,
-                cx,
-            );
-            window.prevent_default();
-            cx.stop_propagation();
-            return;
-        }
-        if self.decision.is_some()
-            || self.preferences.is_some()
-            || (!key.modifiers.control && !key.modifiers.platform)
-        {
-            return;
-        }
-        let bindings = glimpse::commands::bindings(&self.settings.keymaps).unwrap_or_default();
-        let command = bindings
-            .iter()
-            .find(|binding| {
-                let name = match binding.key.name() {
-                    "ArrowLeft" => "left",
-                    "ArrowRight" => "right",
-                    "ArrowUp" => "up",
-                    "ArrowDown" => "down",
-                    "Comma" => ",",
-                    other => other,
-                };
-                name.eq_ignore_ascii_case(&key.key)
-                    && platform::shortcut(&binding.modifiers, &key.modifiers)
-            })
-            .and_then(|binding| {
-                glimpse::commands::COMMANDS
-                    .iter()
-                    .find(|command| command.action == binding.action)
-            });
-        if let Some(command) = command {
-            self.command(command.id, window, cx);
-            window.prevent_default();
-            cx.stop_propagation();
-        } else if key.key.eq_ignore_ascii_case("f")
-            && platform::shortcut(
-                &glimpse::commands::Modifiers {
-                    command: true,
-                    ..Default::default()
-                },
-                &key.modifiers,
-            )
-        {
-            window.prevent_default();
-            cx.stop_propagation();
-        }
-    }
-
     fn command(&mut self, command: &str, window: &mut Window, cx: &mut Context<Self>) {
         glimpse::metrics::event(command, self.active.unwrap_or(0), 0);
         if self.request.pick
@@ -2896,7 +2819,7 @@ impl Shell {
                     self.navigation_only = !self.navigation_only;
                     if self.navigation_only {
                         window.focus(&self.nav_focus);
-                    } else if self.reading {
+                    } else if self.reading() {
                         self.reading_focus.focus(window);
                     } else {
                         self.focus(window, cx);
@@ -2906,7 +2829,7 @@ impl Shell {
                 }
             }
             "find" => {
-                self.reading = false;
+                self.set_reading(false);
                 self.navigation_only = false;
                 self.focus(window, cx);
                 if let Some(doc) = self
@@ -2946,13 +2869,21 @@ impl Shell {
                 if self.panel == Some(Panel::Filter) {
                     self.filter.clear();
                 }
+                // Focus returns to the control that opened the panel only when it is still in
+                // the panel; after opening a result the user is already where they work.
+                let inside = self.query.focus_handle(cx).contains_focused(window, cx)
+                    || self.search_ui.focus.contains_focused(window, cx)
+                    || self.palette.overlay.contains_focused(window, cx)
+                    || self.palette.focus.contains_focused(window, cx)
+                    || (self.panel == Some(Panel::Filter) && self.nav_focus.is_focused(window));
                 self.panel = None;
                 self.path_hint = None;
                 self.search_ui.temporary = None;
                 self.reset_search("Search closed");
                 match self.panel_return.take() {
-                    Some(invoker) => window.focus(&invoker),
-                    None => self.focus(window, cx),
+                    Some(invoker) if inside && self.shown(&invoker, cx) => window.focus(&invoker),
+                    _ if inside => self.focus(window, cx),
+                    _ => {}
                 }
             }
             "cancel-close" | "cancel-closing" => {
@@ -3097,7 +3028,13 @@ impl Shell {
                 .detach();
             }
             "path" => self.panel(Panel::Path, window, cx),
-            "filter" => self.panel(Panel::Filter, window, cx),
+            "filter" => {
+                self.navigator_visible = true;
+                if self.narrow(window) {
+                    self.navigation_only = true;
+                }
+                self.panel(Panel::Filter, window, cx);
+            }
             "find-files" => self.panel(Panel::Files, window, cx),
             "find-text" => self.panel(Panel::Text, window, cx),
             "commands" => self.panel(Panel::Palette, window, cx),
@@ -3107,7 +3044,7 @@ impl Shell {
                 self.io.send(Job::Inventory);
             }
             "line" => {
-                self.reading = false;
+                self.set_reading(false);
                 self.navigation_only = false;
                 self.panel(Panel::Line, window, cx);
             }
@@ -3175,7 +3112,7 @@ impl Shell {
                     "Refreshing mounted locations; reopen Locations for the result".into();
             }
             "undo" | "redo" | "cut" | "copy" | "paste" | "select-all" => {
-                if self.reading {
+                if self.reading() {
                     return;
                 }
                 self.focus(window, cx);
@@ -3190,7 +3127,7 @@ impl Shell {
                 window.dispatch_action(action, cx);
             }
             "indent" | "outdent" => {
-                if self.reading {
+                if self.reading() {
                     return;
                 }
                 self.focus(window, cx);
@@ -3202,9 +3139,10 @@ impl Shell {
                 window.dispatch_action(action, cx);
             }
             "read" => {
-                self.reading = !self.reading;
+                let reading = !self.reading();
+                self.set_reading(reading);
                 self.navigation_only = false;
-                if self.reading {
+                if self.reading() {
                     self.reading_focus.focus(window);
                 } else {
                     if let Some(doc) = self
@@ -3233,7 +3171,7 @@ impl Shell {
                 };
                 doc.preview = false;
                 if !self.navigation_only {
-                    if self.reading {
+                    if self.reading() {
                         self.reading_focus.focus(window);
                     } else {
                         self.focus(window, cx);
@@ -3413,10 +3351,10 @@ impl Shell {
             "find" | "line" | "close" => document.is_some(),
             "read" => document.is_some_and(Document::markdown),
             "keep-tab" => document.is_some_and(|doc| doc.preview),
-            "indent" | "outdent" | "paste" | "select-all" => document.is_some() && !self.reading,
-            "undo" => document.is_some() && !self.reading && self.edit_state.get()[0],
-            "redo" => document.is_some() && !self.reading && self.edit_state.get()[1],
-            "cut" | "copy" => document.is_some() && !self.reading && self.edit_state.get()[2],
+            "indent" | "outdent" | "paste" | "select-all" => document.is_some() && !self.reading(),
+            "undo" => document.is_some() && !self.reading() && self.edit_state.get()[0],
+            "redo" => document.is_some() && !self.reading() && self.edit_state.get()[1],
+            "cut" | "copy" => document.is_some() && !self.reading() && self.edit_state.get()[2],
             "reload" | "reveal" => {
                 document.is_some_and(|doc| !doc.disk.target.as_os_str().is_empty() && !doc.saving)
             }
@@ -3523,7 +3461,7 @@ impl Shell {
             1 => window.focus(&self.nav_focus),
             3 => window.focus(&self.conflict_focus),
             _ => {
-                if self.reading {
+                if self.reading() {
                     self.reading_focus.focus(window);
                 } else {
                     self.focus(window, cx);
@@ -3617,7 +3555,6 @@ impl Shell {
             document.preview = false;
         }
         self.active = Some(id);
-        self.reading = false;
         self.navigation_only = false;
         self.focus(window, cx);
         cx.notify();
@@ -3635,13 +3572,13 @@ impl Render for Shell {
                 })
                 .unwrap_or_default(),
         );
-        if self.reading
+        if self.reading()
             && !self
                 .documents
                 .iter()
                 .any(|doc| Some(doc.id) == self.active && doc.markdown())
         {
-            self.reading = false;
+            self.set_reading(false);
         }
         self.prepare_reading(window, cx);
         let title = self
@@ -3667,7 +3604,7 @@ impl Render for Shell {
         let short = narrow && window.viewport_size().height < px(280. * self.settings.ui_scale);
         let compact_document =
             short && !self.navigation_only && self.active.is_some() && !self.request.pick;
-        let source_visible = !self.reading && (!narrow || !self.navigation_only);
+        let source_visible = !self.reading() && (!narrow || !self.navigation_only);
         self.report_startup_ready(source_visible, window, cx);
         if !self.listing_done && self.listing_waiter.is_none() {
             let id = self.listing_id;
@@ -3882,7 +3819,7 @@ impl Render for Shell {
             self.palette.floating = panel == Panel::Palette && !takeover;
             if self.palette.floating {
                 floating = Some(self.palette_overlay(window, cx));
-            } else if panel == Panel::Filter && !narrow && self.navigator_visible {
+            } else if panel == Panel::Filter {
                 // Filtering belongs to the navigator; it opens there and leaves the document still.
             } else {
                 main = main.child(self.panel_view(panel, takeover, window, cx));
@@ -3918,6 +3855,17 @@ impl Render for Shell {
 
         let visible = self.visible_rows();
         let entries = self.entries.clone();
+        // A focused list always has a current row, so screen readers announce a file rather
+        // than only the list.
+        if self.nav_focus.is_focused(window)
+            && !visible
+                .iter()
+                .any(|&i| Some(&entries[i].path) == self.selection.as_ref())
+            && let Some(&first) = visible.first()
+        {
+            self.selection = Some(entries[first].path.clone());
+            self.search_ui.picker_selection = self.selection.clone();
+        }
         let scroll = self
             .scrolls
             .entry(self.current.clone())
@@ -4117,7 +4065,7 @@ impl Render for Shell {
                 self.tab_scroll.scroll_to_item(index);
             }
         }
-        let edit_source = compact_document && self.reading;
+        let edit_source = compact_document && self.reading();
         let show_documents_menu = self.documents.len() > 1 && !self.request.pick;
         let tab_conflict = short
             && self
@@ -4377,7 +4325,11 @@ impl Render for Shell {
                     .child(self.button("Save", "save", cx))
                     .when(active_markdown, |row| {
                         row.child(self.button(
-                            if self.reading { "Edit Source" } else { "Read" },
+                            if self.reading() {
+                                "Edit Source"
+                            } else {
+                                "Read"
+                            },
                             "read",
                             cx,
                         ))
@@ -4558,7 +4510,7 @@ impl Render for Shell {
                     notices,
                 ));
             }
-            if self.reading {
+            if self.reading() {
                 content = content.child(self.reading_element(narrow, short, cx));
             } else {
                 content = content.child(
@@ -4612,7 +4564,15 @@ impl Render for Shell {
         }
         let body = if narrow {
             if self.navigation_only || self.active.is_none() {
-                navigator.into_any_element()
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .when(self.panel == Some(Panel::Filter), |pane| {
+                        pane.child(self.navigator_filter(cx))
+                    })
+                    .child(div().flex_1().min_h_0().child(navigator))
+                    .into_any_element()
             } else {
                 content.into_any_element()
             }
@@ -4690,7 +4650,7 @@ impl Render for Shell {
                             .iter()
                             .find(|doc| Some(doc.id) == self.active),
                         |footer, doc| {
-                            let information = doc.information(cx, self.reading);
+                            let information = doc.information(cx, self.reading());
                             footer.child(accessible(
                                 "document-information",
                                 div()
@@ -4747,7 +4707,6 @@ impl Render for Shell {
                 if let Some(next) = next {
                     let id = this.documents[next].id;
                     this.active = Some(id);
-                    this.reading = false;
                     this.navigation_only = false;
                     window.focus(&this.documents[next].tab_focus.clone());
                     cx.notify();
@@ -4764,11 +4723,12 @@ impl Render for Shell {
                     .iter()
                     .position(|&i| Some(&rows[i].path) == this.selection.as_ref());
                 match key.key.as_str() {
-                    "up" | "down" if !visible.is_empty() => {
-                        let next = if key.key == "down" {
-                            index.map_or(0, |i| (i + 1).min(visible.len() - 1))
-                        } else {
-                            index.unwrap_or(0).saturating_sub(1)
+                    "up" | "down" | "home" | "end" | "pageup" | "pagedown"
+                        if !visible.is_empty() && !key.modifiers.shift =>
+                    {
+                        let Some(next) = keyboard::list_step(&key.key, index, visible.len(), 10)
+                        else {
+                            return;
                         };
                         this.selection = Some(rows[visible[next]].path.clone());
                         this.search_ui.picker_selection = this.selection.clone();

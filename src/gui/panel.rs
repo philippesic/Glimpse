@@ -97,6 +97,9 @@ impl Shell {
                 "submit",
                 cx,
             )
+            .when(panel == Panel::Palette, |run| {
+                run.disabled(!self.palette_runnable(cx))
+            })
         });
         let input = Input::new(&self.query).flex_1().min_w(px(120. * scale));
         let header = if stacked {
@@ -193,6 +196,7 @@ impl Shell {
         let element = accessibility::group("panel-section", title.into(), section);
         if takeover {
             div()
+                .track_focus(&self.palette.overlay)
                 .flex_1()
                 .min_h_0()
                 .flex()
@@ -240,6 +244,14 @@ impl Shell {
             .collect()
     }
 
+    /// Run acts on the selected command, so it is unavailable when that command is.
+    pub(super) fn palette_runnable(&self, cx: &App) -> bool {
+        let matches = self.palette_matches(cx);
+        matches
+            .get(self.palette.selection.min(matches.len().saturating_sub(1)))
+            .is_some_and(|id| self.command_enabled(id))
+    }
+
     pub(super) fn focus_palette(
         &mut self,
         last: bool,
@@ -269,25 +281,21 @@ impl Shell {
         if matches.is_empty() {
             return false;
         }
-        let last = matches.len() - 1;
-        let index = self.palette.selection.min(last);
+        let index = self.palette.selection.min(matches.len() - 1);
         let next = match key.key.as_str() {
             "up" if index == 0 => {
                 self.query.update(cx, |input, cx| input.focus(window, cx));
                 cx.notify();
                 return true;
             }
-            "up" => index - 1,
-            "down" => (index + 1).min(last),
-            "home" => 0,
-            "end" => last,
-            "pageup" => index.saturating_sub(8),
-            "pagedown" => (index + 8).min(last),
             "enter" | "space" => {
                 self.palette_command(matches[index], window, cx);
                 return true;
             }
-            _ => return false,
+            other => match keyboard::list_step(other, Some(index), matches.len(), 8) {
+                Some(next) => next,
+                None => return false,
+            },
         };
         self.palette.selection = next;
         self.palette.scroll.scroll_to_item(next);
@@ -312,6 +320,11 @@ impl Shell {
                     .id("palette-overlay")
                     .track_focus(&self.palette.overlay)
                     .occlude()
+                    .on_mouse_down_out(cx.listener(|this, _, window, cx| {
+                        if this.panel == Some(Panel::Palette) {
+                            this.command("dismiss", window, cx);
+                        }
+                    }))
                     .w(width)
                     .flex()
                     .flex_col()
@@ -327,10 +340,13 @@ impl Shell {
                             .gap(px(8. * scale))
                             .p(px(8. * scale))
                             .child(Input::new(&self.query).flex_1().min_w_0())
-                            .child(self.button("Run", "submit", cx))
+                            .child(
+                                self.button("Run", "submit", cx)
+                                    .disabled(!self.palette_runnable(cx)),
+                            )
                             .child(self.button("Close", "dismiss", cx)),
                     )
-                    .child(self.palette_list(false, window, cx)),
+                    .child(self.palette_view(false, window, cx)),
             ))
             .into_any_element()
     }

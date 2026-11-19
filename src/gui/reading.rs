@@ -24,7 +24,7 @@ impl Shell {
         if self
             .reading_view
             .as_ref()
-            .is_some_and(|view| !self.reading || self.active != Some(view.id))
+            .is_some_and(|view| !self.reading() || self.active != Some(view.id))
         {
             if let Some(view) = self.reading_view.take()
                 && self.active == Some(view.id)
@@ -35,7 +35,7 @@ impl Shell {
             self.io.cancel_reading();
             self.release_view_memory(window, cx);
         }
-        if !self.reading {
+        if !self.reading() {
             return;
         }
         let Some(doc) = self
@@ -110,10 +110,11 @@ impl Shell {
     }
 
     fn dispatch_reading(&mut self, request: u64, cx: &mut Context<Self>) {
+        let reading = self.reading();
         let Some(view) = self
             .reading_view
             .as_mut()
-            .filter(|view| self.reading && self.active == Some(view.id) && view.request == request)
+            .filter(|view| reading && self.active == Some(view.id) && view.request == request)
         else {
             return;
         };
@@ -135,10 +136,11 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         let weak = cx.entity().downgrade();
+        let reading = self.reading();
         let Some(view) = self
             .reading_view
             .as_mut()
-            .filter(|view| self.reading && self.active == Some(view.id) && view.request == request)
+            .filter(|view| reading && self.active == Some(view.id) && view.request == request)
         else {
             if let Ok(retired) = result {
                 cx.background_spawn(async move { drop(retired) }).detach();

@@ -1784,8 +1784,12 @@ impl Node {
                 .when(overflow, |table| table.pb(rems(1.)))
                 .mb(rems(1.))
                 .w_full()
-                .track_focus(&focus)
-                .focus_ring(focus.is_focused(window), px(0.), window, cx)
+                // Only a table that scrolls sideways needs to be a Tab stop.
+                .when(overflow, |table| {
+                    table
+                        .track_focus(&focus)
+                        .focus_ring(focus.is_focused(window), px(0.), window, cx)
+                })
                 .on_key_down(move |event, window, cx| {
                     let key = &event.keystroke;
                     if input_focus.is_focused(window)
@@ -1909,7 +1913,9 @@ impl Node {
                                 node.set_row_count(row_count);
                                 node.set_column_count(column_count);
                                 node.add_action(Action::Focus);
-                                if scroll.max_offset().width > px(0.) {
+                                if scroll.max_offset().width <= px(0.) {
+                                    node.set_label("Table");
+                                } else {
                                     node.set_label("Scrollable table");
                                     node.set_description("Use Left and Right to scroll. Home and End reach the first and last columns.");
                                     node.add_action(Action::ScrollLeft);

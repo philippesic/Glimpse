@@ -66,9 +66,20 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.command_enabled(command) {
+            // Commands stays open with its query so another command can be chosen.
+            if let Some(found) = glimpse::commands::COMMANDS.iter().find(|c| c.id == command) {
+                self.status = format!("{} is not available now", found.label);
+            }
+            cx.notify();
+            return;
+        }
         if !self.resume_search(window, cx) {
             self.panel = None;
-            self.focus(window, cx);
+            match self.panel_return.take() {
+                Some(invoker) if self.shown(&invoker, cx) => window.focus(&invoker),
+                _ => self.focus(window, cx),
+            }
         }
         self.command(command, window, cx);
     }
@@ -224,12 +235,11 @@ impl Shell {
         }
         let index = self.search_ui.selection.unwrap_or(0).min(count - 1);
         let next = match key.key.as_str() {
-            "up" => index.saturating_sub(1),
-            "down" => (index + 1).min(count - 1),
-            "home" => 0,
-            "end" => count - 1,
-            "pageup" => index.saturating_sub(5),
-            "pagedown" => (index + 5).min(count - 1),
+            "up" if index == 0 => {
+                self.query.update(cx, |input, cx| input.focus(window, cx));
+                cx.notify();
+                return true;
+            }
             "enter" => {
                 self.open_hit(index, cx);
                 return true;
@@ -238,7 +248,10 @@ impl Shell {
                 self.command("dismiss", window, cx);
                 return true;
             }
-            _ => return false,
+            other => match keyboard::list_step(other, Some(index), count, 5) {
+                Some(next) => next,
+                None => return false,
+            },
         };
         self.search_ui.selection = Some(next);
         self.search_ui.picker_selection = Some(self.hits[next].path.clone());
@@ -514,78 +527,127 @@ impl Shell {
                             uniform_list(
                                 "search-hits",
                                 count,
-                                cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
-                                    range
-                                        .map(|i| {
-                                            let hit = &hits[i];
-                                            let name = paths::display(
-                                                hit.path
-                                                    .strip_prefix(this.effective_scope())
-                                                    .unwrap_or(&hit.path),
-                                            );
-                                            let prefix = if hit.fingerprint.is_some() {
-                                                format!("{name}:{}  ", hit.line)
-                                            } else {
-                                                format!("{name}  ")
-                                            };
-                                            let label = format!("{prefix}{}", hit.excerpt);
-                                            let ranges = if hit.fingerprint.is_some() {
-                                                hit.excerpt
-                                                    .match_indices(&hit.query)
-                                                    .map(|(start, text)| {
-                                                        (prefix.len() + start)
-                                                            ..(prefix.len() + start + text.len())
-                                                    })
-                                                    .collect()
-                                            } else {
-                                                search::highlight_ranges(&name, &hit.query)
-                                            };
-                                            let tooltip = if hit.fingerprint.is_some() {
-                                                format!(
-                                                    "{}:{}\n{}",
-                                                    paths::display(&hit.path),
-                                                    hit.line,
+                                cx.processor(
+                                    move |this, range: std::ops::Range<usize>, window, cx| {
+                                        let rem = window.rem_size();
+                                        let measure = |text: &SharedString| {
+                                            let run = window.text_style().to_run(text.len());
+                                            window
+                                                .text_system()
+                                                .shape_line(text.clone(), rem * 0.875, &[run], None)
+                                                .width
+                                        };
+                                        let room = window.viewport_size().width - rem * 3.;
+                                        range
+                                            .map(|i| {
+                                                let hit = &hits[i];
+                                                let relative = paths::display(
+                                                    hit.path
+                                                        .strip_prefix(this.effective_scope())
+                                                        .unwrap_or(&hit.path),
+                                                );
+                                                let content = hit.fingerprint.is_some();
+                                                let name = fit_path(
+                                                    &relative,
+                                                    if content { room * 0.6 } else { room },
+                                                    &measure,
+                                                );
+                                                let prefix = if content {
+                                                    format!("{name}:{}  ", hit.line)
+                                                } else {
+                                                    format!("{name}  ")
+                                                };
+                                                let label = format!("{prefix}{}", hit.excerpt);
+                                                let ranges = if content {
                                                     hit.excerpt
-                                                )
-                                            } else {
-                                                paths::display(&hit.path)
-                                            };
-                                            let text = StyledText::new(label).with_highlights(
-                                                ranges.into_iter().map(|range| {
-                                                    (
-                                                        range,
-                                                        HighlightStyle {
-                                                            font_weight: Some(FontWeight::BOLD),
-                                                            ..Default::default()
-                                                        },
+                                                        .match_indices(&hit.query)
+                                                        .map(|(start, text)| {
+                                                            (prefix.len() + start)
+                                                                ..(prefix.len()
+                                                                    + start
+                                                                    + text.len())
+                                                        })
+                                                        .collect()
+                                                } else {
+                                                    search::highlight_ranges(&name, &hit.query)
+                                                };
+                                                let file = paths::name(&hit.path);
+                                                let folder = paths::display(
+                                                    Path::new(&relative)
+                                                        .parent()
+                                                        .unwrap_or(Path::new("")),
+                                                );
+                                                let spoken = match (content, folder.is_empty()) {
+                                                    (true, true) => {
+                                                        format!(
+                                                            "{file}, line {}: {}",
+                                                            hit.line, hit.excerpt
+                                                        )
+                                                    }
+                                                    (true, false) => format!(
+                                                        "{file}, line {}: {}, in {folder}",
+                                                        hit.line, hit.excerpt
+                                                    ),
+                                                    (false, true) => file.to_string(),
+                                                    (false, false) => {
+                                                        format!("{file}, in {folder}")
+                                                    }
+                                                };
+                                                let tooltip = if content {
+                                                    format!(
+                                                        "{}:{}\n{}",
+                                                        paths::display(&hit.path),
+                                                        hit.line,
+                                                        hit.excerpt
                                                     )
-                                                }),
-                                            );
-                                            Button::new(("search-hit", i))
-                                                .accessibility_role(
-                                                    gpui::accesskit::Role::ListBoxOption,
-                                                )
-                                                .accessibility_focus(this.search_ui.focus.clone())
-                                                .tab_stop(false)
-                                                .tooltip(tooltip)
-                                                .child(
-                                                    div().flex_1().min_w_0().truncate().child(text),
-                                                )
-                                                .ghost()
-                                                .small()
-                                                .w_full()
-                                                .h(row_height)
-                                                .justify_start()
-                                                .selected(this.search_ui.selection == Some(i))
-                                                .when(this.search_ui.selection == Some(i), |row| {
-                                                    row.bg(cx.theme().selection)
-                                                })
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.open_hit(i, cx)
-                                                }))
-                                        })
-                                        .collect::<Vec<_>>()
-                                }),
+                                                } else {
+                                                    paths::display(&hit.path)
+                                                };
+                                                let text = StyledText::new(label).with_highlights(
+                                                    ranges.into_iter().map(|range| {
+                                                        (
+                                                            range,
+                                                            HighlightStyle {
+                                                                font_weight: Some(FontWeight::BOLD),
+                                                                ..Default::default()
+                                                            },
+                                                        )
+                                                    }),
+                                                );
+                                                Button::new(("search-hit", i))
+                                                    .accessibility_role(
+                                                        gpui::accesskit::Role::ListBoxOption,
+                                                    )
+                                                    .accessibility_focus(
+                                                        this.search_ui.focus.clone(),
+                                                    )
+                                                    .accessibility_label(spoken)
+                                                    .tab_stop(false)
+                                                    .tooltip(tooltip)
+                                                    .child(
+                                                        div()
+                                                            .flex_1()
+                                                            .min_w_0()
+                                                            .truncate()
+                                                            .child(text),
+                                                    )
+                                                    .ghost()
+                                                    .small()
+                                                    .w_full()
+                                                    .h(row_height)
+                                                    .justify_start()
+                                                    .selected(this.search_ui.selection == Some(i))
+                                                    .when(
+                                                        this.search_ui.selection == Some(i),
+                                                        |row| row.bg(cx.theme().selection),
+                                                    )
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.open_hit(i, cx)
+                                                    }))
+                                            })
+                                            .collect::<Vec<_>>()
+                                    },
+                                ),
                             )
                             .h_full()
                             .track_scroll(self.search_ui.scroll.clone()),
@@ -594,5 +656,61 @@ impl Shell {
                 ))
             })
             .into_any_element()
+    }
+}
+
+/// Shortens the folder part of a relative path first, so the file name and its extension stay
+/// readable; a name too long on its own loses its middle.
+pub(super) fn fit_path(
+    relative: &str,
+    room: Pixels,
+    measure: &impl Fn(&SharedString) -> Pixels,
+) -> String {
+    if measure(&SharedString::from(relative.to_owned())) <= room {
+        return relative.to_owned();
+    }
+    let Some(split) = relative.rfind('/') else {
+        return decision::abbreviate_folder(relative, room, measure).to_string();
+    };
+    let (folder, name) = relative.split_at(split);
+    let folder_room = room - measure(&SharedString::from(name.to_owned()));
+    if folder_room >= measure(&"…/…".into()) * 2. {
+        format!(
+            "{}{name}",
+            decision::abbreviate_folder(folder, folder_room, measure)
+        )
+    } else {
+        decision::abbreviate_folder(&name[1..], room, measure).to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fit_path;
+    use gpui::{SharedString, px};
+
+    fn measure(text: &SharedString) -> gpui::Pixels {
+        px(text.chars().count() as f32 * 8.)
+    }
+
+    #[test]
+    fn shortened_paths_keep_the_file_name_and_extension() {
+        let path = "project-a/src/config/settings.toml";
+        assert_eq!(fit_path(path, px(400.), &measure), path);
+        let fitted = fit_path(path, px(200.), &measure);
+        assert!(fitted.ends_with("/settings.toml"), "{fitted}");
+        assert!(
+            fitted.starts_with("pro") && fitted.contains('…'),
+            "{fitted}"
+        );
+        assert!(measure(&fitted.clone().into()) <= px(200.), "{fitted}");
+        let tight = fit_path(path, px(112.), &measure);
+        assert!(tight.ends_with(".toml") && !tight.contains('/'), "{tight}");
+        let long = fit_path(
+            "a-very-long-generated-file-name-for-testing.toml",
+            px(160.),
+            &measure,
+        );
+        assert!(long.ends_with(".toml") && long.contains('…'), "{long}");
     }
 }

@@ -853,6 +853,16 @@ impl PopupMenu {
         window.dispatch_action(action.boxed_clone(), cx);
     }
 
+    /// A menu opened from the keyboard starts on its first available item.
+    pub(crate) fn highlight_first_item(&mut self, cx: &mut Context<Self>) {
+        let first = self.clickable_menu_items().next().map(|(ix, _)| ix);
+        if self.selected_index.is_none()
+            && let Some(ix) = first
+        {
+            self.set_selected_index(ix, cx);
+        }
+    }
+
     fn set_selected_index(&mut self, ix: usize, cx: &mut Context<Self>) {
         if self.selected_index != Some(ix) {
             self.selected_index = Some(ix);
@@ -883,7 +893,8 @@ impl PopupMenu {
     fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
         cx.stop_propagation();
         let Some(ix) = self.selected_index else {
-            self.set_selected_index(0, cx);
+            let first = self.clickable_menu_items().next().map(|(ix, _)| ix);
+            self.set_selected_index(first.unwrap_or(0), cx);
             return;
         };
 

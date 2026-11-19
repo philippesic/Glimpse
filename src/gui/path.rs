@@ -324,6 +324,7 @@ impl Shell {
                     div()
                         .id("path-completions")
                         .track_scroll(&self.path_scroll)
+                        .when(self.path_hint.is_some(), |list| list.mt(px(4. * scale)))
                         .flex()
                         .flex_col()
                         .items_start()

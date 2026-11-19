@@ -99,6 +99,7 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let reading = self.reading();
         let Some(doc) = self.documents.iter_mut().find(|doc| doc.id == snapshot.id) else {
             return;
         };
@@ -113,7 +114,7 @@ impl Shell {
         doc.saving = true;
         self.checks.invalidate(doc.id);
         if self.active == Some(doc.id) {
-            if self.reading {
+            if reading {
                 window.focus(&self.reading_focus);
             } else {
                 doc.input.update(cx, |input, cx| input.focus(window, cx));

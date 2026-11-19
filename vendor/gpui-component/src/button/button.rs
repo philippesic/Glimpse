@@ -179,6 +179,7 @@ pub struct Button {
     id: ElementId,
     semantic_role: gpui::accesskit::Role,
     semantic_description: Option<SharedString>,
+    semantic_label: Option<SharedString>,
     semantic_toggled: Option<bool>,
     semantic_expanded: Option<bool>,
     semantic_focus: Option<gpui::FocusHandle>,
@@ -227,6 +228,7 @@ impl Button {
             id: id.clone(),
             semantic_role: gpui::accesskit::Role::Button,
             semantic_description: None,
+            semantic_label: None,
             semantic_toggled: None,
             semantic_expanded: None,
             semantic_focus: None,
@@ -276,6 +278,12 @@ impl Button {
     }
 
     /// Supplementary accessible text, such as a document's unsaved state.
+    /// Name the button for assistive technology when its visible content is shortened.
+    pub fn accessibility_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.semantic_label = Some(label.into());
+        self
+    }
+
     pub fn accessibility_description(mut self, description: impl Into<SharedString>) -> Self {
         self.semantic_description = Some(description.into());
         self
@@ -515,8 +523,9 @@ impl RenderOnce for Button {
         let semantic_id = self.id.clone();
         let semantic_role = self.semantic_role;
         let semantic_label = self
-            .label
+            .semantic_label
             .clone()
+            .or_else(|| self.label.clone())
             .or_else(|| self.tooltip.as_ref().map(|(label, _)| label.clone()))
             .unwrap_or_else(|| "Button".into());
         let italic_label = self.italic_label;
@@ -677,10 +686,12 @@ impl RenderOnce for Button {
                     })
                     .when_some(self.display_label.or(self.label), |this, label| {
                         this.child(
+                            // Truncation clips to the label box, so the line box must hold the font's
+                            // ascenders and descenders or they are cut off.
                             div()
                                 .min_w_0()
                                 .truncate()
-                                .line_height(relative(1.))
+                                .line_height(relative(1.5))
                                 .when(italic_label, |label| label.italic())
                                 .child(label),
                         )
