@@ -306,7 +306,7 @@ impl Shell {
     ) -> impl IntoElement {
         let scope = self.effective_scope();
         let kind = if self.panel == Some(Panel::Text) {
-            "Text"
+            "Saved text"
         } else {
             "Files"
         };

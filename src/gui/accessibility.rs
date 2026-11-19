@@ -25,6 +25,17 @@ pub(super) fn status(
     })
 }
 
+/// Static text that assistive technology should read, such as an empty-state line.
+pub(super) fn label(id: &'static str, text: String, child: impl IntoElement) -> impl IntoElement {
+    accessible(id, child, move |_, _, _| {
+        let mut node = Node::new(Role::Label);
+        node.set_label(text.clone());
+        node.set_value(text.clone());
+        node.set_read_only();
+        AccessibilityInfo::new(node)
+    })
+}
+
 /// A labelled region; also gives assistive technology the clipping bounds of a scrolled area.
 pub(super) fn group(id: &'static str, label: String, child: impl IntoElement) -> impl IntoElement {
     accessible(id, child, move |_, _, _| {

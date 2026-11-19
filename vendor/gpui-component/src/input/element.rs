@@ -1536,7 +1536,7 @@ impl Element for TextElement {
             state.scroll_size = prepaint.scroll_size;
             state.update_scroll_offset(Some(prepaint.cursor_scroll_offset), cx);
             state.deferred_scroll_offset = None;
-            if shrunk {
+            if shrunk || std::mem::take(&mut state.reveal_cursor_after_layout) {
                 let cursor = state.cursor();
                 state.scroll_to(cursor, None, cx);
             }

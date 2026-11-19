@@ -448,7 +448,14 @@ impl Render for Decision {
         } else if !self.subjects.is_empty() {
             Some(Self::close_path(&self.detail).into_any_element())
         } else {
-            Some(self.detail.clone().into_any_element())
+            Some(
+                super::accessibility::label(
+                    "decision-detail-text",
+                    self.detail.clone(),
+                    div().child(self.detail.clone()),
+                )
+                .into_any_element(),
+            )
         };
         let semantic_title = self.title.clone();
         let mut semantic_detail = self.summary.as_ref().map_or_else(

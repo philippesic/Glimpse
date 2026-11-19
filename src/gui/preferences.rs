@@ -104,6 +104,7 @@ pub struct Preferences {
     page: Page,
     focus: FocusHandle,
     row_focus: Vec<FocusHandle>,
+    theme_focus: [FocusHandle; 3],
     scroll: ScrollHandle,
     _subscriptions: Vec<Subscription>,
     error: String,
@@ -177,6 +178,32 @@ impl Preferences {
                 {
                     return;
                 }
+                if let Some(index) = this
+                    .theme_focus
+                    .iter()
+                    .position(|focus| focus.is_focused(window))
+                    && !modifiers.control
+                    && !modifiers.platform
+                    && !modifiers.alt
+                    && !this.pending
+                {
+                    let next = match key.key.as_str() {
+                        "left" | "up" => Some((index + 2) % 3),
+                        "right" | "down" => Some((index + 1) % 3),
+                        _ => None,
+                    };
+                    if let Some(next) = next {
+                        this.draft.system_theme = next == 0;
+                        if next > 0 {
+                            this.draft.dark = next == 2;
+                        }
+                        this.theme_focus[next].focus(window);
+                        window.prevent_default();
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
+                }
                 if super::modal::tab(&event.keystroke, &this.focus, window, cx) {
                     return;
                 }
@@ -195,6 +222,7 @@ impl Preferences {
             page: Page::Appearance,
             focus,
             row_focus,
+            theme_focus: [cx.focus_handle(), cx.focus_handle(), cx.focus_handle()],
             scroll,
             _subscriptions: subscriptions,
             pending: false,
@@ -356,13 +384,16 @@ impl Render for Preferences {
                                 ("Dark", Some(true)),
                             ]
                             .into_iter()
-                            .map(|(label, dark)| {
+                            .enumerate()
+                            .map(|(index, (label, dark))| {
                                 let chosen = if let Some(dark) = dark {
                                     !self.draft.system_theme && self.draft.dark == dark
                                 } else {
                                     self.draft.system_theme
                                 };
                                 Button::new(label)
+                                    .with_focus_handle(self.theme_focus[index].clone())
+                                    .tab_stop(chosen)
                                     .small()
                                     .compact()
                                     .label(label)
@@ -590,7 +621,8 @@ impl Render for Preferences {
                     .track_focus(&self.focus)
                     .occlude()
                     .w(px(620.).min(window.viewport_size().width - px(32.)))
-                    .max_h(window.viewport_size().height - px(32.))
+                    .h((px(560.) * self.draft.ui_scale.max(1.))
+                        .min(window.viewport_size().height - px(32.)))
                     .flex()
                     .flex_col()
                     .gap(px(12.))

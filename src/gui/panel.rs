@@ -2,6 +2,8 @@ use super::*;
 
 pub(super) struct PaletteState {
     pub focus: FocusHandle,
+    pub overlay: FocusHandle,
+    pub floating: bool,
     pub selection: usize,
     pub scroll: ScrollHandle,
 }
@@ -10,6 +12,8 @@ impl PaletteState {
     pub fn new(cx: &mut Context<Shell>) -> Self {
         Self {
             focus: cx.focus_handle().tab_stop(true),
+            overlay: cx.focus_handle(),
+            floating: false,
             selection: 0,
             scroll: ScrollHandle::new(),
         }
@@ -29,6 +33,35 @@ impl Shell {
         listing && (narrow || window.viewport_size().height < px(560. * self.settings.ui_scale))
     }
 
+    pub(super) fn navigator_filter(&self, cx: &Context<Self>) -> impl IntoElement {
+        let scale = self.settings.ui_scale;
+        accessibility::group(
+            "navigator-filter",
+            "Filter This Folder".into(),
+            div()
+                .flex()
+                .items_center()
+                .gap(px(4. * scale))
+                .px(px(8. * scale))
+                .py(px(6. * scale))
+                .flex_shrink_0()
+                .bg(cx.theme().sidebar)
+                .border_b_1()
+                .border_color(cx.theme().sidebar_border)
+                .child(Input::new(&self.query).flex_1().min_w_0())
+                .child(
+                    Button::new("filter-close")
+                        .icon(IconName::Close)
+                        .tooltip("Close Filter")
+                        .ghost()
+                        .small()
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.command("dismiss", window, cx)),
+                        ),
+                ),
+        )
+    }
+
     pub(super) fn panel_view(
         &self,
         panel: Panel,
@@ -39,15 +72,15 @@ impl Shell {
         let scale = self.settings.ui_scale;
         let title = match panel {
             Panel::Path => "Location",
-            Panel::Filter => "Filter this folder",
-            Panel::Files => "Find files",
-            Panel::Text => "Find saved text",
+            Panel::Filter => "Filter This Folder",
+            Panel::Files => "Find Files",
+            Panel::Text => "Find Text in Saved Files",
             Panel::Palette => "Commands",
             Panel::Recovery => "Recovery",
-            Panel::Line => "Go to line",
-            Panel::NewFile => "New file name",
-            Panel::NewFolder => "New folder name",
-            Panel::Rename => "New name",
+            Panel::Line => "Go to Line",
+            Panel::NewFile => "New File Name",
+            Panel::NewFolder => "New Folder Name",
+            Panel::Rename => "New Name",
         };
         let search = matches!(panel, Panel::Files | Panel::Text);
         let stacked = window.viewport_size().width < px(760. * scale);
@@ -277,6 +310,7 @@ impl Shell {
                 "Commands".into(),
                 div()
                     .id("palette-overlay")
+                    .track_focus(&self.palette.overlay)
                     .occlude()
                     .w(width)
                     .flex()

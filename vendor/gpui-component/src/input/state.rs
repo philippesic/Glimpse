@@ -287,6 +287,7 @@ pub struct InputState {
     line_endings: super::text_metadata::LineEndings,
     accessibility_label: Option<SharedString>,
     accessibility_description: Option<SharedString>,
+    pub(super) reveal_cursor_after_layout: bool,
     accessibility_mapping: Rc<std::cell::RefCell<accessibility::Mapping>>,
     pub(super) text_wrapper: TextWrapper,
     defer_large_layout: bool,
@@ -722,6 +723,7 @@ impl InputState {
         Self {
             accessibility_label: None,
             accessibility_description: None,
+            reveal_cursor_after_layout: false,
             accessibility_mapping: Rc::new(std::cell::RefCell::new(
                 accessibility::Mapping::default(),
             )),
@@ -991,6 +993,8 @@ impl InputState {
 
         // Move scroll to top
         self.scroll_handle.set_offset(point(px(0.), px(0.)));
+        // A single-line field keeps the end of its new value, where the cursor is, in view.
+        self.reveal_cursor_after_layout = self.mode.is_single_line();
 
         cx.notify();
     }

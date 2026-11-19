@@ -314,6 +314,9 @@ struct Shell {
     path_completion_token: u64,
     path_completions: Option<path::Completions>,
     path_hint: Option<String>,
+    path_scroll: ScrollHandle,
+    panel_return: Option<FocusHandle>,
+    type_ahead: (String, Option<std::time::Instant>),
     opening: HashMap<u64, OpenIntent>,
     hit_versions: HashMap<u64, (u64, u64)>,
     panel: Option<Panel>,
@@ -551,6 +554,9 @@ impl Shell {
             path_completion_token: 0,
             path_completions: None,
             path_hint: None,
+            path_scroll: ScrollHandle::new(),
+            panel_return: None,
+            type_ahead: (String::new(), None),
             opening,
             hit_versions: HashMap::new(),
             panel: None,
@@ -1366,6 +1372,9 @@ impl Shell {
         }
     }
     fn panel(&mut self, panel: Panel, window: &mut Window, cx: &mut Context<Self>) {
+        if self.panel.is_none() {
+            self.panel_return = window.focused(cx);
+        }
         self.path_completions = None;
         self.path_hint = None;
         self.path_completion_token += 1;
@@ -2692,6 +2701,16 @@ impl Shell {
             return;
         }
         if self.panel == Some(Panel::Palette)
+            && self.palette.floating
+            && self.preferences.is_none()
+            && self.decision.is_none()
+            && !key.modifiers.control
+            && !key.modifiers.platform
+            && modal::tab(key, &self.palette.overlay, window, cx)
+        {
+            return;
+        }
+        if self.panel == Some(Panel::Palette)
             && self.preferences.is_none()
             && self.decision.is_none()
             && self.query.focus_handle(cx).is_focused(window)
@@ -2912,7 +2931,10 @@ impl Shell {
                 self.path_hint = None;
                 self.search_ui.temporary = None;
                 self.reset_search("Search closed");
-                self.focus(window, cx);
+                match self.panel_return.take() {
+                    Some(invoker) => window.focus(&invoker),
+                    None => self.focus(window, cx),
+                }
             }
             "cancel-close" | "cancel-closing" => {
                 self.finishing.invalidate();
@@ -3382,6 +3404,8 @@ impl Shell {
             "compare" | "overwrite" => {
                 document.is_some_and(|doc| doc.external.is_some() && !doc.saving)
             }
+            "stop-search" => self.search_ui.running,
+            "remove-index" => self.search.index_status(self.effective_scope()).is_some(),
             "back" => !self.history.is_empty(),
             "forward" => !self.future.is_empty(),
             "parent" => self.current.parent().is_some(),
@@ -3836,8 +3860,11 @@ impl Render for Shell {
             }
         }
         if let Some(panel) = self.panel.filter(|panel| *panel != Panel::Path) {
-            if panel == Panel::Palette && !takeover {
+            self.palette.floating = panel == Panel::Palette && !takeover;
+            if self.palette.floating {
                 floating = Some(self.palette_overlay(window, cx));
+            } else if panel == Panel::Filter && !narrow && self.navigator_visible {
+                // Filtering belongs to the navigator; it opens there and leaves the document still.
             } else {
                 main = main.child(self.panel_view(panel, takeover, window, cx));
             }
@@ -3946,8 +3973,8 @@ impl Render for Shell {
                 };
                 navigator.child(
                     div().p_2().text_sm()
-                        .child(div().id("listing-state").whitespace_normal().line_clamp(4).child(message.clone())
-                            .tooltip(move |window,cx| gpui_component::tooltip::Tooltip::new(message.clone()).build(window,cx)))
+                        .child(accessibility::label("listing-state-text", message.clone(), div().id("listing-state").whitespace_normal().line_clamp(4).child(message.clone())
+                            .tooltip(move |window,cx| gpui_component::tooltip::Tooltip::new(message.clone()).build(window,cx))))
                         .child(
                             div().flex().flex_wrap().gap_1().mt_1()
                                 .child(self.button("Refresh", "refresh", cx))
@@ -4159,6 +4186,8 @@ impl Render for Shell {
                 .collect::<Vec<_>>()
                 .join(", ");
                 let tab = Button::new(("tab", id))
+                    .with_focus_handle(doc.tab_focus.clone())
+                    .tab_stop(active)
                     .accessibility_role(gpui::accesskit::Role::Tab)
                     .label(spoken)
                     .display_label(title.clone())
@@ -4208,7 +4237,6 @@ impl Render for Shell {
                         this.select_tab(id, event.click_count() > 1, window, cx);
                     }));
                 div()
-                    .track_focus(&doc.tab_focus)
                     .flex()
                     .items_center()
                     .flex_shrink_0()
@@ -4227,6 +4255,7 @@ impl Render for Shell {
                         tab.child(
                             Button::new(("close-tab", id))
                                 .icon(IconName::Close)
+                                .tab_stop(false)
                                 .small()
                                 .ghost()
                                 .text_color(if active {
@@ -4308,6 +4337,15 @@ impl Render for Shell {
             .documents
             .iter()
             .any(|doc| Some(doc.id) == self.active && doc.markdown());
+        // Scope membership matters while searching or with a pinned scope, not while browsing.
+        let outside_scope = (matches!(self.panel, Some(Panel::Files | Panel::Text))
+            || self.scope.is_some()
+            || self.search_ui.temporary.is_some())
+            && self.documents.iter().any(|doc| {
+                Some(doc.id) == self.active
+                    && !doc.disk.target.as_os_str().is_empty()
+                    && !doc.disk.path.starts_with(self.effective_scope())
+            });
         if !self.request.pick && !short && self.active.is_some() {
             content = content.child(
                 div()
@@ -4329,6 +4367,24 @@ impl Render for Shell {
                         row.child(self.button("Keep Preview Tab", "keep-tab", cx))
                     })
                     .child(div().flex_1())
+                    .when(outside_scope, |row| {
+                        row.child(
+                            Button::new("document-search-scope")
+                                .label(format!(
+                                    "Outside search folder: {}",
+                                    paths::name(self.effective_scope())
+                                ))
+                                .tooltip(paths::display(self.effective_scope()))
+                                .ghost()
+                                .small()
+                                .min_w_0()
+                                .flex_shrink()
+                                .text_color(cx.theme().muted_foreground)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.command("search-details", window, cx)
+                                })),
+                        )
+                    })
                     .child(self.document_menu(cx)),
             );
         }
@@ -4341,25 +4397,6 @@ impl Render for Shell {
                 .max_h(relative(0.5))
                 .overflow_y_scroll();
             let mut has_notices = false;
-            if !doc.disk.target.as_os_str().is_empty()
-                && !doc.disk.path.starts_with(self.effective_scope())
-            {
-                has_notices = true;
-                notices = notices.child(
-                    div().px_2().py_1().text_sm().child(
-                        self.command_button(
-                            "document-search-scope",
-                            format!(
-                                "Outside search folder: {}",
-                                paths::name(self.effective_scope())
-                            ),
-                            "search-details",
-                            cx,
-                        )
-                        .tooltip(paths::display(self.effective_scope())),
-                    ),
-                );
-            }
             if doc.recovery_error.is_none() && doc.error.is_some() {
                 has_notices = true;
                 notices = notices.child(
@@ -4569,7 +4606,12 @@ impl Render for Shell {
                         .w(self.pane_state.read(cx).width(window))
                         .h_full()
                         .flex_shrink_0()
-                        .child(navigator),
+                        .flex()
+                        .flex_col()
+                        .when(self.panel == Some(Panel::Filter), |pane| {
+                            pane.child(self.navigator_filter(cx))
+                        })
+                        .child(div().flex_1().min_h_0().child(navigator)),
                 )
                 .child(self.pane_state.clone())
                 .child(content)
@@ -4667,6 +4709,32 @@ impl Render for Shell {
             if this.search_ui.focus.is_focused(window) && this.search_key(key, window, cx) {
                 return;
             }
+            if let Some(index) = this
+                .documents
+                .iter()
+                .position(|doc| doc.tab_focus.is_focused(window))
+                && !key.modifiers.control
+                && !key.modifiers.platform
+                && !key.modifiers.alt
+            {
+                let last = this.documents.len() - 1;
+                let next = match key.key.as_str() {
+                    "left" => Some(index.checked_sub(1).unwrap_or(last)),
+                    "right" => Some(if index == last { 0 } else { index + 1 }),
+                    "home" => Some(0),
+                    "end" => Some(last),
+                    _ => None,
+                };
+                if let Some(next) = next {
+                    let id = this.documents[next].id;
+                    this.active = Some(id);
+                    this.reading = false;
+                    this.navigation_only = false;
+                    window.focus(&this.documents[next].tab_focus.clone());
+                    cx.notify();
+                    return;
+                }
+            }
             if this.nav_focus.is_focused(window)
                 && !key.modifiers.control
                 && !key.modifiers.platform
@@ -4706,6 +4774,39 @@ impl Render for Shell {
                         return;
                     }
                     _ => {}
+                }
+                // Type-ahead: printable keys select the first row whose name starts with
+                // the letters typed in quick succession.
+                if let Some(typed) = key
+                    .key_char
+                    .as_deref()
+                    .filter(|text| !key.modifiers.alt && text.chars().all(|c| !c.is_control()))
+                    .filter(|text| !text.is_empty() && *text != " ")
+                {
+                    let now = std::time::Instant::now();
+                    if this
+                        .type_ahead
+                        .1
+                        .is_none_or(|last| now - last > std::time::Duration::from_millis(900))
+                    {
+                        this.type_ahead.0.clear();
+                    }
+                    this.type_ahead.0.push_str(&typed.to_lowercase());
+                    this.type_ahead.1 = Some(now);
+                    let prefix = this.type_ahead.0.clone();
+                    if let Some(next) = visible.iter().position(|&i| {
+                        paths::name(&rows[i].path)
+                            .to_lowercase()
+                            .starts_with(&prefix)
+                    }) {
+                        this.selection = Some(rows[visible[next]].path.clone());
+                        this.search_ui.picker_selection = this.selection.clone();
+                        if let Some(scroll) = this.scrolls.get(&this.current) {
+                            scroll.scroll_to_item(next, ScrollStrategy::Center);
+                        }
+                        cx.notify();
+                    }
+                    return;
                 }
             }
             if key.key == "escape" {

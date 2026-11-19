@@ -31,6 +31,7 @@ impl Shell {
             let entry = completions.matches.choices[index].entry();
             completions.value = entry.clone();
             completions.next = (index + 1) % count;
+            self.path_scroll.scroll_to_item(index);
             self.query
                 .update(cx, |input, cx| input.set_value(entry, window, cx));
             cx.notify();
@@ -308,9 +309,19 @@ impl Shell {
                 ))
             })
             .when_some(completions, |list, completions| {
+                let count = completions.matches.choices.len();
+                // The completion Enter would open is the one last placed in the field.
+                let current = (count > 0).then(|| (completions.next + count - 1) % count);
+                let width = if floating {
+                    px(600. * scale).min(window.viewport_size().width - px(16. * scale))
+                } else {
+                    window.viewport_size().width
+                } - px(48. * scale);
+                let measure = |text: &SharedString| Self::path_label_width(window, text);
                 list.child(
                     div()
                         .id("path-completions")
+                        .track_scroll(&self.path_scroll)
                         .flex()
                         .flex_col()
                         .items_start()
@@ -319,14 +330,24 @@ impl Shell {
                         .children(completions.matches.choices.iter().enumerate().map(
                             |(i, choice)| {
                                 let entry = choice.entry();
+                                let name = format!(
+                                    "{}{}",
+                                    paths::name(&choice.path),
+                                    if choice.directory { "/" } else { "" }
+                                );
+                                let caption = decision::abbreviate_folder(&name, width, &measure);
+                                let selected = current == Some(i);
                                 Button::new(("path-match", i))
-                                    .label(format!(
-                                        "{}{}",
-                                        paths::name(&choice.path),
-                                        if choice.directory { "/" } else { "" }
-                                    ))
+                                    .label(name)
+                                    .display_label(caption)
+                                    .accessibility_role(gpui::accesskit::Role::ListBoxOption)
+                                    .tab_stop(false)
                                     .small()
                                     .ghost()
+                                    .w_full()
+                                    .justify_start()
+                                    .selected(selected)
+                                    .when(selected, |row| row.bg(cx.theme().selection))
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         this.path_completions = None;
                                         this.path_hint = None;

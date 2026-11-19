@@ -75,6 +75,7 @@ fn add_commands(
     settings: &glimpse::storage::Settings,
     disabled: &std::collections::HashSet<&'static str>,
     ids: &[&'static str],
+    navigator_visible: bool,
 ) -> PopupMenu {
     for id in ids {
         if *id == "-" {
@@ -84,10 +85,15 @@ fn add_commands(
         let Some(command) = commands::COMMANDS.iter().find(|command| command.id == *id) else {
             continue;
         };
+        let label = match command.id {
+            "toggle-navigator" if navigator_visible => "Hide Navigator",
+            "toggle-navigator" => "Show Navigator",
+            _ => command.label,
+        };
         let item = command_item(
             shell.clone(),
             command.id,
-            command.label.to_owned(),
+            label.to_owned(),
             disabled.contains(id),
         )
         .when_some(shortcut(settings, id), |item, hint| {
@@ -108,6 +114,7 @@ impl Shell {
     }
 
     pub(super) fn document_menu(&self, cx: &Context<Self>) -> impl IntoElement {
+        let navigator_visible = self.navigator_visible;
         let shell = cx.entity().downgrade();
         let settings = self.settings.clone();
         let disabled = self.disabled_commands();
@@ -143,6 +150,7 @@ impl Shell {
                         "-",
                         "close",
                     ],
+                    navigator_visible,
                 )
             })
     }
@@ -402,6 +410,7 @@ impl Shell {
     }
 
     pub(super) fn main_menu(&self, requested: bool, cx: &Context<Self>) -> impl IntoElement {
+        let navigator_visible = self.navigator_visible;
         let shell = cx.entity().downgrade();
         let settings = self.settings.clone();
         let disabled = self.disabled_commands();
@@ -505,15 +514,29 @@ impl Shell {
                 // command reachable without overlap.
                 for (label, ids) in groups {
                     if flat {
-                        menu = add_commands(menu.label(label), &shell, &settings, &disabled, ids)
-                            .separator();
+                        menu = add_commands(
+                            menu.label(label),
+                            &shell,
+                            &settings,
+                            &disabled,
+                            ids,
+                            navigator_visible,
+                        )
+                        .separator();
                         continue;
                     }
                     let shell = shell.clone();
                     let settings = settings.clone();
                     let disabled = disabled.clone();
                     menu = menu.submenu(label, window, cx, move |submenu, _, _| {
-                        add_commands(submenu.min_w(px(260.)), &shell, &settings, &disabled, ids)
+                        add_commands(
+                            submenu.accessible_name(label).min_w(px(260.)),
+                            &shell,
+                            &settings,
+                            &disabled,
+                            ids,
+                            navigator_visible,
+                        )
                     });
                 }
                 let cli = ["finish", "abort", "choose", "cancel"];
@@ -524,6 +547,7 @@ impl Shell {
                         &settings,
                         &disabled,
                         &cli,
+                        navigator_visible,
                     )
                     .separator();
                 } else if request {
@@ -531,7 +555,14 @@ impl Shell {
                     let settings = settings.clone();
                     let disabled = disabled.clone();
                     menu = menu.submenu("CLI Request", window, cx, move |submenu, _, _| {
-                        add_commands(submenu.min_w(px(260.)), &shell, &settings, &disabled, &cli)
+                        add_commands(
+                            submenu.min_w(px(260.)),
+                            &shell,
+                            &settings,
+                            &disabled,
+                            &cli,
+                            navigator_visible,
+                        )
                     });
                 }
                 add_commands(
@@ -540,6 +571,7 @@ impl Shell {
                     &settings,
                     &disabled,
                     &["commands", "settings", "-", "quit"],
+                    navigator_visible,
                 )
             })
             .request_open(requested)

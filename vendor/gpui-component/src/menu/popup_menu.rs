@@ -982,7 +982,9 @@ impl PopupMenu {
     }
 
     fn dismiss(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
-        if self.active_submenu().is_some() {
+        // An open submenu handles Escape itself; once focus is back in this menu,
+        // Escape closes the whole menu.
+        if self.active_submenu().is_some() && !self.focus_handle.is_focused(window) {
             return;
         }
 
@@ -1465,11 +1467,14 @@ impl Render for PopupMenu {
                     ),
                 )
             });
-        gpui::accessible("menu-semantics", rendered, move |_, window, _| {
+        let semantic_id = ("menu-semantics", cx.entity_id().as_u64() as usize);
+        let is_submenu = self.parent_menu.is_some();
+        gpui::accessible(semantic_id, rendered, move |_, window, _| {
             let mut node = gpui::accesskit::Node::new(gpui::accesskit::Role::Menu);
             node.set_label(accessible_name.to_string());
             let mut info = gpui::AccessibilityInfo::new(node);
-            info.modal = true;
+            // A submenu lives inside its parent's subtree; only the outermost menu is modal.
+            info.modal = !is_submenu;
             info.focused = semantic_empty && semantic_focus.is_focused(window);
             info
         })
