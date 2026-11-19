@@ -216,7 +216,8 @@ where
                 if let Some(inset) = self.bottom_inset
                     && let Some(bounds) = popover.trigger_bounds
                 {
-                    let height = window.viewport_size().height - bounds.bottom() - inset - px(8.);
+                    let origin = Popover::resolved_corner(self.anchor, bounds);
+                    let height = window.viewport_size().height - origin.y - inset - px(16.);
                     menu.update(cx, |menu, cx| menu.limit_available_height(height, cx));
                 }
                 menu

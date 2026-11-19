@@ -171,7 +171,7 @@ impl Popover {
         self
     }
 
-    fn resolved_corner(anchor: Corner, bounds: Bounds<Pixels>) -> Point<Pixels> {
+    pub(crate) fn resolved_corner(anchor: Corner, bounds: Bounds<Pixels>) -> Point<Pixels> {
         bounds.corner(match anchor {
             Corner::TopLeft => Corner::BottomLeft,
             Corner::TopRight => Corner::BottomRight,

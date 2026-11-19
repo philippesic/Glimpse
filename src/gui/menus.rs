@@ -80,11 +80,13 @@ impl Shell {
             .flex_shrink_0()
             .dropdown_menu_with_anchor(Corner::TopRight, move |mut menu, window, _| {
                 let viewport = window.viewport_size();
+                let width = (window.rem_size() * 14.).min(viewport.width - px(24.));
                 menu = menu
                     .accessible_name("Open Documents")
                     .scrollable(true)
                     .check_side(Side::Right)
-                    .max_w((viewport.width - px(24.)).min(px(620.)))
+                    .min_w(width)
+                    .max_w(width)
                     .max_h((viewport.height - px(96.)).max(px(100.)));
                 for (id, title, status, current) in &items {
                     let id = *id;
