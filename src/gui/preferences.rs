@@ -357,23 +357,23 @@ impl Render for Preferences {
                             ]
                             .into_iter()
                             .map(|(label, dark)| {
+                                let chosen = if let Some(dark) = dark {
+                                    !self.draft.system_theme && self.draft.dark == dark
+                                } else {
+                                    self.draft.system_theme
+                                };
                                 Button::new(label)
                                     .small()
                                     .compact()
                                     .label(label)
-                                    .primary()
-                                    .when(
-                                        if let Some(dark) = dark {
-                                            self.draft.system_theme || self.draft.dark != dark
+                                    .accessibility_role(gpui::accesskit::Role::RadioButton)
+                                    .accessibility_toggled(chosen)
+                                    .map(|button| {
+                                        if chosen {
+                                            button.primary()
                                         } else {
-                                            !self.draft.system_theme
-                                        },
-                                        |button| button.outline(),
-                                    )
-                                    .selected(if let Some(dark) = dark {
-                                        !self.draft.system_theme && self.draft.dark == dark
-                                    } else {
-                                        self.draft.system_theme
+                                            button.outline()
+                                        }
                                     })
                                     .disabled(self.pending)
                                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -506,12 +506,25 @@ impl Render for Preferences {
                     Button::new(page.label())
                         .label(page.label())
                         .small()
-                        .primary()
-                        .when(page != self.page, |button| button.outline())
+                        .accessibility_role(gpui::accesskit::Role::Tab)
                         .selected(page == self.page)
+                        .map(|button| {
+                            if page == self.page {
+                                button.primary()
+                            } else {
+                                button.ghost()
+                            }
+                        })
                         .disabled(self.pending)
                         .on_click(cx.listener(move |this, _, _, cx| this.select_page(page, cx)))
                 }))
+                .map(|tabs| {
+                    gpui::accessible("preferences-categories", tabs, |_, _, _| {
+                        let mut node = gpui::accesskit::Node::new(gpui::accesskit::Role::TabList);
+                        node.set_label("Preferences categories");
+                        AccessibilityInfo::new(node)
+                    })
+                })
                 .into_any_element()
         };
         let title = div()

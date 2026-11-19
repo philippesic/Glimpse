@@ -95,6 +95,7 @@ pub fn apply(settings: &Settings, window: &mut Window, cx: &mut App) -> Option<S
     colors.success = color(palette.success);
     colors.success_foreground = color(palette.canvas);
     colors.window_border = color(palette.separator);
+    colors.overlay = gpui::hsla(0., 0., 0., palette.scrim);
     let mut highlight = (*theme.highlight_theme).clone();
     highlight.style.editor_background = Some(theme.colors.background);
     highlight.style.editor_active_line = settings
@@ -127,6 +128,7 @@ struct Palette {
     warning: u32,
     error: u32,
     success: u32,
+    scrim: f32,
 }
 
 const LIGHT: Palette = Palette {
@@ -148,6 +150,7 @@ const LIGHT: Palette = Palette {
     warning: 0x805600,
     error: 0xB42332,
     success: 0x256B3D,
+    scrim: 0.32,
 };
 
 const DARK: Palette = Palette {
@@ -164,11 +167,12 @@ const DARK: Palette = Palette {
     selection: 0x243E60,
     accent: 0x409CFF,
     action: 0x1F6FD8,
-    action_hover: 0x2A7CE6,
+    action_hover: 0x1B63C6,
     action_text: 0xFFFFFF,
     warning: 0xEBC378,
     error: 0xFF9EAA,
     success: 0x89D6A3,
+    scrim: 0.55,
 };
 
 pub fn source_canvases(cx: &App) -> [[[u8; 3]; 5]; 2] {

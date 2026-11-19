@@ -463,7 +463,9 @@ impl Shell {
                 panel.child(div().h(px(4. * scale)).flex_shrink_0())
             })
             .when(count > 0, |panel| {
-                panel.child(
+                panel.child(accessibility::collection(
+                    "search-results",
+                    "Search results".into(),
                     div()
                         .id("results")
                         .track_focus(&self.search_ui.focus)
@@ -570,7 +572,8 @@ impl Shell {
                             .h_full()
                             .track_scroll(self.search_ui.scroll.clone()),
                         ),
-                )
+                    self.search_ui.focus.clone(),
+                ))
             })
             .into_any_element()
     }

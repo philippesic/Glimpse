@@ -16,7 +16,7 @@ use gpui::{
 use ropey::{LineType, Rope, RopeBuilder, extra::esoterica::ropes_are_instances};
 
 use crate::{
-    ActiveTheme, Disableable, IconName, Selectable, Sizable,
+    ActiveTheme, Disableable, IconName, Sizable,
     actions::SelectUp,
     button::{Button, ButtonVariants},
     h_flex,
@@ -951,7 +951,7 @@ impl Render for SearchPanel {
                                     .when(!compact, |input| {
                                         input.suffix(
                                             Button::new("case-insensitive")
-                                                .selected(!self.case_insensitive)
+                                                .accessibility_toggled(!self.case_insensitive)
                                                 .small()
                                                 .compact()
                                                 .outline()
@@ -1000,7 +1000,7 @@ impl Render for SearchPanel {
                                         .when(self.whole_word, |button| button.primary())
                                         .label("Word")
                                         .tooltip("Match whole words")
-                                        .selected(self.whole_word)
+                                        .accessibility_toggled(self.whole_word)
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.toggle_whole_word(window, cx);
                                         })),
@@ -1011,8 +1011,12 @@ impl Render for SearchPanel {
                                         .outline()
                                         .when(self.replace_mode, |button| button.primary())
                                         .icon(IconName::Replace)
-                                        .tooltip("Show replacement")
-                                        .selected(self.replace_mode)
+                                        .tooltip(if self.replace_mode {
+                                            "Hide replacement"
+                                        } else {
+                                            "Show replacement"
+                                        })
+                                        .accessibility_expanded(self.replace_mode)
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.toggle_replace(window, cx);
                                         })),

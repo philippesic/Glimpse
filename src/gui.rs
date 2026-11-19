@@ -4205,39 +4205,44 @@ impl Render for Shell {
                             "Changed on disk. Local text retained; ordinary Save is blocked."
                                 .into(),
                             div()
-                                .flex()
-                                .flex_wrap()
-                                .gap_x(px(4. * scale))
+                                .min_w_0()
                                 .child(
                                     div()
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .child("Changed on disk."),
                                 )
-                                .child("Local text retained; ordinary Save is blocked."),
+                                .child(
+                                    div()
+                                        .whitespace_normal()
+                                        .child("Local text retained; ordinary Save is blocked."),
+                                ),
                         ))
-                        .child(
-                            div()
-                                .w_full()
-                                .min_w_0()
-                                .flex()
-                                .flex_wrap()
-                                .gap_2()
-                                .child(self.button("Compare", "compare", cx))
-                                .child(self.button("Keep Editing", "keep-editing", cx))
-                                .child(self.command_button(
-                                    "conflict-reload",
-                                    "Reload Disk Version",
-                                    "reload",
-                                    cx,
-                                ))
-                                .child(self.command_button(
-                                    "conflict-save-copy",
-                                    "Save Copy",
-                                    "save-copy",
-                                    cx,
-                                ))
-                                .child(self.button("Overwrite Disk Version…", "overwrite", cx)),
-                        ),
+                        .when(narrow, |banner| banner.child(self.conflict_menu(cx)))
+                        .when(!narrow, |banner| {
+                            banner.child(
+                                div()
+                                    .w_full()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_wrap()
+                                    .gap_2()
+                                    .child(self.button("Compare", "compare", cx))
+                                    .child(self.button("Keep Editing", "keep-editing", cx))
+                                    .child(self.command_button(
+                                        "conflict-reload",
+                                        "Reload Disk Version",
+                                        "reload",
+                                        cx,
+                                    ))
+                                    .child(self.command_button(
+                                        "conflict-save-copy",
+                                        "Save Copy",
+                                        "save-copy",
+                                        cx,
+                                    ))
+                                    .child(self.button("Overwrite Disk Version…", "overwrite", cx)),
+                            )
+                        }),
                 );
             }
             if has_notices {

@@ -4,11 +4,13 @@ impl Shell {
     /// Search and command panels take the whole main area when the window cannot fit
     /// them beside a usable document, as narrow layouts show one surface at a time.
     pub(super) fn panel_takes_over(&self, narrow: bool, window: &Window) -> bool {
-        matches!(
-            self.panel,
-            Some(Panel::Files | Panel::Text | Panel::Palette | Panel::Recovery)
-        ) && !self.search_ui.collapsed
-            && (narrow || window.viewport_size().height < px(560. * self.settings.ui_scale))
+        let listing = match self.panel {
+            Some(Panel::Files | Panel::Text) => !self.search_ui.collapsed,
+            Some(Panel::Palette | Panel::Recovery) => true,
+            Some(Panel::Path) => self.path_completions.is_some() || self.path_hint.is_some(),
+            _ => false,
+        };
+        listing && (narrow || window.viewport_size().height < px(560. * self.settings.ui_scale))
     }
 
     pub(super) fn panel_view(
@@ -161,6 +163,14 @@ impl Shell {
     }
 
     fn palette_view(&self, takeover: bool, cx: &Context<Self>) -> impl IntoElement {
+        accessibility::group(
+            "palette-list",
+            "Matching commands".into(),
+            self.palette_list(takeover, cx),
+        )
+    }
+
+    fn palette_list(&self, takeover: bool, cx: &Context<Self>) -> impl IntoElement {
         let scale = self.settings.ui_scale;
         let query = self.query.read(cx).value().to_lowercase();
         let row_height = px(28. * scale);

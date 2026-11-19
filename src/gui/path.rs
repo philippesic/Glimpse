@@ -297,7 +297,7 @@ impl Shell {
                         .flex()
                         .flex_col()
                         .items_start()
-                        .max_h(px(160. * scale).min(window.viewport_size().height * 0.2))
+                        .max_h(px(160. * scale).min(window.viewport_size().height * 0.5))
                         .overflow_y_scroll()
                         .children(completions.matches.choices.iter().enumerate().map(
                             |(i, choice)| {

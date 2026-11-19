@@ -130,6 +130,29 @@ impl Shell {
             })
     }
 
+    pub(super) fn conflict_menu(&self, cx: &Context<Self>) -> impl IntoElement {
+        let shell = cx.entity().downgrade();
+        let disabled = self.disabled_commands();
+        Button::new("conflict-actions")
+            .label("Resolve")
+            .accessibility_description("Choose how to resolve the change on disk")
+            .small()
+            .outline()
+            .dropdown_caret(true)
+            .dropdown_menu(move |menu, _, _| {
+                let item = |id: &'static str, label: &str| {
+                    command_item(shell.clone(), id, label.into(), disabled.contains(id))
+                };
+                menu.accessible_name("Resolve change on disk")
+                    .item(item("compare", "Compare"))
+                    .item(item("keep-editing", "Keep Editing"))
+                    .separator()
+                    .item(item("reload", "Reload Disk Version"))
+                    .item(item("save-copy", "Save Copy…"))
+                    .item(item("overwrite", "Overwrite Disk Version…"))
+            })
+    }
+
     pub(super) fn search_scope_menu(
         &self,
         label: String,
@@ -283,6 +306,7 @@ impl Shell {
             .dropdown_caret(true)
             .dropdown_menu(move |mut menu, window, _| {
                 menu = menu
+                    .accessible_name("Locations")
                     .scrollable(true)
                     .max_w((window.viewport_size().width - px(16.)).min(px(620.)))
                     .max_h((window.viewport_size().height - px(96.)).max(px(100.)))
