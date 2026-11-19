@@ -67,7 +67,7 @@ impl UnsavedSubject {
     }
 }
 
-fn abbreviate_folder(
+pub(super) fn abbreviate_folder(
     folder: &str,
     width: Pixels,
     text_width: &impl Fn(&SharedString) -> Pixels,

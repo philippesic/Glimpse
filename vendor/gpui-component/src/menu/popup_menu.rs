@@ -36,6 +36,7 @@ pub enum PopupMenuItem {
     Item {
         icon: Option<Icon>,
         label: SharedString,
+        display_label: Option<SharedString>,
         shortcut_hint: Option<SharedString>,
         disabled: bool,
         checked: bool,
@@ -72,6 +73,7 @@ impl PopupMenuItem {
         PopupMenuItem::Item {
             icon: None,
             label: label.into(),
+            display_label: None,
             shortcut_hint: None,
             disabled: false,
             checked: false,
@@ -79,6 +81,13 @@ impl PopupMenuItem {
             is_link: false,
             handler: None,
         }
+    }
+
+    pub fn display_label(mut self, text: impl Into<SharedString>) -> Self {
+        if let Self::Item { display_label, .. } = &mut self {
+            *display_label = Some(text.into());
+        }
+        self
     }
 
     /// Create a new menu item with custom element render.
@@ -224,6 +233,7 @@ impl PopupMenuItem {
         PopupMenuItem::Item {
             icon: None,
             label: label.into(),
+            display_label: None,
             shortcut_hint: None,
             disabled: false,
             checked: false,
@@ -1152,6 +1162,7 @@ impl PopupMenu {
             PopupMenuItem::Item {
                 icon,
                 label,
+                display_label,
                 shortcut_hint,
                 action,
                 disabled,
@@ -1172,7 +1183,7 @@ impl PopupMenu {
                         .min_w_0()
                         .line_clamp(1)
                         .text_ellipsis()
-                        .child(label.clone())
+                        .child(display_label.as_ref().unwrap_or(label).clone())
                         .tooltip({
                             let label = full_label.clone();
                             move |window, cx| {

@@ -125,34 +125,47 @@ impl Shell {
                         .small()
                         .outline()
                         .dropdown_menu(move |mut menu, window, _| {
+                            let viewport = window.viewport_size();
+                            let menu_width = (viewport.width - px(24.)).min(px(620.));
+                            let rem = window.rem_size();
+                            let label_width = menu_width - rem * 0.5 - px(28.);
+                            let text_style = window.text_style();
+                            let measure = |text: &SharedString| {
+                                let run = text_style.to_run(text.len());
+                                window
+                                    .text_system()
+                                    .shape_line(text.clone(), rem * 0.875, &[run], None)
+                                    .width
+                            };
                             menu = menu
                                 .scrollable(true)
-                                .max_w((window.viewport_size().width - px(16.)).min(px(620.)))
-                                .max_h((window.viewport_size().height - px(96.)).max(px(100.)));
+                                .max_w(menu_width)
+                                .max_h((viewport.height - px(96.)).max(px(100.)));
                             for path in ancestors.iter().rev() {
+                                let name = paths::name(path);
                                 let label = match path.parent() {
-                                    Some(parent) => {
-                                        format!(
-                                            "{} — {}",
-                                            paths::name(path),
-                                            paths::display(parent)
-                                        )
-                                    }
+                                    Some(parent) => format!("{name} — {}", paths::display(parent)),
                                     None => paths::display(path),
+                                };
+                                let item = PopupMenuItem::new(label);
+                                let caption =
+                                    decision::abbreviate_folder(&name, label_width, &measure);
+                                let item = if caption.as_ref() != name {
+                                    item.display_label(caption)
+                                } else {
+                                    item
                                 };
                                 let path = path.clone();
                                 let shell = shell.clone();
-                                menu = menu.item(PopupMenuItem::new(label).on_click(
-                                    move |_, window, cx| {
-                                        let shell = shell.clone();
-                                        let path = path.clone();
-                                        window.defer(cx, move |window, cx| {
-                                            let _ = shell.update(cx, |shell, cx| {
-                                                shell.activate_breadcrumb(path, window, cx);
-                                            });
+                                menu = menu.item(item.on_click(move |_, window, cx| {
+                                    let shell = shell.clone();
+                                    let path = path.clone();
+                                    window.defer(cx, move |window, cx| {
+                                        let _ = shell.update(cx, |shell, cx| {
+                                            shell.activate_breadcrumb(path, window, cx);
                                         });
-                                    },
-                                ));
+                                    });
+                                }));
                             }
                             menu
                         }),
