@@ -7,7 +7,7 @@ use gpui_component::{
     scroll::{Scrollbar, ScrollbarShow},
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{MAIN_SEPARATOR, Path},
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -27,9 +27,16 @@ impl UnsavedSubject {
         index: usize,
         lines: Option<usize>,
         folder: SharedString,
+        numbered: bool,
         cx: &App,
     ) -> impl IntoElement {
-        let label = self.label();
+        let mut label = self.label();
+        let folder = if numbered {
+            label = format!("{}. {label}", index + 1);
+            SharedString::from(format!("{}. {folder}", index + 1))
+        } else {
+            folder
+        };
         gpui::accessible(
             ("decision-subject", index),
             div()
@@ -63,20 +70,10 @@ impl UnsavedSubject {
 fn abbreviate_folder(
     folder: &str,
     width: Pixels,
-    font_size: Pixels,
-    keep_start: bool,
-    window: &Window,
+    text_width: &impl Fn(&SharedString) -> Pixels,
 ) -> SharedString {
-    let style = window.text_style();
-    let text_width = |text: SharedString| {
-        let run = style.to_run(text.len());
-        window
-            .text_system()
-            .shape_line(text, font_size, &[run], None)
-            .width
-    };
     let full = SharedString::from(folder.to_owned());
-    if text_width(full.clone()) <= width {
+    if text_width(&full) <= width {
         return full;
     }
 
@@ -91,14 +88,14 @@ fn abbreviate_folder(
     let mut longest = count.saturating_sub(1);
     while shortest <= longest {
         let kept = shortest + (longest - shortest) / 2;
-        let prefix = if keep_start { kept } else { kept * 2 / 5 };
+        let prefix = kept * 2 / 5;
         let suffix = kept - prefix;
         let candidate = SharedString::from(format!(
             "{}…{}",
             &folder[..offsets[prefix]],
             &folder[offsets[count - suffix]..],
         ));
-        if text_width(candidate.clone()) <= width {
+        if text_width(&candidate) <= width {
             abbreviated = candidate;
             shortest = kept + 1;
         } else {
@@ -125,6 +122,7 @@ pub struct Decision {
 }
 pub struct Choice(pub usize);
 impl EventEmitter<Choice> for Decision {}
+
 impl Decision {
     pub fn new(
         title: String,
@@ -212,15 +210,14 @@ impl Decision {
         cx.notify();
     }
     fn folder_captions(
-        &self,
+        subjects: &[UnsavedSubject],
         width: Pixels,
-        font_size: Pixels,
-        window: &Window,
-    ) -> Vec<SharedString> {
-        let mut captions = Vec::with_capacity(self.subjects.len());
+        text_width: impl Fn(&SharedString) -> Pixels,
+    ) -> (Vec<SharedString>, bool) {
+        let mut captions = Vec::with_capacity(subjects.len());
         let mut groups: HashMap<_, Vec<usize>> = HashMap::new();
-        for (index, subject) in self.subjects.iter().enumerate() {
-            let caption = abbreviate_folder(&subject.folder, width, font_size, false, window);
+        for (index, subject) in subjects.iter().enumerate() {
+            let caption = abbreviate_folder(&subject.folder, width, &text_width);
             groups
                 .entry((subject.name.as_str(), caption.clone()))
                 .or_default()
@@ -229,32 +226,44 @@ impl Decision {
         }
         for group in groups.values().filter(|group| group.len() > 1) {
             for &index in group {
-                let folder = &self.subjects[index].folder;
+                let folder = &subjects[index].folder;
                 let common = group
                     .iter()
                     .filter(|&&other| other != index)
                     .map(|&other| {
                         folder
                             .graphemes(true)
-                            .zip(self.subjects[other].folder.graphemes(true))
+                            .zip(subjects[other].folder.graphemes(true))
                             .take_while(|(a, b)| a == b)
                             .count()
                     })
                     .max()
                     .unwrap_or_default();
-                if let Some((start, _)) =
-                    folder.grapheme_indices(true).nth(common.saturating_sub(3))
-                {
+                if let Some((difference, _)) = folder.grapheme_indices(true).nth(common) {
+                    let start = folder
+                        .split_word_bound_indices()
+                        .take_while(|(offset, _)| *offset <= difference)
+                        .last()
+                        .map_or(difference, |(offset, _)| offset);
+                    let start = if difference - start > 12 {
+                        difference
+                    } else {
+                        start
+                    };
                     let prefix = if start == 0 { "" } else { "…" };
                     let distinguishing = format!("{prefix}{}", &folder[start..]);
-                    captions[index] =
-                        abbreviate_folder(&distinguishing, width, font_size, true, window);
+                    captions[index] = abbreviate_folder(&distinguishing, width, &text_width);
                 }
             }
         }
-        captions
+        let mut seen = HashSet::new();
+        let numbered = subjects
+            .iter()
+            .zip(&captions)
+            .any(|(subject, folder)| !seen.insert((&subject.name, folder)));
+        (captions, numbered)
     }
-    fn compact_paths(&self) -> Div {
+    fn compact_paths(&self, numbered: bool) -> Div {
         div()
             .pt_2()
             .children(self.detail.lines().enumerate().map(|(index, path)| {
@@ -266,6 +275,7 @@ impl Decision {
                     .flex()
                     .flex_wrap()
                     .pb_1()
+                    .when(numbered, |row| row.child(format!("{}.\u{a0}", index + 1)))
                     .children(path.split_inclusive(MAIN_SEPARATOR).map(|part| {
                         div()
                             .max_w_full()
@@ -325,17 +335,24 @@ impl Render for Decision {
         } else {
             rem
         };
-        let folder_captions = self.folder_captions(
+        let text_style = window.text_style();
+        let (folder_captions, numbered) = Self::folder_captions(
+            &self.subjects,
             panel_width - px(2.) - horizontal_padding - scroll_inset,
-            caption_size,
-            window,
+            |text| {
+                let run = text_style.to_run(text.len());
+                window
+                    .text_system()
+                    .shape_line(text.clone(), caption_size, &[run], None)
+                    .width
+            },
         );
         let narrow = viewport.width < px(400.) * (cx.theme().font_size / px(16.));
         let comparison_height = px(160.).min(viewport.height * 0.22);
         let detail_fraction = if self.comparison.is_some() { 0.67 } else { 0.4 };
         let subject_lines = compact.then_some(if self.subjects.len() == 1 { 3 } else { 1 });
-        let detail = if compact && !self.subjects.is_empty() {
-            self.compact_paths().into_any_element()
+        let detail = if (compact || numbered) && !self.subjects.is_empty() {
+            self.compact_paths(numbered).into_any_element()
         } else {
             self.detail.clone().into_any_element()
         };
@@ -414,7 +431,13 @@ impl Render for Decision {
                                     .children(
                                         self.subjects.iter().zip(folder_captions).enumerate().map(
                                             |(index, (subject, folder))| {
-                                                subject.element(index, subject_lines, folder, cx)
+                                                subject.element(
+                                                    index,
+                                                    subject_lines,
+                                                    folder,
+                                                    numbered,
+                                                    cx,
+                                                )
                                             },
                                         ),
                                     )
@@ -512,5 +535,52 @@ impl Render for Decision {
             info.modal = true;
             info
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Decision, UnsavedSubject};
+    use gpui::{SharedString, px};
+    use unicode_segmentation::UnicodeSegmentation;
+
+    fn captions(folders: &[&str]) -> (Vec<SharedString>, bool) {
+        let subjects = folders
+            .iter()
+            .map(|folder| UnsavedSubject {
+                name: "notes.md".into(),
+                folder: (*folder).into(),
+            })
+            .collect::<Vec<_>>();
+        Decision::folder_captions(&subjects, px(38.), |text| {
+            px(text.graphemes(true).count() as f32)
+        })
+    }
+
+    #[test]
+    fn numbering_catches_collisions_between_adjusted_groups() {
+        let paths = [("alpha", "A"), ("alpha", "B"), ("beta", "A"), ("beta", "B")].map(
+            |(group, middle)| {
+                format!("{group}-long-shared-folder-middle-{middle}-the-trailing-parent-directory")
+            },
+        );
+        let folders = paths.each_ref().map(String::as_str);
+        let (labels, numbered) = captions(&folders);
+        assert_eq!(labels[0], labels[2]);
+        assert_eq!(labels[1], labels[3]);
+        assert_ne!(labels[0], labels[1]);
+        assert!(numbered);
+        assert!(labels[0].starts_with("…A"));
+        assert!(labels[0].ends_with("directory"));
+    }
+
+    #[test]
+    fn already_distinct_prefixes_and_short_paths_need_no_numbers() {
+        let (labels, numbered) = captions(&["notes", "notes/archive", "other"]);
+        assert_eq!(
+            labels,
+            ["notes", "notes/archive", "other"].map(SharedString::from)
+        );
+        assert!(!numbered);
     }
 }
