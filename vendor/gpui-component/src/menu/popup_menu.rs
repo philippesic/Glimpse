@@ -37,6 +37,7 @@ pub enum PopupMenuItem {
         icon: Option<Icon>,
         label: SharedString,
         display_label: Option<SharedString>,
+        detail: Option<SharedString>,
         shortcut_hint: Option<SharedString>,
         disabled: bool,
         checked: bool,
@@ -74,6 +75,7 @@ impl PopupMenuItem {
             icon: None,
             label: label.into(),
             display_label: None,
+            detail: None,
             shortcut_hint: None,
             disabled: false,
             checked: false,
@@ -86,6 +88,13 @@ impl PopupMenuItem {
     pub fn display_label(mut self, text: impl Into<SharedString>) -> Self {
         if let Self::Item { display_label, .. } = &mut self {
             *display_label = Some(text.into());
+        }
+        self
+    }
+
+    pub fn detail(mut self, text: impl Into<SharedString>) -> Self {
+        if let Self::Item { detail, .. } = &mut self {
+            *detail = Some(text.into());
         }
         self
     }
@@ -234,6 +243,7 @@ impl PopupMenuItem {
             icon: None,
             label: label.into(),
             display_label: None,
+            detail: None,
             shortcut_hint: None,
             disabled: false,
             checked: false,
@@ -1163,6 +1173,7 @@ impl PopupMenu {
                 icon,
                 label,
                 display_label,
+                detail,
                 shortcut_hint,
                 action,
                 disabled,
@@ -1179,7 +1190,6 @@ impl PopupMenu {
                 let label_element = || {
                     div()
                         .id(("menu-label", ix))
-                        .flex_1()
                         .min_w_0()
                         .line_clamp(1)
                         .text_ellipsis()
@@ -1201,7 +1211,12 @@ impl PopupMenu {
                 })
                 .disabled(*disabled)
                 .when_some(shortcut_hint.clone(), |row, hint| row.shortcut(hint))
-                .h(item_height)
+                .h(item_height
+                    + if detail.is_some() {
+                        window.rem_size()
+                    } else {
+                        px(0.)
+                    })
                 .gap_x_1()
                 .children(Self::render_icon(
                     has_left_icon,
@@ -1217,7 +1232,17 @@ impl PopupMenu {
                         .gap_3()
                         .items_center()
                         .justify_between()
-                        .when(!show_link_icon, |this| this.child(label_element()))
+                        .when(!show_link_icon, |this| {
+                            if let Some(detail) = detail {
+                                this.child(
+                                    v_flex().flex_1().min_w_0().child(label_element()).child(
+                                        div().text_xs().whitespace_nowrap().child(detail.clone()),
+                                    ),
+                                )
+                            } else {
+                                this.child(label_element().flex_1())
+                            }
+                        })
                         .children(right_check_icon)
                         .when(show_link_icon, |this| {
                             this.child(
@@ -1226,7 +1251,7 @@ impl PopupMenu {
                                     .justify_between()
                                     .gap_1p5()
                                     .min_w_0()
-                                    .child(label_element())
+                                    .child(label_element().flex_1())
                                     .child(
                                         Icon::new(IconName::ExternalLink)
                                             .xsmall()

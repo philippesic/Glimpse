@@ -49,19 +49,19 @@ impl Shell {
             .documents
             .iter()
             .map(|document| {
-                let mut label = paths::tab_label(
+                let title = paths::tab_label(
                     &document.disk.path,
                     self.documents.iter().map(|doc| doc.disk.path.as_path()),
                 );
                 let current = Some(document.id) == self.active;
                 let dirty = document.dirty(cx);
-                if dirty {
-                    label.push_str(" · Unsaved");
-                }
-                if current {
-                    label.push_str(" · Current");
-                }
-                (document.id, label, current, dirty)
+                let status = match (dirty, current) {
+                    (true, true) => Some("Unsaved · Current"),
+                    (true, false) => Some("Unsaved"),
+                    (false, true) => Some("Current"),
+                    (false, false) => None,
+                };
+                (document.id, title, status, current)
             })
             .collect::<Vec<_>>();
         Button::new("open-documents-menu")
@@ -78,22 +78,23 @@ impl Shell {
                     .check_side(Side::Right)
                     .max_w((viewport.width - px(24.)).min(px(620.)))
                     .max_h((viewport.height - px(96.)).max(px(100.)));
-                for (id, label, current, dirty) in &items {
+                for (id, title, status, current) in &items {
                     let id = *id;
                     let shell = shell.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new(label.clone())
-                            .checked(*current)
-                            .when(*dirty, |item| item.icon(IconName::Asterisk))
-                            .on_click(move |_, window, cx| {
-                                let shell = shell.clone();
-                                window.defer(cx, move |window, cx| {
-                                    let _ = shell.update(cx, |shell, cx| {
-                                        shell.select_tab(id, false, window, cx);
-                                    });
-                                });
-                            }),
-                    );
+                    let item = match status {
+                        Some(status) => PopupMenuItem::new(format!("{title} · {status}"))
+                            .display_label(title.clone())
+                            .detail(*status),
+                        None => PopupMenuItem::new(title.clone()),
+                    };
+                    menu = menu.item(item.checked(*current).on_click(move |_, window, cx| {
+                        let shell = shell.clone();
+                        window.defer(cx, move |window, cx| {
+                            let _ = shell.update(cx, |shell, cx| {
+                                shell.select_tab(id, false, window, cx);
+                            });
+                        });
+                    }));
                 }
                 menu
             })
