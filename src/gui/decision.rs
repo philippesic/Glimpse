@@ -270,7 +270,7 @@ impl Decision {
                 .or_default()
                 .push(index);
         }
-        let separator = SharedString::from(" ");
+        let separator = SharedString::from(" · ");
         let separator_width = text_width(&separator);
         for group in groups.values().filter(|group| group.len() > 1) {
             for &index in group {
@@ -303,26 +303,36 @@ impl Decision {
             .any(|(subject, folder)| !seen.insert((&subject.name, folder)));
         (captions, numbered)
     }
-    fn compact_paths(&self, numbered: bool) -> Div {
+    fn close_paths(&self, numbered: bool) -> Div {
         div()
             .pt_2()
+            .flex()
+            .flex_col()
+            .gap_2()
             .children(self.detail.lines().enumerate().map(|(index, path)| {
                 let full_path = path.to_owned();
+                let filename_offset = path
+                    .rmatch_indices(MAIN_SEPARATOR)
+                    .next()
+                    .map_or(0, |(offset, separator)| offset + separator.len());
+                let (folder, filename) = path.split_at(filename_offset);
                 div()
                     .id(("decision-full-path", index))
                     .w_full()
                     .min_w_0()
                     .flex()
-                    .flex_wrap()
-                    .pb_1()
-                    .when(numbered, |row| row.child(format!("{}.\u{a0}", index + 1)))
-                    .children(path.split_inclusive(MAIN_SEPARATOR).map(|part| {
+                    .flex_col()
+                    .child(
                         div()
-                            .max_w_full()
-                            .flex_shrink_0()
+                            .font_semibold()
                             .whitespace_normal()
-                            .child(part.to_owned())
-                    }))
+                            .child(if numbered {
+                                format!("{}. {filename}", index + 1)
+                            } else {
+                                filename.to_owned()
+                            }),
+                    )
+                    .child(div().w_full().whitespace_normal().child(folder.to_owned()))
                     .tooltip(move |window, cx| {
                         gpui_component::tooltip::Tooltip::new(full_path.clone()).build(window, cx)
                     })
@@ -391,8 +401,8 @@ impl Render for Decision {
         let comparison_height = px(160.).min(viewport.height * 0.22);
         let detail_fraction = if self.comparison.is_some() { 0.67 } else { 0.4 };
         let subject_lines = compact.then_some(if self.subjects.len() == 1 { 3 } else { 1 });
-        let detail = if (compact || numbered) && !self.subjects.is_empty() {
-            self.compact_paths(numbered).into_any_element()
+        let detail = if !self.subjects.is_empty() {
+            self.close_paths(numbered).into_any_element()
         } else {
             self.detail.clone().into_any_element()
         };
