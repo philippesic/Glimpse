@@ -28,10 +28,24 @@ pub fn shortcut(expected: &commands::Modifiers, actual: &Modifiers) -> bool {
 }
 
 pub fn shortcut_label(value: &str) -> String {
+    let keys = value
+        .split('+')
+        .map(|key| match key {
+            "ArrowLeft" => "Left",
+            "ArrowRight" => "Right",
+            "ArrowUp" => "Up",
+            "ArrowDown" => "Down",
+            "PageUp" => "Page Up",
+            "PageDown" => "Page Down",
+            "Comma" => ",",
+            other => other,
+        })
+        .collect::<Vec<_>>()
+        .join("+");
     if cfg!(target_os = "macos") {
-        value.replace("Cmd", "⌘").replace("Alt", "Option")
+        keys.replace("Cmd", "⌘").replace("Alt", "Option")
     } else {
-        value.replace("Cmd", "Ctrl")
+        keys.replace("Cmd", "Ctrl")
     }
 }
 
