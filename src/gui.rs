@@ -2565,14 +2565,15 @@ impl Shell {
                     .collect::<Vec<_>>()
                     .join("\n");
                 let finish = decision.finish;
+                let title = match (finish, paths.len()) {
+                    (true, 0..=1) => "Finish Editing?".into(),
+                    (false, 0..=1) => "Close with unsaved changes?".into(),
+                    (true, count) => format!("Finish editing {count} unsaved documents?"),
+                    (false, count) => format!("Close {count} unsaved documents?"),
+                };
                 self.ask_decision(
                     DecisionAction::Close,
-                    if finish {
-                        "Finish Editing?"
-                    } else {
-                        "Close with unsaved changes?"
-                    }
-                    .into(),
+                    title,
                     details,
                     vec![
                         "Cancel",
