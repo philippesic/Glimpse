@@ -222,8 +222,8 @@ slotmap::new_key_type! {
     pub struct FocusId;
 }
 
-/// With `GLIMPSE_CLIP_PROBE` set, report glyphs cut off vertically by a box little taller than
-/// the text: a label box shorter than its glyphs, not content scrolled past a viewport edge.
+/// With `GLIMPSE_CLIP_PROBE` set, report glyphs cut off vertically by a box under two font sizes
+/// tall: a label box shorter than its glyphs, not content scrolled past a viewport edge.
 /// The edge that cuts the glyph is attributed to the outermost clipping box that introduced it.
 fn report_tight_glyph_clip(
     glyph: &Bounds<ScaledPixels>,
@@ -265,7 +265,7 @@ fn report_tight_glyph_clip(
             })
             .map_or(f32::MAX, |mask| mask.bounds.size.height.0)
     };
-    let tight = font_size.0 * 3.;
+    let tight = font_size.0 * 2.;
     let cut = (top < mask_top - 1. && edge_box_height(true) < tight)
         || (bottom > mask_bottom + 1. && edge_box_height(false) < tight);
     if !cut {

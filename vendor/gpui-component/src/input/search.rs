@@ -11,7 +11,7 @@ use std::{
 use gpui::{
     App, AppContext as _, Context, Empty, Entity, FocusHandle, Focusable, Half,
     InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Render, Styled,
-    Subscription, WeakEntity, Window, actions, prelude::FluentBuilder as _, px, relative, rems,
+    Subscription, WeakEntity, Window, actions, prelude::FluentBuilder as _, div, px, rems,
 };
 use ropey::{LineType, Rope, RopeBuilder, extra::esoterica::ropes_are_instances};
 
@@ -415,6 +415,9 @@ pub(super) struct SearchPanel {
     pending_scan: Option<SearchRequest>,
     cancellation: Arc<AtomicBool>,
     searching: bool,
+    /// Width of the panel in the last frame, which decides whether the options share the
+    /// query row.
+    width: gpui::Pixels,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -498,6 +501,7 @@ impl SearchPanel {
                 scan_running: false,
                 pending_scan: None,
                 cancellation: Arc::new(AtomicBool::new(false)),
+                width: gpui::Pixels::ZERO,
                 searching: false,
                 _subscriptions,
             }
@@ -914,7 +918,6 @@ impl Render for SearchPanel {
         let viewport = window.viewport_size();
         let rem = window.rem_size();
         let compact = viewport.height < rem * 16. || viewport.width < rem * 28.;
-        let narrow = viewport.width <= px(600.);
         let close_query = compact.then(|| Self::close_button(cx));
         let close_options = (!compact).then(|| Self::close_button(cx));
         let count = |compact| {
@@ -931,8 +934,87 @@ impl Render for SearchPanel {
             )
         };
 
+        // Rows never wrap: the options share the query row only when the panel is wide enough
+        // for both, measured from the previous frame, and the replace row always fits.
+        let one_row = !compact && self.width >= rem * 36.;
+        let options = (!compact).then(|| {
+            h_flex()
+                .flex_shrink_0()
+                .gap_2()
+                .when(!one_row, |row| row.w_full())
+                .child(
+                    Button::new("whole-word")
+                        .small()
+                        .map(|button| {
+                            if self.whole_word {
+                                button.primary()
+                            } else {
+                                button.outline()
+                            }
+                        })
+                        .label("Word")
+                        .tooltip("Match whole words")
+                        .accessibility_toggled(self.whole_word)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.toggle_whole_word(window, cx);
+                        })),
+                )
+                .child(
+                    Button::new("replace-mode")
+                        .small()
+                        .map(|button| {
+                            if self.replace_mode {
+                                button.primary()
+                            } else {
+                                button.outline()
+                            }
+                        })
+                        .icon(IconName::Replace)
+                        .tooltip(if self.replace_mode {
+                            "Hide replacement"
+                        } else {
+                            "Show replacement"
+                        })
+                        .accessibility_expanded(self.replace_mode)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.toggle_replace(window, cx);
+                        })),
+                )
+                .child(
+                    Button::new("prev")
+                        .small()
+                        .outline()
+                        .icon(IconName::ChevronLeft)
+                        .tooltip("Previous match")
+                        .disabled(!has_matches)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.prev(window, cx);
+                        })),
+                )
+                .child(
+                    Button::new("next")
+                        .small()
+                        .outline()
+                        .icon(IconName::ChevronRight)
+                        .tooltip("Next match")
+                        .disabled(!has_matches)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.next(window, cx);
+                        })),
+                )
+                .child(count(false))
+                .when(!one_row, |row| row.child(div().flex_1()))
+                .children(close_options)
+        });
+        let (inline_options, row_options) = if one_row {
+            (options, None)
+        } else {
+            (None, options)
+        };
+        let panel = cx.entity().downgrade();
         v_flex()
             .id("search-panel")
+            .relative()
             .tab_group()
             .occlude()
             .track_focus(&self.focus_handle(cx))
@@ -953,164 +1035,92 @@ impl Render for SearchPanel {
             .rounded(cx.theme().radius.half())
             .border_color(cx.theme().border)
             .child(
+                gpui::canvas(
+                    move |bounds, window, cx| {
+                        let _ = panel.update(cx, |panel, _| {
+                            if (panel.width - bounds.size.width).abs() > px(0.5) {
+                                panel.width = bounds.size.width;
+                                window.request_animation_frame();
+                            }
+                        });
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+            .child(
                 h_flex()
                     .w_full()
-                    .flex_wrap()
                     .gap_2()
+                    .when(compact, |query| query.gap_1())
                     .child(
-                        h_flex()
-                            .flex_1()
-                            .flex_basis(rems(14.))
-                            .when(narrow && !compact, |query| query.flex_basis(relative(0.65)))
-                            .min_w_0()
-                            .max_w_full()
-                            .gap_2()
-                            .when(compact, |query| query.gap_1())
-                            .child(
-                                Input::new(&self.search_input)
-                                    .when(!compact, |input| {
-                                        input.suffix(
-                                            Button::new("case-insensitive")
-                                                .accessibility_toggled(!self.case_insensitive)
-                                                .small()
-                                                .compact()
-                                                .map(|button| {
-                                                    if self.case_insensitive {
-                                                        button.outline()
-                                                    } else {
-                                                        button.primary()
-                                                    }
-                                                })
-                                                .icon(IconName::CaseSensitive)
-                                                .tooltip("Match case")
-                                                .on_click(cx.listener(|this, _, window, cx| {
-                                                    this.toggle_case(window, cx);
-                                                })),
-                                        )
-                                    })
-                                    .small()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .shadow_none(),
-                            )
-                            .when(compact, |row| {
-                                row.child(count(true)).child(self.compact_options(cx))
+                        Input::new(&self.search_input)
+                            .when(!compact, |input| {
+                                input.suffix(
+                                    Button::new("case-insensitive")
+                                        .accessibility_toggled(!self.case_insensitive)
+                                        .small()
+                                        .compact()
+                                        .map(|button| {
+                                            if self.case_insensitive {
+                                                button.outline()
+                                            } else {
+                                                button.primary()
+                                            }
+                                        })
+                                        .icon(IconName::CaseSensitive)
+                                        .tooltip("Match case")
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.toggle_case(window, cx);
+                                        })),
+                                )
                             })
-                            .children(close_query),
+                            .small()
+                            .flex_1()
+                            .min_w_0()
+                            .shadow_none(),
                     )
-                    .when(!compact, |row| {
-                        row.child(
-                            h_flex()
-                                .min_w_0()
-                                .max_w_full()
-                                .flex_wrap()
-                                .gap_2()
-                                .child(
-                                    Button::new("whole-word")
-                                        .small()
-                                        .map(|button| {
-                                            if self.whole_word {
-                                                button.primary()
-                                            } else {
-                                                button.outline()
-                                            }
-                                        })
-                                        .label("Word")
-                                        .tooltip("Match whole words")
-                                        .accessibility_toggled(self.whole_word)
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.toggle_whole_word(window, cx);
-                                        })),
-                                )
-                                .child(
-                                    Button::new("replace-mode")
-                                        .small()
-                                        .map(|button| {
-                                            if self.replace_mode {
-                                                button.primary()
-                                            } else {
-                                                button.outline()
-                                            }
-                                        })
-                                        .icon(IconName::Replace)
-                                        .tooltip(if self.replace_mode {
-                                            "Hide replacement"
-                                        } else {
-                                            "Show replacement"
-                                        })
-                                        .accessibility_expanded(self.replace_mode)
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.toggle_replace(window, cx);
-                                        })),
-                                )
-                                .child(
-                                    Button::new("prev")
-                                        .small()
-                                        .outline()
-                                        .icon(IconName::ChevronLeft)
-                                        .tooltip("Previous match")
-                                        .disabled(!has_matches)
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.prev(window, cx);
-                                        })),
-                                )
-                                .child(
-                                    Button::new("next")
-                                        .small()
-                                        .outline()
-                                        .icon(IconName::ChevronRight)
-                                        .tooltip("Next match")
-                                        .disabled(!has_matches)
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.next(window, cx);
-                                        })),
-                                )
-                                .child(count(false))
-                                .children(close_options),
-                        )
-                    }),
+                    .when(compact, |row| {
+                        row.child(count(true)).child(self.compact_options(cx))
+                    })
+                    .children(close_query)
+                    .children(inline_options),
             )
+            .children(row_options)
             .when(self.replace_mode, |this| {
                 this.child(
                     h_flex()
                         .w_full()
-                        .flex_wrap()
                         .gap_2()
                         .child(
                             Input::new(&self.replace_input)
                                 .small()
                                 .flex_1()
-                                .flex_basis(rems(if compact { 5. } else { 12. }))
                                 .min_w_0()
-                                .max_w_full()
                                 .shadow_none(),
                         )
                         .child(
-                            h_flex()
-                                .min_w_0()
-                                .max_w_full()
-                                .flex_wrap()
-                                .gap_2()
-                                .child(
-                                    Button::new("replace-one")
-                                        .when(compact, |button| button.xsmall())
-                                        .when(!compact, |button| button.small())
-                                        .label(t!("Input.Replace"))
-                                        .disabled(!has_matches)
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.replace_next(window, cx);
-                                        })),
-                                )
-                                .child(
-                                    Button::new("replace-all")
-                                        .when(compact, |button| button.xsmall())
-                                        .when(!compact, |button| button.small())
-                                        .label(t!("Input.Replace All"))
-                                        .disabled(!has_matches)
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.replace_all(window, cx);
-                                        })),
-                                ),
+                            Button::new("replace-one")
+                                .when(compact, |button| button.xsmall())
+                                .when(!compact, |button| button.small())
+                                .flex_shrink_0()
+                                .label(t!("Input.Replace"))
+                                .disabled(!has_matches)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.replace_next(window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("replace-all")
+                                .when(compact, |button| button.xsmall())
+                                .when(!compact, |button| button.small())
+                                .flex_shrink_0()
+                                .label(t!("Input.Replace All"))
+                                .disabled(!has_matches)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.replace_all(window, cx);
+                                })),
                         ),
                 )
             })
