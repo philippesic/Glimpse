@@ -92,7 +92,7 @@ impl Shell {
                                         .flex_1()
                                         .min_w_0()
                                         .flex()
-                                        .child(self.search_scope_button(cx)),
+                                        .child(self.search_scope_button(true, window, cx)),
                                 )
                             } else {
                                 row.child(div().flex_1().min_w_0().truncate().child(title))
@@ -260,6 +260,45 @@ impl Shell {
         self.palette.scroll.scroll_to_item(next);
         cx.notify();
         true
+    }
+
+    pub(super) fn palette_overlay(&self, window: &mut Window, cx: &Context<Self>) -> AnyElement {
+        let scale = self.settings.ui_scale;
+        let width = px(640. * scale).min(window.viewport_size().width - px(32. * scale));
+        div()
+            .absolute()
+            .top(px(8. * scale))
+            .left_0()
+            .right_0()
+            .flex()
+            .justify_center()
+            .child(accessibility::popup(
+                "palette-overlay",
+                "Commands".into(),
+                div()
+                    .id("palette-overlay")
+                    .occlude()
+                    .w(width)
+                    .flex()
+                    .flex_col()
+                    .bg(cx.theme().popover)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .rounded(cx.theme().radius_lg)
+                    .shadow_lg()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8. * scale))
+                            .p(px(8. * scale))
+                            .child(Input::new(&self.query).flex_1().min_w_0())
+                            .child(self.button("Run", "submit", cx))
+                            .child(self.button("Close", "dismiss", cx)),
+                    )
+                    .child(self.palette_list(false, window, cx)),
+            ))
+            .into_any_element()
     }
 
     fn palette_view(

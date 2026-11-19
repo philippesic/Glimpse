@@ -880,6 +880,20 @@ impl Focusable for SearchPanel {
     }
 }
 
+impl SearchPanel {
+    fn close_button(cx: &mut Context<Self>) -> Button {
+        Button::new("close")
+            .small()
+            .ghost()
+            .flex_shrink_0()
+            .icon(IconName::Close)
+            .tooltip("Close Find")
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.on_action_escape(&Escape, window, cx);
+            }))
+    }
+}
+
 impl Render for SearchPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.open {
@@ -887,20 +901,26 @@ impl Render for SearchPanel {
         }
 
         let has_matches = self.matcher.len() > 0;
-        let match_label = if self.searching {
+        let match_label: gpui::SharedString = if self.searching {
             "Searching…".into()
+        } else if has_matches {
+            self.matcher.label().into()
+        } else if self.search_input.read(cx).value().is_empty() {
+            "".into()
         } else {
-            self.matcher.label()
+            "No matches".into()
         };
 
         let viewport = window.viewport_size();
         let rem = window.rem_size();
         let compact = viewport.height < rem * 16. || viewport.width < rem * 28.;
         let narrow = viewport.width <= px(600.);
+        let close_query = compact.then(|| Self::close_button(cx));
+        let close_options = (!compact).then(|| Self::close_button(cx));
         let count = |compact| {
             crate::semantic_text::text(
                 "match-count",
-                match_label.clone().into(),
+                match_label.clone(),
                 Label::new(match_label.clone())
                     .when(!has_matches, |label| {
                         label.text_color(cx.theme().muted_foreground)
@@ -954,9 +974,12 @@ impl Render for SearchPanel {
                                                 .accessibility_toggled(!self.case_insensitive)
                                                 .small()
                                                 .compact()
-                                                .outline()
-                                                .when(!self.case_insensitive, |button| {
-                                                    button.primary()
+                                                .map(|button| {
+                                                    if self.case_insensitive {
+                                                        button.outline()
+                                                    } else {
+                                                        button.primary()
+                                                    }
                                                 })
                                                 .icon(IconName::CaseSensitive)
                                                 .tooltip("Match case")
@@ -973,18 +996,7 @@ impl Render for SearchPanel {
                             .when(compact, |row| {
                                 row.child(count(true)).child(self.compact_options(cx))
                             })
-                            .child(
-                                Button::new("close")
-                                    .tab_index(1)
-                                    .small()
-                                    .ghost()
-                                    .flex_shrink_0()
-                                    .icon(IconName::Close)
-                                    .tooltip("Close Find")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.on_action_escape(&Escape, window, cx);
-                                    })),
-                            ),
+                            .children(close_query),
                     )
                     .when(!compact, |row| {
                         row.child(
@@ -996,8 +1008,13 @@ impl Render for SearchPanel {
                                 .child(
                                     Button::new("whole-word")
                                         .small()
-                                        .outline()
-                                        .when(self.whole_word, |button| button.primary())
+                                        .map(|button| {
+                                            if self.whole_word {
+                                                button.primary()
+                                            } else {
+                                                button.outline()
+                                            }
+                                        })
                                         .label("Word")
                                         .tooltip("Match whole words")
                                         .accessibility_toggled(self.whole_word)
@@ -1008,8 +1025,13 @@ impl Render for SearchPanel {
                                 .child(
                                     Button::new("replace-mode")
                                         .small()
-                                        .outline()
-                                        .when(self.replace_mode, |button| button.primary())
+                                        .map(|button| {
+                                            if self.replace_mode {
+                                                button.primary()
+                                            } else {
+                                                button.outline()
+                                            }
+                                        })
                                         .icon(IconName::Replace)
                                         .tooltip(if self.replace_mode {
                                             "Hide replacement"
@@ -1043,7 +1065,8 @@ impl Render for SearchPanel {
                                             this.next(window, cx);
                                         })),
                                 )
-                                .child(count(false)),
+                                .child(count(false))
+                                .children(close_options),
                         )
                     }),
             )

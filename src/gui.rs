@@ -3825,11 +3825,22 @@ impl Render for Shell {
         if self.open_failure.is_some() {
             main = main.child(self.open_failure_view(cx));
         }
+        // Commands and path completions float above the panes so typing never moves
+        // the document; search panels keep a fixed height while open.
+        let mut floating = None;
         if self.panel == Some(Panel::Path) {
-            main = main.child(self.path_matches(window, cx));
+            if takeover {
+                main = main.child(self.path_matches(window, cx));
+            } else {
+                floating = Some(self.path_matches(window, cx));
+            }
         }
         if let Some(panel) = self.panel.filter(|panel| *panel != Panel::Path) {
-            main = main.child(self.panel_view(panel, takeover, window, cx));
+            if panel == Panel::Palette && !takeover {
+                floating = Some(self.palette_overlay(window, cx));
+            } else {
+                main = main.child(self.panel_view(panel, takeover, window, cx));
+            }
         }
         if self.finishing.pending() {
             main = main.child(
@@ -4067,21 +4078,45 @@ impl Render for Shell {
                 .documents
                 .iter()
                 .any(|doc| Some(doc.id) == self.active && doc.external.is_some());
-        let tab_width = (narrow && !edit_source).then(|| {
-            let rem = window.rem_size();
-            let menu_width = if show_documents_menu {
-                Self::path_label_width(window, &"Documents".into()) + rem * 3. + px(2.)
+        let rem = window.rem_size();
+        let documents_full =
+            Self::path_label_width(window, &"Documents".into()) + rem * 3. + px(2.);
+        let edit_full = Self::path_label_width(window, &"Edit Source".into()) + rem * 2.;
+        let close_width = if self.request.pick { px(0.) } else { rem * 1.5 };
+        let conflict_width = if tab_conflict {
+            rem * 1.5 + px(10. * scale)
+        } else {
+            px(0.)
+        };
+        let controls_width = |documents: Pixels, edit: Pixels| {
+            (if show_documents_menu {
+                documents + px(8. * scale)
             } else {
                 px(0.)
-            };
-            let close_width = if self.request.pick { px(0.) } else { rem * 1.5 };
-            let conflict_width = if tab_conflict {
-                rem * 1.5 + px(10. * scale)
+            }) + (if edit_source {
+                edit + px(8. * scale)
             } else {
                 px(0.)
-            };
-            (window.viewport_size().width - menu_width - close_width - conflict_width - px(10.))
-                .max(rem * 1.5)
+            }) + conflict_width
+                + px(10. * scale)
+        };
+        // Keep room for a recognizable active tab: shorten the controls beside the tabs
+        // before the tab itself.
+        let compact_tab_controls = narrow
+            && window.viewport_size().width
+                - controls_width(documents_full, edit_full)
+                - close_width
+                < rem * 10.;
+        let tab_controls_width = if compact_tab_controls {
+            controls_width(
+                rem * 2.,
+                Self::path_label_width(window, &"Edit".into()) + rem * 2.,
+            )
+        } else {
+            controls_width(documents_full, edit_full)
+        };
+        let tab_width = narrow.then(|| {
+            (window.viewport_size().width - tab_controls_width - close_width).max(rem * 1.5)
         });
         let tabs = div()
             .id("tabs")
@@ -4103,10 +4138,11 @@ impl Render for Shell {
                 );
                 let dirty = doc.dirty(cx);
                 let active = Some(id) == self.active;
+                // The warning button beside the tabs already marks the active conflict.
                 let title = format!(
                     "{name}{}{}",
                     if dirty { " •" } else { "" },
-                    if doc.external.is_some() {
+                    if doc.external.is_some() && !(active && tab_conflict) {
                         " (conflict)"
                     } else {
                         ""
@@ -4191,7 +4227,7 @@ impl Render for Shell {
                         tab.child(
                             Button::new(("close-tab", id))
                                 .icon(IconName::Close)
-                                .xsmall()
+                                .small()
                                 .ghost()
                                 .text_color(if active {
                                     cx.theme().tab_active_foreground
@@ -4246,10 +4282,19 @@ impl Render for Shell {
                 .child(self.conflict_menu(true, cx))
             })
             .when(show_documents_menu, |row| {
-                row.child(self.open_documents_menu(open_documents_requested, footer_height, cx))
+                row.child(self.open_documents_menu(
+                    open_documents_requested,
+                    footer_height,
+                    compact_tab_controls,
+                    cx,
+                ))
             })
             .when(edit_source, |row| {
-                row.child(self.button("Edit Source", "read", cx).flex_shrink_0())
+                row.child(
+                    self.button("Edit Source", "read", cx)
+                        .when(compact_tab_controls, |button| button.display_label("Edit"))
+                        .flex_shrink_0(),
+                )
             })
             .into_any_element();
         let mut content = div()
@@ -4532,9 +4577,13 @@ impl Render for Shell {
         } else {
             content.into_any_element()
         };
-        root.child(main.when(!takeover, |main| {
-            main.child(div().flex_1().min_h_0().overflow_hidden().child(body))
-        }))
+        root.child(
+            main.relative()
+                .when(!takeover, |main| {
+                    main.child(div().flex_1().min_h_0().overflow_hidden().child(body))
+                })
+                .children(floating),
+        )
         .when(show_footer, |root| {
             root.child(
                 div()

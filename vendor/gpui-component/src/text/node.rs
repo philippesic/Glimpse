@@ -1608,7 +1608,15 @@ impl Node {
 
                     for (child_ix, child) in children.iter().enumerate() {
                         match child {
-                            Node::Paragraph(_) => {
+                            Node::Paragraph(paragraph) => {
+                                let task_label: SharedString = paragraph
+                                    .children
+                                    .iter()
+                                    .map(|node| node.text.as_str())
+                                    .collect::<String>()
+                                    .trim()
+                                    .to_owned()
+                                    .into();
                                 let last_not_list = child_ix > 0
                                     && !matches!(children[child_ix - 1], Node::List { .. });
 
@@ -1668,6 +1676,7 @@ impl Node {
                                                             .text_xs(),
                                                     )
                                                 });
+                                            let task_label = task_label.clone();
                                             this.child(gpui::accessible(
                                                 ("task", child_ix),
                                                 marker,
@@ -1675,7 +1684,11 @@ impl Node {
                                                     let mut node = gpui::accesskit::Node::new(
                                                         gpui::accesskit::Role::CheckBox,
                                                     );
-                                                    node.set_label("Task");
+                                                    node.set_label(if task_label.is_empty() {
+                                                        "Task".to_owned()
+                                                    } else {
+                                                        task_label.to_string()
+                                                    });
                                                     node.set_read_only();
                                                     node.set_toggled(if checked {
                                                         gpui::accesskit::Toggled::True
@@ -1706,6 +1719,13 @@ impl Node {
                         }
                     }
                     items
+                })
+                .map(|item| {
+                    gpui::accessible(("list-item", ix), item, |_, _, _| {
+                        gpui::AccessibilityInfo::new(gpui::accesskit::Node::new(
+                            gpui::accesskit::Role::ListItem,
+                        ))
+                    })
                 })
                 .into_any_element(),
             _ => div().into_any_element(),
@@ -1762,6 +1782,7 @@ impl Node {
                 .id(id)
                 .relative()
                 .when(overflow, |table| table.pb(rems(1.)))
+                .mb(rems(1.))
                 .w_full()
                 .track_focus(&focus)
                 .focus_ring(focus.is_focused(window), px(0.), window, cx)
@@ -2092,6 +2113,13 @@ impl Node {
                         }
                     }
                     items
+                })
+                .map(|list| {
+                    gpui::accessible("list", list, |_, _, _| {
+                        gpui::AccessibilityInfo::new(gpui::accesskit::Node::new(
+                            gpui::accesskit::Role::List,
+                        ))
+                    })
                 })
                 .into_any_element(),
             Node::CodeBlock(code_block) => code_block.render(&options, node_cx, window, cx),

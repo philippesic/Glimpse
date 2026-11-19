@@ -569,8 +569,9 @@ impl Element for Scrollbar {
                 px(0.)
             };
 
-            // Hide scrollbar, if the scroll area is smaller than the container.
-            if scroll_area_size <= container_size {
+            // Hide scrollbar, if the scroll area is smaller than the container; padding
+            // rounding can leave a few pixels of overflow that is not worth scrolling.
+            if scroll_area_size <= container_size + px(12.) {
                 has_both = false;
                 continue;
             }

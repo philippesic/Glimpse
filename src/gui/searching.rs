@@ -296,24 +296,40 @@ impl Shell {
             cx,
         );
     }
-    pub(super) fn search_scope_button(&self, cx: &Context<Self>) -> impl IntoElement {
+    /// "Text · folder · Location": the search type and whether the scope follows
+    /// Location stay readable; only a long folder name is shortened, in the middle.
+    pub(super) fn search_scope_button(
+        &self,
+        stacked: bool,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
         let scope = self.effective_scope();
-        let label = format!(
-            "{} in {} ({})",
-            if self.panel == Some(Panel::Text) {
-                "Saved text"
-            } else {
-                "Files"
-            },
-            paths::name(scope),
-            if self.search_ui.temporary.is_some() {
-                "temporary"
-            } else if self.scope.is_some() {
-                "pinned"
-            } else {
-                "Location"
-            }
-        );
+        let kind = if self.panel == Some(Panel::Text) {
+            "Text"
+        } else {
+            "Files"
+        };
+        let mode = if self.search_ui.temporary.is_some() {
+            "temporary"
+        } else if self.scope.is_some() {
+            "pinned"
+        } else {
+            "Location"
+        };
+        let rem = window.rem_size();
+        let measure = |text: &SharedString| {
+            let run = window.text_style().to_run(text.len());
+            window
+                .text_system()
+                .shape_line(text.clone(), rem * 0.875, &[run], None)
+                .width
+        };
+        let chrome = rem * 4.5 + if stacked { rem * 2.5 } else { px(0.) };
+        let fixed = measure(&format!("{kind} ·  · {mode}").into());
+        let room = (window.viewport_size().width - chrome - fixed).max(rem * 3.);
+        let folder = decision::abbreviate_folder(&paths::name(scope), room, &measure);
+        let label = format!("{kind} · {folder} · {mode}");
         self.search_scope_menu(label, self.search.index_status(scope).is_some(), cx)
     }
     pub(super) fn search_view(
@@ -369,7 +385,9 @@ impl Shell {
                         .gap(px(8. * scale))
                         .px(px(8. * scale))
                         .flex_shrink_0()
-                        .when(!stacked, |row| row.child(self.search_scope_button(cx)))
+                        .when(!stacked, |row| {
+                            row.child(self.search_scope_button(false, window, cx))
+                        })
                         .when(self.search_ui.running, |row| {
                             row.child(self.button("Stop Search", "stop-search", cx))
                         }),

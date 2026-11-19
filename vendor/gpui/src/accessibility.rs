@@ -273,6 +273,17 @@ impl State {
                                                 ) || record.info.node.text_revision()
                                                     == text_revision)
                                         })
+                                        .or_else(|| {
+                                            // Inline objects such as links are owned nodes
+                                            // published with their text; the owner handles them.
+                                            window.rendered_frame.accessibility.iter().find(|record| {
+                                                window.accessibility.visible.contains(&record.id)
+                                                    && record.info.text.iter().any(|(id, node)| {
+                                                        *id == request.target_node
+                                                            && node.supports_action(request.action)
+                                                    })
+                                            })
+                                        })
                                         .and_then(|record| {
                                             record
                                                 .handler

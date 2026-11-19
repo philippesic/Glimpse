@@ -422,22 +422,42 @@ impl Render for Preferences {
                 rows.push(self.field(Field::Exclusions));
             }
             Page::Shortcuts => {
-                rows.push(div().child("Override commands with a JSON object. Cmd means Control on Linux and Command on macOS. An empty value disables a shortcut. Text editing keys remain reserved.").into_any_element());
+                rows.push(div().child("Override shortcuts with a JSON object from command name to keys, for example {\"find-files\": \"Cmd+Shift+O\"}. In this file Cmd means Control on Linux and Command on macOS. An empty value disables a shortcut. Text editing keys remain reserved.").into_any_element());
                 rows.push(self.field(Field::Keymaps));
+                let muted = cx.theme().muted_foreground;
                 rows.push(
                     div()
-                        .text_size(px(12.))
-                        .children(
-                            glimpse::commands::COMMANDS
-                                .iter()
-                                .filter(|command| !command.shortcut.is_empty())
-                                .map(|command| {
-                                    div().child(format!(
-                                        "{}: {} ({})",
-                                        command.id, command.shortcut, command.label
-                                    ))
-                                }),
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .child(
+                            div()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child("Current shortcuts"),
                         )
+                        .children(glimpse::commands::COMMANDS.iter().filter_map(|command| {
+                            let key = self
+                                .draft
+                                .keymaps
+                                .get(command.id)
+                                .map(String::as_str)
+                                .unwrap_or(command.shortcut);
+                            (!key.is_empty()).then(|| {
+                                div()
+                                    .flex()
+                                    .items_baseline()
+                                    .gap(px(8.))
+                                    .child(div().flex_1().min_w_0().truncate().child(command.label))
+                                    .child(div().text_color(muted).text_sm().child(command.id))
+                                    .child(
+                                        div()
+                                            .w(px(150.))
+                                            .flex_shrink_0()
+                                            .text_right()
+                                            .child(super::platform::shortcut_label(key)),
+                                    )
+                            })
+                        }))
                         .into_any_element(),
                 );
             }
@@ -466,6 +486,7 @@ impl Render for Preferences {
                         .disabled(self.pending)
                         .dropdown_menu(move |mut menu, window, _| {
                             menu = menu
+                                .accessible_name("Preferences category")
                                 .scrollable(true)
                                 .max_w(window.viewport_size().width - px(16.))
                                 .max_h((window.viewport_size().height - px(40.)).max(px(100.)));

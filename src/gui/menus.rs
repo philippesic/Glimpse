@@ -25,12 +25,24 @@ pub(super) fn command_item(
 }
 
 fn location_item(shell: WeakEntity<Shell>, path: PathBuf) -> PopupMenuItem {
-    PopupMenuItem::new(if let Some(parent) = path.parent() {
-        format!("{} — {}", paths::name(&path), paths::display(parent))
-    } else {
-        paths::display(&path)
-    })
-    .on_click(move |_, window, cx| {
+    location_item_labelled(
+        shell,
+        if let Some(parent) = path.parent() {
+            format!("{} — {}", paths::name(&path), paths::display(parent))
+        } else {
+            paths::display(&path)
+        },
+        path,
+    )
+}
+
+/// Mount points are identified by their full path rather than a name and parent.
+fn mount_item(shell: WeakEntity<Shell>, path: PathBuf) -> PopupMenuItem {
+    location_item_labelled(shell, paths::display(&path), path)
+}
+
+fn location_item_labelled(shell: WeakEntity<Shell>, label: String, path: PathBuf) -> PopupMenuItem {
+    PopupMenuItem::new(label).on_click(move |_, window, cx| {
         let shell = shell.clone();
         let path = path.clone();
         window.defer(cx, move |_, cx| {
@@ -234,6 +246,7 @@ impl Shell {
         &self,
         requested: bool,
         footer_height: Pixels,
+        icon_only: bool,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let shell = cx.entity().downgrade();
@@ -259,9 +272,18 @@ impl Shell {
             })
             .collect::<Vec<_>>();
         Button::new("open-documents-menu")
-            .label("Open Documents")
-            .display_label("Documents")
-            .dropdown_caret(true)
+            .map(|button| {
+                if icon_only {
+                    button
+                        .icon(IconName::ChevronsUpDown)
+                        .tooltip("Open Documents")
+                } else {
+                    button
+                        .label("Open Documents")
+                        .display_label("Documents")
+                        .dropdown_caret(true)
+                }
+            })
             .small()
             .compact()
             .outline()
@@ -362,7 +384,7 @@ impl Shell {
                 menu = menu.separator().label("Mounted locations");
                 if let Some(volumes) = &volumes {
                     for path in &volumes.paths {
-                        menu = menu.item(location_item(shell.clone(), path.clone()));
+                        menu = menu.item(mount_item(shell.clone(), path.clone()));
                     }
                     if let Some(note) = &volumes.note {
                         menu = menu.label(note.clone());

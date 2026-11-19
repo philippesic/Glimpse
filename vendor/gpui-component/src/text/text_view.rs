@@ -70,6 +70,7 @@ fn links_menu(
             .dropdown_caret(true)
             .dropdown_menu(move |mut menu, window, _| {
                 menu = menu
+                    .accessible_name("Links")
                     .scrollable(true)
                     .max_h((window.viewport_size().height - px(96.)).max(px(100.)))
                     .max_w((window.viewport_size().width - px(32.)).min(px(700.)));

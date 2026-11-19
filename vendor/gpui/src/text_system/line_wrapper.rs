@@ -178,7 +178,9 @@ impl LineWrapper {
             let char_width = self.width_for_char(c);
             width += char_width;
 
-            if width.floor() > truncate_width {
+            // Per-character advances ignore kerning, so the sum can exceed the shaped
+            // width that sized the box by a pixel or two at fractional font sizes.
+            if width.floor() > truncate_width + px(2.) {
                 let result =
                     SharedString::from(format!("{}{}", &line[..truncate_ix], truncation_suffix));
                 update_runs_after_truncation(&result, truncation_suffix, runs);

@@ -34,6 +34,15 @@ pub(super) fn group(id: &'static str, label: String, child: impl IntoElement) ->
     })
 }
 
+/// A non-modal popup above the panes, such as Commands or path completions.
+pub(super) fn popup(id: &'static str, label: String, child: impl IntoElement) -> impl IntoElement {
+    accessible(id, child, move |_, _, _| {
+        let mut node = Node::new(Role::Dialog);
+        node.set_label(label.clone());
+        AccessibilityInfo::new(node)
+    })
+}
+
 pub(super) fn collection(
     id: &'static str,
     label: String,

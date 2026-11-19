@@ -43,7 +43,6 @@ pub fn apply(settings: &Settings, window: &mut Window, cx: &mut App) -> Option<S
     theme.mono_font_size = px(settings.font_size * settings.ui_scale);
     theme.mono_font_family = family.into();
     theme.radius = px(7. * settings.ui_scale);
-    theme.scrollbar_show = gpui_component::scroll::ScrollbarShow::Always;
     theme.radius_lg = px(12. * settings.ui_scale);
     let palette = if theme.is_dark() { &DARK } else { &LIGHT };
     let color = |value: u32| -> gpui::Hsla { gpui::rgb(value).into() };

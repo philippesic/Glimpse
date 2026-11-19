@@ -274,12 +274,29 @@ impl Shell {
             .as_ref()
             .filter(|c| c.value == current.as_str());
         let scale = self.settings.ui_scale;
+        let floating = !self.panel_takes_over(self.narrow(window), window);
+        if floating && completions.is_none() && self.path_hint.is_none() {
+            return div().into_any_element();
+        }
         div()
             .flex()
             .flex_col()
             .flex_shrink_0()
             .px(px(8. * scale))
             .pb(px(4. * scale))
+            .when(floating, |list| {
+                list.absolute()
+                    .top(px(2. * scale))
+                    .left(px(8. * scale))
+                    .w(px(600. * scale).min(window.viewport_size().width - px(16. * scale)))
+                    .pt(px(6. * scale))
+                    .occlude()
+                    .bg(cx.theme().popover)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .rounded(cx.theme().radius)
+                    .shadow_lg()
+            })
             .when_some(self.path_hint.clone(), |list, hint| {
                 list.child(accessibility::message(
                     "path-completion-hint",
@@ -323,6 +340,13 @@ impl Shell {
                         )),
                 )
             })
-            .into_any_element()
+            .map(|list| {
+                if floating {
+                    accessibility::popup("path-completions-popup", "Path completions".into(), list)
+                        .into_any_element()
+                } else {
+                    list.into_any_element()
+                }
+            })
     }
 }

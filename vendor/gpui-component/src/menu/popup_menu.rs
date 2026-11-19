@@ -1,7 +1,6 @@
 use crate::actions::{Cancel, Confirm, SelectDown, SelectUp};
 use crate::actions::{SelectFirst, SelectLast, SelectLeft, SelectRight};
 use crate::menu::menu_item::MenuItemElement;
-use crate::scroll::ScrollableElement;
 use crate::{ActiveTheme, Icon, IconName, Sizable as _, h_flex, v_flex};
 use crate::{Side, Size, StyledExt, kbd::Kbd};
 use gpui::{
@@ -1434,6 +1433,7 @@ impl Render for PopupMenu {
                     .max_w(max_width)
                     .when(self.scrollable, |this| {
                         this.max_h(max_height)
+                            .pr(px(14.))
                             .overflow_y_scroll()
                             .track_scroll(&self.scroll_handle)
                     })
@@ -1456,7 +1456,14 @@ impl Render for PopupMenu {
             )
             .when(self.scrollable, |this| {
                 // TODO: When the menu is limited by `overflow_y_scroll`, the sub-menu will cannot be displayed.
-                this.vertical_scrollbar(&self.scroll_handle)
+                // A menu that overflows always shows its thumb as the cue that more items exist;
+                // the scrollbar hides itself when everything fits.
+                this.child(
+                    div().absolute().inset_0().child(
+                        crate::scroll::Scrollbar::vertical(&self.scroll_handle)
+                            .scrollbar_show(crate::scroll::ScrollbarShow::Always),
+                    ),
+                )
             });
         gpui::accessible("menu-semantics", rendered, move |_, window, _| {
             let mut node = gpui::accesskit::Node::new(gpui::accesskit::Role::Menu);

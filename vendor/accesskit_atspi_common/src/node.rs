@@ -428,6 +428,9 @@ impl NodeWrapper<'_> {
         if let Some(html_id) = self.html_id() {
             attributes.insert("id", html_id.to_string());
         }
+        if let Some(level) = self.0.level() {
+            attributes.insert("level", level.to_string());
+        }
         if let Some(label) = self.braille_label() {
             attributes.insert("braillelabel", label.to_string());
         }
