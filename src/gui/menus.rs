@@ -60,11 +60,13 @@ impl Shell {
                 );
                 let current = Some(document.id) == self.active;
                 let dirty = document.dirty(cx);
-                let status = match (dirty, current) {
-                    (true, true) => Some("Unsaved · Current"),
-                    (true, false) => Some("Unsaved"),
-                    (false, true) => Some("Current"),
-                    (false, false) => None,
+                let status = match (dirty, document.preview, current) {
+                    (true, _, true) => Some("Unsaved · Current"),
+                    (true, _, false) => Some("Unsaved"),
+                    (false, true, true) => Some("Preview · Current"),
+                    (false, true, false) => Some("Preview"),
+                    (false, false, true) => Some("Current"),
+                    (false, false, false) => None,
                 };
                 (document.id, title, status, current)
             })
@@ -211,6 +213,7 @@ impl Shell {
                             "new",
                             "open",
                             "folder",
+                            "keep-tab",
                             "save",
                             "save-as",
                             "save-copy",

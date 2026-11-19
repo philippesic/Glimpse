@@ -2717,6 +2717,7 @@ impl Shell {
                 "named-file"
                     | "new-folder"
                     | "rename"
+                    | "keep-tab"
                     | "recovery"
                     | "settings"
                     | "pin"
@@ -3054,12 +3055,20 @@ impl Shell {
             }
             "reading-notices" => self.reading_notices(window, cx),
             "keep-tab" => {
-                if let Some(doc) = self
+                let Some(doc) = self
                     .documents
                     .iter_mut()
-                    .find(|doc| Some(doc.id) == self.active)
-                {
-                    doc.preview = false;
+                    .find(|doc| doc.preview && Some(doc.id) == self.active)
+                else {
+                    return;
+                };
+                doc.preview = false;
+                if !self.navigation_only {
+                    if self.reading {
+                        self.reading_focus.focus(window);
+                    } else {
+                        self.focus(window, cx);
+                    }
                 }
             }
             "search-here" => {
@@ -3213,6 +3222,7 @@ impl Shell {
                     | "new-folder"
                     | "rename"
                     | "trash"
+                    | "keep-tab"
                     | "settings"
                     | "wrap"
                     | "indent"
@@ -3229,7 +3239,8 @@ impl Shell {
             "save-as" | "save-copy" => {
                 document.is_some_and(|doc| !doc.saving) && !self.destination_busy
             }
-            "find" | "line" | "read" | "close" | "keep-tab" => document.is_some(),
+            "find" | "line" | "read" | "close" => document.is_some(),
+            "keep-tab" => document.is_some_and(|doc| doc.preview),
             "indent" | "outdent" => document.is_some() && !self.reading,
             "reload" | "reveal" => {
                 document.is_some_and(|doc| !doc.disk.target.as_os_str().is_empty() && !doc.saving)
@@ -3796,13 +3807,20 @@ impl Render for Shell {
                         let text_width = (width - window.rem_size() * 0.75 - px(2.)).max(px(0.));
                         let measure = |text: &SharedString| Self::path_label_width(window, text);
                         let mut caption = decision::abbreviate_folder(&title, text_width, &measure);
-                        if caption.as_ref() != title {
+                        let label =
+                            if doc.preview && doc.external.is_none() && caption.as_ref() != title {
+                                caption = decision::abbreviate_folder(&name, text_width, &measure);
+                                &name
+                            } else {
+                                &title
+                            };
+                        if caption.as_ref() != label {
                             let filename = paths::name(&doc.disk.path);
                             if let Some(folder) = name
                                 .strip_prefix(&filename)
                                 .and_then(|suffix| suffix.strip_prefix(" — "))
                             {
-                                let suffix = format!("… {folder}{}", &title[name.len()..]);
+                                let suffix = format!("… {folder}{}", &label[name.len()..]);
                                 for (offset, _) in filename.grapheme_indices(true).skip(1) {
                                     let candidate =
                                         format!("{}{suffix}", &filename[..offset]).into();
@@ -3885,7 +3903,7 @@ impl Render for Shell {
             .child(tabs);
         if !self.request.pick && !short {
             let actions = div().flex().flex_wrap().gap_2().p_1();
-            content = content.child(if narrow {
+            let actions = if narrow {
                 actions
                     .child(self.button("Save", "save", cx))
                     .child(self.button(
@@ -3906,7 +3924,10 @@ impl Render for Shell {
                     ))
                     .child(self.button("Go to line", "line", cx))
                     .child(self.button("Reload disk", "reload", cx))
-            });
+            };
+            content = content.child(actions.when(self.command_enabled("keep-tab"), |actions| {
+                actions.child(self.button("Keep Preview Tab", "keep-tab", cx))
+            }));
         }
         if let Some(doc) = self.documents.iter().find(|d| Some(d.id) == self.active) {
             if !doc.disk.target.as_os_str().is_empty()
