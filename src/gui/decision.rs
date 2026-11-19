@@ -216,6 +216,25 @@ impl Decision {
     ) -> (Vec<SharedString>, bool) {
         let mut captions = Vec::with_capacity(subjects.len());
         let mut groups: HashMap<_, Vec<usize>> = HashMap::new();
+        let difference = |index: usize, group: &[usize]| {
+            let folder = &subjects[index].folder;
+            let common = group
+                .iter()
+                .filter(|&&other| other != index)
+                .map(|&other| {
+                    folder
+                        .graphemes(true)
+                        .zip(subjects[other].folder.graphemes(true))
+                        .take_while(|(a, b)| a == b)
+                        .count()
+                })
+                .max()
+                .unwrap_or_default();
+            folder
+                .grapheme_indices(true)
+                .nth(common)
+                .map(|(offset, _)| offset)
+        };
         for (index, subject) in subjects.iter().enumerate() {
             let caption = abbreviate_folder(&subject.folder, width, &text_width);
             groups
@@ -227,19 +246,7 @@ impl Decision {
         for group in groups.values().filter(|group| group.len() > 1) {
             for &index in group {
                 let folder = &subjects[index].folder;
-                let common = group
-                    .iter()
-                    .filter(|&&other| other != index)
-                    .map(|&other| {
-                        folder
-                            .graphemes(true)
-                            .zip(subjects[other].folder.graphemes(true))
-                            .take_while(|(a, b)| a == b)
-                            .count()
-                    })
-                    .max()
-                    .unwrap_or_default();
-                if let Some((difference, _)) = folder.grapheme_indices(true).nth(common) {
+                if let Some(difference) = difference(index, group) {
                     let start = folder
                         .split_word_bound_indices()
                         .take_while(|(offset, _)| *offset <= difference)
@@ -253,6 +260,39 @@ impl Decision {
                     let prefix = if start == 0 { "" } else { "…" };
                     let distinguishing = format!("{prefix}{}", &folder[start..]);
                     captions[index] = abbreviate_folder(&distinguishing, width, &text_width);
+                }
+            }
+        }
+        groups.clear();
+        for (index, (subject, caption)) in subjects.iter().zip(&captions).enumerate() {
+            groups
+                .entry((subject.name.as_str(), caption.clone()))
+                .or_default()
+                .push(index);
+        }
+        let separator = SharedString::from(" ");
+        let separator_width = text_width(&separator);
+        for group in groups.values().filter(|group| group.len() > 1) {
+            for &index in group {
+                let folder = &subjects[index].folder;
+                let Some(offset) = difference(index, group) else {
+                    continue;
+                };
+                let Some((_, word)) = folder
+                    .split_word_bound_indices()
+                    .find(|(start, word)| offset < start + word.len())
+                else {
+                    continue;
+                };
+                let cue = abbreviate_folder(word, width * 0.4, &text_width);
+                let context = abbreviate_folder(
+                    &captions[index],
+                    width - text_width(&cue) - separator_width,
+                    &text_width,
+                );
+                let caption = SharedString::from(format!("{cue}{separator}{context}"));
+                if text_width(&caption) <= width {
+                    captions[index] = caption;
                 }
             }
         }
@@ -558,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn numbering_catches_collisions_between_adjusted_groups() {
+    fn adjusted_groups_keep_both_distinguishing_cues() {
         let paths = [("alpha", "A"), ("alpha", "B"), ("beta", "A"), ("beta", "B")].map(
             |(group, middle)| {
                 format!("{group}-long-shared-folder-middle-{middle}-the-trailing-parent-directory")
@@ -566,12 +606,16 @@ mod tests {
         );
         let folders = paths.each_ref().map(String::as_str);
         let (labels, numbered) = captions(&folders);
-        assert_eq!(labels[0], labels[2]);
-        assert_eq!(labels[1], labels[3]);
-        assert_ne!(labels[0], labels[1]);
-        assert!(numbered);
-        assert!(labels[0].starts_with("…A"));
-        assert!(labels[0].ends_with("directory"));
+        assert!(!numbered);
+        for (label, (group, middle)) in
+            labels
+                .iter()
+                .zip([("alpha", "A"), ("alpha", "B"), ("beta", "A"), ("beta", "B")])
+        {
+            assert!(label.starts_with(group), "{label}");
+            assert!(label.contains(middle), "{label}");
+            assert!(label.ends_with("directory"), "{label}");
+        }
     }
 
     #[test]
