@@ -535,6 +535,9 @@ impl InputState {
                 .unwrap_or(&self.placeholder)
                 .to_string(),
         );
+        if let Some(description) = &self.accessibility_description {
+            node.set_description(description.to_string());
+        }
         if self.disabled || !ready {
             node.set_read_only();
         } else {

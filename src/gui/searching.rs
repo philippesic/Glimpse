@@ -15,6 +15,8 @@ pub(super) struct State {
     pub focus: FocusHandle,
     pub scroll: UniformListScrollHandle,
     pub picker_selection: Option<PathBuf>,
+    pub takeover: bool,
+    pub collapsed: bool,
 }
 impl State {
     pub fn new(cx: &mut Context<Shell>) -> Self {
@@ -32,6 +34,8 @@ impl State {
             focus: cx.focus_handle().tab_stop(true),
             scroll: Default::default(),
             picker_selection: None,
+            takeover: false,
+            collapsed: false,
         }
     }
 }
@@ -86,6 +90,7 @@ impl Shell {
         }
     }
     pub(super) fn reset_search(&mut self, status: &str) {
+        self.search_ui.collapsed = false;
         self.search_id = self.search.cancel();
         self.hits = Default::default();
         self.search_ui.selection = None;
@@ -181,6 +186,7 @@ impl Shell {
             .min(self.hits.len() - 1);
         self.search_ui.selection = Some(index);
         self.search_ui.picker_selection = Some(self.hits[index].path.clone());
+        self.search_ui.collapsed = false;
         self.search_ui
             .scroll
             .scroll_to_item(index, ScrollStrategy::Top);
@@ -193,6 +199,7 @@ impl Shell {
         };
         let (path, line, fingerprint) = (hit.path.clone(), hit.line, hit.fingerprint);
         self.search_ui.selection = Some(index);
+        self.search_ui.collapsed = self.search_ui.takeover;
         self.search_ui.picker_selection = Some(path.clone());
         if let Some(token) = self.open(path, false, fingerprint.map(|_| (line, 1)))
             && let Some(fingerprint) = fingerprint
@@ -289,165 +296,199 @@ impl Shell {
             cx,
         );
     }
-    pub(super) fn search_view(&self, window: &mut Window, cx: &Context<Self>) -> AnyElement {
+    pub(super) fn search_scope_button(&self, cx: &Context<Self>) -> impl IntoElement {
+        let scope = self.effective_scope();
+        let label = format!(
+            "{} in {} ({})",
+            if self.panel == Some(Panel::Text) {
+                "Saved text"
+            } else {
+                "Files"
+            },
+            paths::name(scope),
+            if self.search_ui.temporary.is_some() {
+                "temporary"
+            } else if self.scope.is_some() {
+                "pinned"
+            } else {
+                "Location"
+            }
+        );
+        self.search_scope_menu(label, self.search.index_status(scope).is_some(), cx)
+    }
+    pub(super) fn search_view(
+        &self,
+        takeover: bool,
+        stacked: bool,
+        window: &mut Window,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         let scope = self.effective_scope();
         let index = self.search.index_status(scope);
         let compatible = self.search.index_compatible(scope, &self.search_filters());
         let hits = self.hits.clone();
         let count = hits.len().min(1000);
-        let row_height = px(32. * self.settings.ui_scale);
+        let scale = self.settings.ui_scale;
+        let row_height = px(32. * scale);
         let status = format!(
             "{} · {} displayed (limit 1,000)",
             self.search_ui.status, count
         );
+        let coverage = format!(
+            "{} · metadata {} · content ≤ {} MiB/file · exclusions: {}",
+            if self.settings.search_ignored {
+                "Ignore rules bypassed"
+            } else {
+                "Ignore rules respected"
+            },
+            if self.settings.search_metadata {
+                "included"
+            } else {
+                "excluded"
+            },
+            self.settings.search_file_mib,
+            if self.settings.search_exclude.is_empty() {
+                "none".into()
+            } else {
+                format!("{:?}", self.settings.search_exclude)
+            }
+        );
+        let muted = cx.theme().muted_foreground;
+        let small = px(12. * scale);
         div()
             .flex()
             .flex_col()
             .min_h_0()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .flex_wrap()
-                    .gap_2()
-                    .px_2()
-                    .child(
-                        self.command_button(
-                            "search-scope-heading",
-                            format!(
-                                "{} in {} ({})",
-                                if self.panel == Some(Panel::Text) {
-                                    "Saved text"
-                                } else {
-                                    "Files"
-                                },
-                                paths::name(scope),
-                                if self.search_ui.temporary.is_some() {
-                                    "temporary"
-                                } else if self.scope.is_some() {
-                                    "pinned"
-                                } else {
-                                    "Location"
-                                }
-                            ),
-                            "search-details",
-                            cx,
-                        )
-                        .tooltip(paths::display(scope)),
-                    )
-                    .child(self.button("This Folder", "search-here", cx))
-                    .child(self.button(
-                        if self.scope.is_some() {
-                            "Unpin"
-                        } else {
-                            "Pin Here"
-                        },
-                        "scope",
-                        cx,
-                    ))
-                    .child(self.button("Go to Scope", "go-scope", cx))
-                    .child(self.button(
-                        if index.is_some() {
-                            "Rebuild Index"
-                        } else {
-                            "Index This Folder"
-                        },
-                        "index-folder",
-                        cx,
-                    ))
-                    .when(index.is_some(), |row| {
-                        row.child(self.button("Remove Index", "remove-index", cx))
-                    })
-                    .when(self.search_ui.running, |row| {
-                        row.child(self.button("Stop Search", "stop-search", cx))
-                    }),
-            )
-            .when(
-                self.settings.search_directory_links || self.settings.search_mounts,
-                |panel| {
-                    let expansion = match (
-                        self.settings.search_directory_links,
-                        self.settings.search_mounts,
-                    ) {
-                        (true, true) => "Includes directory symlinks and mounted volumes",
-                        (true, false) => "Includes directory symlinks",
-                        (false, _) => "Includes mounted volumes",
-                    };
-                    panel.child(accessibility::message(
-                        "search-traversal",
-                        expansion.into(),
-                        div().px_2().text_sm().child(expansion),
-                    ))
-                },
-            )
-            .child(div().px_2().text_sm().truncate().child(format!(
-                "{} · metadata {} · content ≤ {} MiB/file · exclusions: {}",
-                if self.settings.search_ignored {
-                    "Ignore rules bypassed"
-                } else {
-                    "Ignore rules respected"
-                },
-                if self.settings.search_metadata {
-                    "included"
-                } else {
-                    "excluded"
-                },
-                self.settings.search_file_mib,
-                if self.settings.search_exclude.is_empty() {
-                    "none".into()
-                } else {
-                    format!("{:?}", self.settings.search_exclude)
-                }
-            )))
-            .when_some(index, |panel, index| {
-                let status = format!(
-                    "{index}{}",
-                    if compatible {
-                        ""
-                    } else {
-                        " · settings changed; rebuild to use"
-                    }
-                );
-                panel.child(accessibility::message(
-                    "filename-index-status",
-                    status.clone(),
-                    div().px_2().text_sm().child(status),
-                ))
+            .when(takeover, |panel| panel.flex_1())
+            .when(!stacked || self.search_ui.running, |panel| {
+                panel.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .flex_wrap()
+                        .gap(px(8. * scale))
+                        .px(px(8. * scale))
+                        .flex_shrink_0()
+                        .when(!stacked, |row| row.child(self.search_scope_button(cx)))
+                        .when(self.search_ui.running, |row| {
+                            row.child(self.button("Stop Search", "stop-search", cx))
+                        }),
+                )
             })
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_2()
-                    .py_1()
-                    .child(accessibility::status(
-                        if self.search_ui.announce_status {
-                            "search-result-announcement"
-                        } else {
-                            "search-result-status"
-                        },
-                        status.clone(),
-                        div().flex_1().min_w_0().text_sm().child(status),
-                        self.search_ui.announce_status,
-                    ))
-                    .when(count > 0, |row| {
-                        row.child(self.button("Focus Results", "focus-results", cx))
+                    .px(px(8. * scale))
+                    .pt(px(4. * scale))
+                    .flex_shrink_0()
+                    .text_size(small)
+                    .text_color(muted)
+                    .when(stacked, |panel| {
+                        panel.child(accessibility::status(
+                            if self.search_ui.announce_status {
+                                "search-result-announcement"
+                            } else {
+                                "search-result-status"
+                            },
+                            status.clone(),
+                            div()
+                                .text_color(cx.theme().foreground)
+                                .truncate()
+                                .child(status.clone()),
+                            self.search_ui.announce_status,
+                        ))
                     })
-                    .child(self.button("Coverage…", "search-details", cx)),
+                    .child(
+                        div()
+                            .id("search-coverage")
+                            .truncate()
+                            .child(coverage.clone())
+                            .tooltip(move |window, cx| {
+                                gpui_component::tooltip::Tooltip::new(coverage.clone())
+                                    .build(window, cx)
+                            }),
+                    )
+                    .when(
+                        self.settings.search_directory_links || self.settings.search_mounts,
+                        |panel| {
+                            let expansion = match (
+                                self.settings.search_directory_links,
+                                self.settings.search_mounts,
+                            ) {
+                                (true, true) => "Includes directory symlinks and mounted volumes",
+                                (true, false) => "Includes directory symlinks",
+                                (false, _) => "Includes mounted volumes",
+                            };
+                            panel.child(accessibility::message(
+                                "search-traversal",
+                                expansion.into(),
+                                div().child(expansion),
+                            ))
+                        },
+                    )
+                    .when_some(index, |panel, index| {
+                        let status = format!(
+                            "{index}{}",
+                            if compatible {
+                                ""
+                            } else {
+                                " · settings changed; rebuild to use"
+                            }
+                        );
+                        panel.child(accessibility::message(
+                            "filename-index-status",
+                            status.clone(),
+                            div().child(status),
+                        ))
+                    }),
             )
+            .when(!stacked, |panel| {
+                panel.child(
+                    div()
+                        .px(px(8. * scale))
+                        .py(px(4. * scale))
+                        .flex_shrink_0()
+                        .child(accessibility::status(
+                            if self.search_ui.announce_status {
+                                "search-result-announcement"
+                            } else {
+                                "search-result-status"
+                            },
+                            status.clone(),
+                            div().text_size(small).child(status.clone()),
+                            self.search_ui.announce_status,
+                        )),
+                )
+            })
+            .when(stacked, |panel| {
+                panel.child(div().h(px(4. * scale)).flex_shrink_0())
+            })
             .when(count > 0, |panel| {
                 panel.child(
                     div()
                         .id("results")
                         .track_focus(&self.search_ui.focus)
-                        .h((row_height * count.min(5)).min(window.viewport_size().height * 0.22))
-                        .min_h(row_height)
+                        .mx(px(8. * scale))
+                        .mb(px(8. * scale))
+                        .rounded(px(7. * scale))
+                        .overflow_hidden()
+                        .map(|results| {
+                            if takeover {
+                                results.flex_1().min_h(row_height)
+                            } else {
+                                results
+                                    .h(row_height * count.min(8) + px(2.))
+                                    .flex_shrink()
+                                    .min_h(row_height * count.min(2) + px(2.))
+                            }
+                        })
                         .border_1()
                         .border_color(if self.search_ui.focus.is_focused(window) {
-                            cx.theme().primary
+                            cx.theme().ring
                         } else {
                             cx.theme().border
+                        })
+                        .when(self.search_ui.focus.is_focused(window), |results| {
+                            results.border_2()
                         })
                         .child(
                             uniform_list(
@@ -505,15 +546,20 @@ impl Shell {
                                                     gpui::accesskit::Role::ListBoxOption,
                                                 )
                                                 .accessibility_focus(this.search_ui.focus.clone())
+                                                .tab_stop(false)
                                                 .tooltip(tooltip)
                                                 .child(
                                                     div().flex_1().min_w_0().truncate().child(text),
                                                 )
+                                                .ghost()
                                                 .small()
                                                 .w_full()
                                                 .h(row_height)
                                                 .justify_start()
                                                 .selected(this.search_ui.selection == Some(i))
+                                                .when(this.search_ui.selection == Some(i), |row| {
+                                                    row.bg(cx.theme().selection)
+                                                })
                                                 .on_click(cx.listener(move |this, _, _, cx| {
                                                     this.open_hit(i, cx)
                                                 }))

@@ -72,13 +72,14 @@ Default to System appearance with explicit Light and Dark choices. Every surface
 | Raised | `#FFFFFF` | `#252A33` | Controls and dialogs |
 | Faint | `#E6E8EC` | `#343B45` | Code blocks and quiet groups |
 | Text | `#17213A` | `#F1F3F5` | Primary content |
-| Secondary | `#647085` | `#B5BEC9` | Paths, metadata and hints |
+| Secondary | `#56637A` | `#B5BEC9` | Paths, metadata and hints |
 | Separator | `#E1E6ED` | `#343B45` | Decorative region boundaries |
-| Control border | `#CBD3DF` | `#8B96A5` | Necessary control boundaries |
+| Control border | `#77839A` | `#8B96A5` | Necessary control boundaries |
 | Hover | `#E1E7EE` | `#39424F` | Pointer feedback |
 | Selection | `#DCEBFC` | `#243E60` | Active selection, normal text |
 | Inactive selection | `#E5EBF2` | `#3A424D` | Selection outside the focused pane |
-| Accent | `#007AFF` | `#409CFF` | Focus, links and modified indicator |
+| Accent | `#0A6CDF` | `#409CFF` | Focus, links and modified indicator |
+| Action fill | `#0A63CE` | `#1F6FD8` | Primary button behind white text |
 | Warning | `#805600` | `#EBC378` | Partial coverage, recovery concerns |
 | Error | `#B42332` | `#FF9EAA` | Failed actions and conflicts |
 | Success | `#256B3D` | `#89D6A3` | Confirmed successful outcomes |

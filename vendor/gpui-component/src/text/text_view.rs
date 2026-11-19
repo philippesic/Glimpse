@@ -1081,6 +1081,11 @@ impl Element for TextView {
             .track_focus(focus_handle)
             .size_full()
             .relative()
+            .rounded(cx.theme().radius)
+            .border_1()
+            .border_color(cx.theme().title_bar_border)
+            .px(window.rem_size() * 1.25)
+            .py(window.rem_size() * 0.75)
             .focus_ring(
                 focus_handle.is_focused(window),
                 window.rem_size() / 8.,

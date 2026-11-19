@@ -25,6 +25,15 @@ pub(super) fn status(
     })
 }
 
+/// A labelled region; also gives assistive technology the clipping bounds of a scrolled area.
+pub(super) fn group(id: &'static str, label: String, child: impl IntoElement) -> impl IntoElement {
+    accessible(id, child, move |_, _, _| {
+        let mut node = Node::new(Role::Group);
+        node.set_label(label.clone());
+        AccessibilityInfo::new(node)
+    })
+}
+
 pub(super) fn collection(
     id: &'static str,
     label: String,

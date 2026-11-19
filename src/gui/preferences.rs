@@ -579,7 +579,9 @@ impl Render for Preferences {
                             .when(compact_categories, |fields| {
                                 fields.border_t_1().border_color(cx.theme().border).pt_1()
                             })
-                            .child(
+                            .child(super::accessibility::group(
+                                "preference-fields-group",
+                                "Settings".into(),
                                 div()
                                     .id("preference-fields")
                                     .min_h_0()
@@ -592,7 +594,7 @@ impl Render for Preferences {
                                     .children(rows.into_iter().enumerate().map(|(i, row)| {
                                         div().track_focus(&self.row_focus[i]).pb(px(12.)).child(row)
                                     })),
-                            )
+                            ))
                             .child(
                                 div().absolute().inset_0().child(
                                     Scrollbar::vertical(&self.scroll)

@@ -28,6 +28,7 @@ impl UnsavedSubject {
         lines: Option<usize>,
         folder: SharedString,
         numbered: bool,
+        wrap_folder: bool,
         cx: &App,
     ) -> impl IntoElement {
         let mut label = self.label();
@@ -54,7 +55,13 @@ impl UnsavedSubject {
                 .child(
                     div()
                         .text_color(cx.theme().muted_foreground)
-                        .truncate()
+                        .map(|caption| {
+                            if wrap_folder {
+                                caption.whitespace_normal()
+                            } else {
+                                caption.truncate()
+                            }
+                        })
                         .child(folder),
                 ),
             move |_, _, _| {
@@ -335,7 +342,7 @@ impl Decision {
             .rmatch_indices(MAIN_SEPARATOR)
             .next()
             .map_or(0, |(offset, separator)| offset + separator.len());
-        let (folder, filename) = path.split_at(filename_offset);
+        let folder = &path[..filename_offset];
         let rendered = div()
             .w_full()
             .min_w_0()
@@ -343,12 +350,6 @@ impl Decision {
             .flex_col()
             .pt_1()
             .pb_2()
-            .child(
-                div()
-                    .font_semibold()
-                    .whitespace_normal()
-                    .child(filename.to_owned()),
-            )
             .child(div().w_full().whitespace_normal().child(folder.to_owned()))
             .id("decision-full-path")
             .tooltip(move |window, cx| {
@@ -415,7 +416,7 @@ impl Render for Decision {
         } else {
             Vec::new()
         };
-        let (folder_captions, numbered) = Self::folder_captions(
+        let (mut folder_captions, numbered) = Self::folder_captions(
             &self.subjects,
             panel_width
                 - px(2.)
@@ -434,7 +435,15 @@ impl Render for Decision {
         let comparison_height = px(160.).min(viewport.height * 0.22);
         let detail_fraction = if self.comparison.is_some() { 0.67 } else { 0.4 };
         let subject_lines = compact.then_some(if self.subjects.len() == 1 { 3 } else { 1 });
-        let detail = if reveal_controls {
+        let single_folder = self.subjects.len() == 1 && !self.detail.is_empty();
+        if single_folder {
+            let folder = std::path::Path::new(self.detail.trim())
+                .parent()
+                .map(|folder| folder.display().to_string())
+                .unwrap_or_default();
+            folder_captions = vec![folder.into()];
+        }
+        let detail = if reveal_controls || single_folder {
             None
         } else if !self.subjects.is_empty() {
             Some(Self::close_path(&self.detail).into_any_element())
@@ -501,7 +510,9 @@ impl Render for Decision {
                             .flex_col()
                             .flex_shrink()
                             .overflow_hidden()
-                            .child(
+                            .child(super::accessibility::group(
+                                "decision-detail-group",
+                                "Affected documents".into(),
                                 div()
                                     .id("decision-detail")
                                     .w_full()
@@ -531,6 +542,7 @@ impl Render for Decision {
                                                                     subject_lines,
                                                                     folder,
                                                                     numbered,
+                                                                    single_folder,
                                                                     cx,
                                                                 ),
                                                             ))
@@ -577,7 +589,7 @@ impl Render for Decision {
                                         ))
                                     })
                                     .when_some(detail, |body, detail| body.child(detail)),
-                            )
+                            ))
                             .child(
                                 div().absolute().inset_0().child(
                                     Scrollbar::vertical(&self.detail_scroll)

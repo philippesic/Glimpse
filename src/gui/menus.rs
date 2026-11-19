@@ -2,9 +2,9 @@ use super::Shell;
 use glimpse::{commands, paths};
 use gpui::{prelude::*, *};
 use gpui_component::{
-    Side, Sizable,
-    button::Button,
-    menu::{DropdownMenu, PopupMenuItem},
+    IconName, Side, Sizable,
+    button::{Button, ButtonVariants},
+    menu::{DropdownMenu, PopupMenu, PopupMenuItem},
 };
 use std::path::PathBuf;
 
@@ -42,7 +42,157 @@ fn location_item(shell: WeakEntity<Shell>, path: PathBuf) -> PopupMenuItem {
     })
 }
 
+fn shortcut(settings: &glimpse::storage::Settings, id: &str) -> Option<SharedString> {
+    let command = commands::COMMANDS.iter().find(|command| command.id == id)?;
+    let key = settings
+        .keymaps
+        .get(id)
+        .map(String::as_str)
+        .unwrap_or(command.shortcut);
+    (!key.is_empty()).then(|| super::platform::shortcut_label(key).into())
+}
+
+fn add_commands(
+    mut menu: PopupMenu,
+    shell: &WeakEntity<Shell>,
+    settings: &glimpse::storage::Settings,
+    disabled: &std::collections::HashSet<&'static str>,
+    ids: &[&'static str],
+) -> PopupMenu {
+    for id in ids {
+        if *id == "-" {
+            menu = menu.separator();
+            continue;
+        }
+        let Some(command) = commands::COMMANDS.iter().find(|command| command.id == *id) else {
+            continue;
+        };
+        let item = command_item(
+            shell.clone(),
+            command.id,
+            command.label.to_owned(),
+            disabled.contains(id),
+        )
+        .when_some(shortcut(settings, id), |item, hint| {
+            item.shortcut_hint(hint)
+        });
+        menu = menu.item(item);
+    }
+    menu
+}
+
 impl Shell {
+    fn disabled_commands(&self) -> std::collections::HashSet<&'static str> {
+        commands::COMMANDS
+            .iter()
+            .filter(|command| !self.command_enabled(command.id))
+            .map(|command| command.id)
+            .collect()
+    }
+
+    pub(super) fn document_menu(&self, cx: &Context<Self>) -> impl IntoElement {
+        let shell = cx.entity().downgrade();
+        let settings = self.settings.clone();
+        let disabled = self.disabled_commands();
+        Button::new("document-menu")
+            .icon(IconName::Ellipsis)
+            .tooltip("More Document Actions")
+            .ghost()
+            .small()
+            .dropdown_menu_with_anchor(Corner::TopRight, move |menu, window, _| {
+                let menu = menu
+                    .accessible_name("More Document Actions")
+                    .scrollable(true)
+                    .max_h((window.viewport_size().height - px(96.)).max(px(100.)));
+                add_commands(
+                    menu,
+                    &shell,
+                    &settings,
+                    &disabled,
+                    &[
+                        "new",
+                        "save-as",
+                        "save-copy",
+                        "-",
+                        "find",
+                        "line",
+                        "wrap",
+                        "-",
+                        "reload",
+                        "reveal",
+                        "copy-path",
+                        "copy-relative",
+                        "external",
+                        "-",
+                        "close",
+                    ],
+                )
+            })
+    }
+
+    pub(super) fn search_scope_menu(
+        &self,
+        label: String,
+        indexed: bool,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let shell = cx.entity().downgrade();
+        let pinned = self.scope.is_some();
+        let tooltip = paths::display(self.effective_scope());
+        let disabled: std::collections::HashSet<_> = [
+            "search-here",
+            "scope",
+            "go-scope",
+            "index-folder",
+            "remove-index",
+            "search-details",
+        ]
+        .into_iter()
+        .filter(|id| !self.command_enabled(id))
+        .collect();
+        Button::new("search-scope-heading")
+            .label(label)
+            .min_w_0()
+            .max_w_full()
+            .flex_shrink()
+            .accessibility_description(format!("Search folder {tooltip}"))
+            .tooltip(tooltip)
+            .small()
+            .compact()
+            .outline()
+            .dropdown_caret(true)
+            .dropdown_menu(move |menu, _, _| {
+                let item = |id: &'static str, label: &str| {
+                    command_item(shell.clone(), id, label.into(), disabled.contains(id))
+                };
+                menu.accessible_name("Search folder")
+                    .item(item("search-here", "Search This Folder"))
+                    .item(item(
+                        "scope",
+                        if pinned {
+                            "Unpin Search Folder"
+                        } else {
+                            "Pin Search Folder Here"
+                        },
+                    ))
+                    .item(item("go-scope", "Go to Search Folder"))
+                    .separator()
+                    .item(item(
+                        "index-folder",
+                        if indexed {
+                            "Rebuild Filename Index"
+                        } else {
+                            "Index This Folder"
+                        },
+                    ))
+                    .when(indexed, |menu| {
+                        menu.item(item("remove-index", "Remove Filename Index"))
+                    })
+                    .separator()
+                    .item(item("search-details", "Search Scope and Coverage…"))
+            })
+    }
+
     pub(super) fn open_documents_menu(
         &self,
         requested: bool,
@@ -129,8 +279,7 @@ impl Shell {
         Button::new("locations-menu")
             .label("Locations")
             .small()
-            .compact()
-            .outline()
+            .ghost()
             .dropdown_caret(true)
             .dropdown_menu(move |mut menu, window, _| {
                 menu = menu
@@ -187,111 +336,112 @@ impl Shell {
             })
     }
 
-    pub(super) fn main_menu(&self, cx: &Context<Self>) -> impl IntoElement {
+    pub(super) fn main_menu(&self, requested: bool, cx: &Context<Self>) -> impl IntoElement {
         let shell = cx.entity().downgrade();
         let settings = self.settings.clone();
-        let disabled: std::collections::HashSet<_> = commands::COMMANDS
-            .iter()
-            .filter(|command| !self.command_enabled(command.id))
-            .map(|command| command.id)
-            .collect();
+        let disabled = self.disabled_commands();
+        let request = self.request.wait || self.request.pick;
         Button::new("main-menu")
-            .label("Menu")
+            .icon(IconName::Menu)
+            .tooltip("Menu")
+            .ghost()
             .small()
-            .compact()
-            .outline()
-            .dropdown_caret(true)
-            .dropdown_menu(move |mut menu, window, _| {
-                menu = menu
-                    .scrollable(true)
-                    .max_w((window.viewport_size().width - px(16.)).min(px(620.)))
-                    .max_h((window.viewport_size().height - px(96.)).max(px(100.)));
-                for (group, ids) in [
+            .dropdown_menu_with_anchor(Corner::TopRight, move |menu, window, cx| {
+                let groups: [(&str, &[&'static str]); 5] = [
                     (
                         "File",
                         &[
                             "new",
                             "open",
                             "folder",
-                            "keep-tab",
+                            "-",
                             "save",
                             "save-as",
                             "save-copy",
+                            "keep-tab",
+                            "-",
                             "named-file",
                             "new-folder",
                             "rename",
                             "trash",
+                            "-",
                             "close",
-                            "quit",
-                        ][..],
+                        ],
                     ),
-                    ("Edit", &["find", "indent", "outdent"][..]),
+                    ("Edit", &["find", "line", "-", "indent", "outdent", "wrap"]),
                     (
-                        "Navigate",
+                        "Go",
                         &[
                             "path",
                             "open-documents",
+                            "navigator",
+                            "-",
                             "back",
                             "forward",
                             "parent",
                             "home",
                             "refresh",
+                            "-",
                             "pin",
-                            "scope",
-                            "go-scope",
                             "reveal",
                             "copy-path",
                             "copy-relative",
                             "external",
                             "finder",
-                        ][..],
+                        ],
                     ),
                     (
-                        "Search and view",
+                        "Search",
                         &[
+                            "filter",
                             "find-files",
                             "find-text",
+                            "-",
                             "search-here",
+                            "scope",
+                            "go-scope",
                             "index-folder",
                             "remove-index",
                             "search-details",
                             "stop-search",
-                            "focus-results",
-                            "read",
-                            "wrap",
-                            "recovery",
-                            "settings",
-                            "commands",
-                        ][..],
+                        ],
                     ),
-                    ("CLI request", &["finish", "abort", "choose", "cancel"][..]),
-                ] {
-                    menu = menu.label(group);
-                    for id in ids {
-                        let Some(command) =
-                            commands::COMMANDS.iter().find(|command| command.id == *id)
-                        else {
-                            continue;
-                        };
-                        let shortcut = settings
-                            .keymaps
-                            .get(*id)
-                            .map(String::as_str)
-                            .unwrap_or(command.shortcut);
-                        let item = command_item(
-                            shell.clone(),
-                            command.id,
-                            command.label.to_owned(),
-                            disabled.contains(id),
-                        )
-                        .when(!shortcut.is_empty(), |item| {
-                            item.shortcut_hint(super::platform::shortcut_label(shortcut))
-                        });
-                        menu = menu.item(item);
-                    }
-                    menu = menu.separator();
+                    ("View", &["toggle-navigator", "read", "recovery"]),
+                ];
+                let mut menu = menu
+                    .accessible_name("Menu")
+                    .min_w(px(220.))
+                    .max_h((window.viewport_size().height - px(24.)).max(px(100.)));
+                for (label, ids) in groups {
+                    let shell = shell.clone();
+                    let settings = settings.clone();
+                    let disabled = disabled.clone();
+                    menu = menu.submenu(label, window, cx, move |submenu, _, _| {
+                        add_commands(submenu.min_w(px(260.)), &shell, &settings, &disabled, ids)
+                    });
                 }
-                menu
+                if request {
+                    let shell = shell.clone();
+                    let settings = settings.clone();
+                    let disabled = disabled.clone();
+                    menu = menu.submenu("CLI Request", window, cx, move |submenu, _, _| {
+                        add_commands(
+                            submenu.min_w(px(260.)),
+                            &shell,
+                            &settings,
+                            &disabled,
+                            &["finish", "abort", "choose", "cancel"],
+                        )
+                    });
+                }
+                add_commands(
+                    menu.separator(),
+                    &shell,
+                    &settings,
+                    &disabled,
+                    &["commands", "settings", "-", "quit"],
+                )
             })
+            .request_open(requested)
     }
 }

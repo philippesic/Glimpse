@@ -43,7 +43,7 @@ impl Shell {
             value,
             self.current.clone(),
         ));
-        self.status = "Completing this path…".into();
+        self.path_hint = Some("Completing this path…".into());
     }
     pub(super) fn path_completed(
         &mut self,
@@ -63,13 +63,13 @@ impl Shell {
         match result {
             Ok(matches) => {
                 let count = matches.choices.len();
-                self.status = if count == 0 {
+                self.path_hint = Some(if count == 0 {
                     "No matching paths".into()
                 } else if matches.partial {
                     "Partial path completions — narrow the name to see more".into()
                 } else {
                     format!("{count} path completions · Tab / Shift-Tab cycles; Enter opens")
-                };
+                });
                 self.path_completions = Some(Completions {
                     matches,
                     value,
@@ -77,7 +77,7 @@ impl Shell {
                 });
                 self.complete_path(false, window, cx);
             }
-            Err(error) => self.status = format!("Path completion failed: {error}"),
+            Err(error) => self.path_hint = Some(format!("Path completion failed: {error}")),
         }
     }
     pub(super) fn path_bar(
@@ -267,49 +267,62 @@ impl Shell {
         cx.notify();
     }
 
-    pub(super) fn path_matches(&self, cx: &Context<Self>) -> AnyElement {
+    pub(super) fn path_matches(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
         let current = self.query.read(cx).value();
-        let Some(completions) = self
+        let completions = self
             .path_completions
             .as_ref()
-            .filter(|c| c.value == current.as_str())
-        else {
-            return div().into_any_element();
-        };
+            .filter(|c| c.value == current.as_str());
+        let scale = self.settings.ui_scale;
         div()
             .flex()
             .flex_col()
-            .items_start()
-            .id("path-completions")
-            .max_h(px(160.))
-            .overflow_y_scroll()
-            .px_2()
-            .children(
-                completions
-                    .matches
-                    .choices
-                    .iter()
-                    .enumerate()
-                    .map(|(i, choice)| {
-                        let entry = choice.entry();
-                        Button::new(("path-match", i))
-                            .label(format!(
-                                "{}{}",
-                                paths::name(&choice.path),
-                                if choice.directory { "/" } else { "" }
-                            ))
-                            .small()
-                            .ghost()
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.path_completions = None;
-                                this.query.update(cx, |input, cx| {
-                                    input.set_value(entry.clone(), window, cx);
-                                    input.focus(window, cx);
-                                });
-                                cx.notify();
-                            }))
-                    }),
-            )
+            .flex_shrink_0()
+            .px(px(8. * scale))
+            .pb(px(4. * scale))
+            .when_some(self.path_hint.clone(), |list, hint| {
+                list.child(accessibility::message(
+                    "path-completion-hint",
+                    hint.clone(),
+                    div()
+                        .text_size(px(12. * scale))
+                        .text_color(cx.theme().muted_foreground)
+                        .child(hint),
+                ))
+            })
+            .when_some(completions, |list, completions| {
+                list.child(
+                    div()
+                        .id("path-completions")
+                        .flex()
+                        .flex_col()
+                        .items_start()
+                        .max_h(px(160. * scale).min(window.viewport_size().height * 0.2))
+                        .overflow_y_scroll()
+                        .children(completions.matches.choices.iter().enumerate().map(
+                            |(i, choice)| {
+                                let entry = choice.entry();
+                                Button::new(("path-match", i))
+                                    .label(format!(
+                                        "{}{}",
+                                        paths::name(&choice.path),
+                                        if choice.directory { "/" } else { "" }
+                                    ))
+                                    .small()
+                                    .ghost()
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.path_completions = None;
+                                        this.path_hint = None;
+                                        this.query.update(cx, |input, cx| {
+                                            input.set_value(entry.clone(), window, cx);
+                                            input.focus(window, cx);
+                                        });
+                                        cx.notify();
+                                    }))
+                            },
+                        )),
+                )
+            })
             .into_any_element()
     }
 }

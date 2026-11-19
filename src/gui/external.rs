@@ -22,7 +22,12 @@ impl Shell {
         }
         if doc.dirty(cx) {
             doc.external = doc.deferred_external.take();
-            self.status = "Changed on disk. Local edits retained. Reload or Save Copy.".into();
+            if Some(id) != self.active {
+                self.status = format!(
+                    "{} changed on disk; local edits retained",
+                    glimpse::paths::name(&doc.disk.path)
+                );
+            }
             cx.notify();
             return;
         }

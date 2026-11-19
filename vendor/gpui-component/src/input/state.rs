@@ -286,6 +286,7 @@ pub struct InputState {
     value_cache: std::cell::RefCell<Option<SharedString>>,
     line_endings: super::text_metadata::LineEndings,
     accessibility_label: Option<SharedString>,
+    accessibility_description: Option<SharedString>,
     accessibility_mapping: Rc<std::cell::RefCell<accessibility::Mapping>>,
     pub(super) text_wrapper: TextWrapper,
     defer_large_layout: bool,
@@ -720,6 +721,7 @@ impl InputState {
 
         Self {
             accessibility_label: None,
+            accessibility_description: None,
             accessibility_mapping: Rc::new(std::cell::RefCell::new(
                 accessibility::Mapping::default(),
             )),
@@ -2320,6 +2322,15 @@ impl InputState {
         cx: &mut Context<Self>,
     ) {
         self.accessibility_label = Some(label.into());
+        cx.notify();
+    }
+
+    pub fn set_accessibility_description(
+        &mut self,
+        description: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        self.accessibility_description = Some(description.into());
         cx.notify();
     }
 

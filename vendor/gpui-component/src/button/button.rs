@@ -178,6 +178,9 @@ impl ButtonVariant {
 pub struct Button {
     id: ElementId,
     semantic_role: gpui::accesskit::Role,
+    semantic_description: Option<SharedString>,
+    semantic_toggled: Option<bool>,
+    semantic_expanded: Option<bool>,
     semantic_focus: Option<gpui::FocusHandle>,
     focus_handle: Option<gpui::FocusHandle>,
     base: Stateful<Div>,
@@ -223,6 +226,9 @@ impl Button {
         Self {
             id: id.clone(),
             semantic_role: gpui::accesskit::Role::Button,
+            semantic_description: None,
+            semantic_toggled: None,
+            semantic_expanded: None,
             semantic_focus: None,
             focus_handle: None,
             // ID must be set after div is created;
@@ -266,6 +272,24 @@ impl Button {
 
     pub fn accessibility_role(mut self, role: gpui::accesskit::Role) -> Self {
         self.semantic_role = role;
+        self
+    }
+
+    /// Supplementary accessible text, such as a document's unsaved state.
+    pub fn accessibility_description(mut self, description: impl Into<SharedString>) -> Self {
+        self.semantic_description = Some(description.into());
+        self
+    }
+
+    /// Expose an on/off toggle state to assistive technology.
+    pub fn accessibility_toggled(mut self, toggled: bool) -> Self {
+        self.semantic_toggled = Some(toggled);
+        self
+    }
+
+    /// Expose whether the content this button controls is expanded.
+    pub fn accessibility_expanded(mut self, expanded: bool) -> Self {
+        self.semantic_expanded = Some(expanded);
         self
     }
 
@@ -494,6 +518,9 @@ impl RenderOnce for Button {
         let italic_label = self.italic_label;
         let semantic_disabled = self.disabled || self.loading;
         let semantic_selected = self.selected;
+        let semantic_description = self.semantic_description.clone();
+        let semantic_toggled = self.semantic_toggled;
+        let semantic_expanded = self.semantic_expanded;
         let semantic_handler = self.on_click.clone();
         let semantic_focus = focus_handle.clone();
         let composite_focus = self.semantic_focus.clone();
@@ -613,6 +640,7 @@ impl RenderOnce for Button {
             .child({
                 h_flex()
                     .id("label")
+                    .flex_1()
                     .min_w_0()
                     .max_w_full()
                     .overflow_hidden()
@@ -674,6 +702,19 @@ impl RenderOnce for Button {
             let mut node = Node::new(semantic_role);
             node.set_label(semantic_label.to_string());
             node.set_selected(semantic_selected);
+            if let Some(description) = &semantic_description {
+                node.set_description(description.to_string());
+            }
+            if let Some(toggled) = semantic_toggled {
+                node.set_toggled(if toggled {
+                    gpui::accesskit::Toggled::True
+                } else {
+                    gpui::accesskit::Toggled::False
+                });
+            }
+            if let Some(expanded) = semantic_expanded {
+                node.set_expanded(expanded);
+            }
             if semantic_disabled {
                 node.set_disabled();
             } else {

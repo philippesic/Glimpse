@@ -282,13 +282,12 @@ impl Shell {
             .min_h_0()
             .min_w_0()
             .w_full()
-            .max_w(px(960.))
-            .mx_auto()
             .flex()
             .flex_col()
-            .p_4()
-            .when(narrow, |area| area.px_3())
-            .when(short, |area| area.py_1().line_height(relative(1.4)))
+            .gap(px(8. * self.settings.ui_scale))
+            .px(px(8. * self.settings.ui_scale))
+            .pb(px(8. * self.settings.ui_scale))
+            .when(short, |area| area.line_height(relative(1.4)))
             .text_size(font_size);
         let Some(view) = &self.reading_view else {
             return area.child(self.reading_progress()).into_any_element();

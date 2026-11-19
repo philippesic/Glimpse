@@ -317,8 +317,21 @@ impl RenderOnce for Popover {
         let parent_view_id = window.current_view();
         let wait_for_anchor = self.wait_for_anchor;
 
-        let el = div()
-            .id(self.id)
+        let shrinkable = self
+            .trigger_style
+            .as_ref()
+            .is_some_and(|style| style.min_size.width.is_some() || style.max_size.width.is_some());
+        let mut el = div().id(self.id);
+        if shrinkable {
+            let trigger = self.trigger_style.as_ref().unwrap();
+            let style = el.style();
+            style.display = Some(gpui::Display::Flex);
+            style.min_size.width = trigger.min_size.width;
+            style.max_size.width = trigger.max_size.width;
+            style.flex_shrink = trigger.flex_shrink;
+            style.flex_grow = trigger.flex_grow;
+        }
+        let el = el
             .child((trigger)(open, window, cx))
             .on_mouse_down(self.mouse_button, {
                 let state = state.clone();

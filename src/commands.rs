@@ -104,6 +104,8 @@ pub enum Action {
     Filter,
     KeepPreview,
     OpenDocuments,
+    NextDocument,
+    PreviousDocument,
     RefreshVolumes,
 }
 pub struct Command {
@@ -140,8 +142,8 @@ commands![
     (Home, "home", "Home", "Cmd+Shift+H"),
     (Parent, "parent", "Parent Folder", "Cmd+Alt+ArrowUp"),
     (Refresh, "refresh", "Refresh Folder", "Cmd+R"),
-    (Files, "find-files", "Find Files in Search Folder", "Cmd+P"),
-    (Text, "find-text", "Find Text in Saved Files", "Cmd+Shift+F"),
+    (Files, "find-files", "Find Files", "Cmd+P"),
+    (Text, "find-text", "Find Text", "Cmd+Shift+F"),
     (Find, "find", "Find / Replace in Document", "Cmd+F"),
     (Read, "read", "Read / Edit Markdown", ""),
     (Settings, "settings", "Preferences", "Cmd+Comma"),
@@ -156,13 +158,25 @@ commands![
         "Cmd+Alt+E"
     ),
     (Line, "line", "Go to Line…", "Cmd+G"),
-    (Filter, "filter", "Filter This Folder", ""),
+    (Filter, "filter", "Filter This Folder", "Cmd+Shift+L"),
     (KeepPreview, "keep-tab", "Keep Preview Tab", ""),
     (
         OpenDocuments,
         "open-documents",
         "Open Documents",
         "Cmd+Alt+O"
+    ),
+    (
+        NextDocument,
+        "next-document",
+        "Next Document",
+        "Cmd+PageDown"
+    ),
+    (
+        PreviousDocument,
+        "previous-document",
+        "Previous Document",
+        "Cmd+PageUp"
     ),
     (
         RefreshVolumes,
