@@ -435,6 +435,8 @@ impl Shell {
                 };
                 let enabled = self.command_enabled(command.id);
                 let selected = index == selection;
+                let active = focused || self.query.focus_handle(cx).is_focused(window);
+                let (marker, fill) = theme::list_row(selected, active, cx);
                 Button::new(SharedString::from(format!("palette-{}", command.id)))
                     .label(command.label)
                     .accessibility_role(gpui::accesskit::Role::ListBoxOption)
@@ -451,7 +453,9 @@ impl Shell {
                     .justify_start()
                     .disabled(!enabled)
                     .selected(selected)
-                    .when(selected, |row| row.bg(cx.theme().selection))
+                    .border_l(px(3. * scale))
+                    .border_color(marker)
+                    .when_some(fill, |row, fill| row.bg(fill))
                     .child(
                         div()
                             .ml_auto()

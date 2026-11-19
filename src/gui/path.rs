@@ -340,6 +340,7 @@ impl Shell {
                                 );
                                 let caption = decision::abbreviate_folder(&name, width, &measure);
                                 let selected = current == Some(i);
+                                let (marker, fill) = theme::list_row(selected, true, cx);
                                 Button::new(("path-match", i))
                                     .label(name)
                                     .display_label(caption)
@@ -350,7 +351,9 @@ impl Shell {
                                     .w_full()
                                     .justify_start()
                                     .selected(selected)
-                                    .when(selected, |row| row.bg(cx.theme().selection))
+                                    .border_l(px(3. * scale))
+                                    .border_color(marker)
+                                    .when_some(fill, |row, fill| row.bg(fill))
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         this.path_completions = None;
                                         this.path_hint = None;

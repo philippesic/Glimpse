@@ -502,6 +502,7 @@ impl Shell {
                         .track_focus(&self.search_ui.focus)
                         .mx(px(8. * scale))
                         .mb(px(8. * scale))
+                        .p(px(2. * scale))
                         .rounded(px(7. * scale))
                         .overflow_hidden()
                         .map(|results| {
@@ -509,9 +510,9 @@ impl Shell {
                                 results.flex_1().min_h(row_height)
                             } else {
                                 results
-                                    .h(row_height * count.min(8) + px(2.))
+                                    .h(row_height * count.min(8) + px(2. + 4. * scale))
                                     .flex_shrink()
-                                    .min_h(row_height * count.min(2) + px(2.))
+                                    .min_h(row_height * count.min(2) + px(2. + 4. * scale))
                             }
                         })
                         .border_1()
@@ -603,6 +604,12 @@ impl Shell {
                                                 } else {
                                                     paths::display(&hit.path)
                                                 };
+                                                let selected = this.search_ui.selection == Some(i);
+                                                let (marker, fill) = theme::list_row(
+                                                    selected,
+                                                    this.search_ui.focus.is_focused(window),
+                                                    cx,
+                                                );
                                                 let text = StyledText::new(label).with_highlights(
                                                     ranges.into_iter().map(|range| {
                                                         (
@@ -636,11 +643,10 @@ impl Shell {
                                                     .w_full()
                                                     .h(row_height)
                                                     .justify_start()
-                                                    .selected(this.search_ui.selection == Some(i))
-                                                    .when(
-                                                        this.search_ui.selection == Some(i),
-                                                        |row| row.bg(cx.theme().selection),
-                                                    )
+                                                    .selected(selected)
+                                                    .border_l(px(3. * scale))
+                                                    .border_color(marker)
+                                                    .when_some(fill, |row, fill| row.bg(fill))
                                                     .on_click(cx.listener(move |this, _, _, cx| {
                                                         this.open_hit(i, cx)
                                                     }))

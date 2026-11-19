@@ -175,6 +175,18 @@ const DARK: Palette = Palette {
     scrim: 0.55,
 };
 
+/// The leading-edge bar and fill of a list row. Every list marks its selected row the same way:
+/// a bar in the accent colour while the list or its search field has keyboard focus, in the
+/// secondary text colour otherwise, each at least 3:1 against the row in both themes, so the row
+/// that Enter acts on never depends on the pale fill alone.
+pub(super) fn list_row(selected: bool, active: bool, cx: &App) -> (gpui::Hsla, Option<gpui::Hsla>) {
+    match (selected, active) {
+        (true, true) => (cx.theme().ring, Some(cx.theme().selection)),
+        (true, false) => (cx.theme().muted_foreground, Some(inactive_selection(cx))),
+        _ => (gpui::transparent_black(), None),
+    }
+}
+
 /// Neutral fill for a selection whose pane does not have keyboard focus.
 pub(super) fn inactive_selection(cx: &App) -> gpui::Hsla {
     gpui::rgb(if cx.theme().is_dark() {

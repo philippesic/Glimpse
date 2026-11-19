@@ -307,6 +307,7 @@ struct Shell {
     documents: Vec<Document>,
     active: Option<u64>,
     tab_scroll: ScrollHandle,
+    tab_widths: HashMap<u64, Pixels>,
     tab_reveal: Option<TabReveal>,
     next_id: u64,
     open_token: u64,
@@ -561,6 +562,7 @@ impl Shell {
             documents: vec![],
             active: None,
             tab_scroll: ScrollHandle::new(),
+            tab_widths: HashMap::new(),
             tab_reveal: None,
             next_id: 1,
             open_token,
@@ -3998,6 +4000,7 @@ impl Render for Shell {
                                 } else {
                                     IconName::File
                                 };
+                                let (marker, fill) = theme::list_row(selected, focused, cx);
                                 let row=div()
                                     .id(("entry", i))
                                     .h(px(if this.settings.compact { 28. } else { 32. } * scale))
@@ -4006,18 +4009,10 @@ impl Render for Shell {
                                     .items_center()
                                     .gap(px(8. * scale))
                                     .border_l(px(3. * scale))
-                                    .border_color(match (selected, focused) {
-                                        (true, true) => cx.theme().ring,
-                                        (true, false) => cx.theme().muted_foreground,
-                                        _ => gpui::transparent_black(),
-                                    })
+                                    .border_color(marker)
                                     .pl(px(9. * scale))
                                     .pr(px(12. * scale))
-                                    .bg(match (selected, focused) {
-                                        (true, true) => cx.theme().selection,
-                                        (true, false) => theme::inactive_selection(cx),
-                                        _ => cx.theme().sidebar,
-                                    })
+                                    .bg(fill.unwrap_or(cx.theme().sidebar))
                                     .hover(|row| if selected { row } else { row.bg(cx.theme().list_hover) })
                                     .tooltip(move |window,cx| gpui_component::tooltip::Tooltip::new(tooltip.clone()).build(window,cx))
                                     .cursor_pointer()
@@ -4123,6 +4118,46 @@ impl Render for Shell {
         let tab_width = narrow.then(|| {
             (window.viewport_size().width - tab_controls_width - close_width).max(rem * 1.5)
         });
+        // Like a scrolling notebook, the strip shows the current tab and as many neighbours as
+        // fit whole, from widths measured in the last frame, so no fragment of a tab is left at
+        // an edge. Hidden tabs stay reachable with Ctrl+Tab, the arrow keys and Documents.
+        for (index, doc) in self.documents.iter().enumerate() {
+            if let Some(bounds) = self.tab_scroll.bounds_for_item(index)
+                && bounds.size.width > px(0.)
+                && self.tab_widths.insert(doc.id, bounds.size.width) != Some(bounds.size.width)
+            {
+                cx.notify();
+            }
+        }
+        self.tab_widths
+            .retain(|id, _| self.documents.iter().any(|doc| doc.id == *id));
+        let room = self.tab_scroll.bounds().size.width - px(8. * scale);
+        let shown_tabs = shown_tab.filter(|_| room > px(0.)).map(|center| {
+            let width = |index: usize| {
+                self.tab_widths
+                    .get(&self.documents[index].id)
+                    .copied()
+                    .unwrap_or_default()
+            };
+            let gap = px(2. * scale);
+            let (mut first, mut last, mut used) = (center, center, width(center));
+            loop {
+                let mut grew = false;
+                if last + 1 < self.documents.len() && used + gap + width(last + 1) <= room {
+                    last += 1;
+                    used += gap + width(last);
+                    grew = true;
+                }
+                if first > 0 && used + gap + width(first - 1) <= room {
+                    first -= 1;
+                    used += gap + width(first);
+                    grew = true;
+                }
+                if !grew {
+                    break first..=last;
+                }
+            }
+        });
         let tabs = div()
             .id("tabs")
             .w_full()
@@ -4135,8 +4170,11 @@ impl Render for Shell {
             .overflow_x_scroll()
             .flex_shrink_0()
             .track_scroll(&self.tab_scroll)
-            .children(self.documents.iter().map(|doc| {
+            .children(self.documents.iter().enumerate().map(|(index, doc)| {
                 let id = doc.id;
+                let hidden = shown_tabs
+                    .as_ref()
+                    .is_some_and(|shown| !shown.contains(&index));
                 let name = paths::tab_label(
                     &doc.disk.path,
                     self.documents.iter().map(|doc| doc.disk.path.as_path()),
@@ -4216,6 +4254,7 @@ impl Render for Shell {
                     }));
                 div()
                     .flex()
+                    .when(hidden, |tab| tab.hidden())
                     .items_center()
                     .flex_shrink_0()
                     .h_full()

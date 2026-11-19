@@ -79,6 +79,9 @@ pub fn fingerprint_body(body: &[u8], bom: bool) -> u64 {
     body.hash(&mut hash);
     hash.finish()
 }
+/// Byte ranges of `value` to emphasise for a filename query: the last contiguous occurrence
+/// when there is one (so a match in the file name wins over its folders), otherwise the query's
+/// characters in order, starting in the file name when they all fit there.
 pub fn highlight_ranges(value: &str, query: &str) -> Vec<std::ops::Range<usize>> {
     let chars: Vec<_> = value
         .char_indices()
@@ -87,25 +90,47 @@ pub fn highlight_ranges(value: &str, query: &str) -> Vec<std::ops::Range<usize>>
                 .map(move |lower| (start, start + c.len_utf8(), lower))
         })
         .collect();
-    let mut position = 0;
-    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
-    for expected in query.chars().flat_map(char::to_lowercase) {
-        let Some(offset) = chars[position..]
-            .iter()
-            .position(|(_, _, c)| *c == expected)
-        else {
-            return Vec::new();
-        };
-        position += offset;
-        let (start, end, _) = chars[position];
-        if let Some(last) = ranges.last_mut().filter(|range| range.end >= start) {
-            last.end = end;
-        } else {
-            ranges.push(start..end);
-        }
-        position += 1;
+    let wanted: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
+    if wanted.is_empty() {
+        return Vec::new();
     }
-    ranges
+    if let Some(at) = (0..=chars.len().saturating_sub(wanted.len()))
+        .rev()
+        .filter(|_| chars.len() >= wanted.len())
+        .find(|&at| {
+            chars[at..at + wanted.len()]
+                .iter()
+                .zip(&wanted)
+                .all(|((_, _, c), w)| c == w)
+        })
+    {
+        return std::iter::once(chars[at].0..chars[at + wanted.len() - 1].1).collect();
+    }
+    let name_start = chars
+        .iter()
+        .rposition(|(_, _, c)| *c == '/')
+        .map_or(0, |slash| slash + 1);
+    let subsequence = |from: usize| {
+        let mut position = from;
+        let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+        for expected in &wanted {
+            let offset = chars[position..]
+                .iter()
+                .position(|(_, _, c)| c == expected)?;
+            position += offset;
+            let (start, end, _) = chars[position];
+            if let Some(last) = ranges.last_mut().filter(|range| range.end >= start) {
+                last.end = end;
+            } else {
+                ranges.push(start..end);
+            }
+            position += 1;
+        }
+        Some(ranges)
+    };
+    subsequence(name_start)
+        .or_else(|| subsequence(0))
+        .unwrap_or_default()
 }
 fn excerpt(value: &str, query: &str) -> String {
     let found = value.find(query).unwrap_or(0);
@@ -1016,6 +1041,15 @@ mod presentation_tests {
         assert!(shown.contains("needle α"));
         assert!(shown.chars().count() <= 162);
         assert!(shown.starts_with('…') && shown.ends_with('…'));
+    }
+    #[test]
+    fn filename_highlights_prefer_a_whole_match_in_the_file_name() {
+        let value = "project-a/src/config/settings.toml";
+        let whole = highlight_ranges(value, "Settings");
+        assert_eq!((whole.len(), whole.first()), (1, Some(&(21..29))));
+        assert_eq!(highlight_ranges(value, "stt"), vec![21..22, 23..25]);
+        assert_eq!(highlight_ranges(value, "pac"), vec![0..1, 8..9, 12..13]);
+        assert!(highlight_ranges(value, "zz").is_empty());
     }
 }
 
