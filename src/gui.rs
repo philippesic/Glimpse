@@ -269,6 +269,7 @@ struct Shell {
     search_id: u64,
     hits: std::sync::Arc<Vec<search::Hit>>,
     search_ui: searching::State,
+    palette: panel::PaletteState,
     scope: Option<PathBuf>,
     current: PathBuf,
     launch_folder: PathBuf,
@@ -278,6 +279,8 @@ struct Shell {
     nav_focus: FocusHandle,
     open_documents_requested: bool,
     main_menu_requested: bool,
+    conflict_focus: FocusHandle,
+    edit_state: std::cell::Cell<[bool; 3]>,
     reading_focus: FocusHandle,
     pane_state: Entity<panes::Divider>,
     navigation_only: bool,
@@ -460,6 +463,10 @@ impl Shell {
             {
                 this.search_changed(cx);
             }
+            if matches!(event, InputEvent::Change) && this.panel == Some(Panel::Palette) {
+                this.palette.selection = 0;
+                this.palette.scroll.scroll_to_item(0);
+            }
             if matches!(event, InputEvent::Change)
                 && matches!(this.panel, Some(Panel::Palette | Panel::Recovery))
             {
@@ -509,6 +516,8 @@ impl Shell {
             nav_focus: cx.focus_handle().tab_stop(true),
             open_documents_requested: false,
             main_menu_requested: false,
+            conflict_focus: cx.focus_handle(),
+            edit_state: Default::default(),
             reading_focus: cx.focus_handle().tab_stop(true),
             pane_state: cx.new(panes::Divider::new),
             navigation_only: false,
@@ -595,6 +604,7 @@ impl Shell {
             search_id: 0,
             hits: Default::default(),
             search_ui: searching::State::new(cx),
+            palette: panel::PaletteState::new(cx),
         };
         window.focus(&this.nav_focus);
         this.refresh();
@@ -1407,11 +1417,12 @@ impl Shell {
         let value = self.query.read(cx).value().to_string();
         match self.panel {
             Some(Panel::Palette) => {
-                let query = value.to_lowercase();
-                if let Some(command) = glimpse::commands::COMMANDS.iter().find(|command| {
-                    command.label.to_lowercase().contains(&query) || command.id.contains(&query)
-                }) {
-                    self.palette_command(command.id, window, cx);
+                let matches = self.palette_matches(cx);
+                if let Some(id) = matches
+                    .get(self.palette.selection.min(matches.len().saturating_sub(1)))
+                    .copied()
+                {
+                    self.palette_command(id, window, cx);
                 }
             }
             Some(Panel::Path) => match paths::parse_entry(&value, &self.current) {
@@ -2680,6 +2691,19 @@ impl Shell {
             cx.stop_propagation();
             return;
         }
+        if self.panel == Some(Panel::Palette)
+            && self.preferences.is_none()
+            && self.decision.is_none()
+            && self.query.focus_handle(cx).is_focused(window)
+            && matches!(key.key.as_str(), "down" | "up")
+            && !key.modifiers.control
+            && !key.modifiers.platform
+        {
+            self.focus_palette(key.key == "up", window, cx);
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
         if self.panel == Some(Panel::Path)
             && self.preferences.is_none()
             && self.decision.is_none()
@@ -3109,6 +3133,21 @@ impl Shell {
                 self.status =
                     "Refreshing mounted locations; reopen Locations for the result".into();
             }
+            "undo" | "redo" | "cut" | "copy" | "paste" | "select-all" => {
+                if self.reading {
+                    return;
+                }
+                self.focus(window, cx);
+                let action: Box<dyn Action> = match command {
+                    "undo" => Box::new(gpui_component::input::Undo),
+                    "redo" => Box::new(gpui_component::input::Redo),
+                    "cut" => Box::new(gpui_component::input::Cut),
+                    "copy" => Box::new(gpui_component::input::Copy),
+                    "paste" => Box::new(gpui_component::input::Paste),
+                    _ => Box::new(gpui_component::input::SelectAll),
+                };
+                window.dispatch_action(action, cx);
+            }
             "indent" | "outdent" => {
                 if self.reading {
                     return;
@@ -3333,7 +3372,10 @@ impl Shell {
             "find" | "line" | "close" => document.is_some(),
             "read" => document.is_some_and(Document::markdown),
             "keep-tab" => document.is_some_and(|doc| doc.preview),
-            "indent" | "outdent" => document.is_some() && !self.reading,
+            "indent" | "outdent" | "paste" | "select-all" => document.is_some() && !self.reading,
+            "undo" => document.is_some() && !self.reading && self.edit_state.get()[0],
+            "redo" => document.is_some() && !self.reading && self.edit_state.get()[1],
+            "cut" | "copy" => document.is_some() && !self.reading && self.edit_state.get()[2],
             "reload" | "reveal" => {
                 document.is_some_and(|doc| !doc.disk.target.as_os_str().is_empty() && !doc.saving)
             }
@@ -3397,6 +3439,13 @@ impl Shell {
             areas.push(1);
         }
         if self.active.is_some() && (!narrow || !self.navigation_only) {
+            if self
+                .documents
+                .iter()
+                .any(|doc| Some(doc.id) == self.active && doc.external.is_some())
+            {
+                areas.push(3);
+            }
             areas.push(2);
         }
         if areas.is_empty() {
@@ -3408,6 +3457,8 @@ impl Shell {
             Some(0)
         } else if self.nav_focus.is_focused(window) {
             Some(1)
+        } else if self.conflict_focus.is_focused(window) {
+            Some(3)
         } else if self.reading_focus.contains_focused(window, cx)
             || self.documents.iter().any(|doc| {
                 doc.input.focus_handle(cx).contains_focused(window, cx)
@@ -3427,6 +3478,7 @@ impl Shell {
         match next {
             0 => self.query.update(cx, |input, cx| input.focus(window, cx)),
             1 => window.focus(&self.nav_focus),
+            3 => window.focus(&self.conflict_focus),
             _ => {
                 if self.reading {
                     self.reading_focus.focus(window);
@@ -3436,6 +3488,53 @@ impl Shell {
             }
         }
         cx.notify();
+    }
+    /// How many optional toolbar groups fit, measured from the labels at the current
+    /// scale: 0 shows everything; higher tiers move Commands, then Filter and Find Text,
+    /// then Open, then Back/Forward/Parent into the menu, and finally show Find Files,
+    /// the view switch and Locations as icons.
+    fn toolbar_tier(&self, narrow: bool, window: &Window) -> usize {
+        let rem = window.rem_size();
+        let gap = px(4. * self.settings.ui_scale);
+        let text = |label: &str| {
+            let label = SharedString::from(label.to_owned());
+            let run = window.text_style().to_run(label.len());
+            window
+                .text_system()
+                .shape_line(label, rem * 0.875, &[run], None)
+                .width
+                + rem * 1.75
+        };
+        let icon = rem * 1.5;
+        let with_icon = |label: &str| text(label) + rem + gap;
+        let toggle = if narrow {
+            with_icon("Navigator").max(text("Open…"))
+        } else {
+            icon
+        };
+        let mut required =
+            rem * 2. + toggle + gap * 2. + with_icon("Locations") + with_icon("Find Files") + icon;
+        if self.request.pick {
+            required += text("Choose") + text("Cancel") + gap * 2.;
+        }
+        let optional = [
+            text("Commands") + gap * 2.,
+            text("Filter This Folder") + text("Find Text") + gap * 2.,
+            text("Open…") + gap,
+            icon * 3. + gap * 4.,
+            with_icon("Find Files") - icon,
+            if narrow { toggle - icon } else { px(0.) },
+            with_icon("Locations") - icon,
+        ];
+        let width = window.viewport_size().width;
+        let mut total = required + optional.iter().copied().fold(px(0.), |sum, w| sum + w);
+        for (tier, item) in optional.iter().enumerate() {
+            if total <= width {
+                return tier;
+            }
+            total -= *item;
+        }
+        optional.len()
     }
     fn tool_button(
         &self,
@@ -3483,6 +3582,16 @@ impl Shell {
 }
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.edit_state.set(
+            self.documents
+                .iter()
+                .find(|doc| Some(doc.id) == self.active)
+                .map(|doc| {
+                    let input = doc.input.read(cx);
+                    [input.can_undo(), input.can_redo(), input.has_selection()]
+                })
+                .unwrap_or_default(),
+        );
         if self.reading
             && !self
                 .documents
@@ -3547,60 +3656,67 @@ impl Render for Shell {
             .bg(cx.theme().title_bar)
             .border_b_1()
             .border_color(cx.theme().title_bar_border);
-        if narrow {
-            if self.active.is_some() {
-                toolbar = toolbar.child(self.tool_button(
-                    "toggle-navigator",
-                    if self.navigation_only {
-                        "Document"
-                    } else {
-                        "Navigator"
-                    },
-                    Some(if self.navigation_only {
-                        IconName::File
-                    } else {
-                        IconName::Folder
-                    }),
-                    cx,
-                ));
-            } else if !self.request.pick {
-                toolbar = toolbar.child(self.tool_button("open", "Open…", None, cx));
+        let tier = self.toolbar_tier(narrow, window);
+        toolbar = if narrow && self.active.is_none() && !self.request.pick {
+            toolbar.child(self.tool_button("open", "Open…", None, cx))
+        } else if narrow {
+            let (label, icon) = if self.navigation_only {
+                ("Document", IconName::File)
+            } else {
+                ("Navigator", IconName::Folder)
+            };
+            if tier >= 6 {
+                toolbar.child(self.icon_button("toggle-navigator", label, icon, cx))
+            } else {
+                toolbar.child(self.tool_button("toggle-navigator", label, Some(icon), cx))
             }
-            toolbar = toolbar
-                .child(self.locations_menu(cx))
-                .child(div().flex_1())
-                .child(self.main_menu(main_menu_requested, cx));
         } else {
-            toolbar = toolbar
-                .child(self.icon_button(
-                    "toggle-navigator",
-                    if self.navigator_visible {
-                        "Hide Navigator"
-                    } else {
-                        "Show Navigator"
-                    },
-                    if self.navigator_visible {
-                        IconName::PanelLeftClose
-                    } else {
-                        IconName::PanelLeftOpen
-                    },
-                    cx,
-                ))
-                .child(div().w(px(4. * scale)))
-                .child(self.icon_button("back", "Back", IconName::ArrowLeft, cx))
-                .child(self.icon_button("forward", "Forward", IconName::ArrowRight, cx))
-                .child(self.icon_button("parent", "Parent Folder", IconName::ArrowUp, cx))
-                .child(div().w(px(4. * scale)))
-                .child(self.locations_menu(cx))
-                .child(self.tool_button("open", "Open…", None, cx))
-                .child(div().flex_1())
-                .child(self.tool_button("filter", "Filter This Folder", None, cx))
-                .child(self.tool_button("find-files", "Find Files", Some(IconName::Search), cx))
-                .child(self.tool_button("find-text", "Find Text", None, cx))
-                .child(div().w(px(4. * scale)))
-                .child(self.tool_button("commands", "Commands", None, cx))
-                .child(self.main_menu(main_menu_requested, cx));
-        }
+            toolbar.child(self.icon_button(
+                "toggle-navigator",
+                if self.navigator_visible {
+                    "Hide Navigator"
+                } else {
+                    "Show Navigator"
+                },
+                if self.navigator_visible {
+                    IconName::PanelLeftClose
+                } else {
+                    IconName::PanelLeftOpen
+                },
+                cx,
+            ))
+        };
+        toolbar = toolbar
+            .when(tier <= 3, |toolbar| {
+                toolbar
+                    .child(div().w(px(4. * scale)))
+                    .child(self.icon_button("back", "Back", IconName::ArrowLeft, cx))
+                    .child(self.icon_button("forward", "Forward", IconName::ArrowRight, cx))
+                    .child(self.icon_button("parent", "Parent Folder", IconName::ArrowUp, cx))
+            })
+            .child(div().w(px(4. * scale)))
+            .child(self.locations_menu(tier >= 7, cx))
+            .when(tier <= 2 && !(narrow && self.active.is_none()), |toolbar| {
+                toolbar.child(self.tool_button("open", "Open…", None, cx))
+            })
+            .child(div().flex_1())
+            .when(tier <= 1, |toolbar| {
+                toolbar.child(self.tool_button("filter", "Filter This Folder", None, cx))
+            })
+            .child(if tier >= 5 {
+                self.icon_button("find-files", "Find Files", IconName::Search, cx)
+            } else {
+                self.tool_button("find-files", "Find Files", Some(IconName::Search), cx)
+            })
+            .when(tier <= 1, |toolbar| {
+                toolbar.child(self.tool_button("find-text", "Find Text", None, cx))
+            })
+            .when(tier == 0, |toolbar| {
+                toolbar
+                    .child(div().w(px(4. * scale)))
+                    .child(self.tool_button("commands", "Commands", None, cx))
+            })
+            .child(self.main_menu(main_menu_requested, cx));
         if self.request.pick {
             toolbar = toolbar
                 .child(self.button("Choose", "choose", cx))
@@ -3758,6 +3874,11 @@ impl Render for Shell {
         {
             scroll.scroll_to_item(index, ScrollStrategy::Top);
         }
+        let nav_width = if narrow {
+            window.viewport_size().width
+        } else {
+            self.pane_state.read(cx).width(window)
+        };
         let navigator = div()
             .id("navigator")
             .track_focus(&self.nav_focus)
@@ -3814,7 +3935,7 @@ impl Render for Shell {
                 };
                 navigator.child(
                     div().p_2().text_sm()
-                        .child(div().id("listing-state").truncate().child(message.clone())
+                        .child(div().id("listing-state").whitespace_normal().line_clamp(4).child(message.clone())
                             .tooltip(move |window,cx| gpui_component::tooltip::Tooltip::new(message.clone()).build(window,cx)))
                         .child(
                             div().flex().flex_wrap().gap_1().mt_1()
@@ -3828,14 +3949,32 @@ impl Render for Shell {
                 uniform_list(
                     "entries",
                     visible.len(),
-                    cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                    cx.processor(move |this, range: std::ops::Range<usize>, window, cx| {
+                        let scale = this.settings.ui_scale;
+                        let focused = this.nav_focus.is_focused(window);
+                        let name_width = nav_width - px((3. + 9. + 12. + 16. + 8. + 4.) * scale);
+                        let font_size = px(14. * scale);
+                        let measure = |text: &SharedString| {
+                            let run = window.text_style().to_run(text.len());
+                            window
+                                .text_system()
+                                .shape_line(text.clone(), font_size, &[run], None)
+                                .width
+                        };
                         range
                             .map(|i| {
                                 let entry = &entries[visible[i]];
                                 let path = entry.path.clone();
                                 let selected = this.selection.as_ref() == Some(&path);
                                 let tooltip = paths::display(&path);
-                                let scale = this.settings.ui_scale;
+                                let name = paths::name(&path);
+                                let caption = if name.chars().count() as f32 * 0.4 * font_size
+                                    > name_width
+                                {
+                                    decision::abbreviate_folder(&name, name_width, &measure)
+                                } else {
+                                    SharedString::from(name)
+                                };
                                 let icon = if entry.symlink {
                                     IconName::ExternalLink
                                 } else if entry.directory {
@@ -3846,21 +3985,22 @@ impl Render for Shell {
                                 let row=div()
                                     .id(("entry", i))
                                     .h(px(if this.settings.compact { 28. } else { 32. } * scale))
+                                    .w_full()
                                     .flex()
                                     .items_center()
                                     .gap(px(8. * scale))
                                     .border_l(px(3. * scale))
-                                    .border_color(if selected {
-                                        cx.theme().ring
-                                    } else {
-                                        gpui::transparent_black()
+                                    .border_color(match (selected, focused) {
+                                        (true, true) => cx.theme().ring,
+                                        (true, false) => cx.theme().muted_foreground,
+                                        _ => gpui::transparent_black(),
                                     })
                                     .pl(px(9. * scale))
                                     .pr(px(12. * scale))
-                                    .bg(if selected {
-                                        cx.theme().selection
-                                    } else {
-                                        cx.theme().sidebar
+                                    .bg(match (selected, focused) {
+                                        (true, true) => cx.theme().selection,
+                                        (true, false) => theme::inactive_selection(cx),
+                                        _ => cx.theme().sidebar,
                                     })
                                     .hover(|row| if selected { row } else { row.bg(cx.theme().list_hover) })
                                     .tooltip(move |window,cx| gpui_component::tooltip::Tooltip::new(tooltip.clone()).build(window,cx))
@@ -3875,7 +4015,7 @@ impl Render for Shell {
                                                 cx.theme().muted_foreground
                                             }),
                                     )
-                                    .child(div().min_w_0().flex_1().truncate().child(paths::name(&path)))
+                                    .child(div().min_w_0().flex_1().truncate().child(caption))
                                     .on_click(cx.listener(
                                         move |this, event: &ClickEvent, _, cx| {
                                             this.selection = Some(path.clone());
@@ -3922,6 +4062,11 @@ impl Render for Shell {
         }
         let edit_source = compact_document && self.reading;
         let show_documents_menu = self.documents.len() > 1 && !self.request.pick;
+        let tab_conflict = short
+            && self
+                .documents
+                .iter()
+                .any(|doc| Some(doc.id) == self.active && doc.external.is_some());
         let tab_width = (narrow && !edit_source).then(|| {
             let rem = window.rem_size();
             let menu_width = if show_documents_menu {
@@ -3930,7 +4075,13 @@ impl Render for Shell {
                 px(0.)
             };
             let close_width = if self.request.pick { px(0.) } else { rem * 1.5 };
-            (window.viewport_size().width - menu_width - close_width - px(10.)).max(rem * 1.5)
+            let conflict_width = if tab_conflict {
+                rem * 1.5 + px(10. * scale)
+            } else {
+                px(0.)
+            };
+            (window.viewport_size().width - menu_width - close_width - conflict_width - px(10.))
+                .max(rem * 1.5)
         });
         let tabs = div()
             .id("tabs")
@@ -4082,10 +4233,18 @@ impl Render for Shell {
             .bg(cx.theme().tab_bar)
             .border_b_1()
             .border_color(cx.theme().title_bar_border)
-            .when(show_documents_menu || edit_source, |row| {
+            .when(show_documents_menu || edit_source || tab_conflict, |row| {
                 row.pr(px(8. * scale))
             })
             .child(div().flex_1().min_w_0().child(tabs))
+            .when(tab_conflict, |row| {
+                row.child(accessibility::message(
+                    "external-conflict",
+                    "Changed on disk. Local text retained; ordinary Save is blocked.".into(),
+                    div().size_0(),
+                ))
+                .child(self.conflict_menu(true, cx))
+            })
             .when(show_documents_menu, |row| {
                 row.child(self.open_documents_menu(open_documents_requested, footer_height, cx))
             })
@@ -4187,7 +4346,51 @@ impl Render for Shell {
                 has_notices = true;
                 notices = notices.child(self.recovery_failure_view(doc, error, cx));
             }
-            if doc.external.is_some() {
+            let compact_notice =
+                narrow || window.viewport_size().height < px(560. * self.settings.ui_scale);
+            if doc.external.is_some() && compact_notice && !short {
+                has_notices = true;
+                notices = notices.child(
+                    div()
+                        .flex_shrink_0()
+                        .mx(px(8. * scale))
+                        .mb(px(6. * scale))
+                        .px(px(8. * scale))
+                        .py(px(4. * scale))
+                        .flex()
+                        .items_center()
+                        .gap(px(8. * scale))
+                        .rounded(px(7. * scale))
+                        .bg(cx.theme().secondary)
+                        .border_l(px(3. * scale))
+                        .border_color(cx.theme().warning)
+                        .child(
+                            gpui_component::Icon::new(IconName::TriangleAlert)
+                                .with_size(px(16. * scale))
+                                .flex_shrink_0()
+                                .text_color(cx.theme().warning),
+                        )
+                        .child(
+                            div().flex_1().min_w_0().child(accessibility::message(
+                                "external-conflict",
+                                "Changed on disk. Local text retained; ordinary Save is blocked."
+                                    .into(),
+                                div()
+                                    .id("external-conflict-short")
+                                    .truncate()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Changed on disk")
+                                    .tooltip(|window, cx| {
+                                        gpui_component::tooltip::Tooltip::new(
+                                            "Local text retained; ordinary Save is blocked.",
+                                        )
+                                        .build(window, cx)
+                                    }),
+                            )),
+                        )
+                        .child(self.conflict_menu(false, cx)),
+                );
+            } else if doc.external.is_some() && !compact_notice {
                 has_notices = true;
                 notices = notices.child(
                     div()
@@ -4219,32 +4422,32 @@ impl Render for Shell {
                                         .child("Local text retained; ordinary Save is blocked."),
                                 ),
                         ))
-                        .when(narrow, |banner| banner.child(self.conflict_menu(cx)))
-                        .when(!narrow, |banner| {
-                            banner.child(
-                                div()
-                                    .w_full()
-                                    .min_w_0()
-                                    .flex()
-                                    .flex_wrap()
-                                    .gap_2()
-                                    .child(self.button("Compare", "compare", cx))
-                                    .child(self.button("Keep Editing", "keep-editing", cx))
-                                    .child(self.command_button(
-                                        "conflict-reload",
-                                        "Reload Disk Version",
-                                        "reload",
-                                        cx,
-                                    ))
-                                    .child(self.command_button(
-                                        "conflict-save-copy",
-                                        "Save Copy",
-                                        "save-copy",
-                                        cx,
-                                    ))
-                                    .child(self.button("Overwrite Disk Version…", "overwrite", cx)),
-                            )
-                        }),
+                        .child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .flex()
+                                .flex_wrap()
+                                .gap_2()
+                                .child(
+                                    self.button("Compare", "compare", cx)
+                                        .with_focus_handle(self.conflict_focus.clone()),
+                                )
+                                .child(self.button("Keep Editing", "keep-editing", cx))
+                                .child(self.command_button(
+                                    "conflict-reload",
+                                    "Reload Disk Version",
+                                    "reload",
+                                    cx,
+                                ))
+                                .child(self.command_button(
+                                    "conflict-save-copy",
+                                    "Save Copy",
+                                    "save-copy",
+                                    cx,
+                                ))
+                                .child(self.button("Overwrite Disk Version…", "overwrite", cx)),
+                        ),
                 );
             }
             if has_notices {
@@ -4409,6 +4612,9 @@ impl Render for Shell {
                 return;
             }
             let key = &event.keystroke;
+            if this.palette.focus.is_focused(window) && this.palette_key(key, window, cx) {
+                return;
+            }
             if this.search_ui.focus.is_focused(window) && this.search_key(key, window, cx) {
                 return;
             }

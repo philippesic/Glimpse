@@ -1523,6 +1523,11 @@ impl Element for TextElement {
         }
         self.state.update(cx, |state, cx| {
             let initial_layout_completed = state.initial_layout_pending();
+            // A panel opening above the text (Find) shortens the viewport after the
+            // cursor was scrolled into view; keep the cursor visible in the new height.
+            let shrunk = state
+                .last_bounds
+                .is_some_and(|last| bounds.size.height < last.size.height);
             state.last_layout = Some(prepaint.last_layout.clone());
             state.last_bounds = Some(bounds);
             state.last_cursor = Some(state.cursor());
@@ -1531,6 +1536,10 @@ impl Element for TextElement {
             state.scroll_size = prepaint.scroll_size;
             state.update_scroll_offset(Some(prepaint.cursor_scroll_offset), cx);
             state.deferred_scroll_offset = None;
+            if shrunk {
+                let cursor = state.cursor();
+                state.scroll_to(cursor, None, cx);
+            }
 
             if initial_layout_completed {
                 cx.emit(InputEvent::InitialLayoutReady);

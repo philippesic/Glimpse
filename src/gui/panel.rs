@@ -1,5 +1,21 @@
 use super::*;
 
+pub(super) struct PaletteState {
+    pub focus: FocusHandle,
+    pub selection: usize,
+    pub scroll: ScrollHandle,
+}
+
+impl PaletteState {
+    pub fn new(cx: &mut Context<Shell>) -> Self {
+        Self {
+            focus: cx.focus_handle().tab_stop(true),
+            selection: 0,
+            scroll: ScrollHandle::new(),
+        }
+    }
+}
+
 impl Shell {
     /// Search and command panels take the whole main area when the window cannot fit
     /// them beside a usable document, as narrow layouts show one surface at a time.
@@ -35,27 +51,28 @@ impl Shell {
         };
         let search = matches!(panel, Panel::Files | Panel::Text);
         let stacked = window.viewport_size().width < px(760. * scale);
-        let actions = div()
-            .flex()
-            .gap(px(8. * scale))
-            .flex_shrink_0()
-            .when(!matches!(panel, Panel::Recovery | Panel::Filter), |row| {
-                row.child(self.button(
-                    match panel {
-                        Panel::Files | Panel::Text => "Search",
-                        Panel::Palette => "Run",
-                        Panel::Line => "Go",
-                        Panel::NewFile | Panel::NewFolder => "Create",
-                        Panel::Rename => "Rename",
-                        _ => "Apply",
-                    },
-                    "submit",
-                    cx,
-                ))
-            })
-            .child(self.button("Close", "dismiss", cx));
+        let submit = (!matches!(panel, Panel::Recovery | Panel::Filter)).then(|| {
+            self.button(
+                match panel {
+                    Panel::Files | Panel::Text => "Search",
+                    Panel::Palette => "Run",
+                    Panel::Line => "Go",
+                    Panel::NewFile | Panel::NewFolder => "Create",
+                    Panel::Rename => "Rename",
+                    _ => "Apply",
+                },
+                "submit",
+                cx,
+            )
+        });
         let input = Input::new(&self.query).flex_1().min_w(px(120. * scale));
         let header = if stacked {
+            let close = Button::new("panel-close")
+                .icon(IconName::Close)
+                .tooltip("Close")
+                .ghost()
+                .small()
+                .on_click(cx.listener(|this, _, window, cx| this.command("dismiss", window, cx)));
             div()
                 .flex()
                 .flex_col()
@@ -81,9 +98,16 @@ impl Shell {
                                 row.child(div().flex_1().min_w_0().truncate().child(title))
                             }
                         })
-                        .child(actions),
+                        .child(close),
                 )
-                .child(div().flex().child(input))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8. * scale))
+                        .child(input)
+                        .children(submit),
+                )
         } else {
             div()
                 .flex()
@@ -94,7 +118,8 @@ impl Shell {
                 .flex_shrink_0()
                 .child(div().flex_shrink_0().child(title))
                 .child(input)
-                .child(actions)
+                .children(submit)
+                .child(self.button("Close", "dismiss", cx))
         };
         let section = div()
             .id("panel-section")
@@ -121,7 +146,7 @@ impl Shell {
             Panel::Files | Panel::Text => {
                 section.child(self.search_view(takeover, stacked, window, cx))
             }
-            Panel::Palette => section.child(self.palette_view(takeover, cx)),
+            Panel::Palette => section.child(self.palette_view(takeover, window, cx)),
             Panel::Recovery => section.child(
                 div()
                     .id("recovery-scroll")
@@ -173,24 +198,111 @@ impl Shell {
             .child(self.button("Show Results", "focus-results", cx))
     }
 
-    fn palette_view(&self, takeover: bool, cx: &Context<Self>) -> impl IntoElement {
-        accessibility::group(
+    pub(super) fn palette_matches(&self, cx: &App) -> Vec<&'static str> {
+        let query = self.query.read(cx).value().to_lowercase();
+        glimpse::commands::COMMANDS
+            .iter()
+            .filter(|c| c.label.to_lowercase().contains(&query) || c.id.contains(&query))
+            .map(|c| c.id)
+            .collect()
+    }
+
+    pub(super) fn focus_palette(
+        &mut self,
+        last: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let count = self.palette_matches(cx).len();
+        if count == 0 {
+            return;
+        }
+        self.palette.selection = if last { count - 1 } else { 0 };
+        self.palette.scroll.scroll_to_item(self.palette.selection);
+        window.focus(&self.palette.focus);
+        cx.notify();
+    }
+
+    pub(super) fn palette_key(
+        &mut self,
+        key: &Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if key.modifiers.control || key.modifiers.platform || key.modifiers.alt {
+            return false;
+        }
+        let matches = self.palette_matches(cx);
+        if matches.is_empty() {
+            return false;
+        }
+        let last = matches.len() - 1;
+        let index = self.palette.selection.min(last);
+        let next = match key.key.as_str() {
+            "up" if index == 0 => {
+                self.query.update(cx, |input, cx| input.focus(window, cx));
+                cx.notify();
+                return true;
+            }
+            "up" => index - 1,
+            "down" => (index + 1).min(last),
+            "home" => 0,
+            "end" => last,
+            "pageup" => index.saturating_sub(8),
+            "pagedown" => (index + 8).min(last),
+            "enter" | "space" => {
+                self.palette_command(matches[index], window, cx);
+                return true;
+            }
+            _ => return false,
+        };
+        self.palette.selection = next;
+        self.palette.scroll.scroll_to_item(next);
+        cx.notify();
+        true
+    }
+
+    fn palette_view(
+        &self,
+        takeover: bool,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        accessibility::collection(
             "palette-list",
             "Matching commands".into(),
-            self.palette_list(takeover, cx),
+            self.palette_list(takeover, window, cx),
+            self.palette.focus.clone(),
         )
     }
 
-    fn palette_list(&self, takeover: bool, cx: &Context<Self>) -> impl IntoElement {
+    fn palette_list(
+        &self,
+        takeover: bool,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
         let scale = self.settings.ui_scale;
-        let query = self.query.read(cx).value().to_lowercase();
         let row_height = px(28. * scale);
+        let matches = self.palette_matches(cx);
+        let focused = self.palette.focus.is_focused(window);
+        let selection = self.palette.selection.min(matches.len().saturating_sub(1));
         div()
             .id("palette")
+            .track_focus(&self.palette.focus)
+            .track_scroll(&self.palette.scroll)
             .flex()
             .flex_col()
-            .px(px(4. * scale))
-            .pb(px(4. * scale))
+            .mx(px(4. * scale))
+            .mb(px(4. * scale))
+            .p(px(2. * scale))
+            .rounded(px(7. * scale))
+            .border_2()
+            .border_color(if focused {
+                cx.theme().ring
+            } else {
+                gpui::transparent_black()
+            })
             .min_h_0()
             .overflow_y_scroll()
             .map(|list| {
@@ -200,45 +312,68 @@ impl Shell {
                     list.max_h(px(280. * scale))
                 }
             })
-            .children(
-                glimpse::commands::COMMANDS
+            .when(matches.is_empty(), |list| {
+                list.child(accessibility::message(
+                    "palette-empty",
+                    "No matching commands".into(),
+                    div()
+                        .px(px(12. * scale))
+                        .py(px(6. * scale))
+                        .text_color(cx.theme().muted_foreground)
+                        .child("No matching commands"),
+                ))
+            })
+            .children(matches.into_iter().enumerate().map(|(index, id)| {
+                let command = glimpse::commands::COMMANDS
                     .iter()
-                    .filter(|c| c.label.to_lowercase().contains(&query) || c.id.contains(&query))
-                    .map(|command| {
-                        let key = self
-                            .settings
-                            .keymaps
-                            .get(command.id)
-                            .map(String::as_str)
-                            .unwrap_or(command.shortcut);
-                        let shortcut = (!key.is_empty()).then(|| platform::shortcut_label(key));
-                        let enabled = self.command_enabled(command.id);
-                        Button::new(SharedString::from(format!("palette-{}", command.id)))
-                            .label(command.label)
-                            .when_some(shortcut.clone(), |row, shortcut| {
-                                row.accessibility_description(shortcut)
-                            })
-                            .ghost()
-                            .small()
-                            .w_full()
-                            .h(row_height)
+                    .find(|command| command.id == id)
+                    .unwrap();
+                let key = self
+                    .settings
+                    .keymaps
+                    .get(command.id)
+                    .map(String::as_str)
+                    .unwrap_or(command.shortcut);
+                let key = if key.is_empty() {
+                    glimpse::commands::editing_hint(command.id).unwrap_or_default()
+                } else {
+                    key
+                };
+                let shortcut = if key.is_empty() {
+                    SharedString::default()
+                } else {
+                    SharedString::from(platform::shortcut_label(key))
+                };
+                let enabled = self.command_enabled(command.id);
+                let selected = index == selection;
+                Button::new(SharedString::from(format!("palette-{}", command.id)))
+                    .label(command.label)
+                    .accessibility_role(gpui::accesskit::Role::ListBoxOption)
+                    .accessibility_focus(self.palette.focus.clone())
+                    .when(!shortcut.is_empty(), |row| {
+                        row.accessibility_description(shortcut.clone())
+                    })
+                    .tab_stop(false)
+                    .ghost()
+                    .small()
+                    .w_full()
+                    .h(row_height)
+                    .flex_shrink_0()
+                    .justify_start()
+                    .disabled(!enabled)
+                    .selected(selected)
+                    .when(selected, |row| row.bg(cx.theme().selection))
+                    .child(
+                        div()
+                            .ml_auto()
+                            .pl(px(16. * scale))
                             .flex_shrink_0()
-                            .justify_start()
-                            .disabled(!enabled)
-                            .when_some(shortcut, |row, shortcut| {
-                                row.child(
-                                    div()
-                                        .ml_auto()
-                                        .pl(px(16. * scale))
-                                        .flex_shrink_0()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(shortcut),
-                                )
-                            })
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.palette_command(command.id, window, cx)
-                            }))
-                    }),
-            )
+                            .text_color(cx.theme().muted_foreground)
+                            .child(shortcut),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.palette_command(command.id, window, cx)
+                    }))
+            }))
     }
 }

@@ -2334,6 +2334,18 @@ impl InputState {
         cx.notify();
     }
 
+    pub fn can_undo(&self) -> bool {
+        !self.history.undos().is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.history.redos().is_empty()
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.selected_range.start != self.selected_range.end
+    }
+
     pub fn interaction_active(&self) -> bool {
         self.selecting || self.ime_marked_range.is_some()
     }

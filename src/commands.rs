@@ -106,6 +106,12 @@ pub enum Action {
     OpenDocuments,
     NextDocument,
     PreviousDocument,
+    Undo,
+    Redo,
+    Cut,
+    Copy,
+    Paste,
+    SelectAll,
     RefreshVolumes,
 }
 pub struct Command {
@@ -166,6 +172,12 @@ commands![
         "Open Documents",
         "Cmd+Alt+O"
     ),
+    (Undo, "undo", "Undo", ""),
+    (Redo, "redo", "Redo", ""),
+    (Cut, "cut", "Cut", ""),
+    (Copy, "copy", "Copy", ""),
+    (Paste, "paste", "Paste", ""),
+    (SelectAll, "select-all", "Select All", ""),
     (
         NextDocument,
         "next-document",
@@ -232,6 +244,19 @@ commands![
         ""
     ),
 ];
+/// Text-editing commands keep the editor's standard keys; they are listed in menus and
+/// Commands with these hints but are not app shortcuts, so they cannot be rebound.
+pub fn editing_hint(id: &str) -> Option<&'static str> {
+    Some(match id {
+        "undo" => "Cmd+Z",
+        "redo" => "Cmd+Shift+Z",
+        "cut" => "Cmd+X",
+        "copy" => "Cmd+C",
+        "paste" => "Cmd+V",
+        "select-all" => "Cmd+A",
+        _ => return None,
+    })
+}
 #[derive(Clone, PartialEq)]
 pub struct Binding {
     pub action: Action,

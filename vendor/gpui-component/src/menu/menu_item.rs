@@ -162,6 +162,9 @@ impl RenderOnce for MenuItemElement {
             use gpui::accesskit::{Action, Node};
             let mut node = Node::new(role);
             node.set_label(label.to_string());
+            if role == gpui::accesskit::Role::Label {
+                node.set_value(label.to_string());
+            }
             if let Some(shortcut) = &shortcut {
                 node.set_keyboard_shortcut(shortcut.to_string());
             }

@@ -2,7 +2,7 @@ use super::Shell;
 use glimpse::{commands, paths};
 use gpui::{prelude::*, *};
 use gpui_component::{
-    IconName, Side, Sizable,
+    ActiveTheme, IconName, Side, Sizable,
     button::{Button, ButtonVariants},
     menu::{DropdownMenu, PopupMenu, PopupMenuItem},
 };
@@ -49,6 +49,11 @@ fn shortcut(settings: &glimpse::storage::Settings, id: &str) -> Option<SharedStr
         .get(id)
         .map(String::as_str)
         .unwrap_or(command.shortcut);
+    let key = if key.is_empty() {
+        commands::editing_hint(id).unwrap_or_default()
+    } else {
+        key
+    };
     (!key.is_empty()).then(|| super::platform::shortcut_label(key).into())
 }
 
@@ -130,15 +135,24 @@ impl Shell {
             })
     }
 
-    pub(super) fn conflict_menu(&self, cx: &Context<Self>) -> impl IntoElement {
+    pub(super) fn conflict_menu(&self, warning: bool, cx: &Context<Self>) -> impl IntoElement {
         let shell = cx.entity().downgrade();
         let disabled = self.disabled_commands();
         Button::new("conflict-actions")
-            .label("Resolve")
-            .accessibility_description("Choose how to resolve the change on disk")
+            .with_focus_handle(self.conflict_focus.clone())
+            .map(|button| {
+                if warning {
+                    button
+                        .icon(IconName::TriangleAlert)
+                        .tooltip("Resolve change on disk")
+                        .warning()
+                } else {
+                    button.label("Resolve").dropdown_caret(true)
+                }
+            })
+            .accessibility_description("Changed on disk; choose how to resolve it")
             .small()
             .outline()
-            .dropdown_caret(true)
             .dropdown_menu(move |menu, _, _| {
                 let item = |id: &'static str, label: &str| {
                     command_item(shell.clone(), id, label.into(), disabled.contains(id))
@@ -291,7 +305,7 @@ impl Shell {
             .keep_clear_of_bottom(footer_height)
     }
 
-    pub(super) fn locations_menu(&self, cx: &Context<Self>) -> impl IntoElement {
+    pub(super) fn locations_menu(&self, icon_only: bool, cx: &Context<Self>) -> impl IntoElement {
         let shell = cx.entity().downgrade();
         let pins = self.settings.pins.clone();
         let recents = self.settings.recents.clone();
@@ -300,10 +314,15 @@ impl Shell {
         let pinned = pins.contains(&self.current);
         let busy = self.settings_write.is_some() || self.settings_reloading || self.request.pick;
         Button::new("locations-menu")
-            .label("Locations")
+            .map(|button| {
+                if icon_only {
+                    button.icon(IconName::Star).tooltip("Locations")
+                } else {
+                    button.label("Locations").dropdown_caret(true)
+                }
+            })
             .small()
             .ghost()
-            .dropdown_caret(true)
             .dropdown_menu(move |mut menu, window, _| {
                 menu = menu
                     .accessible_name("Locations")
@@ -392,7 +411,25 @@ impl Shell {
                             "close",
                         ],
                     ),
-                    ("Edit", &["find", "line", "-", "indent", "outdent", "wrap"]),
+                    (
+                        "Edit",
+                        &[
+                            "undo",
+                            "redo",
+                            "-",
+                            "cut",
+                            "copy",
+                            "paste",
+                            "select-all",
+                            "-",
+                            "find",
+                            "line",
+                            "-",
+                            "indent",
+                            "outdent",
+                            "wrap",
+                        ],
+                    ),
                     (
                         "Go",
                         &[
@@ -432,11 +469,24 @@ impl Shell {
                     ),
                     ("View", &["toggle-navigator", "read", "recovery"]),
                 ];
+                let height = (window.viewport_size().height - px(16.)).max(px(100.));
+                let scale = cx.theme().font_size / px(16.);
+                let viewport = window.viewport_size();
+                let flat = viewport.width < px(540.) * scale || viewport.height < px(600.) * scale;
                 let mut menu = menu
                     .accessible_name("Menu")
+                    .scrollable(flat)
                     .min_w(px(220.))
-                    .max_h((window.viewport_size().height - px(24.)).max(px(100.)));
+                    .max_h(height);
+                // Submenus need room for two menus side by side and for the longest
+                // submenu; otherwise one scrolling list with named sections keeps every
+                // command reachable without overlap.
                 for (label, ids) in groups {
+                    if flat {
+                        menu = add_commands(menu.label(label), &shell, &settings, &disabled, ids)
+                            .separator();
+                        continue;
+                    }
                     let shell = shell.clone();
                     let settings = settings.clone();
                     let disabled = disabled.clone();
@@ -444,22 +494,26 @@ impl Shell {
                         add_commands(submenu.min_w(px(260.)), &shell, &settings, &disabled, ids)
                     });
                 }
-                if request {
+                let cli = ["finish", "abort", "choose", "cancel"];
+                if request && flat {
+                    menu = add_commands(
+                        menu.label("CLI Request"),
+                        &shell,
+                        &settings,
+                        &disabled,
+                        &cli,
+                    )
+                    .separator();
+                } else if request {
                     let shell = shell.clone();
                     let settings = settings.clone();
                     let disabled = disabled.clone();
                     menu = menu.submenu("CLI Request", window, cx, move |submenu, _, _| {
-                        add_commands(
-                            submenu.min_w(px(260.)),
-                            &shell,
-                            &settings,
-                            &disabled,
-                            &["finish", "abort", "choose", "cancel"],
-                        )
+                        add_commands(submenu.min_w(px(260.)), &shell, &settings, &disabled, &cli)
                     });
                 }
                 add_commands(
-                    menu.separator(),
+                    if flat { menu } else { menu.separator() },
                     &shell,
                     &settings,
                     &disabled,

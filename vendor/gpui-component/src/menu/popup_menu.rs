@@ -1,5 +1,5 @@
 use crate::actions::{Cancel, Confirm, SelectDown, SelectUp};
-use crate::actions::{SelectLeft, SelectRight};
+use crate::actions::{SelectFirst, SelectLast, SelectLeft, SelectRight};
 use crate::menu::menu_item::MenuItemElement;
 use crate::scroll::ScrollableElement;
 use crate::{ActiveTheme, Icon, IconName, Sizable as _, h_flex, v_flex};
@@ -23,6 +23,10 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("down", SelectDown, Some(CONTEXT)),
         KeyBinding::new("left", SelectLeft, Some(CONTEXT)),
         KeyBinding::new("right", SelectRight, Some(CONTEXT)),
+        KeyBinding::new("home", SelectFirst, Some(CONTEXT)),
+        KeyBinding::new("pageup", SelectFirst, Some(CONTEXT)),
+        KeyBinding::new("end", SelectLast, Some(CONTEXT)),
+        KeyBinding::new("pagedown", SelectLast, Some(CONTEXT)),
     ]);
 }
 
@@ -359,7 +363,15 @@ impl PopupMenu {
             let focus = menu.focus_handle.clone();
             menu._subscriptions
                 .push(cx.on_focus_out(&focus, window, |menu, _, window, cx| {
-                    if !menu.focus_handle.contains_focused(window, cx)
+                    let back_to_parent = menu
+                        .parent_menu
+                        .as_ref()
+                        .and_then(|parent| parent.upgrade())
+                        .is_some_and(|parent| parent.read(cx).focus_handle.is_focused(window));
+                    if back_to_parent {
+                        menu.selected_index = None;
+                        cx.notify();
+                    } else if !menu.focus_handle.contains_focused(window, cx)
                         && menu.active_submenu().is_none()
                     {
                         menu.dismiss(&Cancel, window, cx);
@@ -889,42 +901,40 @@ impl PopupMenu {
         self.set_selected_index(0, cx);
     }
 
-    fn select_left(&mut self, _: &SelectLeft, window: &mut Window, cx: &mut Context<Self>) {
-        let handled = if matches!(self.submenu_anchor.0, Corner::TopLeft | Corner::BottomLeft) {
-            self._unselect_submenu(window, cx)
-        } else {
-            self._select_submenu(window, cx)
-        };
-
-        if self.parent_side(cx).is_left() {
-            self._focus_parent_menu(window, cx);
-        }
-
-        if handled {
-            return;
-        }
-
-        // For parent AppMenuBar to handle.
-        if self.parent_menu.is_none() {
-            cx.propagate();
+    fn select_first(&mut self, _: &SelectFirst, _: &mut Window, cx: &mut Context<Self>) {
+        cx.stop_propagation();
+        let first = self.clickable_menu_items().next().map(|(ix, _)| ix);
+        if let Some(ix) = first {
+            self.set_selected_index(ix, cx);
         }
     }
 
-    fn select_right(&mut self, _: &SelectRight, window: &mut Window, cx: &mut Context<Self>) {
-        let handled = if matches!(self.submenu_anchor.0, Corner::TopLeft | Corner::BottomLeft) {
-            self._select_submenu(window, cx)
-        } else {
-            self._unselect_submenu(window, cx)
-        };
-
-        if self.parent_side(cx).is_right() {
-            self._focus_parent_menu(window, cx);
+    fn select_last(&mut self, _: &SelectLast, _: &mut Window, cx: &mut Context<Self>) {
+        cx.stop_propagation();
+        let last = self.clickable_menu_items().last().map(|(ix, _)| ix);
+        if let Some(ix) = last {
+            self.set_selected_index(ix, cx);
         }
+    }
 
-        if handled {
+    /// Right enters a submenu and Left leaves it, in reading order, wherever the
+    /// submenu had room to open.
+    fn select_left(&mut self, _: &SelectLeft, window: &mut Window, cx: &mut Context<Self>) {
+        if self.parent_menu.is_some() {
+            self._focus_parent_menu(window, cx);
             return;
         }
+        if self._unselect_submenu(window, cx) {
+            return;
+        }
+        // For parent AppMenuBar to handle.
+        cx.propagate();
+    }
 
+    fn select_right(&mut self, _: &SelectRight, window: &mut Window, cx: &mut Context<Self>) {
+        if self._select_submenu(window, cx) {
+            return;
+        }
         // For parent AppMenuBar to handle.
         if self.parent_menu.is_none() {
             cx.propagate();
@@ -970,21 +980,6 @@ impl PopupMenu {
             view.focus_handle.focus(window);
             cx.notify();
         });
-    }
-
-    fn parent_side(&self, cx: &App) -> Side {
-        let Some(parent) = self.parent_menu.as_ref() else {
-            return Side::Left;
-        };
-
-        let Some(parent) = parent.upgrade() else {
-            return Side::Left;
-        };
-
-        match parent.read(cx).submenu_anchor.0 {
-            Corner::TopLeft | Corner::BottomLeft => Side::Left,
-            Corner::TopRight | Corner::BottomRight => Side::Right,
-        }
     }
 
     fn dismiss(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
@@ -1408,6 +1403,8 @@ impl Render for PopupMenu {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::select_up))
             .on_action(cx.listener(Self::select_down))
+            .on_action(cx.listener(Self::select_first))
+            .on_action(cx.listener(Self::select_last))
             .on_action(cx.listener(Self::select_left))
             .on_action(cx.listener(Self::select_right))
             .on_action(cx.listener(Self::confirm))
