@@ -110,6 +110,41 @@ impl Shell {
         let visible = (room / (segment_width + px(24. * scale))) as usize;
         let first_visible = ancestors.len().saturating_sub(visible);
         let visible_ancestors = ancestors.split_off(first_visible);
+        let rem = window.rem_size();
+        let button_padding = rem * 0.75 + px(2.);
+        let edit_label = SharedString::from("Edit path…");
+        let edit_width = Self::path_label_width(window, &edit_label) + button_padding;
+        let overflow_width = if ancestors.is_empty() {
+            px(0.)
+        } else {
+            rem * 2.
+        };
+        let separator_width = Self::path_label_width(window, &"›".into()) + rem * 0.75;
+        let visible_ancestors: Vec<_> = visible_ancestors
+            .into_iter()
+            .map(|path| {
+                let name = paths::name(&path);
+                let caption =
+                    decision::abbreviate_folder(&name, segment_width - button_padding, &|text| {
+                        Self::path_label_width(window, text)
+                    });
+                let width = Self::path_label_width(window, &caption) + button_padding;
+                (path, caption, width + separator_width)
+            })
+            .collect();
+        let ancestor_width = visible_ancestors
+            .iter()
+            .fold(px(0.), |total, (_, _, width)| total + *width);
+        let current_width = window.viewport_size().width
+            - rem * 1.5
+            - edit_width
+            - overflow_width
+            - ancestor_width
+            - button_padding;
+        let current_caption =
+            decision::abbreviate_folder(&paths::name(&self.current), current_width, &|text| {
+                Self::path_label_width(window, text)
+            });
         let shell = cx.entity().downgrade();
         div()
             .flex()
@@ -129,14 +164,8 @@ impl Shell {
                             let menu_width = (viewport.width - px(24.)).min(px(620.));
                             let rem = window.rem_size();
                             let label_width = menu_width - rem * 0.5 - px(28.);
-                            let text_style = window.text_style();
-                            let measure = |text: &SharedString| {
-                                let run = text_style.to_run(text.len());
-                                window
-                                    .text_system()
-                                    .shape_line(text.clone(), rem * 0.875, &[run], None)
-                                    .width
-                            };
+                            let measure =
+                                |text: &SharedString| Self::path_label_width(window, text);
                             menu = menu
                                 .scrollable(true)
                                 .max_w(menu_width)
@@ -171,13 +200,17 @@ impl Shell {
                         }),
                 )
             })
-            .children(visible_ancestors.into_iter().map(|path| {
+            .children(visible_ancestors.into_iter().map(|(path, caption, _)| {
                 div()
                     .flex()
                     .items_center()
                     .flex_shrink_0()
                     .gap_1()
-                    .child(Self::breadcrumb(path, false, cx).max_w(segment_width))
+                    .child(
+                        Self::breadcrumb(path, false, cx)
+                            .display_label(caption)
+                            .max_w(segment_width),
+                    )
                     .child("›")
             }))
             .child(
@@ -186,17 +219,29 @@ impl Shell {
                     .items_center()
                     .flex_1()
                     .min_w_0()
-                    .child(Self::breadcrumb(self.current.clone(), true, cx).max_w_full())
+                    .child(
+                        Self::breadcrumb(self.current.clone(), true, cx)
+                            .display_label(current_caption)
+                            .max_w_full(),
+                    )
                     .child(div().id("edit-path-space").flex_1().h_6().on_click(
                         cx.listener(|this, _, window, cx| this.command("path", window, cx)),
                     )),
             )
             .child(
-                self.command_button("edit-location", "Edit path…", "path", cx)
+                self.command_button("edit-location", edit_label, "path", cx)
                     .flex_shrink_0()
                     .tooltip(paths::display(&self.current)),
             )
             .into_any_element()
+    }
+
+    fn path_label_width(window: &Window, text: &SharedString) -> Pixels {
+        let run = window.text_style().to_run(text.len());
+        window
+            .text_system()
+            .shape_line(text.clone(), window.rem_size() * 0.875, &[run], None)
+            .width
     }
 
     fn breadcrumb(path: PathBuf, current: bool, cx: &Context<Self>) -> Button {

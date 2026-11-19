@@ -184,6 +184,7 @@ pub struct Button {
     style: StyleRefinement,
     icon: Option<Icon>,
     label: Option<SharedString>,
+    display_label: Option<SharedString>,
     italic_label: bool,
     children: Vec<AnyElement>,
     disabled: bool,
@@ -230,6 +231,7 @@ impl Button {
             style: StyleRefinement::default(),
             icon: None,
             label: None,
+            display_label: None,
             italic_label: false,
             disabled: false,
             selected: false,
@@ -294,6 +296,11 @@ impl Button {
     /// Set label to the Button, if no label is set, the button will be in Icon Button mode.
     pub fn label(mut self, label: impl Into<SharedString>) -> Self {
         self.label = Some(label.into());
+        self
+    }
+
+    pub fn display_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.display_label = Some(label.into());
         self
     }
 
@@ -629,7 +636,7 @@ impl RenderOnce for Button {
                                 .when_some(self.loading_icon, |this, icon| this.icon(icon)),
                         )
                     })
-                    .when_some(self.label, |this, label| {
+                    .when_some(self.display_label.or(self.label), |this, label| {
                         this.child(
                             div()
                                 .min_w_0()
