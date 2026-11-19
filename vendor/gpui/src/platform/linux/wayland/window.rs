@@ -115,6 +115,7 @@ pub struct WaylandWindowState {
     in_progress_window_controls: Option<WindowControls>,
     window_controls: WindowControls,
     client_inset: Option<Pixels>,
+    min_size: Option<Size<Pixels>>,
 }
 
 #[derive(Clone)]
@@ -194,6 +195,7 @@ impl WaylandWindowState {
             in_progress_window_controls: None,
             window_controls: WindowControls::default(),
             client_inset: None,
+            min_size: options.window_min_size,
         })
     }
 
@@ -407,6 +409,14 @@ impl WaylandWindowStatePtr {
                         state.resize_throttle = true;
                     }
                     if !configure.fullscreen && !configure.maximized {
+                        // A floating window may be larger than the compositor's suggestion, so
+                        // keep the requested minimum even where the compositor does not enforce it.
+                        if let (Some(size), Some(min), false) =
+                            (configure.size.as_mut(), state.min_size, state.tiling.is_tiled())
+                        {
+                            size.width = size.width.max(min.width);
+                            size.height = size.height.max(min.height);
+                        }
                         configure.size = if got_unmaximized {
                             Some(state.window_bounds.size)
                         } else {
@@ -954,6 +964,15 @@ impl PlatformWindow for WaylandWindow {
 
     fn set_title(&mut self, title: &str) {
         self.borrow().toplevel.set_title(title.to_string());
+    }
+
+    fn set_min_size(&mut self, size: Size<Pixels>) {
+        let mut state = self.borrow_mut();
+        state.min_size = Some(size);
+        state
+            .toplevel
+            .set_min_size(size.width.0 as i32, size.height.0 as i32);
+        state.surface.commit();
     }
 
     fn set_app_id(&mut self, app_id: &str) {

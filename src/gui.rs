@@ -795,6 +795,25 @@ impl Shell {
             self.status = warning.clone();
         }
         self.font_warning = theme::apply(&self.settings, window, cx);
+        // The minimum window grows with the interface scale so every scale keeps the room of
+        // the 520×400 layout, capped at the display size.
+        let scale = self.settings.ui_scale.max(1.);
+        let mut minimum = size(px(520. * scale), px(400. * scale));
+        if let Some(display) = window.display(cx) {
+            let available = display.bounds().size;
+            minimum = size(
+                minimum.width.min(available.width),
+                minimum.height.min(available.height),
+            );
+        }
+        window.set_window_min_size(minimum);
+        let current = window.viewport_size();
+        if current.width < minimum.width || current.height < minimum.height {
+            window.resize(size(
+                current.width.max(minimum.width),
+                current.height.max(minimum.height),
+            ));
+        }
         self.reset_search("Search settings changed; press Enter to search");
         for doc in &self.documents {
             doc.input.update(cx, |input, cx| {

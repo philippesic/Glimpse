@@ -1802,6 +1802,11 @@ impl Window {
         self.platform_window.window_controls()
     }
 
+    /// Change the window's minimum size where the platform supports it.
+    pub fn set_window_min_size(&mut self, size: Size<Pixels>) {
+        self.platform_window.set_min_size(size);
+    }
+
     /// Updates the window's title at the platform level.
     pub fn set_window_title(&mut self, title: &str) {
         self.accessibility.title = title.to_owned();
