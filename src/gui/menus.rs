@@ -2,7 +2,7 @@ use super::Shell;
 use glimpse::{commands, paths};
 use gpui::{prelude::*, *};
 use gpui_component::{
-    IconName, Side, Sizable,
+    Side, Sizable,
     button::Button,
     menu::{DropdownMenu, PopupMenuItem},
 };
@@ -43,7 +43,11 @@ fn location_item(shell: WeakEntity<Shell>, path: PathBuf) -> PopupMenuItem {
 }
 
 impl Shell {
-    pub(super) fn open_documents_menu(&self, cx: &Context<Self>) -> impl IntoElement {
+    pub(super) fn open_documents_menu(
+        &self,
+        requested: bool,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
         let shell = cx.entity().downgrade();
         let items = self
             .documents
@@ -65,15 +69,18 @@ impl Shell {
             })
             .collect::<Vec<_>>();
         Button::new("open-documents-menu")
-            .with_focus_handle(self.open_documents_focus.clone())
-            .icon(IconName::ChevronDown)
-            .tooltip("Open Documents")
+            .label("Open Documents")
+            .display_label("Documents")
+            .dropdown_caret(true)
             .small()
+            .compact()
             .outline()
+            .h(px(28. * self.settings.ui_scale))
             .flex_shrink_0()
             .dropdown_menu_with_anchor(Corner::TopRight, move |mut menu, window, _| {
                 let viewport = window.viewport_size();
                 menu = menu
+                    .accessible_name("Open Documents")
                     .scrollable(true)
                     .check_side(Side::Right)
                     .max_w((viewport.width - px(24.)).min(px(620.)))
@@ -96,8 +103,13 @@ impl Shell {
                         });
                     }));
                 }
-                menu
+                if let Some(index) = items.iter().position(|(_, _, _, current)| *current) {
+                    menu.highlight(index)
+                } else {
+                    menu
+                }
             })
+            .request_open(requested)
     }
 
     pub(super) fn locations_menu(&self, cx: &Context<Self>) -> impl IntoElement {

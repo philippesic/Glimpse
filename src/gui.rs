@@ -259,7 +259,7 @@ struct Shell {
     gesture: glimpse::gesture::Gesture,
     future: Vec<PathBuf>,
     nav_focus: FocusHandle,
-    open_documents_focus: FocusHandle,
+    open_documents_requested: bool,
     reading_focus: FocusHandle,
     pane_state: Entity<panes::Divider>,
     navigation_only: bool,
@@ -487,7 +487,7 @@ impl Shell {
             gesture: glimpse::gesture::Gesture::default(),
             future: vec![],
             nav_focus: cx.focus_handle().tab_stop(true),
-            open_documents_focus: cx.focus_handle(),
+            open_documents_requested: false,
             reading_focus: cx.focus_handle().tab_stop(true),
             pane_state: cx.new(panes::Divider::new),
             navigation_only: false,
@@ -2732,7 +2732,7 @@ impl Shell {
         match command {
             "open-documents" if self.documents.len() > 1 && !self.request.pick => {
                 self.navigation_only = false;
-                window.focus(&self.open_documents_focus);
+                self.open_documents_requested = true;
             }
             "open-documents" => {}
             "cancel" if self.request.pick => {
@@ -3811,16 +3811,17 @@ impl Render for Shell {
         });
         let edit_source = compact_document && self.reading;
         let show_documents_menu = self.documents.len() > 1 && !self.request.pick;
+        let open_documents_requested = std::mem::take(&mut self.open_documents_requested);
         let tabs = if edit_source || show_documents_menu {
             div()
                 .flex()
                 .items_center()
                 .flex_shrink_0()
                 .pr_2()
-                .gap_1()
+                .gap_2()
                 .child(div().flex_1().min_w_0().child(tabs))
                 .when(show_documents_menu, |row| {
-                    row.child(self.open_documents_menu(cx))
+                    row.child(self.open_documents_menu(open_documents_requested, cx))
                 })
                 .when(edit_source, |row| {
                     row.child(self.button("Edit Source", "read", cx).flex_shrink_0())

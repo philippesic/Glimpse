@@ -305,6 +305,7 @@ pub struct PopupMenu {
     /// The focus handle of Entity to handle actions.
     pub(crate) action_context: Option<FocusHandle>,
     selected_index: Option<usize>,
+    accessible_name: SharedString,
     min_width: Option<Pixels>,
     max_width: Option<Pixels>,
     max_height: Option<Pixels>,
@@ -331,6 +332,7 @@ impl PopupMenu {
             parent_menu: None,
             menu_items: Vec::new(),
             selected_index: None,
+            accessible_name: "Menu".into(),
             min_width: None,
             max_width: None,
             max_height: None,
@@ -363,6 +365,23 @@ impl PopupMenu {
                 }));
             menu
         })
+    }
+
+    pub fn accessible_name(mut self, name: impl Into<SharedString>) -> Self {
+        self.accessible_name = name.into();
+        self
+    }
+
+    pub fn highlight(mut self, index: usize) -> Self {
+        if self
+            .menu_items
+            .get(index)
+            .is_some_and(PopupMenuItem::is_clickable)
+        {
+            self.selected_index = Some(index);
+            self.scroll_handle.scroll_to_item(index);
+        }
+        self
     }
 
     /// Set the focus handle of Entity to handle actions.
@@ -1366,6 +1385,7 @@ impl Render for PopupMenu {
 
         let semantic_focus = self.focus_handle.clone();
         let semantic_empty = self.selected_index.is_none();
+        let accessible_name = self.accessible_name.clone();
         let rendered = v_flex()
             .id("popup-menu")
             .key_context(CONTEXT)
@@ -1427,7 +1447,7 @@ impl Render for PopupMenu {
             });
         gpui::accessible("menu-semantics", rendered, move |_, window, _| {
             let mut node = gpui::accesskit::Node::new(gpui::accesskit::Role::Menu);
-            node.set_label("Menu");
+            node.set_label(accessible_name.to_string());
             let mut info = gpui::AccessibilityInfo::new(node);
             info.modal = true;
             info.focused = semantic_empty && semantic_focus.is_focused(window);

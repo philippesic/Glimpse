@@ -161,7 +161,7 @@ commands![
     (
         OpenDocuments,
         "open-documents",
-        "Focus Open Documents",
+        "Open Documents",
         "Cmd+Alt+O"
     ),
     (

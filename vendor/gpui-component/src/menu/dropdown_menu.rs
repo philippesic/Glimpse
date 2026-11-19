@@ -39,6 +39,7 @@ pub struct DropdownMenuPopover<T: Selectable + InteractiveElement + IntoElement 
     style: StyleRefinement,
     anchor: Corner,
     trigger: T,
+    open_requested: bool,
     builder: Rc<dyn Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu>,
 }
 
@@ -57,8 +58,14 @@ where
             style: StyleRefinement::default(),
             anchor: anchor.into(),
             trigger,
+            open_requested: false,
             builder: Rc::new(builder),
         }
+    }
+
+    pub fn request_open(mut self, requested: bool) -> Self {
+        self.open_requested = requested;
+        self
     }
 
     /// Set the anchor corner for the dropdown menu popover.
@@ -91,6 +98,13 @@ where
         let menu_state =
             window.use_keyed_state(self.id.clone(), cx, |_, _| DropdownMenuState::default());
 
+        if self.open_requested && !menu_state.read(cx).open {
+            let return_focus = window.focused(cx);
+            menu_state.update(cx, |state, _| {
+                state.return_focus = return_focus;
+                state.open = true;
+            });
+        }
         let open = menu_state.read(cx).open;
         let trigger = self
             .trigger
