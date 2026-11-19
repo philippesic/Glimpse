@@ -40,7 +40,18 @@ impl Shell {
             .gap(px(8. * scale))
             .flex_shrink_0()
             .when(!matches!(panel, Panel::Recovery | Panel::Filter), |row| {
-                row.child(self.button(if search { "Search" } else { "Apply" }, "submit", cx))
+                row.child(self.button(
+                    match panel {
+                        Panel::Files | Panel::Text => "Search",
+                        Panel::Palette => "Run",
+                        Panel::Line => "Go",
+                        Panel::NewFile | Panel::NewFolder => "Create",
+                        Panel::Rename => "Rename",
+                        _ => "Apply",
+                    },
+                    "submit",
+                    cx,
+                ))
             })
             .child(self.button("Close", "dismiss", cx));
         let input = Input::new(&self.query).flex_1().min_w(px(120. * scale));

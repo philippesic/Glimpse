@@ -3551,14 +3551,16 @@ impl Render for Shell {
             if self.active.is_some() {
                 toolbar = toolbar.child(self.tool_button(
                     "toggle-navigator",
-                    if self.navigation_only && self.reading {
-                        "Reading"
-                    } else if self.navigation_only {
-                        "Edit"
+                    if self.navigation_only {
+                        "Document"
                     } else {
-                        "Browse"
+                        "Navigator"
                     },
-                    None,
+                    Some(if self.navigation_only {
+                        IconName::File
+                    } else {
+                        IconName::Folder
+                    }),
                     cx,
                 ));
             } else if !self.request.pick {
