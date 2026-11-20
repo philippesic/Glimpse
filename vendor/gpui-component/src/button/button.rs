@@ -744,9 +744,9 @@ impl RenderOnce for Button {
                 })
             })
             .map(|this| {
-                // Filled accent buttons carry their ring in the label colour so it stays visible.
+                // Filled buttons keep a separate ring outside their fill, where it stays visible.
                 if focus_gap > px(0.) {
-                    this.focus_ring_color(is_focused && !parent_decorates, normal_style.fg, window)
+                    this.focus_ring_outside(is_focused && !parent_decorates, focus_gap, window, cx)
                 } else {
                     this.focus_ring(is_focused && !parent_decorates, focus_gap, window, cx)
                 }

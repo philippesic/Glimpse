@@ -539,8 +539,11 @@ impl<T: Styled> StyleSized<T> for T {
 pub trait FocusableExt<T: ParentElement + Styled + Sized> {
     /// Add focus ring to the element.
     fn focus_ring(self, is_focused: bool, margins: Pixels, window: &Window, cx: &App) -> Self;
-    /// The focus ring in a given colour, for controls whose fill is the accent.
+    /// The focus ring in a given colour.
     fn focus_ring_color(self, is_focused: bool, color: gpui::Hsla, window: &Window) -> Self;
+    /// A ring outside the element, separated from it by `gap`, for filled controls whose own
+    /// fill would hide an inner ring. It paints above later siblings so they cannot cover it.
+    fn focus_ring_outside(self, is_focused: bool, gap: Pixels, window: &Window, cx: &App) -> Self;
 }
 
 impl<T: ParentElement + Styled + Sized> FocusableExt<T> for T {
@@ -627,6 +630,94 @@ impl<T: ParentElement + Styled + Sized> FocusableExt<T> for T {
                 .border_color(color)
                 .refine_style(&inner_style),
         )
+    }
+
+    fn focus_ring_outside(
+        mut self,
+        is_focused: bool,
+        gap: Pixels,
+        window: &Window,
+        cx: &App,
+    ) -> Self {
+        let color = cx.theme().ring;
+        if !is_focused {
+            return self;
+        }
+
+        // A 2 px ring drawn inside the element's own border box, so clipping containers such
+        // as tab strips and scroll areas never cut it and it never touches a neighbour.
+        const RING_BORDER_WIDTH: Pixels = px(2.);
+        let rem_size = window.rem_size();
+        let style = self.style();
+
+        let border_widths = Edges::<Pixels> {
+            top: style
+                .border_widths
+                .top
+                .map(|v| v.to_pixels(rem_size))
+                .unwrap_or_default(),
+            bottom: style
+                .border_widths
+                .bottom
+                .map(|v| v.to_pixels(rem_size))
+                .unwrap_or_default(),
+            left: style
+                .border_widths
+                .left
+                .map(|v| v.to_pixels(rem_size))
+                .unwrap_or_default(),
+            right: style
+                .border_widths
+                .right
+                .map(|v| v.to_pixels(rem_size))
+                .unwrap_or_default(),
+        };
+
+        // Update the radius based on element's corner radii and the ring border width.
+        let radius = Corners::<Pixels> {
+            top_left: style
+                .corner_radii
+                .top_left
+                .map(|v| v.to_pixels(rem_size))
+                .unwrap_or_default(),
+            top_right: style
+                .corner_radii
+                .top_right
+                .map(|v| v.to_pixels(rem_size))
+                .unwrap_or_default(),
+            bottom_left: style
+                .corner_radii
+                .bottom_left
+                .map(|v| v.to_pixels(rem_size))
+                .unwrap_or_default(),
+            bottom_right: style
+                .corner_radii
+                .bottom_right
+                .map(|v| v.to_pixels(rem_size))
+                .unwrap_or_default(),
+        }
+        .map(|v| *v + RING_BORDER_WIDTH + gap);
+
+        let mut inner_style = StyleRefinement::default();
+        inner_style.corner_radii.top_left = Some(radius.top_left.into());
+        inner_style.corner_radii.top_right = Some(radius.top_right.into());
+        inner_style.corner_radii.bottom_left = Some(radius.bottom_left.into());
+        inner_style.corner_radii.bottom_right = Some(radius.bottom_right.into());
+
+        let inset = RING_BORDER_WIDTH + gap;
+
+        self.child(gpui::deferred(
+            div()
+                .flex_none()
+                .absolute()
+                .top(-(inset + border_widths.top))
+                .left(-(inset + border_widths.left))
+                .right(-(inset + border_widths.right))
+                .bottom(-(inset + border_widths.bottom))
+                .border(RING_BORDER_WIDTH)
+                .border_color(color)
+                .refine_style(&inner_style),
+        ))
     }
 }
 

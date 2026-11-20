@@ -4524,8 +4524,9 @@ impl Render for Shell {
             .retain(|id, _| self.documents.iter().any(|doc| doc.id == *id));
         let room = self.tab_scroll.bounds().size.width - px(8. * scale);
         // The strip's width is known only after layout, so a resize refills it on the next frame.
-        if room != self.tab_room {
+        if room != self.tab_room && !self.documents.is_empty() {
             self.tab_room = room;
+            self.tab_reveal = None;
             cx.notify();
         }
         let shown_tabs = shown_tab.filter(|_| room > px(0.)).map(|center| {
@@ -4562,8 +4563,10 @@ impl Render for Shell {
         let hidden_tabs = shown_tabs.as_ref().map_or(0, |shown| {
             self.documents.len() - (shown.end() + 1 - shown.start())
         });
-        if hidden_tabs != self.tab_hidden {
+        if hidden_tabs != self.tab_hidden && !self.documents.is_empty() {
             self.tab_hidden = hidden_tabs;
+            // The Documents control changes width, so reveal the active tab again.
+            self.tab_reveal = None;
             cx.notify();
         }
         let tabs = div()

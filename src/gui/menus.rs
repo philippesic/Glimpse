@@ -311,7 +311,7 @@ impl Shell {
                 if icon_only {
                     // In the compact strip the count replaces the icon, within the same width.
                     match &count {
-                        Some(count) => button.label(count.clone()),
+                        Some(count) => button.label("Open Documents").display_label(count.clone()),
                         None => button.icon(IconName::ChevronsUpDown),
                     }
                     .tooltip("Open Documents")
@@ -326,7 +326,7 @@ impl Shell {
                 }
             })
             .when(hidden > 0, |button| {
-                button.accessibility_label(format!("Open Documents, {hidden} not shown in tabs"))
+                button.accessibility_description(format!("{hidden} not shown in tabs"))
             })
             .small()
             .compact()
