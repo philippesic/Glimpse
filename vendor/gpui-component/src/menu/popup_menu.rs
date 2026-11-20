@@ -1291,7 +1291,12 @@ impl PopupMenu {
                             if let Some(detail) = detail {
                                 this.child(
                                     v_flex().flex_1().min_w_0().child(label_element()).child(
-                                        div().text_xs().whitespace_nowrap().child(detail.clone()),
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .whitespace_nowrap()
+                                            .truncate()
+                                            .child(detail.clone()),
                                     ),
                                 )
                             } else {

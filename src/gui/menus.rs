@@ -27,16 +27,18 @@ pub(super) fn command_item(
         })
 }
 
+/// The folder name leads; its parent path follows as quieter supporting text.
 fn location_item(shell: WeakEntity<Shell>, path: PathBuf) -> PopupMenuItem {
-    location_item_labelled(
-        shell,
-        if let Some(parent) = path.parent() {
-            format!("{} — {}", paths::name(&path), paths::display(parent))
-        } else {
-            paths::display(&path)
-        },
-        path,
-    )
+    match path.parent() {
+        Some(parent) => {
+            let name = paths::name(&path);
+            let parent = paths::display(parent);
+            location_item_labelled(shell, format!("{name} — {parent}"), path)
+                .display_label(name)
+                .detail(parent)
+        }
+        None => location_item_labelled(shell, paths::display(&path), path),
+    }
 }
 
 /// Mount points are identified by their full path rather than a name and parent.

@@ -4895,6 +4895,7 @@ impl Render for Shell {
                                 .pl(px(24. * scale))
                                 .child(
                                     self.button("Compare", "compare", cx)
+                                        .primary()
                                         .with_focus_handle(self.conflict_focus.clone()),
                                 )
                                 .child(self.button("Keep Editing", "keep-editing", cx))
@@ -4910,7 +4911,12 @@ impl Render for Shell {
                                     "save-copy",
                                     cx,
                                 ))
-                                .child(self.button("Overwrite Disk Version…", "overwrite", cx)),
+                                .child(
+                                    self.button("Overwrite Disk Version…", "overwrite", cx)
+                                        .when(self.command_enabled("overwrite"), |button| {
+                                            button.text_color(cx.theme().danger)
+                                        }),
+                                ),
                         ),
                 );
             }
