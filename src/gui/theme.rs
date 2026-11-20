@@ -41,6 +41,7 @@ pub fn apply(settings: &Settings, window: &mut Window, cx: &mut App) -> Option<S
     let theme = Theme::global_mut(cx);
     theme.font_size = px(16. * settings.ui_scale);
     theme.mono_font_size = px(settings.font_size * settings.ui_scale);
+    gpui::set_monospace_family(family.clone());
     theme.mono_font_family = family.into();
     theme.radius = px(7. * settings.ui_scale);
     theme.radius_lg = px(12. * settings.ui_scale);
@@ -97,6 +98,7 @@ pub fn apply(settings: &Settings, window: &mut Window, cx: &mut App) -> Option<S
     colors.window_border = color(palette.separator);
     colors.overlay = gpui::hsla(0., 0., 0., palette.scrim);
     let mut highlight = (*theme.highlight_theme).clone();
+    highlight.style.syntax = reading_syntax(theme.is_dark());
     highlight.style.editor_background = Some(theme.colors.background);
     highlight.style.editor_active_line = settings
         .current_line
@@ -232,4 +234,32 @@ pub(super) fn reading_code_canvases(cx: &App) -> [[u8; 3]; 2] {
 
 fn rgb_bytes(color: gpui::Rgba) -> [u8; 3] {
     [color.r, color.g, color.b].map(|channel| (channel * 255.).round() as u8)
+}
+
+/// Reading code blocks use the Source palette, mapped from TextMate scopes to Tree-sitter captures.
+fn reading_syntax(dark: bool) -> gpui_component::highlighter::SyntaxColors {
+    let captures: [&[&str]; 7] = [
+        &["keyword"],
+        &["function"],
+        &["type", "constructor"],
+        &["string", "string.escape", "string.regex", "string.special"],
+        &["number", "boolean", "constant"],
+        &["comment", "comment.doc"],
+        &["tag"],
+    ];
+    let mut syntax = serde_json::Map::new();
+    for (names, (_, light, night)) in captures.iter().zip(glimpse::syntax::SOURCE_COLORS) {
+        let mut style = serde_json::Map::new();
+        style.insert(
+            "color".into(),
+            format!("#{:06x}", if dark { night } else { light }).into(),
+        );
+        if names[0] == "comment" {
+            style.insert("font_style".into(), "italic".into());
+        }
+        for name in *names {
+            syntax.insert((*name).into(), style.clone().into());
+        }
+    }
+    serde_json::from_value(syntax.into()).expect("static reading syntax colours")
 }

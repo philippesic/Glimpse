@@ -72,7 +72,7 @@ impl Shell {
             .flex_wrap()
             .items_center()
             .flex_shrink_0()
-            .mx(px(8. * scale))
+            .mx(px(12. * scale))
             .my(px(6. * scale))
             .px(px(10. * scale))
             .py(px(6. * scale))

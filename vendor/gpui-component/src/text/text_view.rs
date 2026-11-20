@@ -14,7 +14,7 @@ use gpui::{
 use smol::stream::StreamExt;
 
 use crate::highlighter::HighlightTheme;
-use crate::button::Button;
+use crate::button::{Button, ButtonVariants as _};
 use crate::menu::{DropdownMenu, PopupMenuItem};
 use crate::scroll::ScrollableElement;
 use crate::text::{
@@ -55,6 +55,7 @@ struct TextViewElement {
 fn links_menu(
     links: Arc<Vec<(SharedString, SharedString)>>,
     resources: &super::TextViewResources,
+    color: gpui::Hsla,
 ) -> Option<AnyElement> {
     if links.is_empty() {
         return None;
@@ -65,6 +66,8 @@ fn links_menu(
         Button::new("reading-links")
             .label("Links")
             .small()
+            .ghost()
+            .text_color(color)
             .dropdown_caret(true)
             .dropdown_menu(move |mut menu, window, _| {
                 menu = menu
@@ -96,6 +99,7 @@ fn links_menu(
 
 impl RenderOnce for TextViewElement {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let muted = cx.theme().muted_foreground;
         self.state.update(cx, |state, cx| {
             v_flex()
                 .size_full()
@@ -113,7 +117,7 @@ impl RenderOnce for TextViewElement {
                         let mut container = this;
                         if self.show_links
                             && let Some(menu) =
-                                links_menu(content.links.clone(), &node_cx.resources)
+                                links_menu(content.links.clone(), &node_cx.resources, muted)
                         {
                             container =
                                 container.child(crate::h_flex().flex_shrink_0().mb_2().child(menu));
@@ -332,7 +336,11 @@ impl MarkdownView {
     pub fn links_menu(&self, cx: &App) -> Option<AnyElement> {
         let state = self.state.read(cx);
         let content = state.parsed_result.as_ref()?.as_ref().ok()?;
-        links_menu(content.links.clone(), &state.resources)
+        links_menu(
+            content.links.clone(),
+            &state.resources,
+            cx.theme().muted_foreground,
+        )
     }
 
     pub fn element(&self, prose_width: Pixels) -> AnyElement {

@@ -109,6 +109,8 @@ pub enum IconName {
     WindowMaximize,
     WindowMinimize,
     WindowRestore,
+    /// Served by the application's asset source (Lucide `whole-word`).
+    WholeWord,
 }
 
 impl IconName {
@@ -207,6 +209,7 @@ impl IconNamed for IconName {
             Self::WindowMaximize => "icons/window-maximize.svg",
             Self::WindowMinimize => "icons/window-minimize.svg",
             Self::WindowRestore => "icons/window-restore.svg",
+            Self::WholeWord => "icons/whole-word.svg",
         }
         .into()
     }

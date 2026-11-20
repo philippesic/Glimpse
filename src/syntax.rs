@@ -59,6 +59,17 @@ pub fn readable_rgb(rgb: [u8; 3], canvases: &[[u8; 3]]) -> [u8; 3] {
     }
     mix(high)
 }
+/// Source colours by TextMate scope (light, dark), shared with the Reading view's code blocks.
+pub const SOURCE_COLORS: [(&str, u32, u32); 7] = [
+    ("keyword, storage", 0x7c3aed, 0xc4a7ff),
+    ("entity.name.function, support.function", 0x1d4ed8, 0x7aa2ff),
+    ("entity.name.type, support.type", 0x0e7490, 0x5ccfe6),
+    ("string", 0x15803d, 0x86d993),
+    ("constant.numeric, constant.language", 0xb45309, 0xf5b06a),
+    ("comment", 0x71717a, 0x80808a),
+    ("entity.name.tag", 0x7c3aed, 0xc4a7ff),
+];
+
 /// Reference-inspired source colors with contrast correction applied on the actual canvas.
 fn source_theme(dark: bool) -> syntect::highlighting::Theme {
     use syntect::highlighting::{Color, StyleModifier, Theme, ThemeItem, ThemeSettings};
@@ -75,15 +86,7 @@ fn source_theme(dark: bool) -> syntect::highlighting::Theme {
         },
         ..Default::default()
     };
-    for (scope, light, night) in [
-        ("keyword, storage", 0x7c3aed, 0xc4a7ff),
-        ("entity.name.function, support.function", 0x1d4ed8, 0x7aa2ff),
-        ("entity.name.type, support.type", 0x0e7490, 0x5ccfe6),
-        ("string", 0x15803d, 0x86d993),
-        ("constant.numeric, constant.language", 0xb45309, 0xf5b06a),
-        ("comment", 0x71717a, 0x80808a),
-        ("entity.name.tag", 0x7c3aed, 0xc4a7ff),
-    ] {
+    for (scope, light, night) in SOURCE_COLORS {
         theme.scopes.push(ThemeItem {
             scope: scope.parse().expect("static syntax scope"),
             style: StyleModifier {

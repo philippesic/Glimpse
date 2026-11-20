@@ -229,9 +229,10 @@ impl Shell {
             .flex_shrink()
             .accessibility_description(format!("Search folder {tooltip}"))
             .tooltip(tooltip)
-            .small()
+            .xsmall()
             .compact()
             .ghost()
+            .text_color(cx.theme().muted_foreground)
             .dropdown_caret(true)
             .dropdown_menu(move |menu, _, _| {
                 let item = |id: &'static str, label: &str| {

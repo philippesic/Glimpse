@@ -1500,7 +1500,14 @@ impl Element for TextElement {
                 if is_active {
                     if let Some(bg_color) = active_line_color {
                         window.paint_quad(fill(
-                            Bounds::new(p, size(prepaint.last_layout.line_number_width, height)),
+                            Bounds::new(
+                                p,
+                                size(
+                                    prepaint.last_layout.line_number_width
+                                        - LINE_NUMBER_RIGHT_MARGIN,
+                                    height,
+                                ),
+                            ),
                             bg_color,
                         ));
                     }

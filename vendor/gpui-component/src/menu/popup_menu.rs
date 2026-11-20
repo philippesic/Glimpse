@@ -1315,7 +1315,17 @@ impl PopupMenu {
                             )
                         })
                         .when_some(shortcut_hint.clone(), |row, hint| {
-                            row.child(div().flex_shrink_0().whitespace_nowrap().child(hint))
+                            row.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .whitespace_nowrap()
+                                    .text_color(if *disabled {
+                                        cx.theme().muted_foreground.opacity(0.6)
+                                    } else {
+                                        cx.theme().muted_foreground
+                                    })
+                                    .child(hint),
+                            )
                         })
                         .children(key),
                 )

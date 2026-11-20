@@ -452,6 +452,16 @@ impl TextStyle {
             self.strikethrough = Some(strikethrough);
         }
 
+        if style.monospace == Some(true)
+            && let Some(family) = MONOSPACE_FAMILY
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        {
+            self.font_family = family;
+            self.font_features = FontFeatures::default();
+        }
+
         self
     }
 
@@ -514,6 +524,17 @@ pub struct HighlightStyle {
 
     /// Similar to the CSS `opacity` property, this will cause the text to be less vibrant.
     pub fade_out: Option<f32>,
+
+    /// Render the run in the family registered with [`set_monospace_family`].
+    pub monospace: Option<bool>,
+}
+
+static MONOSPACE_FAMILY: std::sync::RwLock<Option<SharedString>> = std::sync::RwLock::new(None);
+
+/// Register the family that highlighted runs marked `monospace` use, such as inline code.
+pub fn set_monospace_family(family: impl Into<SharedString>) {
+    *MONOSPACE_FAMILY.write().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        Some(family.into());
 }
 
 impl Eq for HighlightStyle {}
@@ -529,6 +550,7 @@ impl Hash for HighlightStyle {
         state.write_u32(u32::from_be_bytes(
             self.fade_out.map(|f| f.to_be_bytes()).unwrap_or_default(),
         ));
+        self.monospace.hash(state);
     }
 }
 
@@ -866,6 +888,7 @@ impl From<&TextStyle> for HighlightStyle {
             underline: other.underline,
             strikethrough: other.strikethrough,
             fade_out: None,
+            monospace: None,
         }
     }
 }
@@ -906,6 +929,7 @@ impl HighlightStyle {
                         .unwrap_or(source_fade)
                 })
                 .or(self.fade_out),
+            monospace: other.monospace.or(self.monospace),
         }
     }
 }
@@ -1314,6 +1338,7 @@ mod tests {
                 color: Some(blue()),
             }),
             fade_out: Some(0.),
+            monospace: None,
             font_style: Some(FontStyle::Italic),
             font_weight: Some(FontWeight(300.)),
             background_color: Some(yellow()),
@@ -1346,6 +1371,7 @@ mod tests {
                 color: Some(crate::red()),
             }),
             fade_out: Some(0.),
+            monospace: None,
             font_style: Some(FontStyle::Oblique),
             font_weight: Some(FontWeight(800.)),
             background_color: Some(green()),
@@ -1364,6 +1390,7 @@ mod tests {
             }),
             // TODO this does not seem right
             fade_out: Some(0.),
+            monospace: None,
             font_style: Some(FontStyle::Oblique),
             font_weight: Some(FontWeight(800.)),
             background_color: Some(green()),

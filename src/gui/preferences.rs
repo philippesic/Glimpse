@@ -653,7 +653,13 @@ impl Render for Preferences {
                             .flex_col()
                             .gap(px(2.))
                             .child(div().child(prompt))
-                            .child(div().whitespace_nowrap().child(example))
+                            .child(
+                                div()
+                                    .whitespace_nowrap()
+                                    .font_family(cx.theme().mono_font_family.clone())
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(example),
+                            )
                             .child(div().child(rules)),
                     )
                     .into_any_element(),
@@ -794,10 +800,12 @@ impl Render for Preferences {
                 ))
                 .into_any_element()
         } else {
+            // Tab labels align with the title; their fills extend into the margin.
             div()
                 .flex()
                 .flex_wrap()
                 .gap_1()
+                .ml(px(-12.))
                 .children(Page::ALL.into_iter().enumerate().map(|(index, page)| {
                     Button::new(page.label())
                         .label(page.label())
@@ -883,7 +891,7 @@ impl Render for Preferences {
                     .shadow_xl()
                     .bg(cx.theme().popover)
                     .text_color(cx.theme().foreground)
-                    .child(header)
+                    .child(div().pl(px(4.)).pr(px(18.)).child(header))
                     .child(
                         div()
                             .relative()
@@ -936,6 +944,8 @@ impl Render for Preferences {
                             .flex_wrap()
                             .gap_2()
                             .pt(px(12.))
+                            .ml(px(4.))
+                            .mr(px(18.))
                             .border_t_1()
                             .border_color(cx.theme().title_bar_border)
                             .child(

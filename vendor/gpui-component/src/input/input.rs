@@ -12,7 +12,7 @@ use crate::scroll::Scrollbar;
 use crate::spinner::Spinner;
 use crate::{ActiveTheme, v_flex};
 use crate::{IconName, Size};
-use crate::{Selectable, StyledExt, h_flex};
+use crate::{FocusableExt as _, Selectable, StyledExt, h_flex};
 use crate::{Sizable, StyleSized};
 
 use super::InputState;
@@ -397,6 +397,10 @@ impl RenderOnce for Input {
                             })
                     })
             })
+            .when(
+                self.appearance && self.bordered && self.focus_bordered,
+                |this| this.relative().focus_ring(focused, px(0.), window, cx),
+            )
             .items_center()
             .gap(gap_x)
             .refine_style(&self.style)

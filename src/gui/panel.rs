@@ -213,21 +213,31 @@ impl Shell {
                 }
             })
             .child(header);
+        // Validation floats just below the panel so the document never moves when it appears.
         let section = section.when(panel == Panel::Line || naming, |section| {
             let scale = self.settings.ui_scale;
-            section.child(
-                div()
-                    .px(px(8. * scale))
-                    .h(px(24. * scale))
-                    .flex_shrink_0()
-                    .when_some(self.query_error.clone(), |row, error| {
-                        row.child(accessibility::message(
-                            "query-error",
-                            error.clone(),
-                            div().text_color(cx.theme().danger).child(error),
-                        ))
-                    }),
-            )
+            section
+                .relative()
+                .when_some(self.query_error.clone(), |section, error| {
+                    section.child(gpui::deferred(
+                        div()
+                            .absolute()
+                            .top(relative(1.))
+                            .left_0()
+                            .right_0()
+                            .occlude()
+                            .px(px(12. * scale))
+                            .py(px(4. * scale))
+                            .bg(cx.theme().title_bar)
+                            .border_b_1()
+                            .border_color(cx.theme().title_bar_border)
+                            .child(accessibility::message(
+                                "query-error",
+                                error.clone(),
+                                div().text_color(cx.theme().danger).child(error),
+                            )),
+                    ))
+                })
         });
         let section = match panel {
             Panel::Files | Panel::Text if self.search_ui.collapsed => {

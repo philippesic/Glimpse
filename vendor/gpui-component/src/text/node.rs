@@ -545,6 +545,7 @@ impl CodeBlock {
             self.display_code();
         }
 
+        let trailing_newline = self.ends_block() && self.code().ends_with('\n');
         div()
             .when(self.ends_block() && !options.is_last, |this| {
                 this.pb(style.paragraph_gap)
@@ -558,7 +559,14 @@ impl CodeBlock {
                     .when(paged, |block| block.w_full().min_w_0().whitespace_normal())
                     .px_3()
                     .when(self.starts_block(), |block| block.pt_3())
-                    .when(self.ends_block(), |block| block.pb_3())
+                    // A closing newline already leaves an empty line below the code.
+                    .when(self.ends_block(), |block| {
+                        if trailing_newline {
+                            block.pb_0p5()
+                        } else {
+                            block.pb_3()
+                        }
+                    })
                     .bg(cx.theme().muted)
                     .font_family(cx.theme().mono_font_family.clone())
                     .text_size(cx.theme().mono_font_size)
@@ -1006,7 +1014,8 @@ impl TextMark {
             });
         }
         if self.code {
-            highlight.background_color = Some(colors.accent);
+            highlight.background_color = Some(colors.secondary);
+            highlight.monospace = Some(true);
         }
         if self.link.is_some() {
             highlight.color = Some(colors.link);
@@ -1667,7 +1676,11 @@ impl Node {
                                                 .justify_center()
                                                 .rounded(cx.theme().radius.half())
                                                 .border_1()
-                                                .border_color(cx.theme().primary)
+                                                .border_color(if checked {
+                                                    cx.theme().primary
+                                                } else {
+                                                    cx.theme().input
+                                                })
                                                 .text_color(cx.theme().primary_foreground)
                                                 .when(checked, |this| {
                                                     this.bg(cx.theme().primary).child(

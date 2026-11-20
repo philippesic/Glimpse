@@ -38,58 +38,74 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Component icons plus the few the component set lacks.
+struct Assets;
+
+impl gpui::AssetSource for Assets {
+    fn load(&self, path: &str) -> gpui::Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        match path {
+            "icons/whole-word.svg" => Ok(Some(std::borrow::Cow::Borrowed(include_bytes!(
+                "../assets/icons/whole-word.svg"
+            )))),
+            _ => gpui_component_assets::Assets.load(path),
+        }
+    }
+
+    fn list(&self, path: &str) -> gpui::Result<Vec<SharedString>> {
+        gpui_component_assets::Assets.list(path)
+    }
+}
+
 pub fn run(request: cli::Request, data_dir: PathBuf, launch_folder: PathBuf) {
     platform::configure_allocations();
     let startup = StartupIo::new(&request, &data_dir);
-    Application::new()
-        .with_assets(gpui_component_assets::Assets)
-        .run(move |cx| {
-            gpui_component::init(cx);
-            #[cfg(target_os = "linux")]
-            cx.bind_keys([
-                KeyBinding::new(
-                    "ctrl-home",
-                    gpui_component::input::MoveToStart,
-                    Some("Input"),
-                ),
-                KeyBinding::new("ctrl-end", gpui_component::input::MoveToEnd, Some("Input")),
-                KeyBinding::new(
-                    "ctrl-shift-home",
-                    gpui_component::input::SelectToStart,
-                    Some("Input"),
-                ),
-                KeyBinding::new(
-                    "ctrl-shift-end",
-                    gpui_component::input::SelectToEnd,
-                    Some("Input"),
-                ),
-            ]);
-            gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
-            let bounds = Bounds::centered(None, size(px(1280.), px(844.)), cx);
-            cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    app_id: Some("glimpse".into()),
-                    window_min_size: Some(size(px(520.), px(400.))),
-                    ..Default::default()
-                },
-                move |window, cx| {
-                    window.set_window_title("Glimpse");
-                    let view = cx.new(|cx| Shell::new(request, startup, launch_folder, window, cx));
-                    let weak = view.downgrade();
-                    window.on_window_should_close(cx, move |window, cx| {
-                        weak.update(cx, |shell, cx| {
-                            shell.close(true, None, window, cx);
-                            false
-                        })
-                        .unwrap_or(true)
-                    });
-                    cx.new(|cx| Root::new(view, window, cx))
-                },
-            )
-            .expect("Cannot open GPUI window");
-            cx.activate(true);
-        });
+    Application::new().with_assets(Assets).run(move |cx| {
+        gpui_component::init(cx);
+        #[cfg(target_os = "linux")]
+        cx.bind_keys([
+            KeyBinding::new(
+                "ctrl-home",
+                gpui_component::input::MoveToStart,
+                Some("Input"),
+            ),
+            KeyBinding::new("ctrl-end", gpui_component::input::MoveToEnd, Some("Input")),
+            KeyBinding::new(
+                "ctrl-shift-home",
+                gpui_component::input::SelectToStart,
+                Some("Input"),
+            ),
+            KeyBinding::new(
+                "ctrl-shift-end",
+                gpui_component::input::SelectToEnd,
+                Some("Input"),
+            ),
+        ]);
+        gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+        let bounds = Bounds::centered(None, size(px(1280.), px(844.)), cx);
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                app_id: Some("glimpse".into()),
+                window_min_size: Some(size(px(520.), px(400.))),
+                ..Default::default()
+            },
+            move |window, cx| {
+                window.set_window_title("Glimpse");
+                let view = cx.new(|cx| Shell::new(request, startup, launch_folder, window, cx));
+                let weak = view.downgrade();
+                window.on_window_should_close(cx, move |window, cx| {
+                    weak.update(cx, |shell, cx| {
+                        shell.close(true, None, window, cx);
+                        false
+                    })
+                    .unwrap_or(true)
+                });
+                cx.new(|cx| Root::new(view, window, cx))
+            },
+        )
+        .expect("Cannot open GPUI window");
+        cx.activate(true);
+    });
 }
 struct Document {
     id: u64,
@@ -4833,6 +4849,7 @@ impl Render for Shell {
                                 .flex()
                                 .flex_wrap()
                                 .gap_2()
+                                .pl(px(24. * scale))
                                 .child(
                                     self.button("Compare", "compare", cx)
                                         .with_focus_handle(self.conflict_focus.clone()),

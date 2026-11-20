@@ -418,6 +418,9 @@ pub(super) struct SearchPanel {
     /// Width of the panel in the last frame, which decides whether the options share the
     /// query row.
     width: gpui::Pixels,
+    /// Natural widths of the controls after the query and replacement fields in the last
+    /// frame; both rows reserve the larger so the two fields share a right edge.
+    trailing: [gpui::Pixels; 2],
     _subscriptions: Vec<Subscription>,
 }
 
@@ -502,6 +505,7 @@ impl SearchPanel {
                 pending_scan: None,
                 cancellation: Arc::new(AtomicBool::new(false)),
                 width: gpui::Pixels::ZERO,
+                trailing: [gpui::Pixels::ZERO; 2],
                 searching: false,
                 _subscriptions,
             }
@@ -975,7 +979,7 @@ impl Render for SearchPanel {
                                 button.ghost()
                             }
                         })
-                        .label("Word")
+                        .icon(IconName::WholeWord)
                         .tooltip("Match whole words")
                         .accessibility_toggled(self.whole_word)
                         .on_click(cx.listener(|this, _, window, cx| {
@@ -1037,6 +1041,63 @@ impl Render for SearchPanel {
         } else {
             (None, options)
         };
+        let align = one_row && self.replace_mode;
+        let reserved = self.trailing[0].max(self.trailing[1]);
+        let measured = cx.entity().downgrade();
+        let trailing = |index: usize, controls: gpui::AnyElement| {
+            let panel = measured.clone();
+            div()
+                .flex()
+                .justify_end()
+                .flex_shrink_0()
+                .when(align, |slot| slot.min_w(reserved))
+                .child(
+                    div().relative().child(controls).child(
+                        gpui::canvas(
+                            move |bounds, window, cx| {
+                                let _ = panel.update(cx, |panel, _| {
+                                    if (panel.trailing[index] - bounds.size.width).abs() > px(0.5) {
+                                        panel.trailing[index] = bounds.size.width;
+                                        window.request_animation_frame();
+                                    }
+                                });
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .size_full(),
+                    ),
+                )
+        };
+        let inline_options = inline_options.map(|options| trailing(0, options.into_any_element()));
+        let replace_controls = trailing(
+            1,
+            h_flex()
+                .gap_2()
+                .child(
+                    Button::new("replace-one")
+                        .when(compact, |button| button.xsmall())
+                        .when(!compact, |button| button.small())
+                        .flex_shrink_0()
+                        .label(t!("Input.Replace"))
+                        .disabled(!has_matches)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.replace_next(window, cx);
+                        })),
+                )
+                .child(
+                    Button::new("replace-all")
+                        .when(compact, |button| button.xsmall())
+                        .when(!compact, |button| button.small())
+                        .flex_shrink_0()
+                        .label(t!("Input.Replace All"))
+                        .disabled(!has_matches)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.replace_all(window, cx);
+                        })),
+                )
+                .into_any_element(),
+        );
         let panel = cx.entity().downgrade();
         v_flex()
             .id("search-panel")
@@ -1105,28 +1166,7 @@ impl Render for SearchPanel {
                                 .min_w_0()
                                 .shadow_none(),
                         )
-                        .child(
-                            Button::new("replace-one")
-                                .when(compact, |button| button.xsmall())
-                                .when(!compact, |button| button.small())
-                                .flex_shrink_0()
-                                .label(t!("Input.Replace"))
-                                .disabled(!has_matches)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.replace_next(window, cx);
-                                })),
-                        )
-                        .child(
-                            Button::new("replace-all")
-                                .when(compact, |button| button.xsmall())
-                                .when(!compact, |button| button.small())
-                                .flex_shrink_0()
-                                .label(t!("Input.Replace All"))
-                                .disabled(!has_matches)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.replace_all(window, cx);
-                                })),
-                        ),
+                        .child(replace_controls),
                 )
             })
             .into_any_element()

@@ -531,6 +531,7 @@ impl Shell {
                             div()
                                 .id("search-status-text")
                                 .text_size(small)
+                                .text_color(muted)
                                 .truncate()
                                 .child(status.clone()),
                             self.search_ui.announce_status,
@@ -697,17 +698,44 @@ impl Shell {
                                                     this.search_ui.focus.is_focused(window),
                                                     cx,
                                                 );
-                                                let text = StyledText::new(label).with_highlights(
-                                                    ranges.into_iter().map(|range| {
-                                                        (
-                                                            range,
-                                                            HighlightStyle {
-                                                                font_weight: Some(FontWeight::BOLD),
-                                                                ..Default::default()
-                                                            },
-                                                        )
-                                                    }),
-                                                );
+                                                let bold = HighlightStyle {
+                                                    font_weight: Some(FontWeight::BOLD),
+                                                    ..Default::default()
+                                                };
+                                                // A Find Text row reads as location first, then a quieter excerpt
+                                                // in which the match keeps full weight and colour.
+                                                let highlights: Vec<_> = if content {
+                                                    let quiet = HighlightStyle {
+                                                        color: Some(cx.theme().muted_foreground),
+                                                        ..Default::default()
+                                                    };
+                                                    let mut spans = vec![(
+                                                        0..name.len(),
+                                                        HighlightStyle {
+                                                            font_weight: Some(FontWeight::MEDIUM),
+                                                            ..Default::default()
+                                                        },
+                                                    )];
+                                                    let mut at = prefix.len();
+                                                    for range in ranges {
+                                                        if range.start > at {
+                                                            spans.push((at..range.start, quiet));
+                                                        }
+                                                        at = range.end;
+                                                        spans.push((range, bold));
+                                                    }
+                                                    if at < label.len() {
+                                                        spans.push((at..label.len(), quiet));
+                                                    }
+                                                    spans
+                                                } else {
+                                                    ranges
+                                                        .into_iter()
+                                                        .map(|range| (range, bold))
+                                                        .collect()
+                                                };
+                                                let text = StyledText::new(label)
+                                                    .with_highlights(highlights);
                                                 Button::new(("search-hit", i))
                                                     .accessibility_role(
                                                         gpui::accesskit::Role::ListBoxOption,
