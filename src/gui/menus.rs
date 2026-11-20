@@ -234,6 +234,7 @@ impl Shell {
             .xsmall()
             .compact()
             .ghost()
+            .ml(px(-5.))
             .text_color(cx.theme().muted_foreground)
             .dropdown_caret(true)
             .dropdown_menu(move |menu, _, _| {
@@ -302,18 +303,30 @@ impl Shell {
                 (document.id, title, status, current, file, parent, filename)
             })
             .collect::<Vec<_>>();
+        // Tabs that do not fit are counted on the trigger that lists them.
+        let hidden = self.tab_hidden;
+        let count = (hidden > 0).then(|| format!("+{hidden}"));
         Button::new("open-documents-menu")
             .map(|button| {
                 if icon_only {
-                    button
-                        .icon(IconName::ChevronsUpDown)
-                        .tooltip("Open Documents")
+                    // In the compact strip the count replaces the icon, within the same width.
+                    match &count {
+                        Some(count) => button.label(count.clone()),
+                        None => button.icon(IconName::ChevronsUpDown),
+                    }
+                    .tooltip("Open Documents")
                 } else {
                     button
                         .label("Open Documents")
-                        .display_label("Documents")
+                        .display_label(match &count {
+                            Some(count) => format!("Documents {count}"),
+                            None => "Documents".into(),
+                        })
                         .dropdown_caret(true)
                 }
+            })
+            .when(hidden > 0, |button| {
+                button.accessibility_label(format!("Open Documents, {hidden} not shown in tabs"))
             })
             .small()
             .compact()

@@ -539,15 +539,24 @@ impl<T: Styled> StyleSized<T> for T {
 pub trait FocusableExt<T: ParentElement + Styled + Sized> {
     /// Add focus ring to the element.
     fn focus_ring(self, is_focused: bool, margins: Pixels, window: &Window, cx: &App) -> Self;
+    /// The focus ring in a given colour, for controls whose fill is the accent.
+    fn focus_ring_color(self, is_focused: bool, color: gpui::Hsla, window: &Window) -> Self;
 }
 
 impl<T: ParentElement + Styled + Sized> FocusableExt<T> for T {
-    fn focus_ring(mut self, is_focused: bool, margins: Pixels, window: &Window, cx: &App) -> Self {
+    fn focus_ring(self, is_focused: bool, margins: Pixels, window: &Window, cx: &App) -> Self {
+        let _ = margins;
+        self.focus_ring_color(is_focused, cx.theme().ring, window)
+    }
+
+    fn focus_ring_color(mut self, is_focused: bool, color: gpui::Hsla, window: &Window) -> Self {
         if !is_focused {
             return self;
         }
 
-        const RING_BORDER_WIDTH: Pixels = px(1.5);
+        // A 2 px ring drawn inside the element's own border box, so clipping containers such
+        // as tab strips and scroll areas never cut it and it never touches a neighbour.
+        const RING_BORDER_WIDTH: Pixels = px(2.);
         let rem_size = window.rem_size();
         let style = self.style();
 
@@ -596,8 +605,7 @@ impl<T: ParentElement + Styled + Sized> FocusableExt<T> for T {
                 .bottom_right
                 .map(|v| v.to_pixels(rem_size))
                 .unwrap_or_default(),
-        }
-        .map(|v| *v + RING_BORDER_WIDTH);
+        };
 
         let mut inner_style = StyleRefinement::default();
         inner_style.corner_radii.top_left = Some(radius.top_left.into());
@@ -605,7 +613,7 @@ impl<T: ParentElement + Styled + Sized> FocusableExt<T> for T {
         inner_style.corner_radii.bottom_left = Some(radius.bottom_left.into());
         inner_style.corner_radii.bottom_right = Some(radius.bottom_right.into());
 
-        let inset = RING_BORDER_WIDTH + margins;
+        let inset = px(0.);
 
         self.child(
             div()
@@ -616,7 +624,7 @@ impl<T: ParentElement + Styled + Sized> FocusableExt<T> for T {
                 .right(-(inset + border_widths.right))
                 .bottom(-(inset + border_widths.bottom))
                 .border(RING_BORDER_WIDTH)
-                .border_color(cx.theme().ring)
+                .border_color(color)
                 .refine_style(&inner_style),
         )
     }

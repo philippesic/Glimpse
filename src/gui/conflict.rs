@@ -68,6 +68,7 @@ impl Shell {
                 Resolution::Overwrite
             },
         };
+        let destructive = matches!(snapshot.resolution, Resolution::Overwrite);
         let (title, detail, action) = match snapshot.resolution {
             Resolution::Reload => (
                 "Reload Disk Version?",
@@ -92,6 +93,9 @@ impl Shell {
             window,
             cx,
         );
+        if destructive && let Some(view) = &self.decision {
+            view.update(cx, |decision, _| decision.mark_destructive(1));
+        }
     }
     pub(super) fn resolve_conflict(
         &mut self,

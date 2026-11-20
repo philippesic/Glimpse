@@ -459,11 +459,12 @@ impl Preferences {
             .child(label)
             .child(
                 Input::new(&self.fields[field as usize])
+                    .small()
                     .disabled(self.pending)
                     .h(px(if matches!(field, Field::Exclusions | Field::Keymaps) {
                         96.
                     } else {
-                        32. * self.draft.ui_scale
+                        26. * self.draft.ui_scale
                     })),
             )
             .child(super::accessibility::status(
@@ -558,7 +559,7 @@ impl Render for Preferences {
                         "theme-group",
                         "Theme".into(),
                         div().flex().flex_col().gap_1().child("Theme").child(
-                            div().flex().flex_wrap().gap_2().children(
+                            div().flex().flex_wrap().gap_2().ml(px(-7.)).children(
                                 [
                                     ("System", None),
                                     ("Light", Some(false)),
@@ -678,10 +679,12 @@ impl Render for Preferences {
                             .rounded_md()
                             .border_color(gpui::transparent_black())
                             .focus(|style| style.border_color(cx.theme().ring))
-                            .px_1()
+                            // The focus border sits in the margin so the rows share the inset;
+                            // whole-pixel rows keep an even pitch.
+                            .mx(px(-1.))
                             .flex()
                             .flex_col()
-                            .gap(px(2.))
+                            .line_height(px(24.))
                             .on_key_down(cx.listener(Self::scroll_shortcuts))
                             .child(
                                 div()
@@ -890,7 +893,7 @@ impl Render for Preferences {
                     .shadow_xl()
                     .bg(cx.theme().popover)
                     .text_color(cx.theme().foreground)
-                    .child(div().pl(px(4.)).pr(px(18.)).child(header))
+                    .child(header)
                     .child(
                         div()
                             .relative()
@@ -911,18 +914,24 @@ impl Render for Preferences {
                                     .flex_1()
                                     .overflow_y_scroll()
                                     .track_scroll(&self.scroll)
-                                    .pl(px(4.))
                                     .pt(px(4.))
-                                    .pr(px(18.))
+                                    .mr(px(-12.))
+                                    .pr(px(12.))
                                     .children(rows.into_iter().enumerate().map(|(i, row)| {
                                         div().track_focus(&self.row_focus[i]).pb(px(12.)).child(row)
                                     })),
                             ))
                             .child(
-                                div().absolute().inset_0().child(
-                                    Scrollbar::vertical(&self.scroll)
-                                        .scrollbar_show(ScrollbarShow::Always),
-                                ),
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .bottom_0()
+                                    .left_0()
+                                    .right(px(-12.))
+                                    .child(
+                                        Scrollbar::vertical(&self.scroll)
+                                            .scrollbar_show(ScrollbarShow::Always),
+                                    ),
                             ),
                     )
                     .when(!self.error.is_empty(), |this| {
@@ -943,8 +952,6 @@ impl Render for Preferences {
                             .flex_wrap()
                             .gap_2()
                             .pt(px(12.))
-                            .ml(px(4.))
-                            .mr(px(18.))
                             .border_t_1()
                             .border_color(cx.theme().title_bar_border)
                             .child(

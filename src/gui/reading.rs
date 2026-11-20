@@ -369,7 +369,14 @@ impl Shell {
             }
             area = area.child(controls);
         }
-        area.child(content.element(font_size * 36.))
-            .into_any_element()
+        // The Reading scrollbar sits in the pane margin, clear of tables and code blocks.
+        area.child(
+            div()
+                .flex_1()
+                .min_h_0()
+                .mr(px(-12. * self.settings.ui_scale))
+                .child(content.element(font_size * 36.)),
+        )
+        .into_any_element()
     }
 }

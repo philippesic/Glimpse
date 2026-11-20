@@ -1356,7 +1356,19 @@ impl Element for TextElement {
             }
         }
 
-        let active_line_color = cx.theme().highlight_theme.style.editor_active_line;
+        // Read-only views have no editing position worth marking.
+        let read_only = state.disabled;
+        let active_line_color = cx
+            .theme()
+            .highlight_theme
+            .style
+            .editor_active_line
+            .filter(|_| !read_only);
+        let gutter_color = if read_only {
+            cx.theme().muted
+        } else {
+            cx.theme().editor_background()
+        };
 
         // Paint active line
         let mut offset_y = px(0.);
@@ -1485,7 +1497,7 @@ impl Element for TextElement {
                         input_bounds.size.height + prepaint.ghost_lines_height,
                     ),
                 },
-                cx.theme().editor_background(),
+                gutter_color,
             ));
 
             // Each item is the normal lines.

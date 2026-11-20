@@ -743,7 +743,14 @@ impl RenderOnce for Button {
                         .build(window, cx)
                 })
             })
-            .focus_ring(is_focused && !parent_decorates, focus_gap, window, cx);
+            .map(|this| {
+                // Filled accent buttons carry their ring in the label colour so it stays visible.
+                if focus_gap > px(0.) {
+                    this.focus_ring_color(is_focused && !parent_decorates, normal_style.fg, window)
+                } else {
+                    this.focus_ring(is_focused && !parent_decorates, focus_gap, window, cx)
+                }
+            });
         gpui::accessible(semantic_id, rendered, move |_, window, _| {
             use gpui::accesskit::{Action, Node};
             let mut node = Node::new(semantic_role);

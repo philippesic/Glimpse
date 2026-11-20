@@ -337,6 +337,7 @@ struct Shell {
     tab_scroll: ScrollHandle,
     tab_widths: HashMap<u64, Pixels>,
     tab_room: Pixels,
+    tab_hidden: usize,
     tab_reveal: Option<TabReveal>,
     next_id: u64,
     open_token: u64,
@@ -610,6 +611,7 @@ impl Shell {
             tab_scroll: ScrollHandle::new(),
             tab_widths: HashMap::new(),
             tab_room: px(0.),
+            tab_hidden: 0,
             tab_reveal: None,
             next_id: 1,
             open_token,
@@ -4410,8 +4412,14 @@ impl Render for Shell {
                 .iter()
                 .any(|doc| Some(doc.id) == self.active && doc.external.is_some());
         let rem = window.rem_size();
+        // The trigger carries the hidden-tab count from the last layout, so tab labels are sized
+        // for the width it actually takes.
+        let documents_label = match self.tab_hidden {
+            0 => "Documents".to_owned(),
+            hidden => format!("Documents +{hidden}"),
+        };
         let documents_full =
-            Self::path_label_width(window, &"Documents".into()) + rem * 3. + px(2.);
+            Self::path_label_width(window, &documents_label.into()) + rem * 3. + px(2.);
         let edit_full = Self::path_label_width(window, &"Edit Source".into()) + rem * 2.;
         let close_width = if self.request.pick { px(0.) } else { rem * 1.5 };
         let conflict_width = if tab_conflict {
@@ -4551,6 +4559,13 @@ impl Render for Shell {
                 doc.input.focus_handle(cx).contains_focused(window, cx)
                     || doc.tab_focus.contains_focused(window, cx)
             });
+        let hidden_tabs = shown_tabs.as_ref().map_or(0, |shown| {
+            self.documents.len() - (shown.end() + 1 - shown.start())
+        });
+        if hidden_tabs != self.tab_hidden {
+            self.tab_hidden = hidden_tabs;
+            cx.notify();
+        }
         let tabs = div()
             .id("tabs")
             .w_full()
@@ -4648,7 +4663,6 @@ impl Render for Shell {
                     .when(!active, |tab| {
                         tab.hover(|tab| tab.bg(cx.theme().list_hover))
                     })
-                    .focus_ring(tab_focused, px(-1.5), window, cx)
                     .border_t_2()
                     .border_color(match (active, document_focused) {
                         (true, true) => cx.theme().ring,
@@ -4677,6 +4691,9 @@ impl Render for Shell {
                                 })),
                         )
                     })
+                    // Added last, after the border and children, so it spans the whole tab and
+                    // their fills never cover it.
+                    .focus_ring(tab_focused, px(0.), window, cx)
             }));
         let tabs = accessible("open-documents", tabs, |_, _, _| {
             let mut node = gpui::accesskit::Node::new(gpui::accesskit::Role::TabList);

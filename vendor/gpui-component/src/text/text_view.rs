@@ -67,6 +67,8 @@ fn links_menu(
             .label("Links")
             .small()
             .ghost()
+            // The label, not the button's padding, sits on the content edge.
+            .ml(px(-13.))
             .text_color(color)
             .dropdown_caret(true)
             .dropdown_menu(move |mut menu, window, _| {
@@ -1089,6 +1091,8 @@ impl Element for TextView {
             .size_full()
             .relative()
             .pt(window.rem_size() * 0.75)
+            // Room for the scrollbar, which the host places in its margin.
+            .pr(window.rem_size() * 0.75)
             .on_action({
                 let state = self.state.clone();
                 move |_: &input::Copy, _, cx| {

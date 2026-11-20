@@ -201,6 +201,10 @@ impl Decision {
             _comparison_subscriptions: Vec::new(),
         }
     }
+    /// Show an action in the destructive treatment used by Discard.
+    pub(super) fn mark_destructive(&mut self, index: usize) {
+        self.destructive = Some(index);
+    }
     pub fn close_actions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.summary = Some("Discard removes recovery drafts.".into());
         self.primary = Some(1);
@@ -524,12 +528,14 @@ impl Render for Decision {
                                 "Affected documents".into(),
                                 div()
                                     .id("decision-detail")
-                                    .w_full()
                                     .min_h_0()
                                     .flex_shrink()
                                     .overflow_y_scroll()
                                     .track_scroll(&self.detail_scroll)
-                                    .pr(scroll_inset)
+                                    // The scrollbar lives in the dialog's padding, so content keeps
+                                    // the same inset on both sides.
+                                    .mr(px(-12.))
+                                    .pr(px(12.))
                                     .when(compact && self.comparison.is_none(), |body| {
                                         body.text_sm().line_height(relative(1.25))
                                     })
@@ -591,7 +597,7 @@ impl Render for Decision {
                                                         "Observed disk text (read only)"
                                                     })
                                                     .child(div().h(comparison_height).child(
-                                                        Input::new(input).h_full().disabled(true),
+                                                        Input::new(input).h_full().bordered(false).disabled(true),
                                                     ))
                                             },
                                         ))
@@ -599,7 +605,7 @@ impl Render for Decision {
                                     .when_some(detail, |body, detail| body.child(detail)),
                             ))
                             .child(
-                                div().absolute().inset_0().child(
+                                div().absolute().top_0().bottom_0().left_0().right(px(-12.)).child(
                                     Scrollbar::vertical(&self.detail_scroll)
                                         .scrollbar_show(ScrollbarShow::Always),
                                 ),

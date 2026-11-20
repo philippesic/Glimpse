@@ -1117,6 +1117,7 @@ impl Render for SearchPanel {
             .when(!compact, |panel| panel.py_2().px_3())
             .w_full()
             .gap_1()
+            .when(!compact, |panel| panel.gap_2())
             .bg(cx.theme().title_bar)
             .border_b_1()
             .border_color(cx.theme().title_bar_border)

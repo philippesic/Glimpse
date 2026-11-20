@@ -48,7 +48,7 @@ impl Shell {
                 .bg(cx.theme().sidebar)
                 .border_b_1()
                 .border_color(cx.theme().sidebar_border)
-                .child(Input::new(&self.query).flex_1().min_w_0())
+                .child(Input::new(&self.query).small().flex_1().min_w_0())
                 .child(
                     Button::new("filter-close")
                         .icon(IconName::Close)
@@ -130,7 +130,10 @@ impl Shell {
                     format!("Rename {filename}")
                 },
             );
-        let input = Input::new(&self.query).flex_1().min_w(px(120. * scale));
+        let input = Input::new(&self.query)
+            .small()
+            .flex_1()
+            .min_w(px(120. * scale));
         let header = if stacked {
             let close = Button::new("panel-close")
                 .icon(IconName::Close)
@@ -207,7 +210,7 @@ impl Shell {
                 } else if search && !self.search_ui.collapsed {
                     section
                         .flex_shrink_0()
-                        .h((viewport.height * 0.42).min(px(320. * scale)))
+                        .h((viewport.height * 0.36).min(px(264. * scale)))
                 } else {
                     section.flex_shrink_0().max_h(viewport.height * 0.5)
                 }
@@ -418,7 +421,7 @@ impl Shell {
                             .items_center()
                             .gap(px(8. * scale))
                             .p(px(8. * scale))
-                            .child(Input::new(&self.query).flex_1().min_w_0())
+                            .child(Input::new(&self.query).small().flex_1().min_w_0())
                             .child(
                                 self.button("Run", "submit", cx)
                                     .disabled(!self.palette_runnable(cx)),

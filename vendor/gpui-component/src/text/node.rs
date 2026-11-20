@@ -1029,7 +1029,6 @@ impl TextMark {
             });
         }
         if self.code {
-            highlight.background_color = Some(colors.secondary);
             highlight.monospace = Some(true);
         }
         if self.link.is_some() {
