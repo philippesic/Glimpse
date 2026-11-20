@@ -4454,8 +4454,10 @@ impl Render for Shell {
         } else {
             px(0.)
         };
+        // The strip's leading inset is wider than its trailing one.
         let controls_width = |documents: Pixels, edit: Pixels| {
             actions_width
+                + px(6. * scale)
                 + (if show_documents_menu {
                     documents + px(8. * scale)
                 } else {
@@ -4549,9 +4551,6 @@ impl Render for Shell {
                 doc.input.focus_handle(cx).contains_focused(window, cx)
                     || doc.tab_focus.contains_focused(window, cx)
             });
-        let hidden_tabs = shown_tabs.as_ref().map_or(0, |shown| {
-            self.documents.len() - (shown.end() + 1 - shown.start())
-        });
         let tabs = div()
             .id("tabs")
             .w_full()
@@ -4710,24 +4709,6 @@ impl Render for Shell {
                 |row| row.pr(px(12. * scale)),
             )
             .child(div().flex_1().min_w_0().child(tabs))
-            .when(hidden_tabs > 0 && !self.request.pick, |row| {
-                row.child(
-                    Button::new("hidden-tabs")
-                        .label(format!(
-                            "{hidden_tabs} more open document{}",
-                            if hidden_tabs == 1 { "" } else { "s" }
-                        ))
-                        .display_label(format!("+{hidden_tabs}"))
-                        .tooltip("Show all open documents")
-                        .xsmall()
-                        .ghost()
-                        .text_color(cx.theme().muted_foreground)
-                        .flex_shrink_0()
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.command("open-documents", window, cx)
-                        })),
-                )
-            })
             .child(
                 div()
                     .flex()
