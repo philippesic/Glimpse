@@ -66,29 +66,32 @@ Default to System appearance with explicit Light and Dark choices. Every surface
 
 | Role | Light | Dark | Use |
 | --- | --- | --- | --- |
-| Canvas | `#FFFFFF` | `#15181E` | Source and reading surface |
-| Chrome | `#F2F4F7` | `#1D2027` | Toolbar, tabs and status |
-| Sidebar | `#F1F6FA` | `#1C2027` | Navigator |
-| Raised | `#FFFFFF` | `#252A33` | Controls and dialogs |
-| Faint | `#E6E8EC` | `#343B45` | Code blocks and quiet groups |
-| Text | `#17213A` | `#F1F3F5` | Primary content |
-| Secondary | `#56637A` | `#B5BEC9` | Paths, metadata and hints |
-| Separator | `#E1E6ED` | `#343B45` | Decorative region boundaries |
-| Control border | `#77839A` | `#8B96A5` | Necessary control boundaries |
-| Hover | `#E1E7EE` | `#39424F` | Pointer feedback |
-| Selection | `#DCEBFC` | `#243E60` | Active selection, normal text |
-| Inactive selection | `#E5EBF2` | `#3A424D` | Selection outside the focused pane |
-| Accent | `#0A6CDF` | `#409CFF` | Focus, links and modified indicator |
-| Action fill | `#0A63CE` | `#1F6FD8` | Primary button behind white text |
-| Warning | `#805600` | `#EBC378` | Partial coverage, recovery concerns |
-| Error | `#B42332` | `#FF9EAA` | Failed actions and conflicts |
-| Success | `#256B3D` | `#89D6A3` | Confirmed successful outcomes |
+| Canvas | `#FFFFFF` | `#0B0B0C` | Source and reading surface |
+| Chrome | `#F6F6F7` | `#111113` | Toolbar, path bar, tabs, search panel and status |
+| Sidebar | `#F6F6F7` | `#111113` | Navigator |
+| Raised | `#FFFFFF` | `#18181B` | Menus, popovers and dialogs |
+| Faint | `#EDEDEF` | `#1F1F23` | Secondary button fill, code blocks and quiet groups |
+| Text | `#27272A` | `#F4F4F5` | Primary content |
+| Secondary | `#5C5C65` | `#9A9AA3` | Paths, metadata, hints and resting toolbar labels |
+| Separator | `#E4E4E7` | `#1F1F23` | Decorative region boundaries |
+| Border | `#E4E4E7` | `#2A2A2F` | Outlines of menus, popovers and dialogs |
+| Control border | `#8B8B94` | `#6A6A73` | Necessary control boundaries such as text fields |
+| Hover | `#EBEBED` | `#1C1C20` | Pointer feedback |
+| Selection | `#E2E8F8` | `#1A2747` | Active selection, normal text |
+| Inactive selection | `#E9E9EC` | `#222226` | Selection outside the focused pane |
+| Accent | `#1D4ED8` | `#5A8BFF` | Focus, links and modified indicator |
+| Action fill | `#1D4ED8` | `#2F63E6` | Primary button behind white text |
+| Warning | `#9A5800` | `#F5A524` | Partial coverage, recovery concerns |
+| Error | `#C81E2B` | `#FF5C63` | Failed actions and conflicts |
+| Success | `#0F7A55` | `#34D399` | Confirmed successful outcomes |
+
+The palette follows T3 Code's neutral design language: near-white and near-black surfaces without a colour cast, one blue accent, hairline separators, and depth from soft shadows on floating surfaces rather than outlines on resting controls.
 
 Ordinary text must meet 4.5:1 contrast against its rendered background; necessary control boundaries and focus indicators target at least 3:1. Decorative separators are not sufficient control boundaries. Verify actual compositing, disabled controls, syntax colors and custom themes separately; palette calculations alone do not qualify accessibility. Keep secondary text readable instead of fading essential information.
 
 Keep resting chrome quiet. Use grouping, fill and spacing to establish controls; draw an outline where a boundary is needed, rather than boxing every action. Strong keyboard focus remains explicit. Material highlights and translucency must not weaken text or focus contrast.
 
-Selection is a tinted fill; keyboard focus adds a 2-point accent outline. Focus remains visible on selected items and in every theme. Inactive selection retains its shape and normal text with a neutral fill. A modified tab adds a dot and an accessible “Modified” state. A conflict uses an explicit label and actionable notice. Hover, activation, modification and conflict must never collapse into the same signal. Colored text always has a label, shape or other non-color equivalent.
+Selection is a rounded tinted fill with a leading marker that is accent-coloured while its list has keyboard focus and secondary-coloured otherwise. The active tab carries the same signal on its top edge for the document area. Buttons and fields show a 2-point accent outline when focused. Focus remains visible on selected items and in every theme. Inactive selection retains its shape and normal text with a neutral fill. A modified tab adds a dot and an accessible “Modified” state. A conflict uses an explicit label and actionable notice. Hover, activation, modification and conflict must never collapse into the same signal. Colored text always has a label, shape or other non-color equivalent.
 
 Use a crafted, consistent symbol family with optically balanced strokes, sizes and baseline alignment. Start with 16-point file/folder symbols and disclosure chevrons with separate hit targets. Use platform symbols where supported and permitted, or carefully drawn bundled equivalents. Avoid emoji substitutes, ornamental badges, and icons that require filesystem inspection to paint. Tooltips explain a control and its shortcut; they do not substitute for accessible names.
 

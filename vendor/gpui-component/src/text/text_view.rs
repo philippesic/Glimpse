@@ -17,7 +17,6 @@ use crate::highlighter::HighlightTheme;
 use crate::button::Button;
 use crate::menu::{DropdownMenu, PopupMenuItem};
 use crate::scroll::ScrollableElement;
-use crate::styled::FocusableExt;
 use crate::text::{
     document_text::{DocumentSource, DocumentSourceBuilder, DocumentText},
     node::CodeBlock,
@@ -66,7 +65,6 @@ fn links_menu(
         Button::new("reading-links")
             .label("Links")
             .small()
-            .outline()
             .dropdown_caret(true)
             .dropdown_menu(move |mut menu, window, _| {
                 menu = menu
@@ -1082,17 +1080,8 @@ impl Element for TextView {
             .track_focus(focus_handle)
             .size_full()
             .relative()
-            .rounded(cx.theme().radius)
-            .border_1()
-            .border_color(cx.theme().title_bar_border)
             .px(window.rem_size() * 1.25)
             .py(window.rem_size() * 0.75)
-            .focus_ring(
-                focus_handle.is_focused(window),
-                window.rem_size() / 8.,
-                window,
-                cx,
-            )
             .on_action({
                 let state = self.state.clone();
                 move |_: &input::Copy, _, cx| {

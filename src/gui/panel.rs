@@ -198,9 +198,9 @@ impl Shell {
             .flex()
             .flex_col()
             .min_h_0()
-            .bg(cx.theme().background)
+            .bg(cx.theme().title_bar)
             .border_b_1()
-            .border_color(cx.theme().border)
+            .border_color(cx.theme().title_bar_border)
             .map(|section| {
                 if takeover {
                     section.flex_1().overflow_y_scroll()

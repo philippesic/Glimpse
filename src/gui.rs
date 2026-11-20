@@ -4516,6 +4516,11 @@ impl Render for Shell {
                 }
             }
         });
+        let document_focused = self.reading_focus.contains_focused(window, cx)
+            || self.documents.iter().any(|doc| {
+                doc.input.focus_handle(cx).contains_focused(window, cx)
+                    || doc.tab_focus.contains_focused(window, cx)
+            });
         let tabs = div()
             .id("tabs")
             .w_full()
@@ -4601,10 +4606,10 @@ impl Render for Shell {
                     .px(px(2. * scale))
                     .rounded_t(px(7. * scale))
                     .border_t_2()
-                    .border_color(if active {
-                        cx.theme().ring
-                    } else {
-                        gpui::transparent_black()
+                    .border_color(match (active, document_focused) {
+                        (true, true) => cx.theme().ring,
+                        (true, false) => cx.theme().muted_foreground,
+                        _ => gpui::transparent_black(),
                     })
                     .when(active, |tab| tab.bg(cx.theme().tab_active))
                     .child(tab)

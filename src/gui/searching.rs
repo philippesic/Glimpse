@@ -554,15 +554,6 @@ impl Shell {
                         .overflow_hidden()
                         .flex_1()
                         .min_h(row_height + px(4. * scale))
-                        .border_1()
-                        .border_color(if self.search_ui.focus.is_focused(window) {
-                            cx.theme().ring
-                        } else {
-                            cx.theme().border
-                        })
-                        .when(self.search_ui.focus.is_focused(window), |results| {
-                            results.border_2()
-                        })
                         .child(
                             uniform_list(
                                 "search-hits",
@@ -741,6 +732,8 @@ impl Shell {
                                                     .justify_start()
                                                     .selected(selected)
                                                     .border_l(px(3. * scale))
+                                                    .border_y_0()
+                                                    .border_r_0()
                                                     .border_color(marker)
                                                     .when_some(fill, |row, fill| row.bg(fill))
                                                     .on_click(cx.listener(move |this, _, _, cx| {
