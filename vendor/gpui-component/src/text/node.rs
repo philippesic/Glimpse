@@ -1831,6 +1831,11 @@ impl Node {
                                         .when(row_ix < table.children.len() - 1, |this| {
                                             this.border_b_1()
                                         })
+                                        .when(row_ix == 0, |this| {
+                                            this.bg(cx.theme().muted)
+                                                .rounded_t(cx.theme().radius)
+                                                .font_semibold()
+                                        })
                                         .border_color(cx.theme().border)
                                         .flex()
                                         .flex_row()
@@ -1838,7 +1843,6 @@ impl Node {
                                             let mut cells = Vec::with_capacity(row.children.len());
                                             for (ix, cell) in row.children.iter().enumerate() {
                                                 let align = table.column_align(ix);
-                                                let is_last_col = ix == row.children.len() - 1;
                                                 let len = col_lens
                                                     .get(ix)
                                                     .copied()
@@ -1862,10 +1866,6 @@ impl Node {
                                                         .w(rems(len as f32 * 0.6 + 1.))
                                                         .px_2()
                                                         .py_1()
-                                                        .when(!is_last_col, |this| {
-                                                            this.border_r_1()
-                                                                .border_color(cx.theme().border)
-                                                        })
                                                         .child(
                                                             cell.children.render(node_cx, window, cx),
                                                         )

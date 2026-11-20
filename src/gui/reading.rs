@@ -288,7 +288,7 @@ impl Shell {
             .flex_col()
             .gap(px(8. * self.settings.ui_scale))
             .px(px(8. * self.settings.ui_scale))
-            .pb(px(8. * self.settings.ui_scale))
+            .pt(px(6. * self.settings.ui_scale))
             .when(short, |area| area.line_height(relative(1.4)))
             .text_size(font_size);
         let Some(view) = &self.reading_view else {

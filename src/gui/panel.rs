@@ -505,6 +505,8 @@ impl Shell {
                     .disabled(!enabled)
                     .selected(selected)
                     .border_l(px(3. * scale))
+                    .border_y_0()
+                    .border_r_0()
                     .border_color(marker)
                     .when_some(fill, |row, fill| row.bg(fill))
                     .child(

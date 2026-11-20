@@ -19,7 +19,7 @@ pub(super) fn scroll_reading_list(list: &ListState, key: &str, page: Pixels) -> 
 const NUMBERED_PREFIXES_1: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 const NUMBERED_PREFIXES_2: &str = "abcdefghijklmnopqrstuvwxyz";
 
-const BULLETS: [&str; 5] = ["▪", "•", "◦", "‣", "⁃"];
+const BULLETS: [&str; 5] = ["•", "◦", "▪", "‣", "⁃"];
 
 /// Returns the prefix for a list item.
 pub(super) fn list_item_prefix(ix: usize, start: Option<u64>, depth: usize) -> String {
@@ -74,9 +74,9 @@ mod tests {
         assert_eq!(list_item_prefix(6, Some(1), 2), "g. ");
         assert_eq!(list_item_prefix(0, Some(1), 1), "A. ");
         assert_eq!(list_item_prefix(0, Some(1), 2), "a. ");
-        assert_eq!(list_item_prefix(0, None, 0), "▪ ");
-        assert_eq!(list_item_prefix(0, None, 1), "• ");
-        assert_eq!(list_item_prefix(0, None, 2), "◦ ");
+        assert_eq!(list_item_prefix(0, None, 0), "• ");
+        assert_eq!(list_item_prefix(0, None, 1), "◦ ");
+        assert_eq!(list_item_prefix(0, None, 2), "▪ ");
         assert_eq!(list_item_prefix(0, None, 3), "‣ ");
         assert_eq!(list_item_prefix(0, None, 4), "⁃ ");
     }

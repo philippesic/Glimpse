@@ -195,7 +195,15 @@ impl Input {
 
         v_flex()
             .size_full()
-            .children(state.search_panel.clone())
+            .children(state.search_panel.clone().map(|panel| {
+                // The Find bar spans the editor pane edge to edge, outside the text inset.
+                div()
+                    .ml(-paddings.left)
+                    .mr(-paddings.right)
+                    .mt(-paddings.top)
+                    .mb(paddings.top)
+                    .child(panel)
+            }))
             .child(div().flex_1().child(input_state.clone()).map(|this| {
                 if let Some(last_layout) = state.last_layout.as_ref() {
                     let left = if last_layout.line_number_width.is_zero() {

@@ -260,6 +260,7 @@ impl Shell {
             .child(
                 self.command_button("edit-location", edit_label, "path", cx)
                     .ghost()
+                    .text_color(cx.theme().muted_foreground)
                     .flex_shrink_0()
                     .tooltip(paths::display(&self.current)),
             )
@@ -381,6 +382,8 @@ impl Shell {
                                     .justify_start()
                                     .selected(selected)
                                     .border_l(px(3. * scale))
+                                    .border_y_0()
+                                    .border_r_0()
                                     .border_color(marker)
                                     .when_some(fill, |row, fill| row.bg(fill))
                                     .on_click(cx.listener(move |this, _, window, cx| {

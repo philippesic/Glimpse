@@ -580,11 +580,16 @@ impl Render for Preferences {
                                         .label(label)
                                         .accessibility_role(gpui::accesskit::Role::RadioButton)
                                         .accessibility_toggled(chosen)
-                                        .map(
-                                            |button| {
-                                                if chosen { button.primary() } else { button }
-                                            },
-                                        )
+                                        .map(|button| {
+                                            if chosen {
+                                                button
+                                                    .ghost()
+                                                    .bg(cx.theme().selection)
+                                                    .text_color(cx.theme().ring)
+                                            } else {
+                                                button.ghost()
+                                            }
+                                        })
                                         .disabled(self.pending)
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.draft.system_theme = dark.is_none();
@@ -803,7 +808,10 @@ impl Render for Preferences {
                         .selected(page == self.page)
                         .map(|button| {
                             if page == self.page {
-                                button.primary()
+                                button
+                                    .ghost()
+                                    .bg(cx.theme().selection)
+                                    .text_color(cx.theme().ring)
                             } else {
                                 button.ghost()
                             }
@@ -927,6 +935,9 @@ impl Render for Preferences {
                             .flex()
                             .flex_wrap()
                             .gap_2()
+                            .pt(px(12.))
+                            .border_t_1()
+                            .border_color(cx.theme().title_bar_border)
                             .child(
                                 Button::new("reload-preferences")
                                     .small()

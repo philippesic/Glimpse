@@ -625,6 +625,7 @@ impl Render for Decision {
                                     .flex_wrap()
                                     .justify_end()
                                     .gap_2()
+                                    .when(!compact, |row| row.pt_1())
                                     .when(narrow, |row| row.gap_1())
                                     .children(self.actions.iter().enumerate().map(|(i, label)| {
                                         let label = if narrow
@@ -656,7 +657,7 @@ impl Render for Decision {
                                                 },
                                             )
                                             .when(self.destructive == Some(i), |button| {
-                                                button.danger()
+                                                button.text_color(cx.theme().danger)
                                             })
                                             .on_click(
                                                 cx.listener(move |_, _, _, cx| cx.emit(Choice(i))),

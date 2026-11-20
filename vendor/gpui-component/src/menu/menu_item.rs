@@ -2,7 +2,7 @@ use crate::{h_flex, ActiveTheme, Disableable, StyledExt};
 use gpui::{
     prelude::FluentBuilder as _, AnyElement, App, ClickEvent, ElementId, InteractiveElement,
     IntoElement, MouseButton, ParentElement, RenderOnce, SharedString,
-    StatefulInteractiveElement as _, StyleRefinement, Styled, Window,
+    StatefulInteractiveElement as _, StyleRefinement, Styled, Window, px,
 };
 use smallvec::SmallVec;
 use std::rc::Rc;
@@ -146,21 +146,19 @@ impl RenderOnce for MenuItemElement {
             .when_some(self.on_hover, |this, on_hover| {
                 this.on_hover(move |hovered, window, cx| (on_hover)(hovered, window, cx))
             })
+            .border_l(px(3.))
+            .border_color(cx.theme().transparent)
             .when(!self.disabled, |this| {
-                this.group_hover(self.group_name, |this| {
-                    this.bg(cx.theme().primary)
-                        .text_color(cx.theme().primary_foreground)
-                })
-                .when(self.selected, |this| {
-                    this.bg(cx.theme().primary)
-                        .text_color(cx.theme().primary_foreground)
-                })
-                .when_some(self.on_click, |this, on_click| {
-                    this.on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                        cx.stop_propagation();
+                this.group_hover(self.group_name, |this| this.bg(cx.theme().list_hover))
+                    .when(self.selected, |this| {
+                        this.bg(cx.theme().selection).border_color(cx.theme().ring)
                     })
-                    .on_click(move |event, window, cx| on_click(event, window, cx))
-                })
+                    .when_some(self.on_click, |this, on_click| {
+                        this.on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                            cx.stop_propagation();
+                        })
+                        .on_click(move |event, window, cx| on_click(event, window, cx))
+                    })
             })
             .when(self.disabled, |this| {
                 this.text_color(cx.theme().muted_foreground)

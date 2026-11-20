@@ -1176,7 +1176,8 @@ impl PopupMenu {
                 .h_auto()
                 .p_0()
                 .my_0p5()
-                .mx_neg_1()
+                .mx_2()
+                .border_l_0()
                 .h(px(1.))
                 .bg(cx.theme().border)
                 .disabled(true),
@@ -1234,12 +1235,10 @@ impl PopupMenu {
                     .then(|| self.render_key_binding(action, window, cx))
                     .flatten()
                     .map(|key| {
-                        key.text_color(if selected {
-                            cx.theme().primary_foreground
-                        } else if *disabled {
-                            cx.theme().muted_foreground
+                        key.text_color(if *disabled {
+                            cx.theme().muted_foreground.opacity(0.6)
                         } else {
-                            cx.theme().popover_foreground
+                            cx.theme().muted_foreground
                         })
                     });
                 let full_label = label.clone();

@@ -39,6 +39,7 @@ impl Render for Divider {
             .flex_shrink_0()
             .cursor_col_resize()
             .track_focus(&self.focus)
+            .bg(cx.theme().sidebar)
             .map(|style| {
                 if focused {
                     style.bg(cx.theme().ring)
@@ -46,7 +47,7 @@ impl Render for Divider {
                     style.hover(|style| style.bg(cx.theme().title_bar_border))
                 }
             })
-            .border_l_1()
+            .border_r_1()
             .border_color(cx.theme().title_bar_border)
             .on_mouse_down(
                 MouseButton::Left,

@@ -316,7 +316,6 @@ impl Shell {
             .compact()
             .ghost()
             .text_color(cx.theme().muted_foreground)
-            .h(px(28. * self.settings.ui_scale))
             .flex_shrink_0()
             .dropdown_menu_with_anchor(Corner::TopRight, move |mut menu, window, _| {
                 let viewport = window.viewport_size();
@@ -346,10 +345,15 @@ impl Shell {
                         Some(folder) => labels::document(file, "", folder, " — ", room, &measure),
                         None => labels::filename(file, "", filename.as_ref(), room, &measure),
                     };
+                    let visible_status = status
+                        .map(|status| status.trim_end_matches("Current").trim_end_matches(" · "));
                     let item = match status {
                         Some(status) => PopupMenuItem::new(format!("{title} · {status}"))
                             .display_label(caption)
-                            .detail(*status),
+                            .when_some(
+                                visible_status.filter(|status| !status.is_empty()),
+                                |item, status| item.detail(status),
+                            ),
                         None => PopupMenuItem::new(title.clone()).display_label(caption),
                     };
                     menu = menu.item(item.checked(*current).on_click(move |_, window, cx| {

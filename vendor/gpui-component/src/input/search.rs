@@ -9,9 +9,9 @@ use std::{
 };
 
 use gpui::{
-    App, AppContext as _, Context, Empty, Entity, FocusHandle, Focusable, Half,
-    InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Render, Styled,
-    Subscription, WeakEntity, Window, actions, prelude::FluentBuilder as _, div, px, rems,
+    App, AppContext as _, Context, Empty, Entity, FocusHandle, Focusable, InteractiveElement as _,
+    IntoElement, KeyBinding, ParentElement as _, Render, Styled, Subscription, WeakEntity, Window,
+    actions, prelude::FluentBuilder as _, div, px, rems,
 };
 use ropey::{LineType, Rope, RopeBuilder, extra::esoterica::ropes_are_instances};
 
@@ -709,7 +709,7 @@ impl SearchPanel {
         let panel = cx.entity().downgrade();
         Button::new("find-options")
             .small()
-            .outline()
+            .ghost()
             .icon(IconName::Ellipsis)
             .tooltip("Find options")
             .dropdown_menu(move |mut menu, window, _| {
@@ -947,9 +947,12 @@ impl Render for SearchPanel {
                         .small()
                         .map(|button| {
                             if self.case_insensitive {
-                                button.outline()
+                                button.ghost()
                             } else {
-                                button.primary()
+                                button
+                                    .ghost()
+                                    .bg(cx.theme().selection)
+                                    .text_color(cx.theme().ring)
                             }
                         })
                         .icon(IconName::CaseSensitive)
@@ -964,9 +967,12 @@ impl Render for SearchPanel {
                         .small()
                         .map(|button| {
                             if self.whole_word {
-                                button.primary()
+                                button
+                                    .ghost()
+                                    .bg(cx.theme().selection)
+                                    .text_color(cx.theme().ring)
                             } else {
-                                button.outline()
+                                button.ghost()
                             }
                         })
                         .label("Word")
@@ -981,9 +987,12 @@ impl Render for SearchPanel {
                         .small()
                         .map(|button| {
                             if self.replace_mode {
-                                button.primary()
+                                button
+                                    .ghost()
+                                    .bg(cx.theme().selection)
+                                    .text_color(cx.theme().ring)
                             } else {
-                                button.outline()
+                                button.ghost()
                             }
                         })
                         .icon(IconName::Replace)
@@ -1000,7 +1009,7 @@ impl Render for SearchPanel {
                 .child(
                     Button::new("prev")
                         .small()
-                        .outline()
+                        .ghost()
                         .icon(IconName::ChevronLeft)
                         .tooltip("Previous match")
                         .disabled(!has_matches)
@@ -1011,7 +1020,7 @@ impl Render for SearchPanel {
                 .child(
                     Button::new("next")
                         .small()
-                        .outline()
+                        .ghost()
                         .icon(IconName::ChevronRight)
                         .tooltip("Next match")
                         .disabled(!has_matches)
@@ -1047,10 +1056,9 @@ impl Render for SearchPanel {
             .when(!compact, |panel| panel.py_2().px_3())
             .w_full()
             .gap_1()
-            .bg(cx.theme().popover)
+            .bg(cx.theme().title_bar)
             .border_b_1()
-            .rounded(cx.theme().radius.half())
-            .border_color(cx.theme().border)
+            .border_color(cx.theme().title_bar_border)
             .child(
                 gpui::canvas(
                     move |bounds, window, cx| {
@@ -1101,7 +1109,6 @@ impl Render for SearchPanel {
                             Button::new("replace-one")
                                 .when(compact, |button| button.xsmall())
                                 .when(!compact, |button| button.small())
-                                .outline()
                                 .flex_shrink_0()
                                 .label(t!("Input.Replace"))
                                 .disabled(!has_matches)
@@ -1113,7 +1120,6 @@ impl Render for SearchPanel {
                             Button::new("replace-all")
                                 .when(compact, |button| button.xsmall())
                                 .when(!compact, |button| button.small())
-                                .outline()
                                 .flex_shrink_0()
                                 .label(t!("Input.Replace All"))
                                 .disabled(!has_matches)

@@ -84,8 +84,8 @@ pub fn apply(settings: &Settings, window: &mut Window, cx: &mut App) -> Option<S
     colors.tab_active = color(palette.canvas);
     colors.tab_foreground = color(palette.secondary);
     colors.tab_active_foreground = color(palette.text);
-    colors.scrollbar_thumb = color(palette.secondary);
-    colors.scrollbar_thumb_hover = color(palette.text);
+    colors.scrollbar_thumb = color(palette.control_border);
+    colors.scrollbar_thumb_hover = color(palette.secondary);
     colors.danger = color(palette.error);
     colors.danger_hover = color(palette.error);
     colors.danger_active = color(palette.error);
@@ -156,19 +156,19 @@ const LIGHT: Palette = Palette {
 };
 
 const DARK: Palette = Palette {
-    canvas: 0x0B0B0C,
-    chrome: 0x111113,
-    sidebar: 0x111113,
-    raised: 0x18181B,
-    faint: 0x1F1F23,
-    text: 0xF4F4F5,
-    secondary: 0x9A9AA3,
-    separator: 0x1F1F23,
-    border: 0x2A2A2F,
-    control_border: 0x6A6A73,
-    hover: 0x1C1C20,
+    canvas: 0x0A0A0A,
+    chrome: 0x111111,
+    sidebar: 0x111111,
+    raised: 0x171717,
+    faint: 0x1F1F1F,
+    text: 0xF5F5F5,
+    secondary: 0x9C9C9C,
+    separator: 0x1F1F1F,
+    border: 0x2A2A2A,
+    control_border: 0x6B6B6B,
+    hover: 0x1C1C1C,
     selection: 0x1A2747,
-    accent: 0x5A8BFF,
+    accent: 0x6B98FF,
     action: 0x2F63E6,
     action_hover: 0x2857D6,
     action_text: 0xFFFFFF,
@@ -193,7 +193,7 @@ pub(super) fn list_row(selected: bool, active: bool, cx: &App) -> (gpui::Hsla, O
 /// Neutral fill for a selection whose pane does not have keyboard focus.
 pub(super) fn inactive_selection(cx: &App) -> gpui::Hsla {
     gpui::rgb(if cx.theme().is_dark() {
-        0x222226
+        0x232323
     } else {
         0xE9E9EC
     })

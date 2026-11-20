@@ -1081,7 +1081,7 @@ impl Element for TextView {
             .size_full()
             .relative()
             .px(window.rem_size() * 1.25)
-            .py(window.rem_size() * 0.75)
+            .pt(window.rem_size() * 0.75)
             .on_action({
                 let state = self.state.clone();
                 move |_: &input::Copy, _, cx| {

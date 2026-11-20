@@ -3989,7 +3989,7 @@ impl Render for Shell {
             .child(if tier >= 5 {
                 self.icon_button("find-files", "Find Files", IconName::Search, cx)
             } else {
-                self.tool_button("find-files", "Find Files", Some(IconName::Search), cx)
+                self.tool_button("find-files", "Find Files", None, cx)
             })
             .when(tier <= 1, |toolbar| {
                 toolbar.child(self.tool_button("find-text", "Find Text", None, cx))
@@ -4238,8 +4238,13 @@ impl Render for Shell {
                 } else {
                     "No filenames match the filter".into()
                 };
+                let failed = self.listing_error.is_some();
+                let scale = self.settings.ui_scale;
                 navigator.child(
-                    div().p_2().text_sm()
+                    div().m(px(6. * scale)).px(px(10. * scale)).py(px(8. * scale)).text_sm()
+                        .rounded(px(7. * scale))
+                        .when(failed, |notice| notice.bg(cx.theme().warning.opacity(0.1)).border_l(px(3. * scale)).border_color(cx.theme().warning))
+                        .when(!failed, |notice| notice.text_color(cx.theme().muted_foreground))
                         .child(accessibility::label("listing-state-text", message.clone(), div().id("listing-state").whitespace_normal().line_clamp(4).child(message.clone())
                             .tooltip(move |window,cx| gpui_component::tooltip::Tooltip::new(message.clone()).build(window,cx))))
                         .child(
@@ -4664,48 +4669,58 @@ impl Render for Shell {
                 |row| row.pr(px(8. * scale)),
             )
             .child(div().flex_1().min_w_0().child(tabs))
-            .when(tab_conflict, |row| {
-                row.child(accessibility::message(
-                    "external-conflict",
-                    "Changed on disk. Local text retained; ordinary Save is blocked.".into(),
-                    div().size_0(),
-                ))
-                .child(self.conflict_menu(true, cx))
-            })
-            .when(show_documents_menu, |row| {
-                row.child(self.open_documents_menu(
-                    open_documents_requested,
-                    footer_height,
-                    compact_tab_controls,
-                    &tab_parents,
-                    &tab_filenames,
-                    cx,
-                ))
-            })
-            .when(document_actions, |row| {
-                row.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .flex_shrink_0()
-                        .gap(px(8. * scale))
-                        .child(self.button("Save", "save", cx))
-                        .when(active_markdown, |row| {
-                            row.child(self.button(read_label, "read", cx))
-                        })
-                        .when(keep_tab, |row| {
-                            row.child(self.button("Keep Preview Tab", "keep-tab", cx))
-                        }),
-                )
-            })
-            .when(edit_source, |row| {
-                row.child(
-                    self.button("Edit Source", "read", cx)
-                        .when(compact_tab_controls, |button| button.display_label("Edit"))
-                        .flex_shrink_0(),
-                )
-            })
-            .when(document_actions, |row| row.child(self.document_menu(cx)))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_shrink_0()
+                    .gap(px(8. * scale))
+                    // Centre the controls on the tab labels, which sit below a 2-point top edge.
+                    .pt(px(if short { 2. } else { 6. } * scale))
+                    .when(tab_conflict, |row| {
+                        row.child(accessibility::message(
+                            "external-conflict",
+                            "Changed on disk. Local text retained; ordinary Save is blocked."
+                                .into(),
+                            div().size_0(),
+                        ))
+                        .child(self.conflict_menu(true, cx))
+                    })
+                    .when(show_documents_menu, |row| {
+                        row.child(self.open_documents_menu(
+                            open_documents_requested,
+                            footer_height,
+                            compact_tab_controls,
+                            &tab_parents,
+                            &tab_filenames,
+                            cx,
+                        ))
+                    })
+                    .when(document_actions, |row| {
+                        row.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .flex_shrink_0()
+                                .gap(px(8. * scale))
+                                .child(self.button("Save", "save", cx))
+                                .when(active_markdown, |row| {
+                                    row.child(self.button(read_label, "read", cx))
+                                })
+                                .when(keep_tab, |row| {
+                                    row.child(self.button("Keep Preview Tab", "keep-tab", cx))
+                                }),
+                        )
+                    })
+                    .when(edit_source, |row| {
+                        row.child(
+                            self.button("Edit Source", "read", cx)
+                                .when(compact_tab_controls, |button| button.display_label("Edit"))
+                                .flex_shrink_0(),
+                        )
+                    })
+                    .when(document_actions, |row| row.child(self.document_menu(cx))),
+            )
             .into_any_element();
         let mut content = div()
             .flex_1()

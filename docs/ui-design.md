@@ -66,20 +66,20 @@ Default to System appearance with explicit Light and Dark choices. Every surface
 
 | Role | Light | Dark | Use |
 | --- | --- | --- | --- |
-| Canvas | `#FFFFFF` | `#0B0B0C` | Source and reading surface |
-| Chrome | `#F6F6F7` | `#111113` | Toolbar, path bar, tabs, search panel and status |
-| Sidebar | `#F6F6F7` | `#111113` | Navigator |
-| Raised | `#FFFFFF` | `#18181B` | Menus, popovers and dialogs |
-| Faint | `#EDEDEF` | `#1F1F23` | Secondary button fill, code blocks and quiet groups |
-| Text | `#27272A` | `#F4F4F5` | Primary content |
-| Secondary | `#5C5C65` | `#9A9AA3` | Paths, metadata, hints and resting toolbar labels |
-| Separator | `#E4E4E7` | `#1F1F23` | Decorative region boundaries |
-| Border | `#E4E4E7` | `#2A2A2F` | Outlines of menus, popovers and dialogs |
-| Control border | `#8B8B94` | `#6A6A73` | Necessary control boundaries such as text fields |
-| Hover | `#EBEBED` | `#1C1C20` | Pointer feedback |
+| Canvas | `#FFFFFF` | `#0A0A0A` | Source and reading surface |
+| Chrome | `#F6F6F7` | `#111111` | Toolbar, path bar, tabs, search panel and status |
+| Sidebar | `#F6F6F7` | `#111111` | Navigator |
+| Raised | `#FFFFFF` | `#171717` | Menus, popovers and dialogs |
+| Faint | `#EDEDEF` | `#1F1F1F` | Secondary button fill, code blocks and quiet groups |
+| Text | `#27272A` | `#F5F5F5` | Primary content |
+| Secondary | `#5C5C65` | `#9C9C9C` | Paths, metadata, hints and resting toolbar labels |
+| Separator | `#E4E4E7` | `#1F1F1F` | Decorative region boundaries |
+| Border | `#E4E4E7` | `#2A2A2A` | Outlines of menus, popovers and dialogs |
+| Control border | `#8B8B94` | `#6B6B6B` | Necessary control boundaries such as text fields |
+| Hover | `#EBEBED` | `#1C1C1C` | Pointer feedback |
 | Selection | `#E2E8F8` | `#1A2747` | Active selection, normal text |
-| Inactive selection | `#E9E9EC` | `#222226` | Selection outside the focused pane |
-| Accent | `#1D4ED8` | `#5A8BFF` | Focus, links and modified indicator |
+| Inactive selection | `#E9E9EC` | `#232323` | Selection outside the focused pane |
+| Accent | `#1D4ED8` | `#6B98FF` | Focus, links and modified indicator |
 | Action fill | `#1D4ED8` | `#2F63E6` | Primary button behind white text |
 | Warning | `#9A5800` | `#F5A524` | Partial coverage, recovery concerns |
 | Error | `#C81E2B` | `#FF5C63` | Failed actions and conflicts |
