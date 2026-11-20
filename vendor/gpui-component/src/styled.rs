@@ -586,7 +586,7 @@ impl<T: ParentElement + Styled + Sized> FocusableExt<T> for T {
                 .unwrap_or_default(),
         };
 
-        // Update the radius based on element's corner radii and the ring border width.
+        // The ring follows the element's own corner radii.
         let radius = Corners::<Pixels> {
             top_left: style
                 .corner_radii
