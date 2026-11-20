@@ -5,6 +5,7 @@ mod decision;
 mod destination;
 mod external;
 mod keyboard;
+mod labels;
 mod menus;
 mod modal;
 mod notice;
@@ -36,7 +37,6 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
-use unicode_segmentation::UnicodeSegmentation;
 
 pub fn run(request: cli::Request, data_dir: PathBuf, launch_folder: PathBuf) {
     platform::configure_allocations();
@@ -306,6 +306,7 @@ struct Shell {
     visible_key: Option<(u64, String, bool)>,
     visible_entries: std::sync::Arc<Vec<usize>>,
     listing_buffer: Vec<Entry>,
+    navigation_hints: HashMap<String, paths::LabelCue>,
     listing_streaming: bool,
     listing_error: Option<String>,
     listing_waiter: Option<Task<()>>,
@@ -341,6 +342,8 @@ struct Shell {
     status: String,
     last_saved: Option<(u64, u64)>,
     open_failure: Option<notice::Failure>,
+    notice_focus: FocusHandle,
+    notice_details_focus: FocusHandle,
     font_warning: Option<String>,
     window_title: String,
     warnings: Vec<String>,
@@ -575,6 +578,7 @@ impl Shell {
             visible_key: None,
             visible_entries: Default::default(),
             listing_buffer: vec![],
+            navigation_hints: Default::default(),
             listing_streaming: true,
             listing_error: None,
             listing_waiter: None,
@@ -610,6 +614,8 @@ impl Shell {
             status: String::new(),
             last_saved: None,
             open_failure: None,
+            notice_focus: cx.focus_handle(),
+            notice_details_focus: cx.focus_handle().tab_stop(true),
             font_warning: None,
             window_title: String::new(),
             warnings: Vec::new(),
@@ -1655,7 +1661,10 @@ impl Shell {
                     return;
                 }
                 let ticket = self.panel_revision;
-                let job = if !paths::single_name(&value) {
+                let job = if value.is_empty() {
+                    self.query_error = Some("Enter a name.".into());
+                    None
+                } else if !paths::single_name(&value) {
                     self.query_error = Some("Enter a single name without a folder path.".into());
                     None
                 } else if self.panel == Some(Panel::Rename) {
@@ -1720,6 +1729,7 @@ impl Shell {
             .then(|| window.focused(cx))
             .flatten();
         let mut listing_changed = false;
+        let mut navigation_hints = HashMap::new();
         while let Ok(batch) = self.directories.replies.try_recv() {
             if batch.path == self.current && batch.generation == self.listing_id {
                 if self.listing_buffer.is_empty() && !batch.entries.is_empty() {
@@ -1732,6 +1742,7 @@ impl Shell {
                 self.listing_buffer.extend(batch.entries);
                 listing_changed = true;
                 self.listing_done = batch.done;
+                navigation_hints = batch.filename_hints;
                 if batch.done {
                     glimpse::metrics::event(
                         "directory-complete",
@@ -1782,6 +1793,7 @@ impl Shell {
                 } else {
                     self.listing_buffer.clone()
                 });
+                self.navigation_hints = navigation_hints;
                 self.entries_revision += 1;
                 glimpse::metrics::event(
                     "directory-installed",
@@ -2602,7 +2614,10 @@ impl Shell {
                             }
                             Err(error) => {
                                 self.trash_needs_selection = false;
-                                self.status = format!("Could not move to Trash. {error}");
+                                self.status = format!(
+                                    "Could not move to Trash. {error}\n{}",
+                                    paths::name(&path)
+                                );
                             }
                         }
                     }
@@ -2630,6 +2645,7 @@ impl Shell {
                     .and_then(|i| self.hits.get(i))
                     .map(|hit| (hit.path.clone(), hit.line));
                 self.search_ui.duplicate_parents = std::sync::Arc::new(result.duplicate_parents);
+                self.search_ui.filename_hints = std::sync::Arc::new(result.filename_hints);
                 self.hits = std::sync::Arc::new(result.hits);
                 self.search_ui.selection = selected
                     .and_then(|(path, line)| {
@@ -2756,7 +2772,10 @@ impl Shell {
             self.checks.invalidate(doc.id);
             doc.deferred_external = None;
             doc.saving = true;
-            let text = glimpse::io::TextSnapshot::Revision(doc.input.read(cx).text().clone());
+            let text = doc.input.update(cx, |input, _| {
+                input.begin_undo_group();
+                glimpse::io::TextSnapshot::Revision(input.text().clone())
+            });
             self.io.send(Job::Save {
                 id: doc.id,
                 disk: doc.disk.clone(),
@@ -3690,10 +3709,28 @@ impl Shell {
             }
             areas.push(2);
         }
+        if let Some(failure) = &self.open_failure {
+            let anchor = match &failure.return_focus {
+                Some(focus) if focus == &self.nav_focus => 1,
+                Some(focus)
+                    if focus == &self.search_ui.focus || focus == &self.query.focus_handle(cx) =>
+                {
+                    0
+                }
+                _ => 2,
+            };
+            let position = areas
+                .iter()
+                .position(|&area| area == anchor)
+                .map_or(areas.len(), |index| index + 1);
+            areas.insert(position, 4);
+        }
         if areas.is_empty() {
             return;
         }
-        let current = if self.query.focus_handle(cx).contains_focused(window, cx)
+        let current = if self.notice_focus.contains_focused(window, cx) {
+            Some(4)
+        } else if self.query.focus_handle(cx).contains_focused(window, cx)
             || self.search_ui.focus.is_focused(window)
         {
             Some(0)
@@ -3721,6 +3758,7 @@ impl Shell {
             0 => self.query.update(cx, |input, cx| input.focus(window, cx)),
             1 => window.focus(&self.nav_focus),
             3 => window.focus(&self.conflict_focus),
+            4 => window.focus(&self.notice_details_focus),
             _ => {
                 if self.reading() {
                     self.reading_focus.focus(window);
@@ -4234,15 +4272,16 @@ impl Render for Shell {
                                 let path = entry.path.clone();
                                 let cursor = this.selection.as_ref() == Some(&path);
                                 let selected = cursor && !this.trash_needs_selection;
-                                let cursor_border = if cursor && focused && !selected {
+                                let cursor_border = if cursor && (focused || this.navigator_menu.is_some()) && !selected {
                                     cx.theme().ring
                                 } else {
                                     gpui::transparent_black()
                                 };
                                 let tooltip = paths::display(&path);
                                 let name = paths::name(&path);
-                                let caption =
-                                    decision::abbreviate_folder(&name, name_width, &measure);
+                                let caption = labels::filename(
+                                    &name, "", this.navigation_hints.get(&name), name_width, &measure,
+                                );
                                 let icon = if entry.symlink {
                                     IconName::ExternalLink
                                 } else if entry.directory {
@@ -4377,9 +4416,21 @@ impl Render for Shell {
         } else {
             controls_width(documents_full, edit_full)
         };
-        let tab_width = narrow.then(|| {
-            (window.viewport_size().width - tab_controls_width - close_width).max(rem * 1.5)
-        });
+        let navigator_width = if !narrow && self.navigator_visible {
+            nav_width + px(8.)
+        } else {
+            px(0.)
+        };
+        let tab_width =
+            (window.viewport_size().width - navigator_width - tab_controls_width - close_width)
+                .max(rem * 1.5);
+        let tab_parents =
+            paths::parent_hints(self.documents.iter().map(|doc| doc.disk.path.as_path()));
+        let tab_filenames = paths::filename_hints(
+            self.documents
+                .iter()
+                .filter_map(|doc| doc.disk.path.file_name()),
+        );
         // Like a scrolling notebook, the strip shows the current tab and as many neighbours as
         // fit whole, from widths measured in the last frame, so no fragment of a tab is left at
         // an edge. Hidden tabs stay reachable with Ctrl+Tab, the arrow keys and Documents.
@@ -4443,16 +4494,27 @@ impl Render for Shell {
                 );
                 let dirty = doc.dirty(cx);
                 let active = Some(id) == self.active;
-                // The warning button beside the tabs already marks the active conflict.
-                let title = format!(
-                    "{name}{}{}",
-                    if dirty { " •" } else { "" },
-                    if doc.external.is_some() && !(active && tab_conflict) {
-                        " (conflict)"
-                    } else {
-                        ""
+                let suffix = match (dirty, doc.external.is_some() && !(active && tab_conflict)) {
+                    (false, false) => "",
+                    (true, false) => " •",
+                    (false, true) => " (conflict)",
+                    (true, true) => " • (conflict)",
+                };
+                let filename = paths::name(&doc.disk.path);
+                let measure = |text: &SharedString| Self::path_label_width(window, text);
+                let text_width = (tab_width - rem * 0.75 - px(2.)).max(px(0.));
+                let caption = match tab_parents.get(&doc.disk.path) {
+                    Some(folder) => {
+                        labels::document(&filename, suffix, folder, " — ", text_width, &measure)
                     }
-                );
+                    None => labels::filename(
+                        &filename,
+                        suffix,
+                        tab_filenames.get(&filename),
+                        text_width,
+                        &measure,
+                    ),
+                };
                 let spoken = [
                     Some(name.as_str()),
                     dirty.then_some("unsaved changes"),
@@ -4468,7 +4530,8 @@ impl Render for Shell {
                     .tab_stop(active)
                     .accessibility_role(gpui::accesskit::Role::Tab)
                     .label(spoken)
-                    .display_label(title.clone())
+                    .max_w(tab_width)
+                    .display_label(caption)
                     .tooltip(paths::display(&doc.disk.path))
                     .ghost()
                     .small()
@@ -4479,36 +4542,6 @@ impl Render for Shell {
                         cx.theme().tab_foreground
                     })
                     .when(active, |tab| tab.bg(cx.theme().tab_active))
-                    .when_some(tab_width, |tab, width| {
-                        let text_width = (width - window.rem_size() * 0.75 - px(2.)).max(px(0.));
-                        let measure = |text: &SharedString| Self::path_label_width(window, text);
-                        let mut caption = decision::abbreviate_folder(&title, text_width, &measure);
-                        let label =
-                            if doc.preview && doc.external.is_none() && caption.as_ref() != title {
-                                caption = decision::abbreviate_folder(&name, text_width, &measure);
-                                &name
-                            } else {
-                                &title
-                            };
-                        if caption.as_ref() != label {
-                            let filename = paths::name(&doc.disk.path);
-                            if let Some(folder) = name
-                                .strip_prefix(&filename)
-                                .and_then(|suffix| suffix.strip_prefix(" — "))
-                            {
-                                let suffix = format!("… {folder}{}", &label[name.len()..]);
-                                for (offset, _) in filename.grapheme_indices(true).skip(1) {
-                                    let candidate =
-                                        format!("{}{suffix}", &filename[..offset]).into();
-                                    if measure(&candidate) > text_width {
-                                        break;
-                                    }
-                                    caption = candidate;
-                                }
-                            }
-                        }
-                        tab.max_w(width).display_label(caption)
-                    })
                     .selected(active)
                     .when(doc.preview, |tab| tab.italic_label())
                     .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
@@ -4593,6 +4626,8 @@ impl Render for Shell {
                     open_documents_requested,
                     footer_height,
                     compact_tab_controls,
+                    &tab_parents,
+                    &tab_filenames,
                     cx,
                 ))
             })
@@ -4891,19 +4926,32 @@ impl Render for Shell {
                             Some(warning) => format!("{status} · {warning}"),
                             None => status.to_owned(),
                         };
+                        let status = div()
+                            .id("status-message")
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .map(|status| {
+                                if let Some((reason, target)) = message.split_once('\n') {
+                                    let line = |text: &str| {
+                                        div()
+                                            .truncate()
+                                            .line_height(px(13.5 * scale))
+                                            .child(text.to_owned())
+                                    };
+                                    status.child(line(reason)).child(line(target))
+                                } else {
+                                    status.child(message.clone())
+                                }
+                            });
+                        let tooltip = message.clone();
                         footer.child(accessibility::message(
                             "application-status",
-                            message.clone(),
-                            div()
-                                .id("status-message")
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .child(message.clone())
-                                .tooltip(move |window, cx| {
-                                    gpui_component::tooltip::Tooltip::new(message.clone())
-                                        .build(window, cx)
-                                }),
+                            message,
+                            status.tooltip(move |window, cx| {
+                                gpui_component::tooltip::Tooltip::new(tooltip.clone())
+                                    .build(window, cx)
+                            }),
                         ))
                     },
                 )

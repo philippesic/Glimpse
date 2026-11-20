@@ -106,6 +106,30 @@ impl Shell {
                 run.disabled(!self.palette_runnable(cx))
             })
         });
+        let title = self
+            .rename_path
+            .as_ref()
+            .filter(|_| panel == Panel::Rename)
+            .map_or_else(
+                || title.to_owned(),
+                |path| {
+                    let file = paths::name(path);
+                    let measure = |text: &SharedString| Self::path_label_width(window, text);
+                    let room = if stacked {
+                        viewport.width - px(76. * scale)
+                    } else {
+                        viewport.width * 0.32
+                    };
+                    let filename = labels::filename(
+                        &file,
+                        "",
+                        None,
+                        room - measure(&"Rename ".into()),
+                        &measure,
+                    );
+                    format!("Rename {filename}")
+                },
+            );
         let input = Input::new(&self.query).flex_1().min_w(px(120. * scale));
         let header = if stacked {
             let close = Button::new("panel-close")
@@ -136,7 +160,7 @@ impl Shell {
                                         .child(self.search_scope_button(true, window, cx)),
                                 )
                             } else {
-                                row.child(div().flex_1().min_w_0().truncate().child(title))
+                                row.child(div().flex_1().min_w_0().truncate().child(title.clone()))
                             }
                         })
                         .child(close),
@@ -146,6 +170,9 @@ impl Shell {
                         .flex()
                         .items_center()
                         .gap(px(8. * scale))
+                        .when(panel == Panel::Rename, |row| {
+                            row.child(div().flex_shrink_0().child("New Name"))
+                        })
                         .child(input)
                         .children(submit),
                 )
@@ -157,7 +184,10 @@ impl Shell {
                 .px(px(8. * scale))
                 .py(px(6. * scale))
                 .flex_shrink_0()
-                .child(div().flex_shrink_0().child(title))
+                .child(div().flex_shrink_0().child(title.clone()))
+                .when(panel == Panel::Rename, |row| {
+                    row.child(div().flex_shrink_0().child("New Name"))
+                })
                 .child(input)
                 .children(submit)
                 .child(self.button("Close", "dismiss", cx))
@@ -215,7 +245,7 @@ impl Shell {
             ),
             _ => section,
         };
-        let element = accessibility::group("panel-section", title.into(), section);
+        let element = accessibility::group("panel-section", title, section);
         if takeover {
             div()
                 .flex_1()

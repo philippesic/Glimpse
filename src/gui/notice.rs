@@ -3,7 +3,7 @@ use super::*;
 pub(super) struct Failure {
     pub path: PathBuf,
     message: String,
-    return_focus: Option<FocusHandle>,
+    pub(super) return_focus: Option<FocusHandle>,
     above_row: bool,
 }
 
@@ -44,11 +44,24 @@ impl Shell {
                     )
                 })
         };
+        let previous = self
+            .open_failure
+            .as_ref()
+            .filter(|failure| failure.path == path);
+        let inside = self.notice_focus.contains_focused(window, cx);
         self.open_failure = Some(Failure {
             path,
             message,
-            return_focus: window.focused(cx),
-            above_row,
+            return_focus: if inside {
+                previous.and_then(|failure| failure.return_focus.clone())
+            } else {
+                window.focused(cx)
+            },
+            above_row: if inside {
+                previous.is_some_and(|failure| failure.above_row)
+            } else {
+                above_row
+            },
         });
     }
 
@@ -141,6 +154,7 @@ impl Shell {
         };
         div()
             .id("open-failure-overlay")
+            .track_focus(&self.notice_focus)
             .absolute()
             .right_0()
             .w(width)
@@ -170,7 +184,6 @@ impl Shell {
             failure.message
         );
         let retry_path = path.clone();
-        let return_focus = failure.return_focus.clone();
         self.notice(cx)
             .occlude()
             .child(self.notice_label(
@@ -182,6 +195,7 @@ impl Shell {
             ))
             .child(
                 Button::new("open-failure-details")
+                    .with_focus_handle(self.notice_details_focus.clone())
                     .label("Details")
                     .small()
                     .outline()
@@ -223,24 +237,81 @@ impl Shell {
                     .small()
                     .outline()
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.clear_open_failure();
-                        let navigator_shown = if this.narrow(window) {
-                            this.navigation_only
-                        } else {
-                            this.navigator_visible
-                        };
-                        if let Some(focus) = &return_focus
-                            && ((focus == &this.nav_focus && navigator_shown)
-                                || (this.panel.is_some()
-                                    && (focus == &this.query.focus_handle(cx)
-                                        || focus == &this.search_ui.focus)))
-                        {
-                            window.focus(focus);
-                        } else {
-                            this.focus(window, cx);
-                        }
-                        cx.notify();
+                        this.dismiss_open_failure(window, cx);
                     })),
             )
+    }
+
+    fn focus_failure_invoker(
+        &self,
+        focus: Option<FocusHandle>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let navigator_shown = if self.narrow(window) {
+            self.navigation_only || self.active.is_none()
+        } else {
+            self.navigator_visible
+        };
+        if let Some(focus) = focus
+            && ((focus == self.nav_focus && navigator_shown)
+                || (matches!(self.panel, Some(Panel::Files | Panel::Text))
+                    && (focus == self.query.focus_handle(cx) || focus == self.search_ui.focus)))
+        {
+            window.focus(&focus);
+        } else {
+            self.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn dismiss_open_failure(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let focus = self
+            .open_failure
+            .take()
+            .and_then(|failure| failure.return_focus);
+        self.focus_failure_invoker(focus, window, cx);
+    }
+
+    pub(super) fn open_failure_key(
+        &mut self,
+        key: &Keystroke,
+        overlay: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(failure) = &self.open_failure else {
+            return false;
+        };
+        let inside = self.notice_focus.contains_focused(window, cx);
+        let at_invoker = failure
+            .return_focus
+            .as_ref()
+            .is_some_and(|focus| focus.is_focused(window));
+        match key.key.as_str() {
+            "escape" if !key.modifiers.shift && (inside || at_invoker) => {
+                self.dismiss_open_failure(window, cx);
+            }
+            "tab" if inside => {
+                let return_focus = failure.return_focus.clone();
+                if key.modifiers.shift {
+                    window.focus_prev();
+                } else {
+                    window.focus_next();
+                }
+                if !self.notice_focus.contains_focused(window, cx) {
+                    self.focus_failure_invoker(return_focus, window, cx);
+                }
+            }
+            "tab" if at_invoker && !key.modifiers.shift => window.focus(&self.notice_details_focus),
+            "f6" if overlay && inside => {
+                self.focus_failure_invoker(failure.return_focus.clone(), window, cx);
+            }
+            "f6" if overlay && at_invoker => window.focus(&self.notice_details_focus),
+            _ => return false,
+        }
+        window.prevent_default();
+        cx.stop_propagation();
+        true
     }
 }

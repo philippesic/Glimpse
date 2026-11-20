@@ -21,6 +21,7 @@ pub struct Batch {
     pub generation: u64,
     pub entries: Vec<Entry>,
     pub done: bool,
+    pub filename_hints: HashMap<String, crate::paths::LabelCue>,
     pub error: Option<String>,
 }
 struct Request {
@@ -142,12 +143,13 @@ fn read(
     if cancelled() {
         return;
     }
-    let send = |entries, done, error| {
+    let send = |entries, done, error, filename_hints| {
         let mut batch = Batch {
             path: request.path.clone(),
             generation: request.generation,
             entries,
             done,
+            filename_hints,
             error,
         };
         loop {
@@ -172,11 +174,12 @@ fn read(
     let listing = match std::fs::read_dir(&request.path) {
         Ok(value) => value,
         Err(error) => {
-            send(vec![], true, Some(error.to_string()));
+            send(vec![], true, Some(error.to_string()), HashMap::new());
             return;
         }
     };
     let mut batch = Vec::new();
+    let mut long_names = Vec::new();
     let mut bytes = 0;
     let mut count = 0;
     let mut error = None;
@@ -206,6 +209,9 @@ fn read(
             error = Some("Partial — directory entry or 16 MiB listing budget reached".into());
             break;
         }
+        if let Some(name) = path.file_name().filter(|name| name.len() >= 24) {
+            long_names.push(name.to_owned());
+        }
         batch.push(Entry {
             path,
             directory: kind.is_dir(),
@@ -214,14 +220,15 @@ fn read(
         if batch.len() >= if count <= 256 { 256 } else { 2048 }
             || last.elapsed() >= Duration::from_millis(20)
         {
-            if !send(std::mem::take(&mut batch), false, None) {
+            if !send(std::mem::take(&mut batch), false, None, HashMap::new()) {
                 break;
             }
             last = Instant::now();
         }
     }
     if !cancelled() {
-        send(batch, true, error);
+        let hints = crate::paths::filename_hints(long_names.iter().map(|name| name.as_os_str()));
+        send(batch, true, error, hints);
     }
 }
 

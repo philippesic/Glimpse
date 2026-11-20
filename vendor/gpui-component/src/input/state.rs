@@ -219,6 +219,8 @@ pub(crate) fn init(cx: &mut App) {
         KeyBinding::new("ctrl-z", Undo, Some(CONTEXT)),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-y", Redo, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-shift-z", Redo, Some(CONTEXT)),
         #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-.", ToggleCodeActions, Some(CONTEXT)),
         #[cfg(not(target_os = "macos"))]
@@ -2336,6 +2338,10 @@ impl InputState {
     ) {
         self.accessibility_description = Some(description.into());
         cx.notify();
+    }
+
+    pub fn begin_undo_group(&mut self) {
+        self.history.new_group();
     }
 
     pub fn can_undo(&self) -> bool {

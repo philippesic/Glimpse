@@ -422,7 +422,9 @@ impl Preferences {
                         let key = super::platform::shortcut_label(&shortcut);
                         format!("{key} is already used by {command}.")
                     }
-                    glimpse::commands::BindingError::Invalid(message) => message,
+                    glimpse::commands::BindingError::Invalid(message) => {
+                        super::platform::shortcut_label(&message)
+                    }
                 };
                 (Some(Field::Keymaps), message)
             } else if let Err((line, pattern_error)) = settings.validate_exclusion_patterns() {

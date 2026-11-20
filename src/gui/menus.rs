@@ -1,4 +1,4 @@
-use super::Shell;
+use super::{Shell, labels};
 use glimpse::{commands, paths};
 use gpui::{prelude::*, *};
 use gpui_component::{
@@ -6,7 +6,10 @@ use gpui_component::{
     button::{Button, ButtonVariants},
     menu::{DropdownMenu, PopupMenu, PopupMenuItem},
 };
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 pub(super) fn command_item(
     shell: WeakEntity<Shell>,
@@ -266,6 +269,8 @@ impl Shell {
         requested: bool,
         footer_height: Pixels,
         icon_only: bool,
+        parents: &HashMap<PathBuf, paths::ParentHint>,
+        filenames: &HashMap<String, paths::LabelCue>,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let shell = cx.entity().downgrade();
@@ -287,7 +292,10 @@ impl Shell {
                     (false, false, true) => Some("Current"),
                     (false, false, false) => None,
                 };
-                (document.id, title, status, current)
+                let file = paths::name(&document.disk.path);
+                let parent = parents.get(&document.disk.path).cloned();
+                let filename = filenames.get(&file).cloned();
+                (document.id, title, status, current, file, parent, filename)
             })
             .collect::<Vec<_>>();
         Button::new("open-documents-menu")
@@ -310,7 +318,18 @@ impl Shell {
             .flex_shrink_0()
             .dropdown_menu_with_anchor(Corner::TopRight, move |mut menu, window, _| {
                 let viewport = window.viewport_size();
-                let width = (window.rem_size() * 14.).min(viewport.width - px(24.));
+                let rem = window.rem_size();
+                let measure = |text: &SharedString| Self::path_label_width(window, text);
+                let natural = items
+                    .iter()
+                    .map(|(_, title, ..)| measure(&title.clone().into()))
+                    .max()
+                    .unwrap_or_default();
+                let width = (natural + rem * 4.5)
+                    .max(rem * 14.)
+                    .min(rem * 26.)
+                    .min(viewport.width - px(24.));
+                let room = width - rem * 4.5;
                 menu = menu
                     .accessible_name("Open Documents")
                     .scrollable(true)
@@ -318,14 +337,18 @@ impl Shell {
                     .min_w(width)
                     .max_w(width)
                     .max_h((viewport.height - px(96.)).max(px(100.)));
-                for (id, title, status, current) in &items {
+                for (id, title, status, current, file, parent, filename) in &items {
                     let id = *id;
                     let shell = shell.clone();
+                    let caption = match parent {
+                        Some(folder) => labels::document(file, "", folder, " — ", room, &measure),
+                        None => labels::filename(file, "", filename.as_ref(), room, &measure),
+                    };
                     let item = match status {
                         Some(status) => PopupMenuItem::new(format!("{title} · {status}"))
-                            .display_label(title.clone())
+                            .display_label(caption)
                             .detail(*status),
-                        None => PopupMenuItem::new(title.clone()),
+                        None => PopupMenuItem::new(title.clone()).display_label(caption),
                     };
                     menu = menu.item(item.checked(*current).on_click(move |_, window, cx| {
                         let shell = shell.clone();
@@ -336,7 +359,7 @@ impl Shell {
                         });
                     }));
                 }
-                if let Some(index) = items.iter().position(|(_, _, _, current)| *current) {
+                if let Some(index) = items.iter().position(|(_, _, _, current, ..)| *current) {
                     menu.highlight(index)
                 } else {
                     menu
@@ -666,13 +689,19 @@ impl Shell {
         window.focus(&self.nav_focus);
         let shell = cx.weak_entity();
         let disabled = self.disabled_commands();
-        let menu = PopupMenu::build(window, cx, |menu, _, _| {
+        let menu = PopupMenu::build(window, cx, |menu, window, cx| {
+            let blocker = self.file_action_blocker(path, false);
+            let item_height = (px(28.) * (cx.theme().font_size / px(16.))).max(px(24.));
+            let detail_count =
+                usize::from(blocker.is_none() && !from_pointer && self.trash_needs_selection);
+            let total_height = item_height * (4 + usize::from(blocker.is_some()))
+                + window.rem_size() * (detail_count as f32 + 1.)
+                + px(2.);
             let mut menu = menu
                 .accessible_name(title)
                 .action_context(self.nav_focus.clone())
-                .scrollable(true)
+                .scrollable(total_height > room)
                 .max_h(room);
-            let blocker = self.file_action_blocker(path, false);
             if let Some(reason) = blocker {
                 menu = menu.label(reason);
             }

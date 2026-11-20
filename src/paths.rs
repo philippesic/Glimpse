@@ -1,4 +1,10 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    ffi::OsStr,
+    ops::Range,
+    path::{Path, PathBuf},
+};
+use unicode_segmentation::UnicodeSegmentation;
 
 fn escaped(value: &std::ffi::OsStr) -> String {
     value
@@ -64,6 +70,186 @@ pub fn parent_label<'a>(path: &Path, others: impl IntoIterator<Item = &'a Path>)
         |parent| display(&parent),
     )
 }
+fn shared_grapheme_bytes<'a>(
+    left: impl Iterator<Item = &'a str>,
+    right: impl Iterator<Item = &'a str>,
+) -> usize {
+    left.zip(right)
+        .take_while(|(left, right)| left == right)
+        .map(|(grapheme, _)| grapheme.len())
+        .sum()
+}
+
+fn shared_path_edge(left: &str, right: &str, from_end: bool) -> usize {
+    if left.is_ascii() && right.is_ascii() {
+        let equal = |(left, right): &(u8, u8)| left == right;
+        if from_end {
+            left.bytes()
+                .rev()
+                .zip(right.bytes().rev())
+                .take_while(equal)
+                .count()
+        } else {
+            left.bytes().zip(right.bytes()).take_while(equal).count()
+        }
+    } else if from_end {
+        shared_grapheme_bytes(left.graphemes(true).rev(), right.graphemes(true).rev())
+    } else {
+        shared_grapheme_bytes(left.graphemes(true), right.graphemes(true))
+    }
+}
+
+#[derive(Clone)]
+pub struct LabelCue {
+    pub span: Range<usize>,
+    pub ordinal: usize,
+}
+
+#[derive(Clone)]
+pub struct ParentHint {
+    pub text: String,
+    pub cue: LabelCue,
+}
+
+fn label_cues<'a>(labels: &'a [&'a str]) -> impl Iterator<Item = LabelCue> + 'a {
+    let first = labels[0];
+    let prefix = labels.iter().skip(1).fold(first.len(), |prefix, label| {
+        shared_path_edge(&first[..prefix], label, false)
+    });
+    let suffix = labels
+        .iter()
+        .skip(1)
+        .fold(first.len() - prefix, |suffix, label| {
+            shared_path_edge(&first[first.len() - suffix..], &label[prefix..], true)
+        });
+    labels
+        .iter()
+        .enumerate()
+        .map(move |(index, label)| LabelCue {
+            span: prefix..label.len() - suffix,
+            ordinal: index + 1,
+        })
+}
+
+fn label_edges(label: &str) -> Option<(&str, &str)> {
+    let edge = 6;
+    if label.len() < edge * 2 {
+        return None;
+    }
+    if label.is_ascii() {
+        return Some((&label[..edge], &label[label.len() - edge..]));
+    }
+    let (left, _) = label.grapheme_indices(true).nth(edge)?;
+    let (right, _) = label.grapheme_indices(true).rev().nth(edge - 1)?;
+    Some((&label[..left], &label[right..]))
+}
+
+pub fn filename_hints<'a>(names: impl IntoIterator<Item = &'a OsStr>) -> HashMap<String, LabelCue> {
+    let mut names = names
+        .into_iter()
+        .filter(|name| name.len() >= 24)
+        .map(escaped)
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    names.dedup();
+    let mut groups = HashMap::<_, Vec<&str>>::new();
+    for name in &names {
+        if let Some(edges) = label_edges(name) {
+            groups.entry(edges).or_default().push(name);
+        }
+    }
+    groups
+        .values()
+        .filter(|labels| labels.len() > 1)
+        .flat_map(|labels| labels.iter().zip(label_cues(labels)))
+        .map(|(&name, cue)| (name.to_owned(), cue))
+        .collect()
+}
+
+fn parent_cues(labels: &[&str]) -> Vec<LabelCue> {
+    let mut cues: Vec<_> = label_cues(labels).collect();
+    let mut groups = HashMap::<_, Vec<usize>>::new();
+    for (index, label) in labels.iter().enumerate() {
+        if let Some(edges) = label_edges(label) {
+            groups.entry(edges).or_default().push(index);
+        }
+    }
+    if groups.values().any(|group| group.len() == labels.len()) {
+        return cues;
+    }
+
+    let mut unique = HashMap::new();
+    for group in groups.values().filter(|group| group.len() > 1) {
+        let similar = group.iter().map(|&index| labels[index]).collect::<Vec<_>>();
+        for (&index, cue) in group.iter().zip(label_cues(&similar)) {
+            if cue.span.is_empty() {
+                continue;
+            }
+            let fragment = &labels[index][cue.span.clone()];
+            unique
+                .entry(fragment)
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some((index, cue.span)));
+        }
+    }
+    for (index, span) in unique.into_values().flatten() {
+        cues[index].span = span;
+    }
+    cues
+}
+
+pub fn parent_hints<'a>(paths: impl IntoIterator<Item = &'a Path>) -> HashMap<PathBuf, ParentHint> {
+    let mut by_name = HashMap::<&OsStr, HashSet<&OsStr>>::new();
+    for path in paths {
+        if let Some(name) = path.file_name() {
+            by_name.entry(name).or_default().insert(path.as_os_str());
+        }
+    }
+    let mut parents = HashMap::new();
+    for group in by_name.values().filter(|group| group.len() > 1) {
+        let mut counts = HashMap::new();
+        for &path in group {
+            for suffix in parent_suffixes(Path::new(path)) {
+                *counts.entry(suffix.as_os_str()).or_insert(0) += 1;
+            }
+        }
+        let mut labels = group
+            .iter()
+            .filter_map(|&path| {
+                let path = Path::new(path);
+                let suffix = parent_suffixes(path)
+                    .filter(|suffix| counts.get(suffix.as_os_str()) == Some(&1))
+                    .last()?;
+                Some((path, display(suffix)))
+            })
+            .collect::<Vec<_>>();
+        labels.sort_unstable_by_key(|(path, _)| path.as_os_str());
+        if labels.is_empty() {
+            continue;
+        }
+        let values = labels
+            .iter()
+            .map(|(_, text)| text.as_str())
+            .collect::<Vec<_>>();
+        let cues = parent_cues(&values);
+        parents.extend(
+            labels
+                .into_iter()
+                .zip(cues)
+                .map(|((path, text), cue)| (path.to_owned(), ParentHint { text, cue })),
+        );
+    }
+    parents
+}
+
+fn parent_suffixes(path: &Path) -> impl Iterator<Item = &Path> {
+    let mut parts = path.parent().unwrap_or(path).components();
+    std::iter::from_fn(move || {
+        let suffix = parts.as_path();
+        parts.next().map(|_| suffix)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -62,7 +62,14 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         let key = &event.keystroke;
-        match self.layer(&event.context_stack) {
+        let layer = self.layer(&event.context_stack);
+        if plain(key)
+            && matches!(layer, Layer::Overlay(_) | Layer::Base)
+            && self.open_failure_key(key, matches!(layer, Layer::Overlay(_)), window, cx)
+        {
+            return;
+        }
+        match layer {
             Layer::Menu => Self::menu_key(key, window, cx),
             // Dialogs contain their own focus and handle their keys.
             Layer::Dialog => {}
@@ -110,6 +117,7 @@ impl Shell {
 
     fn overlay_contains_focus(&self, panel: Panel, window: &Window, cx: &App) -> bool {
         self.query.focus_handle(cx).contains_focused(window, cx)
+            || (self.open_failure.is_some() && self.notice_focus.contains_focused(window, cx))
             || (panel != Panel::Path && self.palette.overlay.contains_focused(window, cx))
     }
 
@@ -217,7 +225,11 @@ impl Shell {
                 true
             }
             Panel::Files | Panel::Text if down && !self.hits.is_empty() => {
+                let advance = panel == Panel::Files && self.search_ui.selection.is_some();
                 self.focus_results(window, cx);
+                if advance {
+                    self.search_key(key, window, cx);
+                }
                 true
             }
             Panel::Path if self.path_completions.is_some() => {

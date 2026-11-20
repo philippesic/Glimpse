@@ -1,7 +1,6 @@
 use std::{
     cmp::Reverse,
-    collections::{BinaryHeap, HashMap, HashSet, hash_map::DefaultHasher},
-    ffi::OsStr,
+    collections::{BinaryHeap, HashMap, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
     io::Read,
     os::unix::fs::OpenOptionsExt,
@@ -14,7 +13,6 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use unicode_segmentation::UnicodeSegmentation;
 
 const MAX_RESULTS: usize = 1000;
 
@@ -30,14 +28,10 @@ pub struct Hit {
 pub struct ResultSet {
     pub generation: u64,
     pub hits: Vec<Hit>,
-    pub duplicate_parents: HashMap<PathBuf, DuplicateParent>,
+    pub duplicate_parents: HashMap<PathBuf, crate::paths::ParentHint>,
+    pub filename_hints: HashMap<String, crate::paths::LabelCue>,
     pub state: String,
     pub completed: bool,
-}
-pub struct DuplicateParent {
-    pub suffix: String,
-    pub compact: String,
-    pub ordinal: usize,
 }
 #[derive(Clone, PartialEq, Eq)]
 pub struct Filters {
@@ -208,113 +202,6 @@ fn ordered(hits: &[Hit]) -> Vec<Hit> {
     });
     hits
 }
-fn shared_grapheme_bytes<'a>(
-    left: impl Iterator<Item = &'a str>,
-    right: impl Iterator<Item = &'a str>,
-) -> usize {
-    left.zip(right)
-        .take_while(|(left, right)| left == right)
-        .map(|(grapheme, _)| grapheme.len())
-        .sum()
-}
-
-fn shared_path_edge(left: &str, right: &str, from_end: bool) -> usize {
-    if left.is_ascii() && right.is_ascii() {
-        let equal = |(left, right): &(u8, u8)| left == right;
-        if from_end {
-            left.bytes()
-                .rev()
-                .zip(right.bytes().rev())
-                .take_while(equal)
-                .count()
-        } else {
-            left.bytes().zip(right.bytes()).take_while(equal).count()
-        }
-    } else if from_end {
-        shared_grapheme_bytes(left.graphemes(true).rev(), right.graphemes(true).rev())
-    } else {
-        shared_grapheme_bytes(left.graphemes(true), right.graphemes(true))
-    }
-}
-
-fn duplicate_parents(hits: &[Hit], scope: &Path) -> HashMap<PathBuf, DuplicateParent> {
-    let mut by_name: HashMap<&OsStr, HashSet<&OsStr>> = HashMap::new();
-    for hit in hits {
-        if let Some(name) = hit.path.file_name() {
-            by_name
-                .entry(name)
-                .or_default()
-                .insert(hit.path.as_os_str());
-        }
-    }
-    let mut parents = HashMap::new();
-    for paths in by_name.values().filter(|paths| paths.len() > 1) {
-        let mut counts = HashMap::new();
-        for &path in paths {
-            for suffix in parent_suffixes(Path::new(path)) {
-                *counts.entry(suffix.as_os_str()).or_insert(0) += 1;
-            }
-        }
-        let mut group = paths
-            .iter()
-            .map(|&path| {
-                let path = Path::new(path);
-                let parent = path.parent().unwrap_or(path);
-                (
-                    path,
-                    crate::paths::display(parent.strip_prefix(scope).unwrap_or(parent)),
-                )
-            })
-            .collect::<Vec<_>>();
-        group.sort_unstable_by_key(|(path, _)| path.as_os_str());
-        let first = group[0].1.as_str();
-        let prefix = group
-            .iter()
-            .skip(1)
-            .fold(first.len(), |prefix, (_, other)| {
-                shared_path_edge(&first[..prefix], other, false)
-            });
-        let suffix_bytes = group
-            .iter()
-            .skip(1)
-            .fold(first.len() - prefix, |suffix, (_, other)| {
-                shared_path_edge(&first[first.len() - suffix..], &other[prefix..], true)
-            });
-        for (index, (path, parent)) in group.into_iter().enumerate() {
-            if let Some(suffix) = parent_suffixes(path)
-                .filter(|suffix| counts.get(suffix.as_os_str()) == Some(&1))
-                .last()
-            {
-                let start = if prefix == 0 { "" } else { "…" };
-                let end = if suffix_bytes == 0 { "" } else { "…" };
-                let difference = &parent[prefix..parent.len() - suffix_bytes];
-                let compact = if parent.is_empty() {
-                    "Search folder".into()
-                } else {
-                    format!("{start}{difference}{end}")
-                };
-                parents.insert(
-                    path.to_owned(),
-                    DuplicateParent {
-                        suffix: crate::paths::display(suffix),
-                        compact,
-                        ordinal: index + 1,
-                    },
-                );
-            }
-        }
-    }
-    parents
-}
-
-fn parent_suffixes(path: &Path) -> impl Iterator<Item = &Path> {
-    let mut parts = path.parent().unwrap_or(path).components();
-    std::iter::from_fn(move || {
-        let suffix = parts.as_path();
-        parts.next().map(|_| suffix)
-    })
-}
-
 fn indexed_hits(
     paths: &[PathBuf],
     scope: &Path,
@@ -389,7 +276,12 @@ impl Search {
                     let mut result = ResultSet {
                         generation: id,
                         hits: ordered(hits),
-                        duplicate_parents: duplicate_parents(hits, &scope),
+                        duplicate_parents: crate::paths::parent_hints(
+                            hits.iter().map(|hit| hit.path.as_path()),
+                        ),
+                        filename_hints: crate::paths::filename_hints(
+                            hits.iter().filter_map(|hit| hit.path.file_name()),
+                        ),
                         state: state.into(),
                         completed,
                     };
@@ -704,7 +596,7 @@ impl Search {
                             continue;
                         }
                         *index = Some(FilenameIndex {
-                            scope: scope.clone(),
+                            scope,
                             filters,
                             paths: Arc::new(indexed_paths),
                             partial,

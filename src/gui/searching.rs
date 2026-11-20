@@ -10,7 +10,8 @@ pub(super) struct State {
     pub started: bool,
     pub running: bool,
     pub file_opens: HashMap<u64, u64>,
-    pub duplicate_parents: std::sync::Arc<HashMap<PathBuf, search::DuplicateParent>>,
+    pub filename_hints: std::sync::Arc<HashMap<String, paths::LabelCue>>,
+    pub duplicate_parents: std::sync::Arc<HashMap<PathBuf, paths::ParentHint>>,
     pub building: bool,
     pub query: String,
     pub selection: Option<usize>,
@@ -32,6 +33,7 @@ impl State {
             running: false,
             file_opens: HashMap::new(),
             duplicate_parents: Default::default(),
+            filename_hints: Default::default(),
             building: false,
             query: String::new(),
             selection: None,
@@ -109,6 +111,7 @@ impl Shell {
         self.search_id = self.search.cancel();
         self.hits = Default::default();
         self.search_ui.duplicate_parents = Default::default();
+        self.search_ui.filename_hints = Default::default();
         self.search_ui.selection = None;
         self.search_ui.started = false;
         self.search_ui.running = false;
@@ -376,6 +379,7 @@ impl Shell {
         let compatible = self.search.index_compatible(scope, &self.search_filters());
         let hits = self.hits.clone();
         let duplicate_parents = self.search_ui.duplicate_parents.clone();
+        let filename_hints = self.search_ui.filename_hints.clone();
         let count = hits.len().min(1000);
         let scale = self.settings.ui_scale;
         let row_height = px(32. * scale);
@@ -605,36 +609,47 @@ impl Shell {
                                                     .map_or_else(String::new, paths::display);
                                                 let distinguishing =
                                                     duplicate_parents.get(&hit.path);
+                                                let filename_hint = filename_hints.get(&file);
                                                 let name = if content {
+                                                    let suffix = format!(":{}", hit.line);
+                                                    let room = room * 0.6;
                                                     if let Some(folder) = distinguishing {
-                                                        duplicate_caption(
-                                                            &format!("{file}:{}", hit.line),
-                                                            folder,
-                                                            room * 0.6,
+                                                        labels::document(
+                                                            &file, &suffix, folder, " · ", room,
+                                                            &measure,
+                                                        )
+                                                    } else if filename_hint.is_some() {
+                                                        labels::filename(
+                                                            &file,
+                                                            &suffix,
+                                                            filename_hint,
+                                                            room,
                                                             &measure,
                                                         )
                                                     } else {
                                                         format!(
-                                                            "{}:{}",
+                                                            "{}{suffix}",
                                                             fit_path(
                                                                 &paths::display(relative),
-                                                                room * 0.6,
+                                                                room,
                                                                 &measure
                                                             ),
-                                                            hit.line,
                                                         )
                                                     }
                                                 } else {
                                                     match distinguishing {
-                                                        Some(folder) => duplicate_caption(
+                                                        Some(folder) => labels::document(
                                                             &file,
+                                                            "",
                                                             folder,
+                                                            " · ",
                                                             room,
                                                             &measure_bold,
                                                         ),
                                                         None => filename_caption(
                                                             &file,
                                                             &parent,
+                                                            filename_hint,
                                                             room,
                                                             &measure_bold,
                                                         ),
@@ -749,58 +764,26 @@ impl Shell {
 fn filename_caption(
     file: &str,
     folder: &str,
+    cue: Option<&paths::LabelCue>,
     room: Pixels,
     measure: &impl Fn(&SharedString) -> Pixels,
 ) -> String {
     let separator = " · ";
     if folder.is_empty() {
-        return decision::abbreviate_folder(file, room, measure).to_string();
+        return labels::filename(file, "", cue, room, measure);
     }
     let full = SharedString::from(format!("{file}{separator}{folder}"));
     if measure(&full) <= room {
         return full.to_string();
     }
-    let name = decision::abbreviate_folder(file, room, measure);
-    let folder_room = room - measure(&name) - measure(&separator.into());
+    let name = labels::filename(file, "", cue, room, measure);
+    let folder_room =
+        room - measure(&SharedString::from(name.clone())) - measure(&separator.into());
     if folder_room <= measure(&"…".into()) * 2. {
-        return name.to_string();
+        return name;
     }
     let folder = decision::abbreviate_folder(folder, folder_room, measure);
     format!("{name}{separator}{folder}")
-}
-
-fn duplicate_caption(
-    file: &str,
-    folder: &search::DuplicateParent,
-    room: Pixels,
-    measure: &impl Fn(&SharedString) -> Pixels,
-) -> String {
-    let separator = " · ";
-    let full = SharedString::from(format!("{file}{separator}{}", folder.suffix));
-    if measure(&full) <= room {
-        return full.to_string();
-    }
-    let compact = SharedString::from(folder.compact.clone());
-    let folder_number = SharedString::from(format!("#{}", folder.ordinal));
-    let compact_width = measure(&compact);
-    let number_width = measure(&folder_number);
-    let reserve = compact_width.min(room * 0.32).max(number_width);
-    let separator_width = measure(&separator.into());
-    let name = decision::abbreviate_folder(file, room - separator_width - reserve, measure);
-    let folder_room = room - measure(&name) - separator_width;
-    if measure(&SharedString::from(folder.suffix.clone())) <= folder_room {
-        return format!("{name}{separator}{}", folder.suffix);
-    }
-    if compact_width <= folder_room {
-        return format!("{name}{separator}{compact}");
-    }
-    let hint_room = folder_room - number_width - measure(&" ".into());
-    if hint_room >= measure(&"…".into()) * 2. {
-        let hint = decision::abbreviate_folder(&compact, hint_room, measure);
-        format!("{name}{separator}{folder_number} {hint}")
-    } else {
-        format!("{name}{separator}{folder_number}")
-    }
 }
 
 /// Shortens the folder part of a relative path first, so the file name and its extension stay
