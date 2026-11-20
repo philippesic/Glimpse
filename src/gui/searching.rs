@@ -437,7 +437,7 @@ impl Shell {
                         .items_center()
                         .flex_wrap()
                         .gap(px(8. * scale))
-                        .px(px(8. * scale))
+                        .px(px(12. * scale))
                         .flex_shrink_0()
                         .when(!stacked, |row| {
                             row.child(self.search_scope_button(false, window, cx))
@@ -449,7 +449,7 @@ impl Shell {
             })
             .child(
                 div()
-                    .px(px(8. * scale))
+                    .px(px(12. * scale))
                     .pt(px(4. * scale))
                     .flex_shrink_0()
                     .text_size(small)
@@ -518,7 +518,7 @@ impl Shell {
             .when(!stacked, |panel| {
                 panel.child(
                     div()
-                        .px(px(8. * scale))
+                        .px(px(12. * scale))
                         .py(px(4. * scale))
                         .flex_shrink_0()
                         .child(accessibility::status(
@@ -548,7 +548,7 @@ impl Shell {
                     div()
                         .id("results")
                         .track_focus(&self.search_ui.focus)
-                        .mx(px(8. * scale))
+                        .mx(px(10. * scale))
                         .mb(px(8. * scale))
                         .p(px(2. * scale))
                         .rounded(px(7. * scale))

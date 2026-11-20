@@ -354,6 +354,8 @@ pub struct CodeBlock {
     state: Arc<Mutex<InlineState>>,
     page: Option<Box<CodePage>>,
     pages: Option<Arc<Vec<Self>>>,
+    /// The fence's closing newline, kept for copying but not drawn as an empty last line.
+    trailing_newline: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -395,7 +397,14 @@ impl CodeBlock {
     /// Get the code content of the code block.
     pub fn code(&self) -> SharedString {
         self.page.as_ref().map_or_else(
-            || self.state.lock().unwrap().text.clone(),
+            || {
+                let text = self.state.lock().unwrap().text.clone();
+                if self.trailing_newline {
+                    SharedString::from(format!("{text}\n"))
+                } else {
+                    text
+                }
+            },
             |page| SharedString::new(page.text()),
         )
     }
@@ -419,8 +428,20 @@ impl CodeBlock {
         _: &TextViewStyle,
         highlight_theme: &HighlightTheme,
     ) -> Self {
+        let trailing_newline = code.len() <= LONG_READING_BLOCK_BYTES && code.ends_with('\n');
+        let code = if trailing_newline {
+            SharedString::from(code[..code.len() - 1].to_owned())
+        } else {
+            code
+        };
         let mut styles = vec![];
-        if let Some(lang) = &lang {
+        // Without the Tree-sitter language set every name resolves to JSON, which would
+        // mis-colour other languages; leave those blocks plain.
+        let supported = cfg!(feature = "tree-sitter-languages")
+            || lang
+                .as_ref()
+                .is_some_and(|lang| matches!(lang.as_ref(), "json" | "jsonc"));
+        if let Some(lang) = lang.as_ref().filter(|_| supported) {
             let mut highlighter = SyntaxHighlighter::new(&lang);
             highlighter.update(None, &Rope::from_str(code.as_str()));
             styles = highlighter.styles(&(0..code.len()), highlight_theme);
@@ -435,6 +456,7 @@ impl CodeBlock {
             state,
             page: None,
             pages: None,
+            trailing_newline,
         }
     }
 
@@ -496,6 +518,7 @@ impl CodeBlock {
                 state: Arc::new(Mutex::new(InlineState::default())),
                 page: Some(Box::new(page)),
                 pages: None,
+                trailing_newline: false,
             });
             start = end;
         }
@@ -545,7 +568,6 @@ impl CodeBlock {
             self.display_code();
         }
 
-        let trailing_newline = self.ends_block() && self.code().ends_with('\n');
         div()
             .when(self.ends_block() && !options.is_last, |this| {
                 this.pb(style.paragraph_gap)
@@ -559,14 +581,7 @@ impl CodeBlock {
                     .when(paged, |block| block.w_full().min_w_0().whitespace_normal())
                     .px_3()
                     .when(self.starts_block(), |block| block.pt_3())
-                    // A closing newline already leaves an empty line below the code.
-                    .when(self.ends_block(), |block| {
-                        if trailing_newline {
-                            block.pb_0p5()
-                        } else {
-                            block.pb_3()
-                        }
-                    })
+                    .when(self.ends_block(), |block| block.pb_3())
                     .bg(cx.theme().muted)
                     .font_family(cx.theme().mono_font_family.clone())
                     .text_size(cx.theme().mono_font_size)
@@ -1385,8 +1400,11 @@ fn heading_style(level: u8, style: &TextViewStyle, body_size: Pixels) -> (Pixels
         6 => (rems(1.), FontWeight::MEDIUM),
         _ => (rems(1.), FontWeight::NORMAL),
     };
+    // The default scale is defined for 16 px prose; it follows larger or smaller reading text
+    // so headings keep their proportion at every interface scale.
+    let base = style.heading_base_font_size * (body_size / px(16.));
     let size = style.heading_font_size.as_ref().map_or_else(
-        || size.to_pixels(style.heading_base_font_size).max(body_size),
+        || size.to_pixels(base).max(body_size),
         |value| value(level, style.heading_base_font_size),
     );
     (size, weight)
@@ -2167,8 +2185,11 @@ mod reading_page_tests {
     fn default_heading_sizes_keep_up_with_scaled_prose() {
         let style = TextViewStyle::default();
         assert_eq!(heading_style(1, &style, px(16.)).0, px(28.));
+        assert_eq!(heading_style(1, &style, px(56.)).0, px(98.));
+        assert_eq!(heading_style(2, &style, px(24.)).0, px(31.5));
         for level in 1..=6 {
-            assert_eq!(heading_style(level, &style, px(56.)).0, px(56.));
+            assert!(heading_style(level, &style, px(56.)).0 >= px(56.));
+            assert!(heading_style(level, &style, px(12.)).0 >= px(12.));
         }
         let customized = style.heading_font_size(|_, _| px(34.));
         assert_eq!(heading_style(1, &customized, px(56.)).0, px(34.));
@@ -2258,6 +2279,7 @@ mod reading_page_tests {
             state: Arc::new(Mutex::new(state)),
             page: None,
             pages: None,
+            trailing_newline: false,
         };
         let mut quote = Node::Blockquote {
             children: vec![Node::CodeBlock(code.clone())],

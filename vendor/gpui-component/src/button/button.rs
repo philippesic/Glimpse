@@ -190,6 +190,7 @@ pub struct Button {
     label: Option<SharedString>,
     display_label: Option<SharedString>,
     italic_label: bool,
+    parent_decorates: bool,
     children: Vec<AnyElement>,
     disabled: bool,
     pub(crate) selected: bool,
@@ -241,6 +242,7 @@ impl Button {
             label: None,
             display_label: None,
             italic_label: false,
+            parent_decorates: false,
             disabled: false,
             selected: false,
             variant: ButtonVariant::default(),
@@ -338,6 +340,13 @@ impl Button {
 
     pub fn italic_label(mut self) -> Self {
         self.italic_label = true;
+        self
+    }
+
+    /// Leave hover fill and the focus ring to an enclosing element that groups this button
+    /// with others, such as a tab and its close button.
+    pub fn parent_decorates(mut self) -> Self {
+        self.parent_decorates = true;
         self
     }
 
@@ -494,6 +503,7 @@ impl RenderOnce for Button {
         let clickable = self.clickable();
         let is_disabled = self.disabled;
         let hoverable = self.hoverable();
+        let parent_decorates = self.parent_decorates;
         let focus_gap = if !self.outline
             && matches!(
                 style,
@@ -614,11 +624,13 @@ impl RenderOnce for Button {
                 this.border_color(normal_style.border)
                     .bg(normal_style.bg)
                     .when(normal_style.underline, |this| this.text_decoration_1())
-                    .hover(|this| {
-                        let hover_style = style.hovered(self.outline, cx);
-                        this.bg(hover_style.bg)
-                            .border_color(hover_style.border)
-                            .text_color(hover_style.fg)
+                    .when(!parent_decorates, |this| {
+                        this.hover(|this| {
+                            let hover_style = style.hovered(self.outline, cx);
+                            this.bg(hover_style.bg)
+                                .border_color(hover_style.border)
+                                .text_color(hover_style.fg)
+                        })
                     })
                     .active(|this| {
                         let active_style = style.active(self.outline, cx);
@@ -731,7 +743,7 @@ impl RenderOnce for Button {
                         .build(window, cx)
                 })
             })
-            .focus_ring(is_focused, focus_gap, window, cx);
+            .focus_ring(is_focused && !parent_decorates, focus_gap, window, cx);
         gpui::accessible(semantic_id, rendered, move |_, window, _| {
             use gpui::accesskit::{Action, Node};
             let mut node = Node::new(semantic_role);
@@ -982,13 +994,7 @@ impl ButtonVariant {
                     cx.theme().info_hover
                 }
             }
-            ButtonVariant::Ghost => {
-                if cx.theme().mode.is_dark() {
-                    cx.theme().secondary.lighten(0.1).opacity(0.8)
-                } else {
-                    cx.theme().secondary.darken(0.1).opacity(0.8)
-                }
-            }
+            ButtonVariant::Ghost => cx.theme().secondary_hover,
             ButtonVariant::Link => cx.theme().transparent,
             ButtonVariant::Text => cx.theme().transparent,
             ButtonVariant::Custom(colors) => {

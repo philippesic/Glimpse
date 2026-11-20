@@ -85,8 +85,8 @@ pub fn apply(settings: &Settings, window: &mut Window, cx: &mut App) -> Option<S
     colors.tab_active = color(palette.canvas);
     colors.tab_foreground = color(palette.secondary);
     colors.tab_active_foreground = color(palette.text);
-    colors.scrollbar_thumb = color(palette.control_border);
-    colors.scrollbar_thumb_hover = color(palette.secondary);
+    colors.scrollbar_thumb = color(palette.border);
+    colors.scrollbar_thumb_hover = color(palette.control_border);
     colors.danger = color(palette.error);
     colors.danger_hover = color(palette.error);
     colors.danger_active = color(palette.error);
@@ -145,7 +145,7 @@ const LIGHT: Palette = Palette {
     separator: 0xE4E4E7,
     border: 0xE4E4E7,
     control_border: 0x8B8B94,
-    hover: 0xEBEBED,
+    hover: 0xE4E4E7,
     selection: 0xE2E8F8,
     accent: 0x1D4ED8,
     action: 0x1D4ED8,
@@ -168,7 +168,7 @@ const DARK: Palette = Palette {
     separator: 0x1F1F1F,
     border: 0x2A2A2A,
     control_border: 0x6B6B6B,
-    hover: 0x1C1C1C,
+    hover: 0x262626,
     selection: 0x1A2747,
     accent: 0x6B98FF,
     action: 0x2F63E6,

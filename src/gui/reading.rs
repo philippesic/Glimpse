@@ -287,7 +287,7 @@ impl Shell {
             .flex()
             .flex_col()
             .gap(px(8. * self.settings.ui_scale))
-            .px(px(8. * self.settings.ui_scale))
+            .px(px(12. * self.settings.ui_scale))
             .pt(px(6. * self.settings.ui_scale))
             .when(short, |area| area.line_height(relative(1.4)))
             .text_size(font_size);

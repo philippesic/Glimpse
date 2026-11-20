@@ -504,6 +504,7 @@ impl Render for Decision {
                         div()
                             .flex_shrink_0()
                             .text_xl()
+                            .font_semibold()
                             .when(compact, |title| {
                                 title.text_base().line_height(relative(1.2))
                             })

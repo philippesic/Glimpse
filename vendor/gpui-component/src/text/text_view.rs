@@ -1088,7 +1088,6 @@ impl Element for TextView {
             .track_focus(focus_handle)
             .size_full()
             .relative()
-            .px(window.rem_size() * 1.25)
             .pt(window.rem_size() * 0.75)
             .on_action({
                 let state = self.state.clone();

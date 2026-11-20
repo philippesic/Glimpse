@@ -142,7 +142,7 @@ impl Shell {
                 .flex()
                 .flex_col()
                 .gap(px(6. * scale))
-                .px(px(8. * scale))
+                .px(px(12. * scale))
                 .py(px(6. * scale))
                 .flex_shrink_0()
                 .child(
@@ -181,7 +181,7 @@ impl Shell {
                 .flex()
                 .items_center()
                 .gap(px(8. * scale))
-                .px(px(8. * scale))
+                .px(px(12. * scale))
                 .py(px(6. * scale))
                 .flex_shrink_0()
                 .child(div().flex_shrink_0().child(title.clone()))
@@ -379,9 +379,15 @@ impl Shell {
     pub(super) fn palette_overlay(&self, window: &mut Window, cx: &Context<Self>) -> AnyElement {
         let scale = self.settings.ui_scale;
         let width = px(640. * scale).min(window.viewport_size().width - px(32. * scale));
+        // Open below the tab strip so no fragment of a tab label shows beside the palette.
+        let top = if self.documents.is_empty() || window.viewport_size().height < px(560. * scale) {
+            8.
+        } else {
+            40.
+        };
         div()
             .absolute()
-            .top(px(8. * scale))
+            .top(px(top * scale))
             .left_0()
             .right_0()
             .flex()

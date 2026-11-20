@@ -28,7 +28,7 @@ use glimpse::{
 };
 use gpui::{prelude::*, *};
 use gpui_component::{
-    ActiveTheme, Disableable, IconName, Root, Selectable, Sizable,
+    ActiveTheme, Disableable, FocusableExt as _, IconName, Root, Selectable, Sizable,
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState, LineType, Position, PreparedInput, Rope},
 };
@@ -336,6 +336,7 @@ struct Shell {
     active: Option<u64>,
     tab_scroll: ScrollHandle,
     tab_widths: HashMap<u64, Pixels>,
+    tab_room: Pixels,
     tab_reveal: Option<TabReveal>,
     next_id: u64,
     open_token: u64,
@@ -608,6 +609,7 @@ impl Shell {
             active: None,
             tab_scroll: ScrollHandle::new(),
             tab_widths: HashMap::new(),
+            tab_room: px(0.),
             tab_reveal: None,
             next_id: 1,
             open_token,
@@ -4511,6 +4513,11 @@ impl Render for Shell {
         self.tab_widths
             .retain(|id, _| self.documents.iter().any(|doc| doc.id == *id));
         let room = self.tab_scroll.bounds().size.width - px(8. * scale);
+        // The strip's width is known only after layout, so a resize refills it on the next frame.
+        if room != self.tab_room {
+            self.tab_room = room;
+            cx.notify();
+        }
         let shown_tabs = shown_tab.filter(|_| room > px(0.)).map(|center| {
             let width = |index: usize| {
                 self.tab_widths
@@ -4542,13 +4549,17 @@ impl Render for Shell {
                 doc.input.focus_handle(cx).contains_focused(window, cx)
                     || doc.tab_focus.contains_focused(window, cx)
             });
+        let hidden_tabs = shown_tabs.as_ref().map_or(0, |shown| {
+            self.documents.len() - (shown.end() + 1 - shown.start())
+        });
         let tabs = div()
             .id("tabs")
             .w_full()
             .flex()
             .items_end()
             .gap(px(2. * scale))
-            .px(px(4. * scale))
+            .pl(px(10. * scale))
+            .pr(px(4. * scale))
             .pt(px(4. * scale))
             .when(short, |tabs| tabs.pt_0())
             .overflow_x_scroll()
@@ -4575,8 +4586,11 @@ impl Render for Shell {
                 let measure = |text: &SharedString| Self::path_label_width(window, text);
                 let text_width = (tab_width - rem * 0.75 - px(2.)).max(px(0.));
                 let caption = match tab_parents.get(&doc.disk.path) {
+                    // State marks follow the whole label, after the distinguishing folder.
                     Some(folder) => {
-                        labels::document(&filename, suffix, folder, " — ", text_width, &measure)
+                        let room = (text_width - measure(&suffix.into())).max(px(0.));
+                        let label = labels::document(&filename, "", folder, " — ", room, &measure);
+                        format!("{label}{suffix}")
                     }
                     None => labels::filename(
                         &filename,
@@ -4605,6 +4619,7 @@ impl Render for Shell {
                     .display_label(caption)
                     .tooltip(paths::display(&doc.disk.path))
                     .ghost()
+                    .parent_decorates()
                     .small()
                     .compact()
                     .text_color(if active {
@@ -4618,7 +4633,10 @@ impl Render for Shell {
                     .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                         this.select_tab(id, event.click_count() > 1, window, cx);
                     }));
+                let tab_focused = doc.tab_focus.is_focused(window);
                 div()
+                    .id(("tab-frame", id))
+                    .relative()
                     .flex()
                     .when(hidden, |tab| tab.hidden())
                     .items_center()
@@ -4626,6 +4644,12 @@ impl Render for Shell {
                     .h_full()
                     .px(px(2. * scale))
                     .rounded_t(px(7. * scale))
+                    // One hover shape and one focus ring cover the label and its close button;
+                    // the ring sits on the tab's own edges so it neither doubles nor clips.
+                    .when(!active, |tab| {
+                        tab.hover(|tab| tab.bg(cx.theme().list_hover))
+                    })
+                    .focus_ring(tab_focused, px(-1.5), window, cx)
                     .border_t_2()
                     .border_color(match (active, document_focused) {
                         (true, true) => cx.theme().ring,
@@ -4641,6 +4665,7 @@ impl Render for Shell {
                                 .tab_stop(false)
                                 .small()
                                 .ghost()
+                                .parent_decorates()
                                 .text_color(if active {
                                     cx.theme().tab_active_foreground
                                 } else {
@@ -4682,9 +4707,27 @@ impl Render for Shell {
             .border_color(cx.theme().title_bar_border)
             .when(
                 show_documents_menu || edit_source || tab_conflict || document_actions,
-                |row| row.pr(px(8. * scale)),
+                |row| row.pr(px(12. * scale)),
             )
             .child(div().flex_1().min_w_0().child(tabs))
+            .when(hidden_tabs > 0 && !self.request.pick, |row| {
+                row.child(
+                    Button::new("hidden-tabs")
+                        .label(format!(
+                            "{hidden_tabs} more open document{}",
+                            if hidden_tabs == 1 { "" } else { "s" }
+                        ))
+                        .display_label(format!("+{hidden_tabs}"))
+                        .tooltip("Show all open documents")
+                        .xsmall()
+                        .ghost()
+                        .text_color(cx.theme().muted_foreground)
+                        .flex_shrink_0()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.command("open-documents", window, cx)
+                        })),
+                )
+            })
             .child(
                 div()
                     .flex()

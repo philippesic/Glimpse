@@ -76,7 +76,7 @@ Default to System appearance with explicit Light and Dark choices. Every surface
 | Separator | `#E4E4E7` | `#1F1F1F` | Decorative region boundaries |
 | Border | `#E4E4E7` | `#2A2A2A` | Outlines of menus, popovers and dialogs |
 | Control border | `#8B8B94` | `#6B6B6B` | Necessary control boundaries such as text fields |
-| Hover | `#EBEBED` | `#1C1C1C` | Pointer feedback |
+| Hover | `#E4E4E7` | `#262626` | Pointer feedback |
 | Selection | `#E2E8F8` | `#1A2747` | Active selection, normal text |
 | Inactive selection | `#E9E9EC` | `#232323` | Selection outside the focused pane |
 | Accent | `#1D4ED8` | `#6B98FF` | Focus, links and modified indicator |

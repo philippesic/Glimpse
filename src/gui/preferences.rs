@@ -800,12 +800,10 @@ impl Render for Preferences {
                 ))
                 .into_any_element()
         } else {
-            // Tab labels align with the title; their fills extend into the margin.
             div()
                 .flex()
                 .flex_wrap()
                 .gap_1()
-                .ml(px(-12.))
                 .children(Page::ALL.into_iter().enumerate().map(|(index, page)| {
                     Button::new(page.label())
                         .label(page.label())
@@ -838,6 +836,7 @@ impl Render for Preferences {
         };
         let title = div()
             .flex_shrink_0()
+            .font_weight(gpui::FontWeight::SEMIBOLD)
             .text_size(px(20. * self.draft.ui_scale))
             .when(compact_header, |title| {
                 title.text_size(px(16. * self.draft.ui_scale))
