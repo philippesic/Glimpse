@@ -49,6 +49,26 @@ pub fn shortcut_label(value: &str) -> String {
     }
 }
 
+pub fn portable_shortcut(value: &str) -> String {
+    value
+        .split('+')
+        .map(|part| match part.trim() {
+            "Ctrl" if !cfg!(target_os = "macos") => "Cmd",
+            "⌘" => "Cmd",
+            "Option" => "Alt",
+            "Left" => "ArrowLeft",
+            "Right" => "ArrowRight",
+            "Up" => "ArrowUp",
+            "Down" => "ArrowDown",
+            "Page Up" => "PageUp",
+            "Page Down" => "PageDown",
+            "," => "Comma",
+            other => other,
+        })
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
 #[cfg(target_os = "macos")]
 pub const MONOSPACE_FAMILIES: &[&str] = &["Menlo", "SF Mono", "Monaco"];
 #[cfg(target_os = "windows")]

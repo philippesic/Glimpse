@@ -10,6 +10,7 @@ pub(super) struct State {
     pub started: bool,
     pub running: bool,
     pub file_opens: HashMap<u64, u64>,
+    pub duplicate_parents: std::sync::Arc<HashMap<PathBuf, String>>,
     pub building: bool,
     pub query: String,
     pub selection: Option<usize>,
@@ -30,6 +31,7 @@ impl State {
             started: false,
             running: false,
             file_opens: HashMap::new(),
+            duplicate_parents: Default::default(),
             building: false,
             query: String::new(),
             selection: None,
@@ -106,6 +108,7 @@ impl Shell {
         self.search_ui.collapsed = false;
         self.search_id = self.search.cancel();
         self.hits = Default::default();
+        self.search_ui.duplicate_parents = Default::default();
         self.search_ui.selection = None;
         self.search_ui.started = false;
         self.search_ui.running = false;
@@ -213,8 +216,6 @@ impl Shell {
         let (path, line, fingerprint) = (hit.path.clone(), hit.line, hit.fingerprint);
         self.search_ui.selection = Some(index);
         let filename_result = self.panel == Some(Panel::Files);
-        self.search_ui.collapsed =
-            (!filename_result || self.request.pick) && self.search_ui.takeover;
         self.search_ui.picker_selection = Some(path.clone());
         if let Some(token) = self.open(path, false, fingerprint.map(|_| (line, 1))) {
             if let Some(fingerprint) = fingerprint {
@@ -354,7 +355,6 @@ impl Shell {
     }
     pub(super) fn search_view(
         &self,
-        takeover: bool,
         stacked: bool,
         window: &mut Window,
         cx: &Context<Self>,
@@ -363,6 +363,7 @@ impl Shell {
         let index = self.search.index_status(scope);
         let compatible = self.search.index_compatible(scope, &self.search_filters());
         let hits = self.hits.clone();
+        let duplicate_parents = self.search_ui.duplicate_parents.clone();
         let count = hits.len().min(1000);
         let scale = self.settings.ui_scale;
         let row_height = px(32. * scale);
@@ -410,8 +411,8 @@ impl Shell {
         div()
             .flex()
             .flex_col()
+            .flex_1()
             .min_h_0()
-            .when(takeover, |panel| panel.flex_1())
             .when(!stacked || self.search_ui.running, |panel| {
                 panel.child(
                     div()
@@ -534,16 +535,8 @@ impl Shell {
                         .p(px(2. * scale))
                         .rounded(px(7. * scale))
                         .overflow_hidden()
-                        .map(|results| {
-                            if takeover {
-                                results.flex_1().min_h(row_height)
-                            } else {
-                                results
-                                    .h(row_height * count.min(8) + px(2. + 4. * scale))
-                                    .flex_shrink()
-                                    .min_h(row_height * count.min(2) + px(2. + 4. * scale))
-                            }
-                        })
+                        .flex_1()
+                        .min_h(row_height + px(4. * scale))
                         .border_1()
                         .border_color(if self.search_ui.focus.is_focused(window) {
                             cx.theme().ring
@@ -560,32 +553,79 @@ impl Shell {
                                 cx.processor(
                                     move |this, range: std::ops::Range<usize>, window, cx| {
                                         let rem = window.rem_size();
-                                        let measure = |text: &SharedString| {
-                                            let run = window.text_style().to_run(text.len());
-                                            window
-                                                .text_system()
-                                                .shape_line(text.clone(), rem * 0.875, &[run], None)
-                                                .width
-                                        };
-                                        let room = window.viewport_size().width - rem * 3.;
+                                        let style = window.text_style();
+                                        let bold = style.clone().highlight(HighlightStyle {
+                                            font_weight: Some(FontWeight::BOLD),
+                                            ..Default::default()
+                                        });
+                                        let measure_with =
+                                            |text: &SharedString, style: &TextStyle| {
+                                                let run = style.to_run(text.len());
+                                                window
+                                                    .text_system()
+                                                    .shape_line(
+                                                        text.clone(),
+                                                        rem * 0.875,
+                                                        &[run],
+                                                        None,
+                                                    )
+                                                    .width
+                                            };
+                                        let measure =
+                                            |text: &SharedString| measure_with(text, &style);
+                                        let measure_bold =
+                                            |text: &SharedString| measure_with(text, &bold);
+                                        let room = window.viewport_size().width
+                                            - rem * 1.5
+                                            - px(27. * scale + 4.);
                                         range
                                             .map(|i| {
                                                 let hit = &hits[i];
-                                                let relative = paths::display(
-                                                    hit.path
-                                                        .strip_prefix(this.effective_scope())
-                                                        .unwrap_or(&hit.path),
-                                                );
+                                                let relative = hit
+                                                    .path
+                                                    .strip_prefix(this.effective_scope())
+                                                    .unwrap_or(&hit.path);
                                                 let content = hit.fingerprint.is_some();
-                                                let name = fit_path(
-                                                    &relative,
-                                                    if content { room * 0.6 } else { room },
-                                                    &measure,
-                                                );
-                                                let prefix = if content {
-                                                    format!("{name}:{}  ", hit.line)
+                                                let file = paths::name(&hit.path);
+                                                let parent = relative
+                                                    .parent()
+                                                    .map_or_else(String::new, paths::display);
+                                                let distinguishing =
+                                                    duplicate_parents.get(&hit.path);
+                                                let name = if content {
+                                                    if let Some(folder) = distinguishing {
+                                                        filename_caption(
+                                                            &format!("{file}:{}", hit.line),
+                                                            folder,
+                                                            true,
+                                                            room * 0.6,
+                                                            &measure,
+                                                        )
+                                                    } else {
+                                                        format!(
+                                                            "{}:{}",
+                                                            fit_path(
+                                                                &paths::display(relative),
+                                                                room * 0.6,
+                                                                &measure
+                                                            ),
+                                                            hit.line,
+                                                        )
+                                                    }
                                                 } else {
+                                                    filename_caption(
+                                                        &file,
+                                                        distinguishing
+                                                            .map_or(&parent, String::as_str),
+                                                        distinguishing.is_some(),
+                                                        room,
+                                                        &measure_bold,
+                                                    )
+                                                };
+                                                let prefix = if content {
                                                     format!("{name}  ")
+                                                } else {
+                                                    name.clone()
                                                 };
                                                 let label = format!("{prefix}{}", hit.excerpt);
                                                 let ranges = if content {
@@ -601,13 +641,7 @@ impl Shell {
                                                 } else {
                                                     search::highlight_ranges(&name, &hit.query)
                                                 };
-                                                let file = paths::name(&hit.path);
-                                                let folder = paths::display(
-                                                    Path::new(&relative)
-                                                        .parent()
-                                                        .unwrap_or(Path::new("")),
-                                                );
-                                                let spoken = match (content, folder.is_empty()) {
+                                                let spoken = match (content, parent.is_empty()) {
                                                     (true, true) => {
                                                         format!(
                                                             "{file}, line {}: {}",
@@ -615,12 +649,12 @@ impl Shell {
                                                         )
                                                     }
                                                     (true, false) => format!(
-                                                        "{file}, line {}: {}, in {folder}",
+                                                        "{file}, line {}: {}, in {parent}",
                                                         hit.line, hit.excerpt
                                                     ),
                                                     (false, true) => file.to_string(),
                                                     (false, false) => {
-                                                        format!("{file}, in {folder}")
+                                                        format!("{file}, in {parent}")
                                                     }
                                                 };
                                                 let tooltip = if content {
@@ -692,6 +726,42 @@ impl Shell {
             })
             .into_any_element()
     }
+}
+
+fn filename_caption(
+    file: &str,
+    folder: &str,
+    distinguish: bool,
+    room: Pixels,
+    measure: &impl Fn(&SharedString) -> Pixels,
+) -> String {
+    let separator = " · ";
+    if folder.is_empty() {
+        return decision::abbreviate_folder(file, room, measure).to_string();
+    }
+    let full = SharedString::from(format!("{file}{separator}{folder}"));
+    if measure(&full) <= room {
+        return full.to_string();
+    }
+    let file_room = if distinguish { room * 0.68 } else { room };
+    let name = decision::abbreviate_folder(file, file_room, measure);
+    let folder_room = room - measure(&name) - measure(&separator.into());
+    if folder_room <= measure(&"…".into()) * 2. {
+        return name.to_string();
+    }
+    if distinguish
+        && let Some((component, rest)) = folder.split_once(std::path::MAIN_SEPARATOR)
+        && !component.is_empty()
+    {
+        let prefix = SharedString::from(format!("{component}{}", std::path::MAIN_SEPARATOR));
+        let rest_room = folder_room - measure(&prefix);
+        if rest_room >= measure(&"…".into()) {
+            let rest = decision::abbreviate_folder(rest, rest_room, measure);
+            return format!("{name}{separator}{prefix}{rest}");
+        }
+    }
+    let folder = decision::abbreviate_folder(folder, folder_room, measure);
+    format!("{name}{separator}{folder}")
 }
 
 /// Shortens the folder part of a relative path first, so the file name and its extension stay

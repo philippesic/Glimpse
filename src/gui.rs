@@ -211,6 +211,10 @@ struct OpenIntent {
     position: Option<(usize, usize)>,
     interaction: u64,
 }
+struct TrashRequest {
+    path: PathBuf,
+    adjacent: Option<PathBuf>,
+}
 struct CloseDecision {
     quit: bool,
     documents: Vec<u64>,
@@ -293,6 +297,8 @@ struct Shell {
     navigator_visible: bool,
     scrolls: HashMap<PathBuf, UniformListScrollHandle>,
     selection: Option<PathBuf>,
+    trash_pending: Option<TrashRequest>,
+    trash_needs_selection: bool,
     reveal_pending: Option<PathBuf>,
     selections: HashMap<PathBuf, PathBuf>,
     entries: std::sync::Arc<Vec<Entry>>,
@@ -560,6 +566,8 @@ impl Shell {
             scrolls: HashMap::new(),
             selection: None,
             reveal_pending: None,
+            trash_pending: None,
+            trash_needs_selection: false,
             selections: HashMap::new(),
             entries: Default::default(),
             entries_revision: 0,
@@ -1101,6 +1109,7 @@ impl Shell {
     fn change_location(&mut self, path: PathBuf) {
         self.restoring_location = false;
         self.clear_open_failure();
+        self.trash_needs_selection = false;
         let old_scope = self.effective_scope().clone();
         if let Some(selection) = self.selection.take() {
             self.selections.insert(self.current.clone(), selection);
@@ -1141,6 +1150,44 @@ impl Shell {
         self.documents
             .iter()
             .any(|doc| doc.disk.path.starts_with(path) || doc.disk.target.starts_with(path))
+    }
+
+    fn select_navigation(&mut self, path: PathBuf) {
+        self.selection = Some(path.clone());
+        self.search_ui.picker_selection = Some(path);
+        self.trash_needs_selection = false;
+    }
+
+    fn file_action_blocker(&self, path: &Path, command: &str) -> Option<&'static str> {
+        if self.path_is_open(path) {
+            Some("Close open documents in this item first.")
+        } else if self.trash_pending.is_some() {
+            Some("Wait for the move to Trash to finish.")
+        } else if command == "trash" && self.trash_needs_selection {
+            Some("Select the next item before moving it to Trash.")
+        } else {
+            None
+        }
+    }
+
+    fn trash_selection(&mut self, path: PathBuf) {
+        let visible = self.visible_rows();
+        let adjacent = visible
+            .iter()
+            .position(|&index| self.entries[index].path == path)
+            .and_then(|index| {
+                visible
+                    .get(index + 1)
+                    .or_else(|| index.checked_sub(1).and_then(|index| visible.get(index)))
+            })
+            .map(|&index| self.entries[index].path.clone());
+        self.trash_pending = Some(TrashRequest {
+            path: path.clone(),
+            adjacent,
+        });
+        self.trash_needs_selection = true;
+        self.type_ahead.0.clear();
+        self.io.send(Job::Trash(path));
     }
 
     fn open(
@@ -1568,7 +1615,7 @@ impl Shell {
                     .or_else(|| visible.first().map(|&i| &rows[i].path))
                     .cloned();
                 if let Some(path) = path {
-                    self.selection = Some(path.clone());
+                    self.select_navigation(path.clone());
                     self.open(path, false, None);
                 }
             }
@@ -1756,6 +1803,9 @@ impl Shell {
                 Reply::Open(path, token, result) => {
                     let expected = self.hit_versions.remove(&token);
                     let file_search_generation = self.search_ui.file_opens.remove(&token);
+                    let search_generation = expected
+                        .map(|(_, generation)| generation)
+                        .or(file_search_generation);
                     if let Some(OpenIntent {
                         preview,
                         position,
@@ -1763,10 +1813,15 @@ impl Shell {
                     }) = self.opening.remove(&token)
                     {
                         let activate = interaction == self.interaction
-                            && file_search_generation.is_none_or(|generation| {
+                            && search_generation.is_none_or(|generation| {
                                 token == self.open_token
                                     && generation == self.search_id
-                                    && self.panel == Some(Panel::Files)
+                                    && self.panel
+                                        == Some(if file_search_generation.is_some() {
+                                            Panel::Files
+                                        } else {
+                                            Panel::Text
+                                        })
                             })
                             && self.preferences.is_none()
                             && self.decision.is_none();
@@ -1806,6 +1861,8 @@ impl Shell {
                                         self.panel_return = None;
                                         self.search_ui.temporary = None;
                                         self.reset_search("Search closed");
+                                    } else if search_generation.is_some() {
+                                        self.search_ui.collapsed = self.search_ui.takeover;
                                     } else if from_path {
                                         self.panel = None;
                                         self.panel_return = None;
@@ -1830,11 +1887,7 @@ impl Shell {
                                         format!("{}: {e}", paths::display(&path))
                                     });
                                 }
-                                if expected
-                                    .map(|(_, generation)| generation)
-                                    .or(file_search_generation)
-                                    == Some(self.search_id)
-                                {
+                                if search_generation == Some(self.search_id) {
                                     self.search_ui.status = format!("Failed to open result: {e}");
                                 }
                                 if from_path && activate {
@@ -1843,12 +1896,9 @@ impl Shell {
                                 } else if activate {
                                     self.open_failure = Some(notice::Failure {
                                         path,
-                                        message: e.clone(),
+                                        message: e,
+                                        return_focus: window.focused(cx),
                                     });
-                                    self.status = e;
-                                }
-                                if !from_path && file_search_generation.is_none() && activate {
-                                    self.focus(window, cx);
                                 }
                             }
                         }
@@ -2504,16 +2554,27 @@ impl Shell {
                         Err(error) => self.status = error,
                     }
                 }
-                Reply::Changed(result) => match result {
-                    Ok(()) => {
-                        self.refresh();
-                        window.focus(&self.nav_focus);
+                Reply::Trashed(path, result) => {
+                    if let Some(request) = self.trash_pending.take() {
+                        match result {
+                            Ok(()) => {
+                                if path.parent() == Some(self.current.as_path()) {
+                                    if self.selection.as_ref() == Some(&path) {
+                                        self.selection = request.adjacent;
+                                        self.search_ui.picker_selection = self.selection.clone();
+                                    }
+                                    self.refresh();
+                                }
+                                self.status = format!("Moved to Trash: {}", paths::name(&path));
+                            }
+                            Err(error) => {
+                                self.trash_needs_selection = false;
+                                self.status =
+                                    format!("Cannot move {} to Trash. {error}", paths::name(&path));
+                            }
+                        }
                     }
-                    Err(e) => {
-                        self.reveal_pending = None;
-                        self.status = e;
-                    }
-                },
+                }
                 _ => {}
             }
         }
@@ -2536,6 +2597,7 @@ impl Shell {
                     .selection
                     .and_then(|i| self.hits.get(i))
                     .map(|hit| (hit.path.clone(), hit.line));
+                self.search_ui.duplicate_parents = std::sync::Arc::new(result.duplicate_parents);
                 self.hits = std::sync::Arc::new(result.hits);
                 self.search_ui.selection = selected
                     .and_then(|(path, line)| {
@@ -2942,7 +3004,12 @@ impl Shell {
             "named-file" => self.panel(Panel::NewFile, window, cx),
             "new-folder" => self.panel(Panel::NewFolder, window, cx),
             "rename" => {
-                if let Some(path) = self.selected_path().filter(|path| !self.path_is_open(path)) {
+                if let Some(path) = self.selected_path() {
+                    if let Some(reason) = self.file_action_blocker(&path, command) {
+                        self.status = reason.into();
+                        cx.notify();
+                        return;
+                    }
                     self.panel(Panel::Rename, window, cx);
                     if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
                         self.query.update(cx, |input, cx| {
@@ -2952,7 +3019,7 @@ impl Shell {
                     }
                     self.rename_path = Some(path);
                 } else {
-                    self.status = "Select a closed file or folder to rename".into();
+                    self.status = "Select a file or folder to rename.".into();
                 }
             }
             "navigator" => {
@@ -3383,11 +3450,10 @@ impl Shell {
             }
             "trash" if !self.request.pick => {
                 if let Some(path) = self.selected_path() {
-                    if self.path_is_open(&path) {
-                        self.status =
-                            "Close documents in this item before moving it to Trash".into();
+                    if let Some(reason) = self.file_action_blocker(&path, command) {
+                        self.status = reason.into();
                     } else {
-                        self.io.send(Job::Trash(path));
+                        self.trash_selection(path);
                     }
                 }
             }
@@ -3513,7 +3579,7 @@ impl Shell {
             "rename" | "trash" => self
                 .selection
                 .as_ref()
-                .is_some_and(|path| !self.path_is_open(path)),
+                .is_some_and(|path| self.file_action_blocker(path, command).is_none()),
             "stop-search" => self.search_ui.running,
             "remove-index" => self.search.index_status(self.effective_scope()).is_some(),
             "back" => !self.history.is_empty(),
@@ -4010,6 +4076,10 @@ impl Render for Shell {
         if self.nav_focus.is_focused(window)
             && self.listing_done
             && self.reveal_pending.is_none()
+            && self
+                .trash_pending
+                .as_ref()
+                .is_none_or(|request| Some(&request.path) != self.selection.as_ref())
             && !visible
                 .iter()
                 .any(|&i| Some(&entries[i].path) == self.selection.as_ref())
@@ -4126,13 +4196,8 @@ impl Render for Shell {
                                 let selected = this.selection.as_ref() == Some(&path);
                                 let tooltip = paths::display(&path);
                                 let name = paths::name(&path);
-                                let caption = if name.chars().count() as f32 * 0.4 * font_size
-                                    > name_width
-                                {
-                                    decision::abbreviate_folder(&name, name_width, &measure)
-                                } else {
-                                    SharedString::from(name)
-                                };
+                                let caption =
+                                    decision::abbreviate_folder(&name, name_width, &measure);
                                 let icon = if entry.symlink {
                                     IconName::ExternalLink
                                 } else if entry.directory {
@@ -4177,9 +4242,9 @@ impl Render for Shell {
                                         },
                                     ))
                                     .on_click(cx.listener(
-                                        move |this, event: &ClickEvent, _, cx| {
-                                            this.selection = Some(path.clone());
-                                            this.search_ui.picker_selection = Some(path.clone());
+                                        move |this, event: &ClickEvent, window, cx| {
+                                            this.select_navigation(path.clone());
+                                            window.focus(&this.nav_focus);
                                             this.open(path.clone(), event.click_count() < 2, None);
                                             cx.notify();
                                         },
@@ -4882,7 +4947,10 @@ impl Render for Shell {
                 match key.key.as_str() {
                     "f2" | "delete" if !key.modifiers.shift => {
                         let command = if key.key == "f2" { "rename" } else { "trash" };
-                        if !event.is_held && this.command_enabled(command) {
+                        if !event.is_held
+                            && !this.request.pick
+                            && (command != "trash" || !this.trash_needs_selection)
+                        {
                             this.command(command, window, cx);
                         }
                         return;
@@ -4902,8 +4970,7 @@ impl Render for Shell {
                         else {
                             return;
                         };
-                        this.selection = Some(rows[visible[next]].path.clone());
-                        this.search_ui.picker_selection = this.selection.clone();
+                        this.select_navigation(rows[visible[next]].path.clone());
                         if let Some(scroll) = this.scrolls.get(&this.current) {
                             scroll.scroll_to_item(next, ScrollStrategy::Top);
                         }
@@ -4950,8 +5017,7 @@ impl Render for Shell {
                             .to_lowercase()
                             .starts_with(&prefix)
                     }) {
-                        this.selection = Some(rows[visible[next]].path.clone());
-                        this.search_ui.picker_selection = this.selection.clone();
+                        this.select_navigation(rows[visible[next]].path.clone());
                         if let Some(scroll) = this.scrolls.get(&this.current) {
                             scroll.scroll_to_item(next, ScrollStrategy::Center);
                         }

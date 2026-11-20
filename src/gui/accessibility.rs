@@ -132,8 +132,7 @@ impl Shell {
         )
         .on_action(move |request, _, window, cx| {
             let _ = view.update(cx, |this, cx| {
-                this.selection = Some(path.clone());
-                this.search_ui.picker_selection = Some(path.clone());
+                this.select_navigation(path.clone());
                 match request.action {
                     Action::Focus => {
                         this.nav_focus.focus(window);
@@ -142,6 +141,7 @@ impl Shell {
                         }
                     }
                     Action::Click => {
+                        this.nav_focus.focus(window);
                         this.open(path.clone(), true, None);
                     }
                     _ => return,

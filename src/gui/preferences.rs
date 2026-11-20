@@ -117,7 +117,14 @@ impl Field {
             Self::Indent => settings.indent.to_string(),
             Self::FileLimit => settings.search_file_mib.to_string(),
             Self::Exclusions => settings.search_exclude.clone(),
-            Self::Keymaps => serde_json::to_string_pretty(&settings.keymaps).unwrap(),
+            Self::Keymaps => serde_json::to_string_pretty(
+                &settings
+                    .keymaps
+                    .iter()
+                    .map(|(command, key)| (command, super::platform::shortcut_label(key)))
+                    .collect::<std::collections::BTreeMap<_, _>>(),
+            )
+            .unwrap(),
         }
     }
 }
@@ -385,6 +392,9 @@ impl Preferences {
                 ),
             )
         })?;
+        for key in settings.keymaps.values_mut() {
+            *key = super::platform::portable_shortcut(key);
+        }
         for (value, lower, upper, field) in [
             (settings.font_size, 10., 32., Field::Size),
             (settings.line_height, 1.2, 2., Field::Height),
@@ -617,11 +627,14 @@ impl Render for Preferences {
                 rows.push(self.field(Field::Exclusions, cx));
             }
             Page::Shortcuts => {
-                let guidance = "Enter a JSON object that maps command names to keys, such as {\"find-files\": \"Cmd+Shift+O\"}. Cmd means Control on Linux and Command on macOS. Use an empty value to disable a shortcut. Text editing keys are reserved.";
+                let example = super::platform::shortcut_label("Cmd+Shift+O");
+                let guidance = format!(
+                    "Enter a JSON object that maps command names to keys, such as {{\"find-files\": \"{example}\"}}. Use an empty value to disable a shortcut. Text editing keys are reserved."
+                );
                 rows.push(
                     super::accessibility::label(
                         "keymap-help",
-                        guidance.into(),
+                        guidance.clone(),
                         div().child(guidance),
                     )
                     .into_any_element(),

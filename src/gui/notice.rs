@@ -3,15 +3,12 @@ use super::*;
 pub(super) struct Failure {
     pub path: PathBuf,
     pub message: String,
+    pub return_focus: Option<FocusHandle>,
 }
 
 impl Shell {
     pub(super) fn clear_open_failure(&mut self) {
-        if let Some(failure) = self.open_failure.take()
-            && self.status == failure.message
-        {
-            self.status.clear();
-        }
+        self.open_failure = None;
     }
 
     pub(super) fn notice(&self, cx: &App) -> Div {
@@ -47,8 +44,13 @@ impl Shell {
             .flex()
             .items_center()
             .gap(px(8. * self.settings.ui_scale))
-            .flex_1()
-            .min_w(px(140. * self.settings.ui_scale))
+            .map(|label| {
+                if show_reason {
+                    label.w_full().min_w_0()
+                } else {
+                    label.flex_1().min_w(px(140. * self.settings.ui_scale))
+                }
+            })
             .child(
                 gpui_component::Icon::new(IconName::TriangleAlert)
                     .with_size(px(16. * self.settings.ui_scale))
@@ -64,18 +66,12 @@ impl Shell {
                     .min_w_0()
                     .child(
                         div()
-                            .truncate()
+                            .whitespace_normal()
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(title),
                     )
                     .when(show_reason, |label| {
-                        label.child(
-                            div()
-                                .text_sm()
-                                .whitespace_normal()
-                                .line_clamp(2)
-                                .child(reason),
-                        )
+                        label.child(div().text_sm().whitespace_normal().child(reason))
                     })
                     .tooltip(move |window, cx| {
                         gpui_component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx)
@@ -92,6 +88,7 @@ impl Shell {
             failure.message
         );
         let retry_path = path.clone();
+        let return_focus = failure.return_focus.clone();
         self.notice(cx)
             .child(self.notice_label(
                 "open-failure",
@@ -142,9 +139,23 @@ impl Shell {
                     .label("Dismiss")
                     .small()
                     .outline()
-                    .on_click(cx.listener(|this, _, window, cx| {
+                    .on_click(cx.listener(move |this, _, window, cx| {
                         this.clear_open_failure();
-                        this.focus(window, cx);
+                        let navigator_shown = if this.narrow(window) {
+                            this.navigation_only
+                        } else {
+                            this.navigator_visible
+                        };
+                        if let Some(focus) = &return_focus
+                            && ((focus == &this.nav_focus && navigator_shown)
+                                || (this.panel.is_some()
+                                    && (focus == &this.query.focus_handle(cx)
+                                        || focus == &this.search_ui.focus)))
+                        {
+                            window.focus(focus);
+                        } else {
+                            this.focus(window, cx);
+                        }
                         cx.notify();
                     })),
             )

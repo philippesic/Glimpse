@@ -95,7 +95,7 @@ pub enum Reply {
     Volumes(Result<crate::locations::Volumes, String>),
     SettingsLoaded(Result<storage::Settings, String>),
     SettingsSaved(Result<storage::Settings, String>),
-    Changed(Result<(), String>),
+    Trashed(PathBuf, Result<(), String>),
     NamedChange(u64, PathBuf, Result<(), String>),
     Records(Result<storage::Inventory, String>),
     Finished(u64, u64, u64, DiskFile, Result<(), String>),
@@ -543,7 +543,10 @@ impl IoWorker {
                         Job::TrashRecord(path) => {
                             Reply::RecordTrashed(storage::trash_record(&path))
                         }
-                        Job::Trash(path) => Reply::Changed(fileops::trash(&path)),
+                        Job::Trash(path) => {
+                            let result = fileops::trash(&path);
+                            Reply::Trashed(path, result)
+                        }
                         Job::Prepare(destination) => {
                             let result = DiskFile::prepare_destination(destination.path.clone());
                             Reply::Prepared(Box::new(destination), result)
@@ -864,6 +867,7 @@ impl IoWorker {
                         Reply::NamedChange(ticket, path, Err(message))
                     }
                     Job::TrashRecord(_) => Reply::RecordTrashed(Err(message)),
+                    Job::Trash(path) => Reply::Trashed(path, Err(message)),
                     Job::Reload(reload) => Reply::Reloaded(reload, Err(message)),
                     Job::BindingApplied(..) => Reply::Done(Ok(())),
                     _ => Reply::Done(Err(message)),

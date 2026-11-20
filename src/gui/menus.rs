@@ -624,8 +624,7 @@ impl Shell {
             return;
         }
         let title = format!("Actions for {}", paths::name(&path));
-        self.selection = Some(path.clone());
-        self.search_ui.picker_selection = Some(path);
+        self.select_navigation(path.clone());
         window.focus(&self.nav_focus);
         let shell = cx.weak_entity();
         let disabled = self.disabled_commands();
@@ -635,6 +634,10 @@ impl Shell {
                 .action_context(self.nav_focus.clone())
                 .scrollable(true)
                 .max_h(window.viewport_size().height - px(24.));
+            let blocker = self.file_action_blocker(&path, "rename");
+            if let Some(reason) = blocker {
+                menu = menu.label(reason);
+            }
             let actions = [
                 ("rename", "Rename…", "F2"),
                 ("trash", "Move to Trash", "Delete"),
@@ -645,7 +648,7 @@ impl Shell {
             for (index, (id, label, key)) in actions.into_iter().enumerate() {
                 let enabled = !disabled.contains(id);
                 if enabled && first.is_none() {
-                    first = Some(index);
+                    first = Some(index + usize::from(blocker.is_some()));
                 }
                 menu = menu.item(
                     command_item(shell.clone(), id, label.into(), !enabled)

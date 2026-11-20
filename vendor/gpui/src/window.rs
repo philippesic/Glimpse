@@ -751,6 +751,7 @@ pub(crate) struct Frame {
     pub(crate) deferred_draws: Vec<DeferredDraw>,
     pub(crate) input_handlers: Vec<Option<PlatformInputHandler>>,
     pub(crate) tooltip_requests: Vec<Option<TooltipRequest>>,
+    tooltip_start: usize,
     pub(crate) cursor_styles: Vec<CursorStyleRequest>,
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) debug_bounds: FxHashMap<String, Bounds<Pixels>>,
@@ -799,6 +800,7 @@ impl Frame {
             deferred_draws: Vec::new(),
             input_handlers: Vec::new(),
             tooltip_requests: Vec::new(),
+            tooltip_start: 0,
             cursor_styles: Vec::new(),
 
             #[cfg(any(test, feature = "test-support"))]
@@ -822,6 +824,7 @@ impl Frame {
         self.scene.clear();
         self.input_handlers.clear();
         self.tooltip_requests.clear();
+        self.tooltip_start = 0;
         self.cursor_styles.clear();
         self.hitboxes.clear();
         self.window_control_hitboxes.clear();
@@ -2185,7 +2188,9 @@ impl Window {
 
     fn prepaint_tooltip(&mut self, cx: &mut App) -> Option<AnyElement> {
         // Use indexing instead of iteration to avoid borrowing self for the duration of the loop.
-        for tooltip_request_index in (0..self.next_frame.tooltip_requests.len()).rev() {
+        for tooltip_request_index in
+            (self.next_frame.tooltip_start..self.next_frame.tooltip_requests.len()).rev()
+        {
             let Some(Some(tooltip_request)) = self
                 .next_frame
                 .tooltip_requests
@@ -2482,6 +2487,12 @@ impl Window {
             .tooltip_requests
             .push(Some(TooltipRequest { id, tooltip }));
         id
+    }
+
+    /// Keep tooltips from earlier layers below a transient surface.
+    pub fn hide_underlying_tooltips(&mut self) {
+        self.invalidator.debug_assert_prepaint();
+        self.next_frame.tooltip_start = self.next_frame.tooltip_requests.len();
     }
 
     /// Invoke the given function with the given content mask after intersecting it

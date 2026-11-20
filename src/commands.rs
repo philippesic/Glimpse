@@ -223,7 +223,7 @@ commands![
     (NewFolder, "new-folder", "New Folder…", "Cmd+Shift+N"),
     (NamedFile, "named-file", "New Named File…", ""),
     (Rename, "rename", "Rename Selected…", ""),
-    (Trash, "trash", "Move Selected to Trash…", ""),
+    (Trash, "trash", "Move Selected to Trash", ""),
     (
         Finish,
         "finish",

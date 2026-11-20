@@ -19,6 +19,7 @@ pub(crate) struct MenuItemElement {
     style: StyleRefinement,
     disabled: bool,
     selected: bool,
+    expanded: Option<bool>,
     on_click: Option<Rc<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
     on_hover: Option<Box<dyn Fn(&bool, &mut Window, &mut App) + 'static>>,
     children: SmallVec<[AnyElement; 2]>,
@@ -39,6 +40,7 @@ impl MenuItemElement {
             style: StyleRefinement::default(),
             disabled: false,
             selected: false,
+            expanded: None,
             on_click: None,
             on_hover: None,
             children: SmallVec::new(),
@@ -67,6 +69,11 @@ impl MenuItemElement {
     /// Set ListItem as the selected item style.
     pub(crate) fn selected(mut self, selected: bool) -> Self {
         self.selected = selected;
+        self
+    }
+
+    pub(crate) fn expanded(mut self, expanded: bool) -> Self {
+        self.expanded = Some(expanded);
         self
     }
 
@@ -120,6 +127,7 @@ impl RenderOnce for MenuItemElement {
         let shortcut = self.shortcut;
         let disabled = self.disabled;
         let selected = self.selected;
+        let expanded = self.expanded;
         let focus = self.focus;
         let on_focus = self.on_focus;
         let on_click = self.on_click.clone();
@@ -169,6 +177,9 @@ impl RenderOnce for MenuItemElement {
                 node.set_keyboard_shortcut(shortcut.to_string());
             }
             node.set_selected(selected);
+            if let Some(expanded) = expanded {
+                node.set_expanded(expanded);
+            }
             if disabled {
                 node.set_disabled()
             } else {

@@ -84,7 +84,8 @@ impl Shell {
         };
         let naming = matches!(panel, Panel::NewFile | Panel::NewFolder | Panel::Rename);
         let search = matches!(panel, Panel::Files | Panel::Text);
-        let stacked = window.viewport_size().width < px(760. * scale);
+        let viewport = window.viewport_size();
+        let stacked = viewport.width < px(760. * scale);
         let submit = (!matches!(panel, Panel::Recovery | Panel::Filter)).then(|| {
             self.button(
                 match panel {
@@ -173,10 +174,12 @@ impl Shell {
             .map(|section| {
                 if takeover {
                     section.flex_1().overflow_y_scroll()
-                } else {
+                } else if search && !self.search_ui.collapsed {
                     section
                         .flex_shrink_0()
-                        .max_h(window.viewport_size().height * 0.5)
+                        .h((viewport.height * 0.42).min(px(320. * scale)))
+                } else {
+                    section.flex_shrink_0().max_h(viewport.height * 0.5)
                 }
             })
             .child(header);
@@ -200,9 +203,7 @@ impl Shell {
             Panel::Files | Panel::Text if self.search_ui.collapsed => {
                 section.child(self.collapsed_results(cx))
             }
-            Panel::Files | Panel::Text => {
-                section.child(self.search_view(takeover, stacked, window, cx))
-            }
+            Panel::Files | Panel::Text => section.child(self.search_view(stacked, window, cx)),
             Panel::Palette => section.child(self.palette_view(takeover, window, cx)),
             Panel::Recovery => section.child(
                 div()

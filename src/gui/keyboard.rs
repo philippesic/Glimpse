@@ -240,8 +240,7 @@ impl Shell {
             .iter()
             .position(|&i| Some(&rows[i].path) == self.selection.as_ref())
             .unwrap_or(0);
-        self.selection = Some(rows[visible[index]].path.clone());
-        self.search_ui.picker_selection = self.selection.clone();
+        self.select_navigation(rows[visible[index]].path.clone());
         if let Some(scroll) = self.scrolls.get(&self.current) {
             scroll.scroll_to_item(index, ScrollStrategy::Top);
         }
@@ -305,6 +304,18 @@ impl Shell {
                 }
                 "f6" => {
                     self.cycle_focus(key.modifiers.shift, window, cx);
+                    stop(window, cx);
+                    return;
+                }
+                "menu" | "f10"
+                    if (key.key == "f10") == key.modifiers.shift
+                        && let Some(document) = self.documents.iter().find(|document| {
+                            document.input.focus_handle(cx).is_focused(window)
+                        }) =>
+                {
+                    document
+                        .input
+                        .update(cx, |input, cx| input.open_context_menu(window, cx));
                     stop(window, cx);
                     return;
                 }

@@ -1,6 +1,7 @@
 use std::{
     cmp::Reverse,
-    collections::{BinaryHeap, hash_map::DefaultHasher},
+    collections::{BinaryHeap, HashMap, HashSet, hash_map::DefaultHasher},
+    ffi::OsStr,
     hash::{Hash, Hasher},
     io::Read,
     os::unix::fs::OpenOptionsExt,
@@ -27,6 +28,7 @@ pub struct Hit {
 pub struct ResultSet {
     pub generation: u64,
     pub hits: Vec<Hit>,
+    pub duplicate_parents: HashMap<PathBuf, String>,
     pub state: String,
     pub completed: bool,
 }
@@ -199,6 +201,44 @@ fn ordered(hits: &[Hit]) -> Vec<Hit> {
     });
     hits
 }
+fn duplicate_parents(hits: &[Hit]) -> HashMap<PathBuf, String> {
+    let mut by_name: HashMap<&OsStr, HashSet<&OsStr>> = HashMap::new();
+    for hit in hits {
+        if let Some(name) = hit.path.file_name() {
+            by_name
+                .entry(name)
+                .or_default()
+                .insert(hit.path.as_os_str());
+        }
+    }
+    let mut parents = HashMap::new();
+    for paths in by_name.values().filter(|paths| paths.len() > 1) {
+        let mut counts = HashMap::new();
+        for &path in paths {
+            for suffix in parent_suffixes(Path::new(path)) {
+                *counts.entry(suffix.as_os_str()).or_insert(0) += 1;
+            }
+        }
+        for &path in paths {
+            if let Some(suffix) = parent_suffixes(Path::new(path))
+                .filter(|suffix| counts.get(suffix.as_os_str()) == Some(&1))
+                .last()
+            {
+                parents.insert(PathBuf::from(path), crate::paths::display(suffix));
+            }
+        }
+    }
+    parents
+}
+
+fn parent_suffixes(path: &Path) -> impl Iterator<Item = &Path> {
+    let mut parts = path.parent().unwrap_or(path).components();
+    std::iter::from_fn(move || {
+        let suffix = parts.as_path();
+        parts.next().map(|_| suffix)
+    })
+}
+
 fn indexed_hits(
     paths: &[PathBuf],
     scope: &Path,
@@ -273,6 +313,7 @@ impl Search {
                     let mut result = ResultSet {
                         generation: id,
                         hits: ordered(hits),
+                        duplicate_parents: duplicate_parents(hits),
                         state: state.into(),
                         completed,
                     };

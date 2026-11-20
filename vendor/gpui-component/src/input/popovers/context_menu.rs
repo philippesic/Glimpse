@@ -1,7 +1,7 @@
 use gpui::{
     App, AppContext as _, Context, Corner, DismissEvent, Entity, IntoElement, MouseDownEvent,
     ParentElement as _, Pixels, Point, Render, Styled, Subscription, WeakEntity, Window, anchored,
-    deferred, div, prelude::FluentBuilder as _, px,
+    deferred, div, point, prelude::FluentBuilder as _, px,
 };
 use rust_i18n::t;
 
@@ -34,37 +34,62 @@ impl InputState {
             self.move_to(offset, None, cx);
         }
 
-        self.context_menu = Some(ContextMenu::MouseContext(self.mouse_context_menu.clone()));
-
-        let is_code_editor = self.mode.is_code_editor();
-        if is_code_editor {
+        if self.mode.is_code_editor() {
             self.handle_hover_definition(offset, window, cx);
         }
 
+        self.show_context_menu(event.position, window, cx);
+    }
+
+    pub fn open_context_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(bounds) = self.last_bounds else {
+            return;
+        };
+        let cursor = self.cursor();
+        let position = self
+            .range_to_bounds(&(cursor..cursor))
+            .map(|caret| point(caret.left(), caret.bottom()))
+            .filter(|point| bounds.contains(point))
+            .unwrap_or_else(|| bounds.center());
+        self.show_context_menu(position, window, cx);
+    }
+
+    fn show_context_menu(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.context_menu = Some(ContextMenu::MouseContext(self.mouse_context_menu.clone()));
         let is_enable = !self.disabled;
-        let has_goto_definition = is_enable && self.lsp.definition_provider.is_some();
-        let has_code_action = is_enable && !self.lsp.code_action_providers.is_empty();
+        let has_goto_definition =
+            self.mode.is_code_editor() && self.lsp.definition_provider.is_some();
+        let has_code_action =
+            self.mode.is_code_editor() && !self.lsp.code_action_providers.is_empty();
         let is_selected = !self.selected_range.is_empty();
         let has_paste = is_enable && cx.read_from_clipboard().is_some();
 
         let action_context = self.focus_handle.clone();
         self.mouse_context_menu.update(cx, |this, cx| {
-            this.mouse_position = event.position;
+            this.mouse_position = position;
+            this.open = true;
             this.menu.update(cx, |menu, cx| {
                 let new_menu = PopupMenu::new(cx)
-                    .when(is_code_editor, |m| {
+                    .when(has_goto_definition, |m| {
                         m.menu_with_enable(
                             t!("Input.Go to Definition"),
                             Box::new(input::GoToDefinition),
-                            has_goto_definition,
+                            is_enable,
                         )
-                        .menu_with_enable(
+                    })
+                    .when(has_code_action, |m| {
+                        m.menu_with_enable(
                             t!("Input.Show Code Actions"),
                             Box::new(input::ToggleCodeActions),
-                            has_code_action,
+                            is_enable,
                         )
-                        .separator()
                     })
+                    .when(has_code_action || has_goto_definition, |m| m.separator())
                     .menu_with_enable(
                         t!("Input.Cut"),
                         Box::new(input::Cut),
@@ -77,9 +102,12 @@ impl InputState {
 
                 menu.menu_items = new_menu.menu_items;
                 menu.action_context = Some(action_context);
+                menu.min_width = Some(window.rem_size() * 12.);
+                menu.highlight_first_item(cx);
+                let focus = menu.focus_handle.clone();
+                window.defer(cx, move |window, _| window.focus(&focus));
                 cx.notify();
             });
-            this.open = true;
 
             cx.notify();
         });
