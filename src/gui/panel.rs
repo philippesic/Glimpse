@@ -213,31 +213,43 @@ impl Shell {
                 }
             })
             .child(header);
-        // Validation floats just below the panel so the document never moves when it appears.
+        // The row under the field always holds its guidance, so validation never moves the
+        // document; an error replaces the hint in the same place.
+        let line_hint = (panel == Panel::Line)
+            .then(|| {
+                self.documents
+                    .iter()
+                    .find(|doc| Some(doc.id) == self.active)
+                    .map(|doc| doc.input.read(cx).text().len_lines(LineType::LF))
+            })
+            .flatten()
+            .map(|lines| {
+                if lines == 1 {
+                    "This file has one line.".to_owned()
+                } else {
+                    format!("Lines 1 to {lines}")
+                }
+            });
         let section = section.when(panel == Panel::Line || naming, |section| {
             let scale = self.settings.ui_scale;
-            section
-                .relative()
-                .when_some(self.query_error.clone(), |section, error| {
-                    section.child(gpui::deferred(
-                        div()
-                            .absolute()
-                            .top(relative(1.))
-                            .left_0()
-                            .right_0()
-                            .occlude()
-                            .px(px(12. * scale))
-                            .py(px(4. * scale))
-                            .bg(cx.theme().title_bar)
-                            .border_b_1()
-                            .border_color(cx.theme().title_bar_border)
-                            .child(accessibility::message(
-                                "query-error",
-                                error.clone(),
-                                div().text_color(cx.theme().danger).child(error),
-                            )),
-                    ))
-                })
+            section.child(
+                div()
+                    .px(px(12. * scale))
+                    .h(px(24. * scale))
+                    .flex_shrink_0()
+                    .text_size(px(12. * scale))
+                    .map(|row| match (self.query_error.clone(), line_hint) {
+                        (Some(error), _) => row.child(accessibility::message(
+                            "query-error",
+                            error.clone(),
+                            div().text_color(cx.theme().danger).child(error),
+                        )),
+                        (None, Some(hint)) => {
+                            row.text_color(cx.theme().muted_foreground).child(hint)
+                        }
+                        (None, None) => row,
+                    }),
+            )
         });
         let section = match panel {
             Panel::Files | Panel::Text if self.search_ui.collapsed => {
