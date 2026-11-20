@@ -309,12 +309,9 @@ impl Shell {
         Button::new("open-documents-menu")
             .map(|button| {
                 if icon_only {
-                    // In the compact strip the count replaces the icon, within the same width.
-                    match &count {
-                        Some(count) => button.label("Open Documents").display_label(count.clone()),
-                        None => button.icon(IconName::ChevronsUpDown),
-                    }
-                    .tooltip("Open Documents")
+                    button
+                        .icon(IconName::ChevronsUpDown)
+                        .tooltip("Open Documents")
                 } else {
                     button
                         .label("Open Documents")

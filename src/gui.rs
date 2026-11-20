@@ -4526,7 +4526,6 @@ impl Render for Shell {
         // The strip's width is known only after layout, so a resize refills it on the next frame.
         if room != self.tab_room && !self.documents.is_empty() {
             self.tab_room = room;
-            self.tab_reveal = None;
             cx.notify();
         }
         let shown_tabs = shown_tab.filter(|_| room > px(0.)).map(|center| {
@@ -4560,13 +4559,12 @@ impl Render for Shell {
                 doc.input.focus_handle(cx).contains_focused(window, cx)
                     || doc.tab_focus.contains_focused(window, cx)
             });
-        let hidden_tabs = shown_tabs.as_ref().map_or(0, |shown| {
+        // Narrow strips keep every pixel for the tab label, so they show no count.
+        let hidden_tabs = shown_tabs.as_ref().filter(|_| !narrow).map_or(0, |shown| {
             self.documents.len() - (shown.end() + 1 - shown.start())
         });
         if hidden_tabs != self.tab_hidden && !self.documents.is_empty() {
             self.tab_hidden = hidden_tabs;
-            // The Documents control changes width, so reveal the active tab again.
-            self.tab_reveal = None;
             cx.notify();
         }
         let tabs = div()
