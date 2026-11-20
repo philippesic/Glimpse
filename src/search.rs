@@ -14,6 +14,8 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+use unicode_segmentation::UnicodeSegmentation;
+
 const MAX_RESULTS: usize = 1000;
 
 #[derive(Clone)]
@@ -28,9 +30,14 @@ pub struct Hit {
 pub struct ResultSet {
     pub generation: u64,
     pub hits: Vec<Hit>,
-    pub duplicate_parents: HashMap<PathBuf, String>,
+    pub duplicate_parents: HashMap<PathBuf, DuplicateParent>,
     pub state: String,
     pub completed: bool,
+}
+pub struct DuplicateParent {
+    pub suffix: String,
+    pub compact: String,
+    pub ordinal: usize,
 }
 #[derive(Clone, PartialEq, Eq)]
 pub struct Filters {
@@ -201,7 +208,36 @@ fn ordered(hits: &[Hit]) -> Vec<Hit> {
     });
     hits
 }
-fn duplicate_parents(hits: &[Hit]) -> HashMap<PathBuf, String> {
+fn shared_grapheme_bytes<'a>(
+    left: impl Iterator<Item = &'a str>,
+    right: impl Iterator<Item = &'a str>,
+) -> usize {
+    left.zip(right)
+        .take_while(|(left, right)| left == right)
+        .map(|(grapheme, _)| grapheme.len())
+        .sum()
+}
+
+fn shared_path_edge(left: &str, right: &str, from_end: bool) -> usize {
+    if left.is_ascii() && right.is_ascii() {
+        let equal = |(left, right): &(u8, u8)| left == right;
+        if from_end {
+            left.bytes()
+                .rev()
+                .zip(right.bytes().rev())
+                .take_while(equal)
+                .count()
+        } else {
+            left.bytes().zip(right.bytes()).take_while(equal).count()
+        }
+    } else if from_end {
+        shared_grapheme_bytes(left.graphemes(true).rev(), right.graphemes(true).rev())
+    } else {
+        shared_grapheme_bytes(left.graphemes(true), right.graphemes(true))
+    }
+}
+
+fn duplicate_parents(hits: &[Hit], scope: &Path) -> HashMap<PathBuf, DuplicateParent> {
     let mut by_name: HashMap<&OsStr, HashSet<&OsStr>> = HashMap::new();
     for hit in hits {
         if let Some(name) = hit.path.file_name() {
@@ -219,12 +255,52 @@ fn duplicate_parents(hits: &[Hit]) -> HashMap<PathBuf, String> {
                 *counts.entry(suffix.as_os_str()).or_insert(0) += 1;
             }
         }
-        for &path in paths {
-            if let Some(suffix) = parent_suffixes(Path::new(path))
+        let mut group = paths
+            .iter()
+            .map(|&path| {
+                let path = Path::new(path);
+                let parent = path.parent().unwrap_or(path);
+                (
+                    path,
+                    crate::paths::display(parent.strip_prefix(scope).unwrap_or(parent)),
+                )
+            })
+            .collect::<Vec<_>>();
+        group.sort_unstable_by_key(|(path, _)| path.as_os_str());
+        let first = group[0].1.as_str();
+        let prefix = group
+            .iter()
+            .skip(1)
+            .fold(first.len(), |prefix, (_, other)| {
+                shared_path_edge(&first[..prefix], other, false)
+            });
+        let suffix_bytes = group
+            .iter()
+            .skip(1)
+            .fold(first.len() - prefix, |suffix, (_, other)| {
+                shared_path_edge(&first[first.len() - suffix..], &other[prefix..], true)
+            });
+        for (index, (path, parent)) in group.into_iter().enumerate() {
+            if let Some(suffix) = parent_suffixes(path)
                 .filter(|suffix| counts.get(suffix.as_os_str()) == Some(&1))
                 .last()
             {
-                parents.insert(PathBuf::from(path), crate::paths::display(suffix));
+                let start = if prefix == 0 { "" } else { "…" };
+                let end = if suffix_bytes == 0 { "" } else { "…" };
+                let difference = &parent[prefix..parent.len() - suffix_bytes];
+                let compact = if parent.is_empty() {
+                    "Search folder".into()
+                } else {
+                    format!("{start}{difference}{end}")
+                };
+                parents.insert(
+                    path.to_owned(),
+                    DuplicateParent {
+                        suffix: crate::paths::display(suffix),
+                        compact,
+                        ordinal: index + 1,
+                    },
+                );
             }
         }
     }
@@ -313,7 +389,7 @@ impl Search {
                     let mut result = ResultSet {
                         generation: id,
                         hits: ordered(hits),
-                        duplicate_parents: duplicate_parents(hits),
+                        duplicate_parents: duplicate_parents(hits, &scope),
                         state: state.into(),
                         completed,
                     };
@@ -628,7 +704,7 @@ impl Search {
                             continue;
                         }
                         *index = Some(FilenameIndex {
-                            scope,
+                            scope: scope.clone(),
                             filters,
                             paths: Arc::new(indexed_paths),
                             partial,

@@ -6,7 +6,7 @@ use gpui_component::{
     button::{Button, ButtonVariants},
     menu::{DropdownMenu, PopupMenu, PopupMenuItem},
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub(super) fn command_item(
     shell: WeakEntity<Shell>,
@@ -73,7 +73,7 @@ fn add_commands(
     mut menu: PopupMenu,
     shell: &WeakEntity<Shell>,
     settings: &glimpse::storage::Settings,
-    disabled: &std::collections::HashSet<&'static str>,
+    disabled: &std::collections::HashMap<&'static str, Option<&'static str>>,
     ids: &[&'static str],
     navigator_visible: bool,
 ) -> PopupMenu {
@@ -90,12 +90,18 @@ fn add_commands(
             "toggle-navigator" => "Show Navigator",
             _ => command.label,
         };
+        let reason = disabled.get(id).copied().flatten();
+        let accessible_label =
+            reason.map_or_else(|| label.to_owned(), |reason| format!("{label} · {reason}"));
         let item = command_item(
             shell.clone(),
             command.id,
-            label.to_owned(),
-            disabled.contains(id),
+            accessible_label,
+            disabled.contains_key(id),
         )
+        .when_some(reason, |item, reason| {
+            item.display_label(label).detail(reason)
+        })
         .when_some(shortcut(settings, id), |item, hint| {
             item.shortcut_hint(hint)
         });
@@ -105,11 +111,16 @@ fn add_commands(
 }
 
 impl Shell {
-    fn disabled_commands(&self) -> std::collections::HashSet<&'static str> {
+    fn disabled_commands(&self) -> std::collections::HashMap<&'static str, Option<&'static str>> {
         commands::COMMANDS
             .iter()
             .filter(|command| !self.command_enabled(command.id))
-            .map(|command| command.id)
+            .map(|command| {
+                let reason =
+                    (command.id == "trash" && self.trash_needs_selection && !self.request.pick)
+                        .then_some("Select an item first");
+                (command.id, reason)
+            })
             .collect()
     }
 
@@ -175,7 +186,7 @@ impl Shell {
             .outline()
             .dropdown_menu(move |menu, _, _| {
                 let item = |id: &'static str, label: &str| {
-                    command_item(shell.clone(), id, label.into(), disabled.contains(id))
+                    command_item(shell.clone(), id, label.into(), disabled.contains_key(id))
                 };
                 menu.accessible_name("Resolve change on disk")
                     .item(item("compare", "Compare"))
@@ -581,6 +592,7 @@ impl Shell {
 pub(super) struct NavigatorMenu {
     menu: Entity<PopupMenu>,
     position: Point<Pixels>,
+    corner: Corner,
     _dismiss: Subscription,
 }
 
@@ -595,25 +607,31 @@ impl Shell {
         let Some(index) = index else {
             return;
         };
-        let position = self.scrolls.get(&self.current).map(|scroll| {
-            let scroll = scroll.0.borrow();
-            let bounds = scroll.base_handle.bounds();
-            let row_height = scroll
-                .last_item_size
-                .map_or(px(0.), |size| size.item.height);
-            let y = (bounds.top() + scroll.base_handle.offset().y + row_height * (index + 1))
-                .clamp(bounds.top(), bounds.bottom());
-            point(bounds.left() + px(12. * self.settings.ui_scale), y)
-        });
-        self.show_navigator_menu(
-            self.entries[visible[index]].path.clone(),
-            position.unwrap_or_default(),
-            window,
-            cx,
-        );
+        let Some(scroll) = self.scrolls.get(&self.current) else {
+            return;
+        };
+        let scroll = scroll.0.borrow();
+        let bounds = scroll.base_handle.bounds();
+        let height = self.navigation_row_height();
+        let top = bounds.top() + scroll.base_handle.offset().y + height * index;
+        let margin = px(8.);
+        let below = (top + height).clamp(bounds.top(), bounds.bottom());
+        let above = top.clamp(bounds.top(), bounds.bottom());
+        let below_space = window.viewport_size().height - below - margin;
+        let above_space = above - margin;
+        let menu_height = height * 5. + px(32.);
+        let (y, corner, room) = if below_space >= menu_height || below_space >= above_space {
+            (below, Corner::TopLeft, below_space)
+        } else {
+            (above, Corner::BottomLeft, above_space)
+        };
+        let position = point(bounds.left() + px(12. * self.settings.ui_scale), y);
+        drop(scroll);
+        let path = self.entries[visible[index]].path.clone();
+        self.show_navigator_menu(&path, (position, corner, room), false, window, cx);
     }
 
-    pub(super) fn show_navigator_menu(
+    pub(super) fn navigator_menu_from_pointer(
         &mut self,
         path: PathBuf,
         position: Point<Pixels>,
@@ -623,18 +641,38 @@ impl Shell {
         if self.decision.is_some() || self.preferences.is_some() {
             return;
         }
-        let title = format!("Actions for {}", paths::name(&path));
-        self.select_navigation(path.clone());
+        if self.trash_needs_selection {
+            self.selection = Some(path.clone());
+        } else {
+            self.select_navigation(path.clone());
+        }
+        let room = window.viewport_size().height - px(24.);
+        self.show_navigator_menu(&path, (position, Corner::TopLeft, room), true, window, cx);
+    }
+
+    fn show_navigator_menu(
+        &mut self,
+        path: &Path,
+        anchor: (Point<Pixels>, Corner, Pixels),
+        from_pointer: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.decision.is_some() || self.preferences.is_some() {
+            return;
+        }
+        let (position, corner, room) = anchor;
+        let title = format!("Actions for {}", paths::name(path));
         window.focus(&self.nav_focus);
         let shell = cx.weak_entity();
         let disabled = self.disabled_commands();
-        let menu = PopupMenu::build(window, cx, |menu, window, _| {
+        let menu = PopupMenu::build(window, cx, |menu, _, _| {
             let mut menu = menu
                 .accessible_name(title)
                 .action_context(self.nav_focus.clone())
                 .scrollable(true)
-                .max_h(window.viewport_size().height - px(24.));
-            let blocker = self.file_action_blocker(&path, "rename");
+                .max_h(room);
+            let blocker = self.file_action_blocker(path, false);
             if let Some(reason) = blocker {
                 menu = menu.label(reason);
             }
@@ -646,13 +684,48 @@ impl Shell {
             ];
             let mut first = None;
             for (index, (id, label, key)) in actions.into_iter().enumerate() {
-                let enabled = !disabled.contains(id);
+                let direct_trash = from_pointer && id == "trash";
+                let enabled = if direct_trash {
+                    blocker.is_none() && !self.request.pick
+                } else {
+                    !disabled.contains_key(id)
+                };
                 if enabled && first.is_none() {
                     first = Some(index + usize::from(blocker.is_some()));
                 }
+                let reason = disabled
+                    .get(id)
+                    .copied()
+                    .flatten()
+                    .filter(|_| blocker.is_none() && !direct_trash);
+                let accessible_label =
+                    reason.map_or_else(|| label.to_owned(), |reason| format!("{label} · {reason}"));
+                let item = if direct_trash {
+                    let path = path.to_owned();
+                    let shell = shell.clone();
+                    PopupMenuItem::new(accessible_label)
+                        .disabled(!enabled)
+                        .on_click(move |_, window, cx| {
+                            let path = path.clone();
+                            let shell = shell.clone();
+                            window.defer(cx, move |_, cx| {
+                                let _ = shell.update(cx, |shell, cx| {
+                                    shell.move_to_trash(path, false);
+                                    cx.notify();
+                                });
+                            });
+                        })
+                } else {
+                    command_item(shell.clone(), id, accessible_label, !enabled)
+                };
                 menu = menu.item(
-                    command_item(shell.clone(), id, label.into(), !enabled)
-                        .when(!key.is_empty(), |item| item.shortcut_hint(key)),
+                    item.when_some(reason, |item, reason| {
+                        item.display_label(label).detail(reason)
+                    })
+                    .when(
+                        !(key.is_empty() || direct_trash && self.trash_needs_selection),
+                        |item| item.shortcut_hint(key),
+                    ),
                 );
             }
             menu.when_some(first, |menu, index| menu.highlight(index))
@@ -665,6 +738,7 @@ impl Shell {
         self.navigator_menu = Some(NavigatorMenu {
             menu,
             position,
+            corner,
             _dismiss: dismiss,
         });
         cx.notify();
@@ -676,6 +750,7 @@ impl Shell {
                 div().absolute().inset_0().occlude().child(
                     anchored()
                         .position(menu.position)
+                        .anchor(menu.corner)
                         .snap_to_window_with_margin(px(8.))
                         .child(menu.menu.clone()),
                 ),

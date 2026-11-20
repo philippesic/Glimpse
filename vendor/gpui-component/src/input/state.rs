@@ -2073,7 +2073,7 @@ impl InputState {
     /// The offset is the UTF-8 offset.
     ///
     /// Ensure the offset use self.next_boundary or self.previous_boundary to get the correct offset.
-    pub(crate) fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+    pub fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         self.clear_inline_completion(cx);
 
         let offset = super::grapheme::floor(&self.text, offset);

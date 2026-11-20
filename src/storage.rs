@@ -264,7 +264,7 @@ impl Settings {
         {
             return Err("Settings exceed 64 KiB; the saved settings are retained.".into());
         }
-        crate::commands::bindings(&self.keymaps)?;
+        crate::commands::bindings(&self.keymaps).map_err(|error| error.to_string())?;
         self.validate_exclusion_patterns()
             .map_err(|(_, error)| error.to_string())
     }

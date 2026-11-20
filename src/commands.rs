@@ -44,7 +44,7 @@ impl Key {
         &self.0
     }
 }
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Action {
     New,
@@ -306,13 +306,35 @@ pub fn parse(value: &str) -> Result<(Modifiers, Key), String> {
     }
     Ok((modifiers, key))
 }
-pub fn bindings(overrides: &BTreeMap<String, String>) -> Result<Vec<Binding>, String> {
-    for id in overrides.keys() {
-        if !COMMANDS.iter().any(|c| c.id == id) {
-            return Err(format!("Unknown command: {id}"));
+#[derive(Debug)]
+pub enum BindingError {
+    Invalid(String),
+    Conflict {
+        shortcut: String,
+        command: &'static str,
+    },
+}
+
+impl std::fmt::Display for BindingError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(message) => formatter.write_str(message),
+            Self::Conflict { shortcut, command } => {
+                write!(formatter, "{shortcut} is already used by {command}.")
+            }
         }
     }
-    let mut used = HashSet::new();
+}
+
+impl std::error::Error for BindingError {}
+
+pub fn bindings(overrides: &BTreeMap<String, String>) -> Result<Vec<Binding>, BindingError> {
+    for id in overrides.keys() {
+        if !COMMANDS.iter().any(|c| c.id == id) {
+            return Err(BindingError::Invalid(format!("Unknown command: {id}")));
+        }
+    }
+    let mut used = HashMap::<_, (&Command, &str)>::new();
     let mut result = vec![];
     for command in COMMANDS {
         let value = overrides
@@ -322,10 +344,19 @@ pub fn bindings(overrides: &BTreeMap<String, String>) -> Result<Vec<Binding>, St
         if value.is_empty() {
             continue;
         }
-        let (modifiers, key) = parse(value)?;
+        let (modifiers, key) = parse(value).map_err(BindingError::Invalid)?;
         let signature = format!("{:?}:{:?}", modifiers, key);
-        if !used.insert(signature) {
-            return Err(format!("Duplicate shortcut: {value}"));
+        if let Some((earlier, earlier_value)) = used.insert(signature, (command, value)) {
+            let (owner, shortcut) =
+                if overrides.contains_key(earlier.id) && !overrides.contains_key(command.id) {
+                    (command, value)
+                } else {
+                    (earlier, earlier_value)
+                };
+            return Err(BindingError::Conflict {
+                shortcut: shortcut.to_owned(),
+                command: owner.label,
+            });
         }
         result.push(Binding {
             action: command.action,

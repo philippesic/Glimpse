@@ -10,7 +10,7 @@ pub(super) struct State {
     pub started: bool,
     pub running: bool,
     pub file_opens: HashMap<u64, u64>,
-    pub duplicate_parents: std::sync::Arc<HashMap<PathBuf, String>>,
+    pub duplicate_parents: std::sync::Arc<HashMap<PathBuf, search::DuplicateParent>>,
     pub building: bool,
     pub query: String,
     pub selection: Option<usize>,
@@ -122,6 +122,8 @@ impl Shell {
         self.start_search_value(query, self.panel == Some(Panel::Text));
     }
     pub(super) fn start_search_value(&mut self, query: String, content: bool) {
+        self.status.clear();
+        self.clear_open_failure();
         self.reset_search("Searching saved files…");
         self.search_ui.query = query.clone();
         if query.is_empty() {
@@ -261,6 +263,9 @@ impl Shell {
                 None => return false,
             },
         };
+        if next != index {
+            self.clear_open_failure();
+        }
         self.search_ui.selection = Some(next);
         self.search_ui.picker_selection = Some(self.hits[next].path.clone());
         self.search_ui
@@ -271,13 +276,20 @@ impl Shell {
     }
     pub(super) fn search_details(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let scope = paths::display(self.effective_scope());
+        let selected = self
+            .search_ui
+            .selection
+            .and_then(|index| self.hits.get(index));
+        let result_path = selected.map_or_else(String::new, |hit| {
+            format!("Selected result: {}\n", paths::display(&hit.path))
+        });
         let exclusions = if self.settings.search_exclude.is_empty() {
             "None"
         } else {
             &self.settings.search_exclude
         };
         let detail = format!(
-            "Search folder: {scope}\nScope: {}\nIgnore files: {}\nRepository metadata: {}\nAdditional exclusions: {exclusions}\nSaved-file content limit: {} MiB per file. Unsaved buffers are excluded from recursive text search; use Find in Document for the active buffer.\n{} {}\nCoverage is bounded to 100,000 entries and 1,000 displayed matches. Unreadable paths and reached limits produce Partial. A filename index is a session snapshot with a 16 MiB path budget; filesystem notifications can mark it stale. Rebuild refreshes it, and Remove releases it. Content searches always read saved files.\nCurrent result state: {}",
+            "Search folder: {scope}\n{result_path}Scope: {}\nIgnore files: {}\nRepository metadata: {}\nAdditional exclusions: {exclusions}\nSaved-file content limit: {} MiB per file. Unsaved buffers are excluded from recursive text search; use Find in Document for the active buffer.\n{} {}\nCoverage is bounded to 100,000 entries and 1,000 displayed matches. Unreadable paths and reached limits produce Partial. A filename index is a session snapshot with a 16 MiB path budget; filesystem notifications can mark it stale. Rebuild refreshes it, and Remove releases it. Content searches always read saved files.\nCurrent result state: {}",
             if self.search_ui.temporary.is_some() {
                 "temporary; existing pin retained"
             } else if self.scope.is_some() {
@@ -377,6 +389,7 @@ impl Shell {
             }
             (0, state) => state.to_owned(),
             (1, "Complete") => "1 match".into(),
+            (_, state) if state.starts_with("Failed to open result.") => state.to_owned(),
             (_, "Complete") => format!("{count} matches"),
             (_, state) => format!("{state} · {count} displayed"),
         };
@@ -594,10 +607,9 @@ impl Shell {
                                                     duplicate_parents.get(&hit.path);
                                                 let name = if content {
                                                     if let Some(folder) = distinguishing {
-                                                        filename_caption(
+                                                        duplicate_caption(
                                                             &format!("{file}:{}", hit.line),
                                                             folder,
-                                                            true,
                                                             room * 0.6,
                                                             &measure,
                                                         )
@@ -613,14 +625,20 @@ impl Shell {
                                                         )
                                                     }
                                                 } else {
-                                                    filename_caption(
-                                                        &file,
-                                                        distinguishing
-                                                            .map_or(&parent, String::as_str),
-                                                        distinguishing.is_some(),
-                                                        room,
-                                                        &measure_bold,
-                                                    )
+                                                    match distinguishing {
+                                                        Some(folder) => duplicate_caption(
+                                                            &file,
+                                                            folder,
+                                                            room,
+                                                            &measure_bold,
+                                                        ),
+                                                        None => filename_caption(
+                                                            &file,
+                                                            &parent,
+                                                            room,
+                                                            &measure_bold,
+                                                        ),
+                                                    }
                                                 };
                                                 let prefix = if content {
                                                     format!("{name}  ")
@@ -731,7 +749,6 @@ impl Shell {
 fn filename_caption(
     file: &str,
     folder: &str,
-    distinguish: bool,
     room: Pixels,
     measure: &impl Fn(&SharedString) -> Pixels,
 ) -> String {
@@ -743,25 +760,47 @@ fn filename_caption(
     if measure(&full) <= room {
         return full.to_string();
     }
-    let file_room = if distinguish { room * 0.68 } else { room };
-    let name = decision::abbreviate_folder(file, file_room, measure);
+    let name = decision::abbreviate_folder(file, room, measure);
     let folder_room = room - measure(&name) - measure(&separator.into());
     if folder_room <= measure(&"…".into()) * 2. {
         return name.to_string();
     }
-    if distinguish
-        && let Some((component, rest)) = folder.split_once(std::path::MAIN_SEPARATOR)
-        && !component.is_empty()
-    {
-        let prefix = SharedString::from(format!("{component}{}", std::path::MAIN_SEPARATOR));
-        let rest_room = folder_room - measure(&prefix);
-        if rest_room >= measure(&"…".into()) {
-            let rest = decision::abbreviate_folder(rest, rest_room, measure);
-            return format!("{name}{separator}{prefix}{rest}");
-        }
-    }
     let folder = decision::abbreviate_folder(folder, folder_room, measure);
     format!("{name}{separator}{folder}")
+}
+
+fn duplicate_caption(
+    file: &str,
+    folder: &search::DuplicateParent,
+    room: Pixels,
+    measure: &impl Fn(&SharedString) -> Pixels,
+) -> String {
+    let separator = " · ";
+    let full = SharedString::from(format!("{file}{separator}{}", folder.suffix));
+    if measure(&full) <= room {
+        return full.to_string();
+    }
+    let compact = SharedString::from(folder.compact.clone());
+    let folder_number = SharedString::from(format!("#{}", folder.ordinal));
+    let compact_width = measure(&compact);
+    let number_width = measure(&folder_number);
+    let reserve = compact_width.min(room * 0.32).max(number_width);
+    let separator_width = measure(&separator.into());
+    let name = decision::abbreviate_folder(file, room - separator_width - reserve, measure);
+    let folder_room = room - measure(&name) - separator_width;
+    if measure(&SharedString::from(folder.suffix.clone())) <= folder_room {
+        return format!("{name}{separator}{}", folder.suffix);
+    }
+    if compact_width <= folder_room {
+        return format!("{name}{separator}{compact}");
+    }
+    let hint_room = folder_room - number_width - measure(&" ".into());
+    if hint_room >= measure(&"…".into()) * 2. {
+        let hint = decision::abbreviate_folder(&compact, hint_room, measure);
+        format!("{name}{separator}{folder_number} {hint}")
+    } else {
+        format!("{name}{separator}{folder_number}")
+    }
 }
 
 /// Shortens the folder part of a relative path first, so the file name and its extension stay

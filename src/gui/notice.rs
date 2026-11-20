@@ -2,13 +2,54 @@ use super::*;
 
 pub(super) struct Failure {
     pub path: PathBuf,
-    pub message: String,
-    pub return_focus: Option<FocusHandle>,
+    message: String,
+    return_focus: Option<FocusHandle>,
+    above_row: bool,
 }
 
 impl Shell {
     pub(super) fn clear_open_failure(&mut self) {
         self.open_failure = None;
+    }
+
+    pub(super) fn record_open_failure(
+        &mut self,
+        path: PathBuf,
+        message: String,
+        window: &Window,
+        cx: &App,
+    ) {
+        let row_below_middle = |scroll: &UniformListScrollHandle, index, height: Pixels| {
+            let scroll = scroll.0.borrow();
+            let viewport = scroll.base_handle.bounds();
+            let row = viewport.top() + scroll.base_handle.offset().y + height * index;
+            row + height / 2. > viewport.top() + viewport.size.height / 2.
+        };
+        let above_row = if self.nav_focus.is_focused(window) {
+            let visible = self.visible_rows();
+            visible
+                .iter()
+                .position(|&index| self.entries[index].path == path)
+                .zip(self.scrolls.get(&self.current))
+                .is_some_and(|(index, scroll)| {
+                    row_below_middle(scroll, index, self.navigation_row_height())
+                })
+        } else {
+            self.search_ui.focus.is_focused(window)
+                && self.search_ui.selection.is_some_and(|index| {
+                    row_below_middle(
+                        &self.search_ui.scroll,
+                        index,
+                        px(32. * self.settings.ui_scale),
+                    )
+                })
+        };
+        self.open_failure = Some(Failure {
+            path,
+            message,
+            return_focus: window.focused(cx),
+            above_row,
+        });
     }
 
     pub(super) fn notice(&self, cx: &App) -> Div {
@@ -79,7 +120,48 @@ impl Shell {
             ))
     }
 
-    pub(super) fn open_failure_view(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn open_failure_overlay(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let viewport = window.viewport_size();
+        let scale = self.settings.ui_scale;
+        let narrow = self.narrow(window);
+        let navigator_width = if !narrow && self.navigator_visible {
+            self.pane_state.read(cx).width(window) + px(8.)
+        } else {
+            px(0.)
+        };
+        let available = viewport.width - navigator_width;
+        let width = if narrow {
+            available
+        } else {
+            available.min(px(620. * scale))
+        };
+        div()
+            .id("open-failure-overlay")
+            .absolute()
+            .right_0()
+            .w(width)
+            .max_h(relative(0.48))
+            .overflow_y_scroll()
+            .map(|overlay| {
+                if narrow
+                    && self
+                        .open_failure
+                        .as_ref()
+                        .is_some_and(|failure| failure.above_row)
+                {
+                    overlay.top_0().pt(px(6. * scale))
+                } else {
+                    overlay.bottom_0()
+                }
+            })
+            .child(self.open_failure_view(cx))
+    }
+
+    fn open_failure_view(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let failure = self.open_failure.as_ref().unwrap();
         let path = failure.path.clone();
         let detail = format!(
@@ -90,6 +172,7 @@ impl Shell {
         let retry_path = path.clone();
         let return_focus = failure.return_focus.clone();
         self.notice(cx)
+            .occlude()
             .child(self.notice_label(
                 "open-failure",
                 format!("Cannot open {}", paths::name(&path)),

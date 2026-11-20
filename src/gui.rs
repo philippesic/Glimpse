@@ -339,6 +339,7 @@ struct Shell {
     reading_request: u64,
     memory_release: Option<Task<()>>,
     status: String,
+    last_saved: Option<(u64, u64)>,
     open_failure: Option<notice::Failure>,
     font_warning: Option<String>,
     window_title: String,
@@ -607,6 +608,7 @@ impl Shell {
             reading_request: 0,
             memory_release: None,
             status: String::new(),
+            last_saved: None,
             open_failure: None,
             font_warning: None,
             window_title: String::new(),
@@ -838,7 +840,7 @@ impl Shell {
         self.font_warning = theme::apply(&self.settings, window, cx);
         // The minimum window grows with the interface scale so every scale keeps the room of
         // the 520×400 layout, capped at the display size.
-        let scale = self.settings.ui_scale.max(1.);
+        let scale = self.settings.ui_scale;
         let mut minimum = size(px(520. * scale), px(400. * scale));
         if let Some(display) = window.display(cx) {
             let available = display.bounds().size;
@@ -1153,21 +1155,49 @@ impl Shell {
     }
 
     fn select_navigation(&mut self, path: PathBuf) {
+        if self
+            .open_failure
+            .as_ref()
+            .is_some_and(|failure| failure.path != path)
+        {
+            self.clear_open_failure();
+        }
         self.selection = Some(path.clone());
         self.search_ui.picker_selection = Some(path);
+        if self.trash_needs_selection && self.status == Self::TRASH_SELECTION_GUIDANCE {
+            self.status.clear();
+        }
         self.trash_needs_selection = false;
     }
 
-    fn file_action_blocker(&self, path: &Path, command: &str) -> Option<&'static str> {
-        if self.path_is_open(path) {
-            Some("Close open documents in this item first.")
-        } else if self.trash_pending.is_some() {
+    const TRASH_SELECTION_GUIDANCE: &str =
+        "Press Space to select the item before moving it to Trash.";
+
+    fn file_action_blocker(&self, path: &Path, needs_selection: bool) -> Option<&'static str> {
+        if self.trash_pending.is_some() {
             Some("Wait for the move to Trash to finish.")
-        } else if command == "trash" && self.trash_needs_selection {
-            Some("Select the next item before moving it to Trash.")
+        } else if needs_selection && self.trash_needs_selection {
+            Some(Self::TRASH_SELECTION_GUIDANCE)
+        } else if self.path_is_open(path) {
+            Some("Close open documents in this item first.")
         } else {
             None
         }
+    }
+
+    fn move_to_trash(&mut self, path: PathBuf, needs_selection: bool) {
+        if self.request.pick {
+            return;
+        }
+        if let Some(reason) = self.file_action_blocker(&path, needs_selection) {
+            self.status = reason.into();
+        } else {
+            self.trash_selection(path);
+        }
+    }
+
+    fn navigation_row_height(&self) -> Pixels {
+        px(if self.settings.compact { 28. } else { 32. } * self.settings.ui_scale)
     }
 
     fn trash_selection(&mut self, path: PathBuf) {
@@ -1554,7 +1584,8 @@ impl Shell {
                     Panel::Palette => "Search commands",
                     Panel::Recovery => "Search recovery records",
                     Panel::Line => "Line number",
-                    Panel::NewFile | Panel::NewFolder | Panel::Rename => "One filename",
+                    Panel::NewFile | Panel::NewFolder => "One filename",
+                    Panel::Rename => "New Name",
                 },
                 window,
                 cx,
@@ -1837,23 +1868,27 @@ impl Shell {
                                 if self.destination_busy {
                                     continue;
                                 }
-                                if let Some((expected, search_generation)) = expected
-                                    && (expected
+                                if let Some((expected, search_generation)) = expected {
+                                    let dirty = self
+                                        .documents
+                                        .iter()
+                                        .any(|doc| doc.disk.same_file(&disk) && doc.dirty(cx));
+                                    let changed = expected
                                         != search::fingerprint_body(
                                             text.value().as_bytes(),
                                             disk.bom,
-                                        )
-                                        || self
-                                            .documents
-                                            .iter()
-                                            .any(|doc| doc.disk.same_file(&disk) && doc.dirty(cx)))
-                                {
-                                    let message = "Failed to open result — disk changed or the document has unsaved edits. Search again before jumping.";
-                                    self.status = message.into();
-                                    if search_generation == self.search_id {
-                                        self.search_ui.status = message.into();
+                                        );
+                                    if dirty || changed {
+                                        if search_generation == self.search_id {
+                                            self.search_ui.status = if dirty {
+                                                "Failed to open result. Save edits, then search again."
+                                            } else {
+                                                "Failed to open result. File changed. Search again."
+                                            }
+                                            .into();
+                                        }
+                                        continue;
                                     }
-                                    continue;
                                 }
                                 if activate {
                                     if file_search_generation.is_some() && !self.request.pick {
@@ -1894,11 +1929,7 @@ impl Shell {
                                     self.query_error =
                                         Some(format!("Could not open this path. {e}"));
                                 } else if activate {
-                                    self.open_failure = Some(notice::Failure {
-                                        path,
-                                        message: e,
-                                        return_focus: window.focused(cx),
-                                    });
+                                    self.record_open_failure(path, e, window, cx);
                                 }
                             }
                         }
@@ -2028,6 +2059,7 @@ impl Shell {
                                 }
                                 self.io
                                     .send(Job::BindingApplied(id, generation, doc.generation));
+                                self.last_saved = Some((id, doc.generation));
                                 self.status = match (unrecovered, doc.dirty(cx)) {
                                     (true, true) => {
                                         "Saved without recovery. Newer edits are still unsaved."
@@ -2119,6 +2151,7 @@ impl Shell {
                                     destination.generation,
                                     doc.generation,
                                 ));
+                                self.last_saved = Some((id, doc.generation));
                             }
                             if !destination.copy
                                 && self.abandon_destination.as_ref().is_some_and(
@@ -2569,8 +2602,7 @@ impl Shell {
                             }
                             Err(error) => {
                                 self.trash_needs_selection = false;
-                                self.status =
-                                    format!("Cannot move {} to Trash. {error}", paths::name(&path));
+                                self.status = format!("Could not move to Trash. {error}");
                             }
                         }
                     }
@@ -3005,16 +3037,28 @@ impl Shell {
             "new-folder" => self.panel(Panel::NewFolder, window, cx),
             "rename" => {
                 if let Some(path) = self.selected_path() {
-                    if let Some(reason) = self.file_action_blocker(&path, command) {
+                    if let Some(reason) = self.file_action_blocker(&path, false) {
                         self.status = reason.into();
                         cx.notify();
                         return;
                     }
                     self.panel(Panel::Rename, window, cx);
                     if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+                        let directory = self
+                            .entries
+                            .iter()
+                            .any(|entry| entry.path == path && entry.directory);
+                        let stem = if directory {
+                            name
+                        } else {
+                            path.file_stem()
+                                .and_then(|stem| stem.to_str())
+                                .unwrap_or(name)
+                        };
                         self.query.update(cx, |input, cx| {
                             input.set_value(name.to_owned(), window, cx);
-                            input.select_all(&gpui_component::input::SelectAll, window, cx);
+                            input.set_cursor_offset_unfocused(0, cx);
+                            input.select_to(stem.len(), cx);
                         });
                     }
                     self.rename_path = Some(path);
@@ -3450,11 +3494,9 @@ impl Shell {
             }
             "trash" if !self.request.pick => {
                 if let Some(path) = self.selected_path() {
-                    if let Some(reason) = self.file_action_blocker(&path, command) {
-                        self.status = reason.into();
-                    } else {
-                        self.trash_selection(path);
-                    }
+                    self.move_to_trash(path, true);
+                } else {
+                    self.status = "Select a file or folder to move to Trash.".into();
                 }
             }
             "reload" | "overwrite" | "compare" => self.conflict_action(command, window, cx),
@@ -3579,7 +3621,7 @@ impl Shell {
             "rename" | "trash" => self
                 .selection
                 .as_ref()
-                .is_some_and(|path| self.file_action_blocker(path, command).is_none()),
+                .is_some_and(|path| self.file_action_blocker(path, command == "trash").is_none()),
             "stop-search" => self.search_ui.running,
             "remove-index" => self.search.index_status(self.effective_scope()).is_some(),
             "back" => !self.history.is_empty(),
@@ -4018,9 +4060,6 @@ impl Render for Shell {
             self.search_ui.picker_selection = Some(self.hits[0].path.clone());
         }
         let mut main = div().flex_1().min_h_0().overflow_hidden().flex().flex_col();
-        if self.open_failure.is_some() {
-            main = main.child(self.open_failure_view(cx));
-        }
         // Commands and path completions float above the panes so typing never moves
         // the document; search panels keep a fixed height while open.
         let mut floating = None;
@@ -4193,7 +4232,13 @@ impl Render for Shell {
                             .map(|i| {
                                 let entry = &entries[visible[i]];
                                 let path = entry.path.clone();
-                                let selected = this.selection.as_ref() == Some(&path);
+                                let cursor = this.selection.as_ref() == Some(&path);
+                                let selected = cursor && !this.trash_needs_selection;
+                                let cursor_border = if cursor && focused && !selected {
+                                    cx.theme().ring
+                                } else {
+                                    gpui::transparent_black()
+                                };
                                 let tooltip = paths::display(&path);
                                 let name = paths::name(&path);
                                 let caption =
@@ -4209,13 +4254,16 @@ impl Render for Shell {
                                 let context_path = path.clone();
                                 let row=div()
                                     .id(("entry", i))
-                                    .h(px(if this.settings.compact { 28. } else { 32. } * scale))
+                                    .h(this.navigation_row_height())
                                     .w_full()
                                     .flex()
                                     .items_center()
                                     .gap(px(8. * scale))
                                     .border_l(px(3. * scale))
-                                    .border_color(marker)
+                                    .border_y_1()
+                                    .border_r_1()
+                                    .border_color(if selected { marker } else { cursor_border })
+                                    .when(selected, |row| row.border_y_0().border_r_0())
                                     .pl(px(9. * scale))
                                     .pr(px(12. * scale))
                                     .bg(fill.unwrap_or(cx.theme().sidebar))
@@ -4237,7 +4285,7 @@ impl Render for Shell {
                                     .child(div().min_w_0().flex_1().truncate().child(caption))
                                     .on_mouse_down(MouseButton::Right, cx.listener(
                                         move |this, event: &MouseDownEvent, window, cx| {
-                                            this.show_navigator_menu(context_path.clone(), event.position, window, cx);
+                                            this.navigator_menu_from_pointer(context_path.clone(), event.position, window, cx);
                                             cx.stop_propagation();
                                         },
                                     ))
@@ -4249,7 +4297,7 @@ impl Render for Shell {
                                             cx.notify();
                                         },
                                     ));
-                                this.navigation_row(entry,(i,visible.len()),selected,row,cx)
+                                this.navigation_row(entry,(i,visible.len()),cursor,row,cx)
                             })
                             .collect::<Vec<_>>()
                     }),
@@ -4507,7 +4555,15 @@ impl Render for Shell {
             node.set_label("Open documents");
             AccessibilityInfo::new(node)
         });
-        let has_status = !self.status.is_empty() || self.font_warning.is_some();
+        let status = if self.status == "Saved"
+            && !self.documents.iter().any(|doc| {
+                self.active == Some(doc.id) && self.last_saved == Some((doc.id, doc.generation))
+            }) {
+            ""
+        } else {
+            self.status.as_str()
+        };
+        let has_status = !status.is_empty() || self.font_warning.is_some();
         let footer_height = if narrow { 28. } else { 36. };
         let footer_height = px(footer_height * self.settings.ui_scale);
         let open_documents_requested = std::mem::take(&mut self.open_documents_requested);
@@ -4805,6 +4861,9 @@ impl Render for Shell {
                     main.child(div().flex_1().min_h_0().overflow_hidden().child(body))
                 })
                 .children(floating)
+                .when(self.open_failure.is_some(), |main| {
+                    main.child(self.open_failure_overlay(window, cx))
+                })
                 .when_some(
                     self.query_error
                         .clone()
@@ -4828,9 +4887,9 @@ impl Render for Shell {
                     self.warnings.is_empty() && (!narrow || has_status),
                     |footer| {
                         let message = match &self.font_warning {
-                            Some(warning) if self.status.is_empty() => warning.clone(),
-                            Some(warning) => format!("{} · {warning}", self.status),
-                            None => self.status.clone(),
+                            Some(warning) if status.is_empty() => warning.clone(),
+                            Some(warning) => format!("{status} · {warning}"),
+                            None => status.to_owned(),
                         };
                         footer.child(accessibility::message(
                             "application-status",
@@ -4853,9 +4912,13 @@ impl Render for Shell {
                     |footer| footer.child(div().flex_1()),
                 )
                 .when_some(
-                    self.documents
-                        .iter()
-                        .find(|doc| Some(doc.id) == self.active),
+                    (!narrow || !self.navigation_only)
+                        .then(|| {
+                            self.documents
+                                .iter()
+                                .find(|doc| Some(doc.id) == self.active)
+                        })
+                        .flatten(),
                     |footer, doc| {
                         let information = doc.information(cx, self.reading());
                         footer.child(accessible(
@@ -4864,7 +4927,7 @@ impl Render for Shell {
                                 .truncate()
                                 .min_w_0()
                                 .when(has_status || !self.warnings.is_empty(), |info| {
-                                    info.max_w(relative(0.55))
+                                    info.max_w(relative(0.4))
                                 })
                                 .child(information.clone()),
                             move |_, _, _| {
@@ -4947,11 +5010,15 @@ impl Render for Shell {
                 match key.key.as_str() {
                     "f2" | "delete" if !key.modifiers.shift => {
                         let command = if key.key == "f2" { "rename" } else { "trash" };
-                        if !event.is_held
-                            && !this.request.pick
-                            && (command != "trash" || !this.trash_needs_selection)
-                        {
+                        if !event.is_held && !this.request.pick {
                             this.command(command, window, cx);
+                        }
+                        return;
+                    }
+                    "space" if !key.modifiers.shift && this.trash_needs_selection => {
+                        if let Some(path) = this.selected_path() {
+                            this.select_navigation(path);
+                            cx.notify();
                         }
                         return;
                     }

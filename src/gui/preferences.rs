@@ -416,8 +416,15 @@ impl Preferences {
         }
         settings.warning = None;
         settings.validate().map_err(|error| {
-            if glimpse::commands::bindings(&settings.keymaps).is_err() {
-                (Some(Field::Keymaps), error)
+            if let Err(binding_error) = glimpse::commands::bindings(&settings.keymaps) {
+                let message = match binding_error {
+                    glimpse::commands::BindingError::Conflict { shortcut, command } => {
+                        let key = super::platform::shortcut_label(&shortcut);
+                        format!("{key} is already used by {command}.")
+                    }
+                    glimpse::commands::BindingError::Invalid(message) => message,
+                };
+                (Some(Field::Keymaps), message)
             } else if let Err((line, pattern_error)) = settings.validate_exclusion_patterns() {
                 let reason = match pattern_error {
                     ignore::Error::Glob { err, .. } => err,
@@ -627,15 +634,22 @@ impl Render for Preferences {
                 rows.push(self.field(Field::Exclusions, cx));
             }
             Page::Shortcuts => {
-                let example = super::platform::shortcut_label("Cmd+Shift+O");
-                let guidance = format!(
-                    "Enter a JSON object that maps command names to keys, such as {{\"find-files\": \"{example}\"}}. Use an empty value to disable a shortcut. Text editing keys are reserved."
-                );
+                let key = super::platform::shortcut_label("Cmd+Shift+O");
+                let example = format!("{{\"folder\": \"{key}\"}}");
+                let prompt = "Enter a JSON object that maps command names to keys.";
+                let rules =
+                    "Use an empty value to disable a shortcut. Text editing keys are reserved.";
                 rows.push(
                     super::accessibility::label(
                         "keymap-help",
-                        guidance.clone(),
-                        div().child(guidance),
+                        format!("{prompt} {example}. {rules}"),
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(div().child(prompt))
+                            .child(div().whitespace_nowrap().child(example))
+                            .child(div().child(rules)),
                     )
                     .into_any_element(),
                 );

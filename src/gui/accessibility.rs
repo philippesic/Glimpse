@@ -93,7 +93,7 @@ impl Shell {
         &self,
         entry: &Entry,
         position: (usize, usize),
-        selected: bool,
+        cursor: bool,
         child: impl IntoElement,
         cx: &Context<Self>,
     ) -> AnyElement {
@@ -102,6 +102,7 @@ impl Shell {
         let symlink = entry.symlink;
         let (index, total) = position;
         let focus = self.nav_focus.clone();
+        let selected = cursor && !self.trash_needs_selection;
         let view = cx.entity().downgrade();
         let label = format!(
             "{}{}",
@@ -126,21 +127,26 @@ impl Shell {
                 node.add_action(Action::Focus);
                 node.add_action(Action::Click);
                 let mut info = AccessibilityInfo::new(node);
-                info.focused = selected && focus.is_focused(window);
+                info.focused = cursor && focus.is_focused(window);
                 info
             },
         )
         .on_action(move |request, _, window, cx| {
             let _ = view.update(cx, |this, cx| {
-                this.select_navigation(path.clone());
                 match request.action {
                     Action::Focus => {
+                        if this.trash_needs_selection {
+                            this.selection = Some(path.clone());
+                        } else {
+                            this.select_navigation(path.clone());
+                        }
                         this.nav_focus.focus(window);
                         if let Some(scroll) = this.scrolls.get(&this.current) {
                             scroll.scroll_to_item(index, ScrollStrategy::Top);
                         }
                     }
                     Action::Click => {
+                        this.select_navigation(path.clone());
                         this.nav_focus.focus(window);
                         this.open(path.clone(), true, None);
                     }

@@ -89,8 +89,54 @@ fn trash_location(path: &Path) -> Result<Option<std::path::PathBuf>, String> {
 
 #[cfg(target_os = "linux")]
 fn trash_location(path: &Path) -> Result<Option<std::path::PathBuf>, String> {
-    trash::delete(path).map_err(|error| error.to_string())?;
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+    if let Some(parent) = path.parent() {
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        let parent = CString::new(parent.as_os_str().as_bytes())
+            .map_err(|_| "The parent folder is unavailable.")?;
+        let access = unsafe {
+            libc::faccessat(
+                libc::AT_FDCWD,
+                parent.as_ptr(),
+                libc::W_OK | libc::X_OK,
+                libc::AT_EACCESS,
+            )
+        };
+        if access != 0 {
+            return Err(trash_io_reason(&io::Error::last_os_error()).into());
+        }
+    }
+    trash::delete(path).map_err(|error| {
+        if std::env::var_os("GLIMPSE_TRACE").is_some() {
+            eprintln!("GLIMPSE_TRASH {error}");
+        }
+        match &error {
+            trash::Error::FileSystem { source, .. } => trash_io_reason(source),
+            trash::Error::CouldNotAccess { .. } | trash::Error::CanonicalizePath { .. } => {
+                "The file or folder is unavailable."
+            }
+            _ => "Trash is unavailable for this item.",
+        }
+        .to_owned()
+    })?;
     Ok(None)
+}
+
+#[cfg(target_os = "linux")]
+fn trash_io_reason(error: &io::Error) -> &'static str {
+    match error.kind() {
+        io::ErrorKind::PermissionDenied => "Permission denied.",
+        io::ErrorKind::ReadOnlyFilesystem => "The volume is read-only.",
+        io::ErrorKind::NotFound => "The file or folder is unavailable.",
+        io::ErrorKind::StorageFull => "The volume is full.",
+        io::ErrorKind::QuotaExceeded => "The storage quota has been reached.",
+        _ => "Check the file and Trash and try again.",
+    }
 }
 
 #[cfg(test)]
