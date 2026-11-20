@@ -77,6 +77,7 @@ Default to System appearance with explicit Light and Dark choices. Every surface
 | Border | `#E4E4E7` | `#2A2A2A` | Outlines of menus, popovers and dialogs |
 | Control border | `#8B8B94` | `#6B6B6B` | Necessary control boundaries such as text fields |
 | Hover | `#E4E4E7` | `#262626` | Pointer feedback |
+| Pressed | `#D4D4D8` | `#323232` | Pressed buttons |
 | Selection | `#E2E8F8` | `#1A2747` | Active selection, normal text |
 | Inactive selection | `#E9E9EC` | `#232323` | Selection outside the focused pane |
 | Accent | `#1D4ED8` | `#6B98FF` | Focus, links and modified indicator |
@@ -91,7 +92,7 @@ Ordinary text must meet 4.5:1 contrast against its rendered background; necessar
 
 Keep resting chrome quiet. Use grouping, fill and spacing to establish controls; draw an outline where a boundary is needed, rather than boxing every action. Strong keyboard focus remains explicit. Material highlights and translucency must not weaken text or focus contrast.
 
-Selection is a rounded tinted fill with a leading marker that is accent-coloured while its list has keyboard focus and secondary-coloured otherwise. The active tab carries the same signal on its top edge for the document area. Buttons, fields and tabs show a 2-point accent ring drawn inside their own edges when focused, so no container clips it; on an accent fill the ring takes the label colour. Focus remains visible on selected items and in every theme. Inactive selection retains its shape and normal text with a neutral fill. A modified tab adds a dot and an accessible “Modified” state. A conflict uses an explicit label and actionable notice. Hover, activation, modification and conflict must never collapse into the same signal. Colored text always has a label, shape or other non-color equivalent.
+Selection is a rounded tinted fill with a leading marker that is accent-coloured while its list has keyboard focus and secondary-coloured otherwise. The active tab carries the same signal on its top edge for the document area. Buttons, fields and tabs show a 2-point accent ring drawn inside their own edges when focused, so no container clips it; filled buttons keep a separate ring outside the fill. Focus remains visible on selected items and in every theme. Inactive selection retains its shape and normal text with a neutral fill. A modified tab adds a dot and an accessible “Modified” state. A conflict uses an explicit label and actionable notice. Hover, activation, modification and conflict must never collapse into the same signal. Colored text always has a label, shape or other non-color equivalent.
 
 Use a crafted, consistent symbol family with optically balanced strokes, sizes and baseline alignment. Start with 16-point file/folder symbols and disclosure chevrons with separate hit targets. Use platform symbols where supported and permitted, or carefully drawn bundled equivalents. Avoid emoji substitutes, ornamental badges, and icons that require filesystem inspection to paint. Tooltips explain a control and its shortcut; they do not substitute for accessible names.
 

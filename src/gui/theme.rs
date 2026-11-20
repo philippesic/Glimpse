@@ -72,7 +72,7 @@ pub fn apply(settings: &Settings, window: &mut Window, cx: &mut App) -> Option<S
     colors.primary_foreground = color(palette.action_text);
     colors.secondary = color(palette.faint);
     colors.secondary_hover = color(palette.hover);
-    colors.secondary_active = color(palette.hover);
+    colors.secondary_active = color(palette.pressed);
     colors.secondary_foreground = color(palette.text);
     colors.accent = color(palette.hover);
     colors.accent_foreground = color(palette.text);
@@ -123,6 +123,7 @@ struct Palette {
     border: u32,
     control_border: u32,
     hover: u32,
+    pressed: u32,
     selection: u32,
     accent: u32,
     action: u32,
@@ -146,6 +147,7 @@ const LIGHT: Palette = Palette {
     border: 0xE4E4E7,
     control_border: 0x8B8B94,
     hover: 0xE4E4E7,
+    pressed: 0xD4D4D8,
     selection: 0xE2E8F8,
     accent: 0x1D4ED8,
     action: 0x1D4ED8,
@@ -169,6 +171,7 @@ const DARK: Palette = Palette {
     border: 0x2A2A2A,
     control_border: 0x6B6B6B,
     hover: 0x262626,
+    pressed: 0x323232,
     selection: 0x1A2747,
     accent: 0x6B98FF,
     action: 0x2F63E6,

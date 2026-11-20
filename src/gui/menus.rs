@@ -224,17 +224,16 @@ impl Shell {
         .into_iter()
         .filter(|id| !self.command_enabled(id))
         .collect();
+        // The label is abbreviated to the window before layout, so the control keeps its width.
         Button::new("search-scope-heading")
             .label(label)
-            .min_w_0()
             .max_w_full()
-            .flex_shrink()
+            .flex_shrink_0()
             .accessibility_description(format!("Search folder {tooltip}"))
             .tooltip(tooltip)
             .xsmall()
             .compact()
             .ghost()
-            .ml(px(-5.))
             .text_color(cx.theme().muted_foreground)
             .dropdown_caret(true)
             .dropdown_menu(move |menu, _, _| {

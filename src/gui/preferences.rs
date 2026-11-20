@@ -559,7 +559,7 @@ impl Render for Preferences {
                         "theme-group",
                         "Theme".into(),
                         div().flex().flex_col().gap_1().child("Theme").child(
-                            div().flex().flex_wrap().gap_2().ml(px(-7.)).children(
+                            div().flex().flex_wrap().gap_2().children(
                                 [
                                     ("System", None),
                                     ("Light", Some(false)),

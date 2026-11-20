@@ -43,6 +43,7 @@ impl Shell {
         );
         if command == "compare" {
             let observed = text.clone();
+            let name = paths::name(&doc.disk.path);
             self.ask_decision(
                 DecisionAction::Compare,
                 "Compare local and disk text".into(),
@@ -52,7 +53,12 @@ impl Shell {
                 cx,
             );
             if let Some(view) = &self.decision {
-                view.update(cx, |view, cx| view.compare(&local, &observed, window, cx));
+                view.update(cx, |view, cx| {
+                    view.set_lead(format!(
+                        "{name} changed on disk while you were editing. Neither version has been changed."
+                    ));
+                    view.compare(&local, &observed, window, cx)
+                });
             }
             return;
         }
@@ -69,18 +75,21 @@ impl Shell {
             },
         };
         let destructive = matches!(snapshot.resolution, Resolution::Overwrite);
-        let (title, detail, action) = match snapshot.resolution {
+        let name = paths::name(&snapshot.disk.target);
+        let (title, lead, detail, action) = match snapshot.resolution {
             Resolution::Reload => (
                 "Reload Disk Version?",
+                format!("The local text of {name} will be replaced by the version on disk."),
                 format!(
-                    "{detail}\nThe local text will be replaced by this observed disk version. Its automatic draft will be retired after recovery storage acknowledges the operation. The local text remains in history and Undo."
+                    "{detail}\nIts automatic draft will be retired after recovery storage acknowledges the operation. The local text remains in history and Undo."
                 ),
                 "Reload Disk Version",
             ),
             Resolution::Overwrite => (
                 "Overwrite Disk Version?",
+                format!("The version of {name} on disk will be replaced by the local text."),
                 format!(
-                    "{detail}\nThis replaces only the observed disk version with the local text. Both versions must be preserved in recovery first."
+                    "{detail}\nOnly the observed disk version is replaced. Both versions are preserved in recovery first."
                 ),
                 "Overwrite Disk Version",
             ),
@@ -93,8 +102,13 @@ impl Shell {
             window,
             cx,
         );
-        if destructive && let Some(view) = &self.decision {
-            view.update(cx, |decision, _| decision.mark_destructive(1));
+        if let Some(view) = &self.decision {
+            view.update(cx, |decision, _| {
+                decision.set_lead(lead);
+                if destructive {
+                    decision.mark_destructive(1);
+                }
+            });
         }
     }
     pub(super) fn resolve_conflict(

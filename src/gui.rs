@@ -4679,7 +4679,6 @@ impl Render for Shell {
                                 .tab_stop(false)
                                 .small()
                                 .ghost()
-                                .parent_decorates()
                                 .text_color(if active {
                                     cx.theme().tab_active_foreground
                                 } else {

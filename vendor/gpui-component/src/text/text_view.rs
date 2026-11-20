@@ -67,8 +67,7 @@ fn links_menu(
             .label("Links")
             .small()
             .ghost()
-            // The label, not the button's padding, sits on the content edge.
-            .ml(px(-13.))
+            .compact()
             .text_color(color)
             .dropdown_caret(true)
             .dropdown_menu(move |mut menu, window, _| {

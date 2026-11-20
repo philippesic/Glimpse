@@ -1,8 +1,8 @@
 use std::rc::Rc;
 
 use crate::{
-    ActiveTheme, Colorize as _, Disableable, FocusableExt as _, Icon, IconName, Selectable,
-    Sizable, Size, StyleSized, StyledExt, h_flex, spinner::Spinner, tooltip::Tooltip,
+    ActiveTheme, Disableable, FocusableExt as _, Icon, IconName, Selectable, Sizable, Size,
+    StyleSized, StyledExt, h_flex, spinner::Spinner, tooltip::Tooltip,
 };
 use gpui::{
     Action, AnyElement, App, ClickEvent, Corners, Div, Edges, ElementId, Hsla, InteractiveElement,
@@ -1041,13 +1041,7 @@ impl ButtonVariant {
                 }
             }
             ButtonVariant::Secondary => cx.theme().secondary_active,
-            ButtonVariant::Ghost => {
-                if cx.theme().mode.is_dark() {
-                    cx.theme().secondary.lighten(0.2).opacity(0.8)
-                } else {
-                    cx.theme().secondary.darken(0.2).opacity(0.8)
-                }
-            }
+            ButtonVariant::Ghost => cx.theme().secondary_active,
             ButtonVariant::Danger => {
                 if outline {
                     cx.theme().danger_active.opacity(0.1)

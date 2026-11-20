@@ -2041,6 +2041,8 @@ impl Node {
             let is_last = ix + 1 == children.len();
             div()
                 .id(("block", ix))
+                // The end of a document keeps the reading inset below its last line.
+                .when(is_last, |block| block.pb(rems(1.25)))
                 .child(children[ix].render_block(options.is_last(is_last), &node_cx, window, cx))
                 .into_any_element()
         })

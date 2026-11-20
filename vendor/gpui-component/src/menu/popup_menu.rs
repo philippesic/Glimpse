@@ -727,9 +727,8 @@ impl PopupMenu {
         self
     }
 
-    /// Use small size, the menu item will have smaller height.
-    pub(crate) fn small(mut self) -> Self {
-        self.size = Size::Small;
+    /// Kept for callers; every menu uses one row height so menus share one rhythm.
+    pub(crate) fn small(self) -> Self {
         self
     }
 
@@ -1487,8 +1486,8 @@ impl Render for PopupMenu {
                     .when_some(self.min_width, |this, min_width| this.min_w(min_width))
                     .max_w(max_width)
                     .when(self.scrollable, |this| {
+                        // The scrollbar overlays the rows so both side insets match.
                         this.max_h(max_height)
-                            .pr(px(14.))
                             .overflow_y_scroll()
                             .track_scroll(&self.scroll_handle)
                     })

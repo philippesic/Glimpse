@@ -117,6 +117,8 @@ pub struct Decision {
     detail: String,
     subjects: Vec<UnsavedSubject>,
     summary: Option<String>,
+    /// The consequence, read before the supporting detail.
+    lead: Option<String>,
     primary: Option<usize>,
     primary_focus: Option<FocusHandle>,
     destructive: Option<usize>,
@@ -187,6 +189,7 @@ impl Decision {
             detail,
             subjects: Vec::new(),
             summary: None,
+            lead: None,
             primary: None,
             primary_focus: None,
             destructive: None,
@@ -200,6 +203,10 @@ impl Decision {
             _path_subscriptions: Vec::new(),
             _comparison_subscriptions: Vec::new(),
         }
+    }
+    /// State the consequence first; the detail then reads as quieter supporting text.
+    pub(super) fn set_lead(&mut self, lead: String) {
+        self.lead = Some(lead);
     }
     /// Show an action in the destructive treatment used by Discard.
     pub(super) fn mark_destructive(&mut self, index: usize) {
@@ -452,19 +459,25 @@ impl Render for Decision {
         } else if !self.subjects.is_empty() {
             Some(Self::close_path(&self.detail).into_any_element())
         } else {
-            Some(
-                super::accessibility::label(
-                    "decision-detail-text",
-                    self.detail.clone(),
-                    div().child(self.detail.clone()),
-                )
-                .into_any_element(),
-            )
+            let detail = super::accessibility::label(
+                "decision-detail-text",
+                self.detail.clone(),
+                div()
+                    .when(self.lead.is_some(), |detail| {
+                        detail.text_sm().text_color(cx.theme().muted_foreground)
+                    })
+                    .child(self.detail.clone()),
+            );
+            Some(detail.into_any_element())
         };
         let semantic_title = self.title.clone();
+        let detail_text = match &self.lead {
+            Some(lead) => format!("{lead}\n\n{}", self.detail),
+            None => self.detail.clone(),
+        };
         let mut semantic_detail = self.summary.as_ref().map_or_else(
-            || self.detail.clone(),
-            |summary| format!("{summary}\n\n{}", self.detail),
+            || detail_text.clone(),
+            |summary| format!("{summary}\n\n{detail_text}"),
         );
         if !self.subjects.is_empty() {
             semantic_detail = format!(
@@ -586,17 +599,27 @@ impl Render for Decision {
                                             },
                                         ),
                                     )
+                                    .when_some(self.lead.clone(), |body, lead| {
+                                        body.child(
+                                            div().pb_2().child(super::accessibility::label(
+                                                "decision-lead",
+                                                lead.clone(),
+                                                div().child(lead),
+                                            )),
+                                        )
+                                    })
                                     .when_some(self.comparison.as_ref(), |body, inputs| {
                                         body.children(inputs.iter().enumerate().map(
                                             |(i, input)| {
                                                 div()
                                                     .pt_3()
+                                                    .pb_2()
                                                     .child(if i == 0 {
                                                         "Local text (read only)"
                                                     } else {
                                                         "Observed disk text (read only)"
                                                     })
-                                                    .child(div().h(comparison_height).child(
+                                                    .child(div().h(comparison_height).mt_1().font_family(cx.theme().mono_font_family.clone()).child(
                                                         Input::new(input).h_full().bordered(false).disabled(true),
                                                     ))
                                             },

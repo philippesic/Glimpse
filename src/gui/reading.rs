@@ -343,18 +343,25 @@ impl Shell {
                 } else {
                     let label = view.notes.clone();
                     controls = controls
-                        .child(div().flex_1().min_w_0().child(accessible(
-                            "reading-notices",
-                            div().w_full().truncate().text_sm().when(!narrow, |label| {
-                                label.child("Images omitted or unavailable")
-                            }),
-                            move |_, _, _| {
-                                let mut node =
-                                    gpui::accesskit::Node::new(gpui::accesskit::Role::Note);
-                                node.set_label(label.clone());
-                                AccessibilityInfo::new(node)
-                            },
-                        )))
+                        .child(
+                            div().flex_1().min_w_0().child(accessible(
+                                "reading-notices",
+                                div()
+                                    .w_full()
+                                    .truncate()
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .when(!narrow, |label| {
+                                        label.child("Images omitted or unavailable")
+                                    }),
+                                move |_, _, _| {
+                                    let mut node =
+                                        gpui::accesskit::Node::new(gpui::accesskit::Role::Note);
+                                    node.set_label(label.clone());
+                                    AccessibilityInfo::new(node)
+                                },
+                            )),
+                        )
                         .child(self.button(
                             if narrow {
                                 "Images omitted…"
