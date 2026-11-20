@@ -580,13 +580,11 @@ impl Render for Preferences {
                                         .label(label)
                                         .accessibility_role(gpui::accesskit::Role::RadioButton)
                                         .accessibility_toggled(chosen)
-                                        .map(|button| {
-                                            if chosen {
-                                                button.primary()
-                                            } else {
-                                                button.outline()
-                                            }
-                                        })
+                                        .map(
+                                            |button| {
+                                                if chosen { button.primary() } else { button }
+                                            },
+                                        )
                                         .disabled(self.pending)
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.draft.system_theme = dark.is_none();
@@ -754,7 +752,6 @@ impl Render for Preferences {
                         })
                         .tooltip("Preferences category")
                         .small()
-                        .outline()
                         .dropdown_caret(true)
                         .disabled(self.pending)
                         .dropdown_menu(move |mut menu, window, _| {
@@ -872,10 +869,11 @@ impl Render for Preferences {
                     .gap(px(12.))
                     .p(px(16.))
                     .when(short, |panel| panel.gap(px(8.)).py(px(10.)))
-                    .rounded_lg()
+                    .rounded(cx.theme().radius_lg)
                     .border_1()
                     .border_color(cx.theme().border)
-                    .bg(cx.theme().background)
+                    .shadow_xl()
+                    .bg(cx.theme().popover)
                     .text_color(cx.theme().foreground)
                     .child(header)
                     .child(
@@ -933,7 +931,6 @@ impl Render for Preferences {
                                 Button::new("reload-preferences")
                                     .small()
                                     .compact()
-                                    .outline()
                                     .label("Reload")
                                     .tooltip("Reload preferences from disk")
                                     .disabled(self.pending)
@@ -947,7 +944,6 @@ impl Render for Preferences {
                                 Button::new("cancel-preferences")
                                     .small()
                                     .compact()
-                                    .outline()
                                     .label("Cancel")
                                     .disabled(self.pending)
                                     .on_click(cx.listener(|_, _, _, cx| cx.emit(Event::Cancel))),

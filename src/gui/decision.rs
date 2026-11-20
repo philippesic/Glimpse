@@ -494,10 +494,11 @@ impl Render for Decision {
                     .gap_3()
                     .p_4()
                     .when(compact, |panel| panel.gap_2().p_2())
-                    .rounded_lg()
+                    .rounded(cx.theme().radius_lg)
                     .border_1()
                     .border_color(cx.theme().border)
-                    .bg(cx.theme().background)
+                    .shadow_xl()
+                    .bg(cx.theme().popover)
                     .text_color(cx.theme().foreground)
                     .child(
                         div()
@@ -559,7 +560,6 @@ impl Render for Decision {
                                                                     Button::new(("show-close-path", index))
                                                                         .label(format!("{verb} full path for {}", subject.label()))
                                                                         .display_label(if open { "Hide" } else { "Path" })
-                                                                        .outline()
                                                                         .small()
                                                                         .compact()
                                                                         .with_focus_handle(self.path_focus[index].clone())
@@ -642,7 +642,7 @@ impl Render for Decision {
                                             .small()
                                             .when(narrow, |button| button.compact())
                                             .when(self.primary != Some(i), |button| {
-                                                button.outline()
+                                                button
                                             })
                                             .when(self.primary == Some(i), |button| {
                                                 button.primary()

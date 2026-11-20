@@ -136,6 +136,7 @@ impl Shell {
             .icon(IconName::Ellipsis)
             .tooltip("More Document Actions")
             .ghost()
+            .text_color(cx.theme().muted_foreground)
             .small()
             .dropdown_menu_with_anchor(Corner::TopRight, move |menu, window, _| {
                 let menu = menu
@@ -186,7 +187,7 @@ impl Shell {
             })
             .accessibility_description("Changed on disk; choose how to resolve it")
             .small()
-            .outline()
+            .ghost()
             .dropdown_menu(move |menu, _, _| {
                 let item = |id: &'static str, label: &str| {
                     command_item(shell.clone(), id, label.into(), disabled.contains_key(id))
@@ -230,7 +231,7 @@ impl Shell {
             .tooltip(tooltip)
             .small()
             .compact()
-            .outline()
+            .ghost()
             .dropdown_caret(true)
             .dropdown_menu(move |menu, _, _| {
                 let item = |id: &'static str, label: &str| {
@@ -313,7 +314,8 @@ impl Shell {
             })
             .small()
             .compact()
-            .outline()
+            .ghost()
+            .text_color(cx.theme().muted_foreground)
             .h(px(28. * self.settings.ui_scale))
             .flex_shrink_0()
             .dropdown_menu_with_anchor(Corner::TopRight, move |mut menu, window, _| {
@@ -387,6 +389,7 @@ impl Shell {
             })
             .small()
             .ghost()
+            .text_color(cx.theme().muted_foreground)
             .dropdown_menu(move |mut menu, window, _| {
                 menu = menu
                     .accessible_name("Locations")
@@ -453,6 +456,7 @@ impl Shell {
             .icon(IconName::Menu)
             .tooltip("Menu")
             .ghost()
+            .text_color(cx.theme().muted_foreground)
             .small()
             .dropdown_menu_with_anchor(Corner::TopRight, move |menu, window, cx| {
                 let groups: [(&str, &[&'static str]); 5] = [

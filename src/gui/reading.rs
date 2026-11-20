@@ -323,7 +323,6 @@ impl Shell {
                             .label("Images omitted")
                             .small()
                             .compact()
-                            .outline()
                             .dropdown_caret(true)
                             .dropdown_menu(move |menu, _, _| {
                                 menu.action_context(focus.clone())

@@ -198,7 +198,6 @@ impl Shell {
                     .with_focus_handle(self.notice_details_focus.clone())
                     .label("Details")
                     .small()
-                    .outline()
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.ask_decision(
                             DecisionAction::Notice,
@@ -214,7 +213,6 @@ impl Shell {
                 Button::new("open-failure-retry")
                     .label("Retry Open")
                     .small()
-                    .outline()
                     .on_click(cx.listener(move |this, _, _, _| {
                         this.open(retry_path.clone(), false, None);
                     })),
@@ -223,7 +221,6 @@ impl Shell {
                 Button::new("open-failure-external")
                     .label("Open Externally")
                     .small()
-                    .outline()
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Err(error) = platform::open_path(&path) {
                             this.status = error;
@@ -235,7 +232,6 @@ impl Shell {
                 Button::new("open-failure-dismiss")
                     .label("Dismiss")
                     .small()
-                    .outline()
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.dismiss_open_failure(window, cx);
                     })),

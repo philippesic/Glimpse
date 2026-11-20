@@ -58,7 +58,7 @@ pub fn apply(settings: &Settings, window: &mut Window, cx: &mut App) -> Option<S
     colors.sidebar_border = color(palette.separator);
     colors.popover = color(palette.raised);
     colors.popover_foreground = color(palette.text);
-    colors.border = color(palette.control_border);
+    colors.border = color(palette.border);
     colors.input = color(palette.control_border);
     colors.ring = color(palette.accent);
     colors.caret = color(palette.text);
@@ -118,6 +118,7 @@ struct Palette {
     text: u32,
     secondary: u32,
     separator: u32,
+    border: u32,
     control_border: u32,
     hover: u32,
     selection: u32,
@@ -133,46 +134,48 @@ struct Palette {
 
 const LIGHT: Palette = Palette {
     canvas: 0xFFFFFF,
-    chrome: 0xF2F4F7,
-    sidebar: 0xF1F6FA,
+    chrome: 0xF6F6F7,
+    sidebar: 0xF6F6F7,
     raised: 0xFFFFFF,
-    faint: 0xE6E8EC,
-    text: 0x17213A,
-    secondary: 0x56637A,
-    separator: 0xE1E6ED,
-    control_border: 0x77839A,
-    hover: 0xE1E7EE,
-    selection: 0xDCEBFC,
-    accent: 0x0A6CDF,
-    action: 0x0A63CE,
-    action_hover: 0x0957B5,
+    faint: 0xEDEDEF,
+    text: 0x27272A,
+    secondary: 0x63636C,
+    separator: 0xE4E4E7,
+    border: 0xE4E4E7,
+    control_border: 0x8B8B94,
+    hover: 0xEBEBED,
+    selection: 0xE2E8F8,
+    accent: 0x1D4ED8,
+    action: 0x1D4ED8,
+    action_hover: 0x1E40AF,
     action_text: 0xFFFFFF,
-    warning: 0x805600,
-    error: 0xB42332,
-    success: 0x256B3D,
-    scrim: 0.32,
+    warning: 0x9A5800,
+    error: 0xC81E2B,
+    success: 0x0F7A55,
+    scrim: 0.28,
 };
 
 const DARK: Palette = Palette {
-    canvas: 0x15181E,
-    chrome: 0x1D2027,
-    sidebar: 0x1C2027,
-    raised: 0x252A33,
-    faint: 0x343B45,
-    text: 0xF1F3F5,
-    secondary: 0xB5BEC9,
-    separator: 0x343B45,
-    control_border: 0x8B96A5,
-    hover: 0x39424F,
-    selection: 0x243E60,
-    accent: 0x409CFF,
-    action: 0x1F6FD8,
-    action_hover: 0x1B63C6,
+    canvas: 0x0B0B0C,
+    chrome: 0x111113,
+    sidebar: 0x111113,
+    raised: 0x18181B,
+    faint: 0x1F1F23,
+    text: 0xF4F4F5,
+    secondary: 0x9A9AA3,
+    separator: 0x1F1F23,
+    border: 0x2A2A2F,
+    control_border: 0x6A6A73,
+    hover: 0x1C1C20,
+    selection: 0x1A2747,
+    accent: 0x5A8BFF,
+    action: 0x2F63E6,
+    action_hover: 0x3A6EF0,
     action_text: 0xFFFFFF,
-    warning: 0xEBC378,
-    error: 0xFF9EAA,
-    success: 0x89D6A3,
-    scrim: 0.55,
+    warning: 0xF5A524,
+    error: 0xFF5C63,
+    success: 0x34D399,
+    scrim: 0.6,
 };
 
 /// The leading-edge bar and fill of a list row. Every list marks its selected row the same way:
@@ -190,9 +193,9 @@ pub(super) fn list_row(selected: bool, active: bool, cx: &App) -> (gpui::Hsla, O
 /// Neutral fill for a selection whose pane does not have keyboard focus.
 pub(super) fn inactive_selection(cx: &App) -> gpui::Hsla {
     gpui::rgb(if cx.theme().is_dark() {
-        0x3A424D
+        0x222226
     } else {
-        0xE5EBF2
+        0xE9E9EC
     })
     .into()
 }

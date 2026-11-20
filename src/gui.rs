@@ -3679,13 +3679,7 @@ impl Shell {
             .small()
             .compact()
             .disabled(!enabled)
-            .map(|button| {
-                if dirty_save {
-                    button.primary()
-                } else {
-                    button.outline()
-                }
-            })
+            .map(|button| if dirty_save { button.primary() } else { button })
             .on_click(cx.listener(move |this, _, window, cx| this.command(command, window, cx)))
     }
     /// F6 moves between the main areas, as in other desktop applications, so the
@@ -3827,6 +3821,9 @@ impl Shell {
             .label(label)
             .when_some(icon, |button, icon| button.icon(icon))
             .ghost()
+            .when(self.command_enabled(command), |button| {
+                button.text_color(cx.theme().muted_foreground)
+            })
             .small()
             .disabled(!self.command_enabled(command))
             .on_click(cx.listener(move |this, _, window, cx| this.command(command, window, cx)))
@@ -3842,6 +3839,9 @@ impl Shell {
             .icon(icon)
             .tooltip(label)
             .ghost()
+            .when(self.command_enabled(command), |button| {
+                button.text_color(cx.theme().muted_foreground)
+            })
             .small()
             .disabled(!self.command_enabled(command))
             .on_click(cx.listener(move |this, _, window, cx| this.command(command, window, cx)))
@@ -3934,8 +3934,11 @@ impl Render for Shell {
             .py(px(6. * scale))
             .when(short, |toolbar| toolbar.py(px(3. * scale)))
             .bg(cx.theme().title_bar)
-            .border_b_1()
-            .border_color(cx.theme().title_bar_border);
+            .when(compact_document, |toolbar| {
+                toolbar
+                    .border_b_1()
+                    .border_color(cx.theme().title_bar_border)
+            });
         let tier = self.toolbar_tier(narrow, window);
         toolbar = if narrow && self.active.is_none() && !self.request.pick {
             toolbar.child(self.tool_button("open", "Open…", None, cx))
@@ -4190,9 +4193,6 @@ impl Render for Shell {
             .w_full()
             .h_full()
             .bg(cx.theme().sidebar)
-            .border_2()
-            .border_color(cx.theme().sidebar)
-            .focus(|style| style.border_color(cx.theme().ring))
             .flex()
             .flex_col()
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
@@ -4257,7 +4257,7 @@ impl Render for Shell {
                     cx.processor(move |this, range: std::ops::Range<usize>, window, cx| {
                         let scale = this.settings.ui_scale;
                         let focused = this.nav_focus.is_focused(window);
-                        let name_width = nav_width - px((3. + 9. + 12. + 16. + 8. + 4.) * scale);
+                        let name_width = nav_width - px((12. + 3. + 9. + 12. + 16. + 8. + 4.) * scale);
                         let font_size = px(14. * scale);
                         let measure = |text: &SharedString| {
                             let run = window.text_style().to_run(text.len());
@@ -4293,8 +4293,9 @@ impl Render for Shell {
                                 let context_path = path.clone();
                                 let row=div()
                                     .id(("entry", i))
-                                    .h(this.navigation_row_height())
+                                    .h_full()
                                     .w_full()
+                                    .rounded(px(6. * scale))
                                     .flex()
                                     .items_center()
                                     .gap(px(8. * scale))
@@ -4336,6 +4337,12 @@ impl Render for Shell {
                                             cx.notify();
                                         },
                                     ));
+                                let row = div()
+                                    .h(this.navigation_row_height())
+                                    .w_full()
+                                    .px(px(6. * scale))
+                                    .py(px(1. * scale))
+                                    .child(row);
                                 this.navigation_row(entry,(i,visible.len()),cursor,row,cx)
                             })
                             .collect::<Vec<_>>()
@@ -4389,16 +4396,54 @@ impl Render for Shell {
         } else {
             px(0.)
         };
+        let active_markdown = self
+            .documents
+            .iter()
+            .any(|doc| Some(doc.id) == self.active && doc.markdown());
+        let document_actions = !self.request.pick && !short && self.active.is_some();
+        let read_label = if self.reading() {
+            "Edit Source"
+        } else {
+            "Read"
+        };
+        let keep_tab = self.command_enabled("keep-tab");
+        let actions_width = if document_actions {
+            let gap = px(8. * scale);
+            let button = |label: &str| {
+                Self::path_label_width(window, &SharedString::from(label.to_owned()))
+                    + rem * 0.75
+                    + px(2.)
+                    + gap
+            };
+            button("Save")
+                + if active_markdown {
+                    button(read_label)
+                } else {
+                    px(0.)
+                }
+                + if keep_tab {
+                    button("Keep Preview Tab")
+                } else {
+                    px(0.)
+                }
+                + rem * 1.5
+                + gap
+        } else {
+            px(0.)
+        };
         let controls_width = |documents: Pixels, edit: Pixels| {
-            (if show_documents_menu {
-                documents + px(8. * scale)
-            } else {
-                px(0.)
-            }) + (if edit_source {
-                edit + px(8. * scale)
-            } else {
-                px(0.)
-            }) + conflict_width
+            actions_width
+                + (if show_documents_menu {
+                    documents + px(8. * scale)
+                } else {
+                    px(0.)
+                })
+                + (if edit_source {
+                    edit + px(8. * scale)
+                } else {
+                    px(0.)
+                })
+                + conflict_width
                 + px(10. * scale)
         };
         // Keep room for a recognizable active tab: shorten the controls beside the tabs
@@ -4609,9 +4654,10 @@ impl Render for Shell {
             .bg(cx.theme().tab_bar)
             .border_b_1()
             .border_color(cx.theme().title_bar_border)
-            .when(show_documents_menu || edit_source || tab_conflict, |row| {
-                row.pr(px(8. * scale))
-            })
+            .when(
+                show_documents_menu || edit_source || tab_conflict || document_actions,
+                |row| row.pr(px(8. * scale)),
+            )
             .child(div().flex_1().min_w_0().child(tabs))
             .when(tab_conflict, |row| {
                 row.child(accessibility::message(
@@ -4631,6 +4677,22 @@ impl Render for Shell {
                     cx,
                 ))
             })
+            .when(document_actions, |row| {
+                row.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .flex_shrink_0()
+                        .gap(px(8. * scale))
+                        .child(self.button("Save", "save", cx))
+                        .when(active_markdown, |row| {
+                            row.child(self.button(read_label, "read", cx))
+                        })
+                        .when(keep_tab, |row| {
+                            row.child(self.button("Keep Preview Tab", "keep-tab", cx))
+                        }),
+                )
+            })
             .when(edit_source, |row| {
                 row.child(
                     self.button("Edit Source", "read", cx)
@@ -4638,6 +4700,7 @@ impl Render for Shell {
                         .flex_shrink_0(),
                 )
             })
+            .when(document_actions, |row| row.child(self.document_menu(cx)))
             .into_any_element();
         let mut content = div()
             .flex_1()
@@ -4646,10 +4709,6 @@ impl Render for Shell {
             .flex()
             .flex_col()
             .child(tabs);
-        let active_markdown = self
-            .documents
-            .iter()
-            .any(|doc| Some(doc.id) == self.active && doc.markdown());
         // Scope membership matters while searching or with a pinned scope, not while browsing.
         let outside_scope = (matches!(self.panel, Some(Panel::Files | Panel::Text))
             || self.scope.is_some()
@@ -4659,50 +4718,30 @@ impl Render for Shell {
                     && !doc.disk.target.as_os_str().is_empty()
                     && !doc.disk.path.starts_with(self.effective_scope())
             });
-        if !self.request.pick && !short && self.active.is_some() {
+        if document_actions && outside_scope {
             content = content.child(
                 div()
                     .flex()
-                    .items_center()
+                    .justify_end()
                     .flex_shrink_0()
-                    .gap(px(8. * scale))
                     .px(px(8. * scale))
-                    .py(px(6. * scale))
-                    .child(self.button("Save", "save", cx))
-                    .when(active_markdown, |row| {
-                        row.child(self.button(
-                            if self.reading() {
-                                "Edit Source"
-                            } else {
-                                "Read"
-                            },
-                            "read",
-                            cx,
-                        ))
-                    })
-                    .when(self.command_enabled("keep-tab"), |row| {
-                        row.child(self.button("Keep Preview Tab", "keep-tab", cx))
-                    })
-                    .child(div().flex_1())
-                    .when(outside_scope, |row| {
-                        row.child(
-                            Button::new("document-search-scope")
-                                .label(format!(
-                                    "Outside search folder: {}",
-                                    paths::name(self.effective_scope())
-                                ))
-                                .tooltip(paths::display(self.effective_scope()))
-                                .ghost()
-                                .small()
-                                .min_w_0()
-                                .flex_shrink()
-                                .text_color(cx.theme().muted_foreground)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.command("search-details", window, cx)
-                                })),
-                        )
-                    })
-                    .child(self.document_menu(cx)),
+                    .pt(px(4. * scale))
+                    .child(
+                        Button::new("document-search-scope")
+                            .label(format!(
+                                "Outside search folder: {}",
+                                paths::name(self.effective_scope())
+                            ))
+                            .tooltip(paths::display(self.effective_scope()))
+                            .ghost()
+                            .small()
+                            .min_w_0()
+                            .flex_shrink()
+                            .text_color(cx.theme().muted_foreground)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.command("search-details", window, cx)
+                            })),
+                    ),
             );
         }
         if let Some(doc) = self.documents.iter().find(|d| Some(d.id) == self.active) {
@@ -4809,8 +4848,6 @@ impl Render for Shell {
                     div()
                         .flex_1()
                         .min_h_0()
-                        .px(px(8. * scale))
-                        .pb(px(8. * scale))
                         .when(short, |editor| editor.pt(px(4. * scale)))
                         .font_family(if self.settings.proportional && doc.grammar(cx).is_none() {
                             cx.theme().font_family.clone()
@@ -4819,6 +4856,7 @@ impl Render for Shell {
                         })
                         .child(
                             Input::new(&doc.input)
+                                .bordered(false)
                                 .text_size(px(self.settings.font_size * self.settings.ui_scale))
                                 .line_height(relative(self.settings.line_height))
                                 .h_full()
@@ -4911,6 +4949,10 @@ impl Render for Shell {
                 .h(footer_height)
                 .flex_shrink_0()
                 .px_2()
+                .bg(cx.theme().title_bar)
+                .border_t_1()
+                .border_color(cx.theme().title_bar_border)
+                .text_color(cx.theme().muted_foreground)
                 .flex()
                 .items_center()
                 .gap_2()

@@ -175,13 +175,16 @@ impl Shell {
             .gap_2()
             .px_2()
             .when(!short, |bar| bar.py_1())
+            .bg(cx.theme().title_bar)
+            .border_b_1()
+            .border_color(cx.theme().title_bar_border)
             .when(!ancestors.is_empty(), |bar| {
                 bar.child(
                     Button::new("ancestor-folders")
                         .icon(IconName::Ellipsis)
                         .tooltip("Ancestor folders")
                         .small()
-                        .outline()
+                        .ghost()
                         .dropdown_menu(move |mut menu, window, _| {
                             let viewport = window.viewport_size();
                             let menu_width = (viewport.width - px(24.)).min(px(620.));
@@ -234,7 +237,7 @@ impl Shell {
                             .display_label(caption)
                             .max_w(segment_width),
                     )
-                    .child("›")
+                    .child(div().text_color(cx.theme().muted_foreground).child("›"))
             }))
             .child(
                 div()
@@ -253,6 +256,7 @@ impl Shell {
             )
             .child(
                 self.command_button("edit-location", edit_label, "path", cx)
+                    .ghost()
                     .flex_shrink_0()
                     .tooltip(paths::display(&self.current)),
             )

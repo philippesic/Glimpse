@@ -70,19 +70,19 @@ fn source_theme(dark: bool) -> syntect::highlighting::Theme {
     };
     let mut theme = Theme {
         settings: ThemeSettings {
-            foreground: Some(color(if dark { 0xd4dcee } else { 0x17335c })),
+            foreground: Some(color(if dark { 0xe4e4e7 } else { 0x27272a })),
             ..Default::default()
         },
         ..Default::default()
     };
     for (scope, light, night) in [
-        ("keyword, storage", 0x004dff, 0x34aaff),
-        ("entity.name.function, support.function", 0x0059d9, 0x51acff),
-        ("entity.name.type, support.type", 0x006c8f, 0x52c9ed),
-        ("string", 0x08732b, 0xa9da73),
-        ("constant.numeric, constant.language", 0x7145b8, 0xcba3fa),
-        ("comment", 0x717f91, 0x939eaf),
-        ("entity.name.tag", 0x004dff, 0x34aaff),
+        ("keyword, storage", 0x7c3aed, 0xc4a7ff),
+        ("entity.name.function, support.function", 0x1d4ed8, 0x7aa2ff),
+        ("entity.name.type, support.type", 0x0e7490, 0x5ccfe6),
+        ("string", 0x15803d, 0x86d993),
+        ("constant.numeric, constant.language", 0xb45309, 0xf5b06a),
+        ("comment", 0x71717a, 0x80808a),
+        ("entity.name.tag", 0x7c3aed, 0xc4a7ff),
     ] {
         theme.scopes.push(ThemeItem {
             scope: scope.parse().expect("static syntax scope"),

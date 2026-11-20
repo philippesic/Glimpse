@@ -43,11 +43,11 @@ impl Render for Divider {
                 if focused {
                     style.bg(cx.theme().ring)
                 } else {
-                    style.hover(|style| style.bg(cx.theme().border))
+                    style.hover(|style| style.bg(cx.theme().title_bar_border))
                 }
             })
-            .border_x_1()
-            .border_color(cx.theme().border)
+            .border_l_1()
+            .border_color(cx.theme().title_bar_border)
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
