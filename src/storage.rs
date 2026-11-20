@@ -265,12 +265,22 @@ impl Settings {
             return Err("Settings exceed 64 KiB; the saved settings are retained.".into());
         }
         crate::commands::bindings(&self.keymaps)?;
+        self.validate_exclusion_patterns()
+            .map_err(|(_, error)| error.to_string())
+    }
+
+    pub fn validate_exclusion_patterns(&self) -> Result<(), (usize, ignore::Error)> {
         let mut globs = ignore::overrides::OverrideBuilder::new("/");
-        for line in self.search_exclude.lines().filter(|s| !s.trim().is_empty()) {
-            globs.add(&format!("!{line}")).map_err(|e| e.to_string())?;
+        for (index, line) in self.search_exclude.lines().enumerate() {
+            if !line.trim().is_empty() {
+                globs
+                    .add(&format!("!{line}"))
+                    .map_err(|error| (index + 1, error))?;
+            }
         }
         Ok(())
     }
+
     pub fn load() -> Result<Self, String> {
         Self::load_in(&data_dir()?)
     }

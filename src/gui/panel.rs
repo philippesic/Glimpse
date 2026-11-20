@@ -82,6 +82,7 @@ impl Shell {
             Panel::NewFolder => "New Folder Name",
             Panel::Rename => "New Name",
         };
+        let naming = matches!(panel, Panel::NewFile | Panel::NewFolder | Panel::Rename);
         let search = matches!(panel, Panel::Files | Panel::Text);
         let stacked = window.viewport_size().width < px(760. * scale);
         let submit = (!matches!(panel, Panel::Recovery | Panel::Filter)).then(|| {
@@ -97,6 +98,9 @@ impl Shell {
                 "submit",
                 cx,
             )
+            .when(naming && self.name_request.is_some(), |submit| {
+                submit.disabled(true)
+            })
             .when(panel == Panel::Palette, |run| {
                 run.disabled(!self.palette_runnable(cx))
             })
@@ -176,6 +180,22 @@ impl Shell {
                 }
             })
             .child(header);
+        let section = section.when(panel == Panel::Line || naming, |section| {
+            let scale = self.settings.ui_scale;
+            section.child(
+                div()
+                    .px(px(8. * scale))
+                    .h(px(24. * scale))
+                    .flex_shrink_0()
+                    .when_some(self.query_error.clone(), |row, error| {
+                        row.child(accessibility::message(
+                            "query-error",
+                            error.clone(),
+                            div().text_color(cx.theme().danger).child(error),
+                        ))
+                    }),
+            )
+        });
         let section = match panel {
             Panel::Files | Panel::Text if self.search_ui.collapsed => {
                 section.child(self.collapsed_results(cx))

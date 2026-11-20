@@ -9,6 +9,7 @@ pub(super) struct State {
     announcement: Option<Task<()>>,
     pub started: bool,
     pub running: bool,
+    pub file_opens: HashMap<u64, u64>,
     pub building: bool,
     pub query: String,
     pub selection: Option<usize>,
@@ -28,6 +29,7 @@ impl State {
             announcement: None,
             started: false,
             running: false,
+            file_opens: HashMap::new(),
             building: false,
             query: String::new(),
             selection: None,
@@ -210,13 +212,18 @@ impl Shell {
         };
         let (path, line, fingerprint) = (hit.path.clone(), hit.line, hit.fingerprint);
         self.search_ui.selection = Some(index);
-        self.search_ui.collapsed = self.search_ui.takeover;
+        let filename_result = self.panel == Some(Panel::Files);
+        self.search_ui.collapsed =
+            (!filename_result || self.request.pick) && self.search_ui.takeover;
         self.search_ui.picker_selection = Some(path.clone());
-        if let Some(token) = self.open(path, false, fingerprint.map(|_| (line, 1)))
-            && let Some(fingerprint) = fingerprint
-        {
-            self.hit_versions
-                .insert(token, (fingerprint, self.search_id));
+        if let Some(token) = self.open(path, false, fingerprint.map(|_| (line, 1))) {
+            if let Some(fingerprint) = fingerprint {
+                self.hit_versions
+                    .insert(token, (fingerprint, self.search_id));
+            }
+            if filename_result {
+                self.search_ui.file_opens.insert(token, self.search_id);
+            }
         }
         cx.notify();
     }
@@ -359,10 +366,26 @@ impl Shell {
         let count = hits.len().min(1000);
         let scale = self.settings.ui_scale;
         let row_height = px(32. * scale);
-        let status = format!(
-            "{} · {} displayed (limit 1,000)",
-            self.search_ui.status, count
-        );
+        let mut status = match (count, self.search_ui.status.as_str()) {
+            (0, "Complete") => "No matches".into(),
+            (0, state) if state.starts_with("Indexed snapshot") => {
+                format!("No matches in snapshot · {state}")
+            }
+            (0, state) if state.starts_with("Partial") => {
+                format!("No matches in scanned files · {state}")
+            }
+            (0, state) => state.to_owned(),
+            (1, "Complete") => "1 match".into(),
+            (_, "Complete") => format!("{count} matches"),
+            (_, state) => format!("{state} · {count} displayed"),
+        };
+        if self.panel == Some(Panel::Files)
+            && self.search_ui.selection.is_some()
+            && !self.search_ui.running
+            && !self.search_ui.status.starts_with("Failed")
+        {
+            status.push_str(" · Enter opens selected file");
+        }
         let coverage = format!(
             "{} · metadata {} · content ≤ {} MiB/file · exclusions: {}",
             if self.settings.search_ignored {
@@ -428,7 +451,9 @@ impl Shell {
                             self.search_ui.announce_status,
                         ))
                     })
-                    .child(
+                    .child(accessibility::label(
+                        "search-coverage-label",
+                        coverage.clone(),
                         div()
                             .id("search-coverage")
                             .truncate()
@@ -437,7 +462,7 @@ impl Shell {
                                 gpui_component::tooltip::Tooltip::new(coverage.clone())
                                     .build(window, cx)
                             }),
-                    )
+                    ))
                     .when(
                         self.settings.search_directory_links || self.settings.search_mounts,
                         |panel| {
@@ -485,7 +510,11 @@ impl Shell {
                                 "search-result-status"
                             },
                             status.clone(),
-                            div().text_size(small).child(status.clone()),
+                            div()
+                                .id("search-status-text")
+                                .text_size(small)
+                                .truncate()
+                                .child(status.clone()),
                             self.search_ui.announce_status,
                         )),
                 )

@@ -7,7 +7,7 @@ mod external;
 mod keyboard;
 mod menus;
 mod modal;
-mod open_failure;
+mod notice;
 mod panel;
 mod panes;
 mod path;
@@ -29,7 +29,7 @@ use gpui::{prelude::*, *};
 use gpui_component::{
     ActiveTheme, Disableable, IconName, Root, Selectable, Sizable,
     button::{Button, ButtonVariants},
-    input::{Input, InputEvent, InputState, Position, PreparedInput, Rope},
+    input::{Input, InputEvent, InputState, LineType, Position, PreparedInput, Rope},
 };
 use std::{
     cell::RefCell,
@@ -280,6 +280,11 @@ struct Shell {
     nav_focus: FocusHandle,
     open_documents_requested: bool,
     main_menu_requested: bool,
+    navigator_menu: Option<menus::NavigatorMenu>,
+    query_error: Option<String>,
+    panel_revision: u64,
+    name_request: Option<u64>,
+    rename_path: Option<PathBuf>,
     conflict_focus: FocusHandle,
     edit_state: std::cell::Cell<[bool; 3]>,
     reading_focus: FocusHandle,
@@ -328,7 +333,7 @@ struct Shell {
     reading_request: u64,
     memory_release: Option<Task<()>>,
     status: String,
-    open_failure: Option<open_failure::Failure>,
+    open_failure: Option<notice::Failure>,
     font_warning: Option<String>,
     window_title: String,
     warnings: Vec<String>,
@@ -453,6 +458,9 @@ impl Shell {
                 this.submit(window, cx);
             }
             if matches!(event, InputEvent::Change) && this.panel == Some(Panel::Path) {
+                if let Some(token) = this.path_request.take() {
+                    this.opening.remove(&token);
+                }
                 if this
                     .path_completions
                     .as_ref()
@@ -467,6 +475,9 @@ impl Shell {
                 && matches!(this.panel, Some(Panel::Files | Panel::Text))
             {
                 this.search_changed(cx);
+            }
+            if matches!(event, InputEvent::Change) && this.query_error.take().is_some() {
+                cx.notify();
             }
             if matches!(event, InputEvent::Change) && this.panel == Some(Panel::Palette) {
                 this.palette.selection = 0;
@@ -535,6 +546,11 @@ impl Shell {
             nav_focus: cx.focus_handle().tab_stop(true),
             open_documents_requested: false,
             main_menu_requested: false,
+            navigator_menu: None,
+            query_error: None,
+            panel_revision: 0,
+            name_request: None,
+            rename_path: None,
             conflict_focus: cx.focus_handle(),
             edit_state: Default::default(),
             reading_focus: cx.focus_handle().tab_stop(true),
@@ -1084,6 +1100,7 @@ impl Shell {
     }
     fn change_location(&mut self, path: PathBuf) {
         self.restoring_location = false;
+        self.clear_open_failure();
         let old_scope = self.effective_scope().clone();
         if let Some(selection) = self.selection.take() {
             self.selections.insert(self.current.clone(), selection);
@@ -1120,6 +1137,12 @@ impl Shell {
             })
             .cloned()
     }
+    fn path_is_open(&self, path: &Path) -> bool {
+        self.documents
+            .iter()
+            .any(|doc| doc.disk.path.starts_with(path) || doc.disk.target.starts_with(path))
+    }
+
     fn open(
         &mut self,
         path: PathBuf,
@@ -1154,6 +1177,9 @@ impl Shell {
         let OpenIntent {
             preview, position, ..
         } = intent;
+        if activate {
+            self.clear_open_failure();
+        }
         if activate && self.request.pick {
             self.search_ui.picker_selection = Some(disk.path.clone());
         }
@@ -1459,7 +1485,13 @@ impl Shell {
             self.reset_search("Enter a query, then press Enter to search");
             self.search_ui.query.clear();
         }
+        if let Some(token) = self.path_request.take() {
+            self.opening.remove(&token);
+        }
         self.panel = Some(panel);
+        self.panel_revision += 1;
+        self.query_error = None;
+        self.rename_path = None;
         let value = if panel == Panel::Path {
             paths::entry(&self.current)
         } else {
@@ -1508,10 +1540,23 @@ impl Shell {
                     if let Some(old) = self.path_request.take() {
                         self.opening.remove(&old);
                     }
+                    self.query_error = None;
+                    self.path_completions = None;
+                    self.path_hint = None;
                     self.path_request = self.open(path, false, None);
                 }
-                Err(error) => self.status = error,
+                Err(error) => self.query_error = Some(error),
             },
+            Some(Panel::Files)
+                if self.search_ui.started
+                    && !self.search_ui.running
+                    && self.search_ui.query == value =>
+            {
+                if let Some(index) = self.search_ui.selection {
+                    self.open_hit(index, cx);
+                }
+            }
+            Some(Panel::Files) if self.search_ui.running && self.search_ui.query == value => {}
             Some(Panel::Files | Panel::Text) => self.start_search(cx),
             Some(Panel::Filter) => {
                 let visible = self.visible_rows();
@@ -1528,45 +1573,64 @@ impl Shell {
                 }
             }
             Some(Panel::NewFile | Panel::NewFolder | Panel::Rename) => {
-                let path = self.current.join(&value);
-                if !paths::single_name(&value) {
-                    self.status = "Enter one filename".into();
+                if self.name_request.is_some() {
+                    return;
+                }
+                let ticket = self.panel_revision;
+                let job = if !paths::single_name(&value) {
+                    self.query_error = Some("Enter a single name without a folder path.".into());
+                    None
                 } else if self.panel == Some(Panel::Rename) {
-                    if let Some(source) = self.selected_path() {
-                        if self.documents.iter().any(|doc| doc.disk.path == source) {
-                            self.status = "Close the file before renaming".into();
+                    self.rename_path.clone().and_then(|source| {
+                        let destination = source.with_file_name(&value);
+                        if self.path_is_open(&source) {
+                            self.query_error =
+                                Some("Close documents in this item before renaming it.".into());
+                            None
+                        } else if destination == source {
+                            self.command("dismiss", window, cx);
+                            None
                         } else {
-                            let destination = source.with_file_name(&value);
-                            self.selection = Some(destination.clone());
-                            self.reveal_pending = Some(destination.clone());
-                            self.io.send(Job::Rename(source, destination));
-                            self.panel = None;
+                            Some(Job::Rename(ticket, source, destination))
                         }
-                    }
+                    })
                 } else {
-                    // The navigator selects the new entry once the folder is listed again.
-                    self.selection = Some(path.clone());
-                    self.reveal_pending = Some(path.clone());
-                    self.io.send(Job::Create(
-                        path,
+                    Some(Job::Create(
+                        ticket,
+                        self.current.join(&value),
                         self.panel == Some(Panel::NewFolder),
-                        String::new(),
-                    ));
-                    self.panel = None;
+                    ))
+                };
+                if let Some(job) = job {
+                    self.query_error = None;
+                    self.name_request = Some(ticket);
+                    self.io.send(job);
                 }
             }
             Some(Panel::Line) => {
-                if let Ok(line) = value.parse::<u32>() {
-                    if let Some(doc) = self.documents.iter().find(|d| Some(d.id) == self.active) {
-                        doc.input.update(cx, |input, cx| {
-                            input.set_cursor_position(
-                                Position::new(line.saturating_sub(1), 0),
-                                window,
-                                cx,
-                            )
-                        });
+                if let Some(doc) = self.documents.iter().find(|d| Some(d.id) == self.active) {
+                    let lines = doc.input.read(cx).text().len_lines(LineType::LF);
+                    match value.trim().parse::<u32>() {
+                        Ok(line) if (1..=lines).contains(&(line as usize)) => {
+                            self.panel = None;
+                            self.panel_return = None;
+                            let input = doc.input.clone();
+                            self.set_reading(false);
+                            self.navigation_only = false;
+                            input.update(cx, |input, cx| {
+                                input.set_cursor_position(Position::new(line - 1, 0), window, cx);
+                            });
+                        }
+                        _ => {
+                            let message = if lines == 1 {
+                                "Enter 1. This file has one line.".into()
+                            } else {
+                                format!("Enter a whole number from 1 to {lines}.")
+                            };
+                            self.query_error = Some(message);
+                            self.query.update(cx, |input, cx| input.focus(window, cx));
+                        }
                     }
-                    self.panel = None;
                 }
             }
             _ => {}
@@ -1660,7 +1724,17 @@ impl Shell {
                 },
                 Reply::OpenDirectory(path, token) => {
                     if let Some(intent) = self.opening.remove(&token) {
-                        if !self.ready && self.request.files.contains(&path) {
+                        let search_generation =
+                            self.search_ui.file_opens.remove(&token).or_else(|| {
+                                self.hit_versions
+                                    .remove(&token)
+                                    .map(|(_, generation)| generation)
+                            });
+                        if let Some(generation) = search_generation {
+                            if generation == self.search_id {
+                                self.search_ui.status = "This result is now a folder. Search again for current results.".into();
+                            }
+                        } else if !self.ready && self.request.files.contains(&path) {
                             self.status = format!(
                                 "Requested file became a directory: {}",
                                 paths::display(&path)
@@ -1681,6 +1755,7 @@ impl Shell {
                 }
                 Reply::Open(path, token, result) => {
                     let expected = self.hit_versions.remove(&token);
+                    let file_search_generation = self.search_ui.file_opens.remove(&token);
                     if let Some(OpenIntent {
                         preview,
                         position,
@@ -1688,6 +1763,11 @@ impl Shell {
                     }) = self.opening.remove(&token)
                     {
                         let activate = interaction == self.interaction
+                            && file_search_generation.is_none_or(|generation| {
+                                token == self.open_token
+                                    && generation == self.search_id
+                                    && self.panel == Some(Panel::Files)
+                            })
                             && self.preferences.is_none()
                             && self.decision.is_none();
                         if preview && (!activate || token != self.open_token) {
@@ -1699,13 +1779,6 @@ impl Shell {
                         }
                         match result {
                             Ok((disk, text)) => {
-                                if self
-                                    .open_failure
-                                    .as_ref()
-                                    .is_some_and(|failure| failure.path == path)
-                                {
-                                    self.open_failure = None;
-                                }
                                 if self.destination_busy {
                                     continue;
                                 }
@@ -1727,8 +1800,16 @@ impl Shell {
                                     }
                                     continue;
                                 }
-                                if from_path && activate {
-                                    self.panel = None;
+                                if activate {
+                                    if file_search_generation.is_some() && !self.request.pick {
+                                        self.panel = None;
+                                        self.panel_return = None;
+                                        self.search_ui.temporary = None;
+                                        self.reset_search("Search closed");
+                                    } else if from_path {
+                                        self.panel = None;
+                                        self.panel_return = None;
+                                    }
                                 }
                                 self.add_document(
                                     disk,
@@ -1750,16 +1831,23 @@ impl Shell {
                                     });
                                 }
                                 if expected
-                                    .is_some_and(|(_, generation)| generation == self.search_id)
+                                    .map(|(_, generation)| generation)
+                                    .or(file_search_generation)
+                                    == Some(self.search_id)
                                 {
                                     self.search_ui.status = format!("Failed to open result: {e}");
                                 }
-                                self.open_failure = Some(open_failure::Failure {
-                                    path,
-                                    message: e.clone(),
-                                });
-                                self.status = e;
-                                if !from_path && activate {
+                                if from_path && activate {
+                                    self.query_error =
+                                        Some(format!("Could not open this path. {e}"));
+                                } else if activate {
+                                    self.open_failure = Some(notice::Failure {
+                                        path,
+                                        message: e.clone(),
+                                    });
+                                    self.status = e;
+                                }
+                                if !from_path && file_search_generation.is_none() && activate {
                                     self.focus(window, cx);
                                 }
                             }
@@ -2388,6 +2476,34 @@ impl Shell {
                 }
                 Reply::Done(Err(error)) => self.status = error,
                 Reply::HistoryWarning(error) => self.warn(error),
+                Reply::NamedChange(ticket, path, result) => {
+                    self.name_request = None;
+                    let current_form = self.panel_revision == ticket
+                        && matches!(
+                            self.panel,
+                            Some(Panel::NewFile | Panel::NewFolder | Panel::Rename)
+                        );
+                    match result {
+                        Ok(()) => {
+                            if path.parent() == Some(self.current.as_path()) {
+                                self.selection = Some(path.clone());
+                                self.reveal_pending = Some(path);
+                                self.refresh();
+                            }
+                            if current_form {
+                                self.panel = None;
+                                self.panel_return = None;
+                                self.rename_path = None;
+                                window.focus(&self.nav_focus);
+                            }
+                        }
+                        Err(error) if current_form => {
+                            self.query_error = Some(error);
+                            self.query.update(cx, |input, cx| input.focus(window, cx));
+                        }
+                        Err(error) => self.status = error,
+                    }
+                }
                 Reply::Changed(result) => match result {
                     Ok(()) => {
                         self.refresh();
@@ -2421,11 +2537,18 @@ impl Shell {
                     .and_then(|i| self.hits.get(i))
                     .map(|hit| (hit.path.clone(), hit.line));
                 self.hits = std::sync::Arc::new(result.hits);
-                self.search_ui.selection = selected.and_then(|(path, line)| {
-                    self.hits
-                        .iter()
-                        .position(|hit| hit.path == path && hit.line == line)
-                });
+                self.search_ui.selection = selected
+                    .and_then(|(path, line)| {
+                        self.hits
+                            .iter()
+                            .position(|hit| hit.path == path && hit.line == line)
+                    })
+                    .or_else(|| {
+                        (result.completed
+                            && self.panel == Some(Panel::Files)
+                            && !self.hits.is_empty())
+                        .then_some(0)
+                    });
                 self.search_ui.status = result.state;
                 self.search_ui.running = !result.completed;
                 if result.completed && self.search_ui.building {
@@ -2818,7 +2941,20 @@ impl Shell {
             }
             "named-file" => self.panel(Panel::NewFile, window, cx),
             "new-folder" => self.panel(Panel::NewFolder, window, cx),
-            "rename" => self.panel(Panel::Rename, window, cx),
+            "rename" => {
+                if let Some(path) = self.selected_path().filter(|path| !self.path_is_open(path)) {
+                    self.panel(Panel::Rename, window, cx);
+                    if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+                        self.query.update(cx, |input, cx| {
+                            input.set_value(name.to_owned(), window, cx);
+                            input.select_all(&gpui_component::input::SelectAll, window, cx);
+                        });
+                    }
+                    self.rename_path = Some(path);
+                } else {
+                    self.status = "Select a closed file or folder to rename".into();
+                }
+            }
             "navigator" => {
                 self.navigation_only = true;
                 self.navigator_visible = true;
@@ -2851,6 +2987,7 @@ impl Shell {
                         .update(cx, |input, cx| input.show_search(window, cx));
                 }
             }
+            "submit" if self.panel == Some(Panel::Files) => self.start_search(cx),
             "submit" => self.submit(window, cx),
             "next-document" | "previous-document" => {
                 if let Some(index) = self
@@ -2887,6 +3024,7 @@ impl Shell {
                     || self.palette.focus.contains_focused(window, cx)
                     || (self.panel == Some(Panel::Filter) && self.nav_focus.is_focused(window));
                 self.panel = None;
+                self.query_error = None;
                 self.path_hint = None;
                 self.search_ui.temporary = None;
                 self.reset_search("Search closed");
@@ -3245,8 +3383,9 @@ impl Shell {
             }
             "trash" if !self.request.pick => {
                 if let Some(path) = self.selected_path() {
-                    if self.documents.iter().any(|d| d.disk.path == path) {
-                        self.status = "Close this file before moving it to Trash".into();
+                    if self.path_is_open(&path) {
+                        self.status =
+                            "Close documents in this item before moving it to Trash".into();
                     } else {
                         self.io.send(Job::Trash(path));
                     }
@@ -3371,6 +3510,10 @@ impl Shell {
             "compare" | "overwrite" => {
                 document.is_some_and(|doc| doc.external.is_some() && !doc.saving)
             }
+            "rename" | "trash" => self
+                .selection
+                .as_ref()
+                .is_some_and(|path| !self.path_is_open(path)),
             "stop-search" => self.search_ui.running,
             "remove-index" => self.search.index_status(self.effective_scope()).is_some(),
             "back" => !self.history.is_empty(),
@@ -3564,6 +3707,7 @@ impl Shell {
         if keep {
             document.preview = false;
         }
+        self.clear_open_failure();
         self.active = Some(id);
         self.navigation_only = false;
         self.focus(window, cx);
@@ -3770,10 +3914,10 @@ impl Render for Shell {
             .text_color(cx.theme().foreground)
             .text_size(px(14. * self.settings.ui_scale))
             .child(toolbar)
-            .when(
-                !compact_document || self.panel == Some(Panel::Path),
-                |root| root.child(self.path_bar(short, window, cx)),
-            )
+            .relative()
+            .when(!compact_document, |root| {
+                root.child(self.path_bar(short, window, cx))
+            })
             .when(self.request.pick, |root| {
                 let candidate = if self.request.directory {
                     Some(self.current.clone())
@@ -3807,10 +3951,6 @@ impl Render for Shell {
             self.search_ui.selection = Some(0);
             self.search_ui.picker_selection = Some(self.hits[0].path.clone());
         }
-        let show_footer = !takeover
-            || !self.status.is_empty()
-            || self.font_warning.is_some()
-            || !self.warnings.is_empty();
         let mut main = div().flex_1().min_h_0().overflow_hidden().flex().flex_col();
         if self.open_failure.is_some() {
             main = main.child(self.open_failure_view(cx));
@@ -4001,6 +4141,7 @@ impl Render for Shell {
                                     IconName::File
                                 };
                                 let (marker, fill) = theme::list_row(selected, focused, cx);
+                                let context_path = path.clone();
                                 let row=div()
                                     .id(("entry", i))
                                     .h(px(if this.settings.compact { 28. } else { 32. } * scale))
@@ -4014,7 +4155,9 @@ impl Render for Shell {
                                     .pr(px(12. * scale))
                                     .bg(fill.unwrap_or(cx.theme().sidebar))
                                     .hover(|row| if selected { row } else { row.bg(cx.theme().list_hover) })
-                                    .tooltip(move |window,cx| gpui_component::tooltip::Tooltip::new(tooltip.clone()).build(window,cx))
+                                    .when(this.navigator_menu.is_none(), |row| {
+                                        row.tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx))
+                                    })
                                     .cursor_pointer()
                                     .child(
                                         gpui_component::Icon::new(icon)
@@ -4027,6 +4170,12 @@ impl Render for Shell {
                                             }),
                                     )
                                     .child(div().min_w_0().flex_1().truncate().child(caption))
+                                    .on_mouse_down(MouseButton::Right, cx.listener(
+                                        move |this, event: &MouseDownEvent, window, cx| {
+                                            this.show_navigator_menu(context_path.clone(), event.position, window, cx);
+                                            cx.stop_propagation();
+                                        },
+                                    ))
                                     .on_click(cx.listener(
                                         move |this, event: &ClickEvent, _, cx| {
                                             this.selection = Some(path.clone());
@@ -4294,16 +4443,7 @@ impl Render for Shell {
             AccessibilityInfo::new(node)
         });
         let has_status = !self.status.is_empty() || self.font_warning.is_some();
-        let stacked_footer = narrow && !short && (has_status || !self.warnings.is_empty());
-        let footer_height = if stacked_footer {
-            48.
-        } else if short && self.warnings.is_empty() {
-            20.
-        } else if narrow {
-            28.
-        } else {
-            36.
-        };
+        let footer_height = if narrow { 28. } else { 36. };
         let footer_height = px(footer_height * self.settings.ui_scale);
         let open_documents_requested = std::mem::take(&mut self.open_documents_requested);
         let tabs = div()
@@ -4418,30 +4558,25 @@ impl Render for Shell {
                 .max_h(relative(0.5))
                 .overflow_y_scroll();
             let mut has_notices = false;
-            if doc.recovery_error.is_none() && doc.error.is_some() {
+            if doc.recovery_error.is_none()
+                && let Some(error) = &doc.error
+            {
                 has_notices = true;
+                let title = match doc.failure_action {
+                    FailureAction::Save => "Last save failed",
+                    FailureAction::Reload => "Reload stopped",
+                    FailureAction::Check => "File unavailable",
+                    FailureAction::Choose(_) => "Destination unavailable",
+                };
                 notices = notices.child(
-                    div()
-                        .w_full()
-                        .flex_shrink_0()
-                        .p_2()
-                        .flex()
-                        .flex_wrap()
-                        .items_center()
-                        .gap_2()
-                        .child({
-                            let message = match doc.failure_action {
-                                FailureAction::Save => "Last save failed",
-                                FailureAction::Reload => "Reload stopped",
-                                FailureAction::Check => "File unavailable",
-                                FailureAction::Choose(_) => "Destination unavailable",
-                            };
-                            accessibility::message(
-                                "operation-failure",
-                                message.into(),
-                                div().child(message),
-                            )
-                        })
+                    self.notice(cx)
+                        .child(self.notice_label(
+                            "operation-failure",
+                            title.into(),
+                            error,
+                            true,
+                            cx,
+                        ))
                         .child(self.button("Details and Retry…", "failure-details", cx)),
                 );
             }
@@ -4451,79 +4586,30 @@ impl Render for Shell {
             }
             let compact_notice =
                 narrow || window.viewport_size().height < px(560. * self.settings.ui_scale);
+            let conflict_reason = "Local text retained; ordinary Save is blocked.";
             if doc.external.is_some() && compact_notice && !short {
                 has_notices = true;
                 notices = notices.child(
-                    div()
-                        .flex_shrink_0()
-                        .mx(px(8. * scale))
-                        .mb(px(6. * scale))
-                        .px(px(8. * scale))
-                        .py(px(4. * scale))
-                        .flex()
-                        .items_center()
-                        .gap(px(8. * scale))
-                        .rounded(px(7. * scale))
-                        .bg(cx.theme().secondary)
-                        .border_l(px(3. * scale))
-                        .border_color(cx.theme().warning)
-                        .child(
-                            gpui_component::Icon::new(IconName::TriangleAlert)
-                                .with_size(px(16. * scale))
-                                .flex_shrink_0()
-                                .text_color(cx.theme().warning),
-                        )
-                        .child(
-                            div().flex_1().min_w_0().child(accessibility::message(
-                                "external-conflict",
-                                "Changed on disk. Local text retained; ordinary Save is blocked."
-                                    .into(),
-                                div()
-                                    .id("external-conflict-short")
-                                    .truncate()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child("Changed on disk")
-                                    .tooltip(|window, cx| {
-                                        gpui_component::tooltip::Tooltip::new(
-                                            "Local text retained; ordinary Save is blocked.",
-                                        )
-                                        .build(window, cx)
-                                    }),
-                            )),
-                        )
+                    self.notice(cx)
+                        .child(self.notice_label(
+                            "external-conflict",
+                            "Changed on disk".into(),
+                            conflict_reason,
+                            false,
+                            cx,
+                        ))
                         .child(self.conflict_menu(false, cx)),
                 );
             } else if doc.external.is_some() && !compact_notice {
                 has_notices = true;
                 notices = notices.child(
-                    div()
-                        .flex_shrink_0()
-                        .mx(px(8. * scale))
-                        .mb(px(8. * scale))
-                        .p(px(8. * scale))
-                        .flex()
-                        .flex_col()
-                        .gap(px(8. * scale))
-                        .rounded(px(7. * scale))
-                        .bg(cx.theme().secondary)
-                        .border_l(px(3. * scale))
-                        .border_color(cx.theme().warning)
-                        .child(accessibility::message(
+                    self.notice(cx)
+                        .child(self.notice_label(
                             "external-conflict",
-                            "Changed on disk. Local text retained; ordinary Save is blocked."
-                                .into(),
-                            div()
-                                .min_w_0()
-                                .child(
-                                    div()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .child("Changed on disk."),
-                                )
-                                .child(
-                                    div()
-                                        .whitespace_normal()
-                                        .child("Local text retained; ordinary Save is blocked."),
-                                ),
+                            "Changed on disk".into(),
+                            conflict_reason,
+                            true,
+                            cx,
                         ))
                         .child(
                             div()
@@ -4653,78 +4739,95 @@ impl Render for Shell {
                 .when(!takeover, |main| {
                     main.child(div().flex_1().min_h_0().overflow_hidden().child(body))
                 })
-                .children(floating),
+                .children(floating)
+                .when_some(
+                    self.query_error
+                        .clone()
+                        .filter(|_| self.panel == Some(Panel::Path)),
+                    |main, error| main.child(self.path_error_view(error, cx)),
+                ),
         )
-        .when(show_footer, |root| {
-            root.child(
-                div()
-                    .h(footer_height)
-                    .flex_shrink_0()
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .text_size(px(12. * self.settings.ui_scale))
-                    .when(stacked_footer, |footer| {
-                        footer.flex_col().items_start().justify_center().gap_0()
-                    })
-                    .when(!self.warnings.is_empty(), |footer| {
-                        footer.child(self.button("Warnings…", "warnings", cx))
-                    })
-                    .when(
-                        self.warnings.is_empty() && (!narrow || has_status),
-                        |footer| {
-                            let message = match &self.font_warning {
-                                Some(warning) if self.status.is_empty() => warning.clone(),
-                                Some(warning) => format!("{} · {warning}", self.status),
-                                None => self.status.clone(),
-                            };
-                            footer.child(accessibility::message(
-                                "application-status",
-                                message.clone(),
-                                div()
-                                    .id("status-message")
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .child(message.clone())
-                                    .tooltip(move |window, cx| {
-                                        gpui_component::tooltip::Tooltip::new(message.clone())
-                                            .build(window, cx)
-                                    }),
-                            ))
-                        },
-                    )
-                    .when_some(
-                        self.documents
-                            .iter()
-                            .find(|doc| Some(doc.id) == self.active),
-                        |footer, doc| {
-                            let information = doc.information(cx, self.reading());
-                            footer.child(accessible(
-                                "document-information",
-                                div()
-                                    .when(short, |info| {
-                                        info.truncate().when(
-                                            !self.status.is_empty()
-                                                || self.font_warning.is_some()
-                                                || !self.warnings.is_empty(),
-                                            |info| info.max_w(rems(10.)),
-                                        )
-                                    })
-                                    .flex_shrink_0()
-                                    .child(information.clone()),
-                                move |_, _, _| {
-                                    let mut node =
-                                        gpui::accesskit::Node::new(gpui::accesskit::Role::Status);
-                                    node.set_label(information.clone());
-                                    AccessibilityInfo::new(node)
-                                },
-                            ))
-                        },
-                    ),
-            )
-        })
+        .child(
+            div()
+                .h(footer_height)
+                .flex_shrink_0()
+                .px_2()
+                .flex()
+                .items_center()
+                .gap_2()
+                .text_size(px(12. * self.settings.ui_scale))
+                .when(!self.warnings.is_empty(), |footer| {
+                    footer.child(self.button("Warnings…", "warnings", cx))
+                })
+                .when(
+                    self.warnings.is_empty() && (!narrow || has_status),
+                    |footer| {
+                        let message = match &self.font_warning {
+                            Some(warning) if self.status.is_empty() => warning.clone(),
+                            Some(warning) => format!("{} · {warning}", self.status),
+                            None => self.status.clone(),
+                        };
+                        footer.child(accessibility::message(
+                            "application-status",
+                            message.clone(),
+                            div()
+                                .id("status-message")
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .child(message.clone())
+                                .tooltip(move |window, cx| {
+                                    gpui_component::tooltip::Tooltip::new(message.clone())
+                                        .build(window, cx)
+                                }),
+                        ))
+                    },
+                )
+                .when(
+                    narrow && (!has_status || !self.warnings.is_empty()),
+                    |footer| footer.child(div().flex_1()),
+                )
+                .when_some(
+                    self.documents
+                        .iter()
+                        .find(|doc| Some(doc.id) == self.active),
+                    |footer, doc| {
+                        let information = doc.information(cx, self.reading());
+                        footer.child(accessible(
+                            "document-information",
+                            div()
+                                .truncate()
+                                .min_w_0()
+                                .when(has_status || !self.warnings.is_empty(), |info| {
+                                    info.max_w(relative(0.55))
+                                })
+                                .child(information.clone()),
+                            move |_, _, _| {
+                                let mut node =
+                                    gpui::accesskit::Node::new(gpui::accesskit::Role::Status);
+                                node.set_label(information.clone());
+                                AccessibilityInfo::new(node)
+                            },
+                        ))
+                    },
+                ),
+        )
+        .when(
+            compact_document && self.panel == Some(Panel::Path),
+            |root| {
+                root.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .occlude()
+                        .bg(cx.theme().background)
+                        .child(self.path_bar(short, window, cx)),
+                )
+            },
+        )
+        .children(self.navigator_menu_view())
         .children(self.preferences.clone())
         .children(self.decision.clone())
         .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
@@ -4756,6 +4859,7 @@ impl Render for Shell {
                 };
                 if let Some(next) = next {
                     let id = this.documents[next].id;
+                    this.clear_open_failure();
                     this.active = Some(id);
                     this.navigation_only = false;
                     window.focus(&this.documents[next].tab_focus.clone());
@@ -4767,12 +4871,30 @@ impl Render for Shell {
                 && !key.modifiers.control
                 && !key.modifiers.platform
             {
+                if key.modifiers.alt {
+                    return;
+                }
                 let visible = this.visible_rows();
                 let rows = this.entries.clone();
                 let index = visible
                     .iter()
                     .position(|&i| Some(&rows[i].path) == this.selection.as_ref());
                 match key.key.as_str() {
+                    "f2" | "delete" if !key.modifiers.shift => {
+                        let command = if key.key == "f2" { "rename" } else { "trash" };
+                        if !event.is_held && this.command_enabled(command) {
+                            this.command(command, window, cx);
+                        }
+                        return;
+                    }
+                    "f10" if key.modifiers.shift => {
+                        this.navigator_menu_from_keyboard(&visible, index, window, cx);
+                        return;
+                    }
+                    "menu" if !key.modifiers.shift => {
+                        this.navigator_menu_from_keyboard(&visible, index, window, cx);
+                        return;
+                    }
                     "up" | "down" | "home" | "end" | "pageup" | "pagedown"
                         if !visible.is_empty() && !key.modifiers.shift =>
                     {

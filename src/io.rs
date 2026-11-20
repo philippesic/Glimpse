@@ -38,8 +38,8 @@ pub enum Job {
     RecentLocation(Vec<PathBuf>),
     Volumes,
     External(PathBuf, bool),
-    Create(PathBuf, bool, String),
-    Rename(PathBuf, PathBuf),
+    Create(u64, PathBuf, bool),
+    Rename(u64, PathBuf, PathBuf),
     Trash(PathBuf),
     TrashRecord(PathBuf),
     Prepare(SaveDestination),
@@ -96,6 +96,7 @@ pub enum Reply {
     SettingsLoaded(Result<storage::Settings, String>),
     SettingsSaved(Result<storage::Settings, String>),
     Changed(Result<(), String>),
+    NamedChange(u64, PathBuf, Result<(), String>),
     Records(Result<storage::Inventory, String>),
     Finished(u64, u64, u64, DiskFile, Result<(), String>),
     Chosen(PathBuf, Result<(), String>),
@@ -531,10 +532,14 @@ impl IoWorker {
                                 .as_ref()
                                 .map_or(Ok(()), |r| r.saved(id, generation)),
                         ),
-                        Job::Create(path, folder, text) => {
-                            Reply::Changed(fileops::create(&path, folder, &text))
+                        Job::Create(ticket, path, folder) => {
+                            let result = fileops::create(&path, folder, "");
+                            Reply::NamedChange(ticket, path, result)
                         }
-                        Job::Rename(from, to) => Reply::Changed(fileops::rename(&from, &to)),
+                        Job::Rename(ticket, from, to) => {
+                            let result = fileops::rename(&from, &to);
+                            Reply::NamedChange(ticket, to, result)
+                        }
                         Job::TrashRecord(path) => {
                             Reply::RecordTrashed(storage::trash_record(&path))
                         }
@@ -855,6 +860,9 @@ impl IoWorker {
                     Job::Import(id, _)
                     | Job::RestoreHistory(id, _)
                     | Job::RestoreObserved(id, _) => Reply::Imported(id, Err(message)),
+                    Job::Create(ticket, path, _) | Job::Rename(ticket, _, path) => {
+                        Reply::NamedChange(ticket, path, Err(message))
+                    }
                     Job::TrashRecord(_) => Reply::RecordTrashed(Err(message)),
                     Job::Reload(reload) => Reply::Reloaded(reload, Err(message)),
                     Job::BindingApplied(..) => Reply::Done(Ok(())),

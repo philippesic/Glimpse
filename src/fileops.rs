@@ -1,18 +1,34 @@
-use std::{fs, io::Write, path::Path};
+use std::{
+    fs,
+    io::{self, Write},
+    path::Path,
+};
+
+fn destination_error(error: io::Error) -> String {
+    match error.kind() {
+        io::ErrorKind::AlreadyExists => "An item with this name already exists.".into(),
+        io::ErrorKind::PermissionDenied => "You don’t have permission to make this change.".into(),
+        io::ErrorKind::ReadOnlyFilesystem => "This folder is on a read-only volume.".into(),
+        _ => error.to_string(),
+    }
+}
+
 pub fn create(path: &Path, folder: bool, text: &str) -> Result<(), String> {
     if folder {
-        return fs::create_dir(path).map_err(|e| e.to_string());
+        return fs::create_dir(path).map_err(destination_error);
     }
     if text.len() as u64 > crate::document::MAX_BYTES {
         return Err("New file exceeds the 10 MiB editing limit".into());
     }
     let parent = path.parent().ok_or("Missing parent folder")?;
-    let mut staged = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
+    let mut staged = tempfile::NamedTempFile::new_in(parent).map_err(destination_error)?;
     staged
         .write_all(text.as_bytes())
         .and_then(|_| staged.as_file().sync_all())
-        .map_err(|e| e.to_string())?;
-    staged.persist_noclobber(path).map_err(|e| e.to_string())?;
+        .map_err(destination_error)?;
+    staged
+        .persist_noclobber(path)
+        .map_err(|error| destination_error(error.error))?;
     Ok(())
 }
 pub fn rename(source: &Path, destination: &Path) -> Result<(), String> {
@@ -35,7 +51,7 @@ pub fn rename(source: &Path, destination: &Path) -> Result<(), String> {
         )
     };
     if result != 0 {
-        return Err(std::io::Error::last_os_error().to_string());
+        return Err(destination_error(io::Error::last_os_error()));
     }
     Ok(())
 }

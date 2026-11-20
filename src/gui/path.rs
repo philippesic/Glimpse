@@ -81,6 +81,27 @@ impl Shell {
             Err(error) => self.path_hint = Some(format!("Path completion failed: {error}")),
         }
     }
+    pub(super) fn path_error_view(&self, error: String, cx: &App) -> impl IntoElement {
+        let foreground = cx.theme().danger;
+        let background = cx.theme().background;
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .occlude()
+            .bg(background)
+            .px_2()
+            .py_1()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(accessibility::message(
+                "path-error",
+                error.clone(),
+                div().text_color(foreground).child(error),
+            ))
+    }
+
     pub(super) fn path_bar(
         &mut self,
         short: bool,
@@ -92,8 +113,9 @@ impl Shell {
                 .flex()
                 .items_center()
                 .gap_2()
-                .p_2()
-                .child(Input::new(&self.query).flex_1().min_w_0())
+                .px_2()
+                .when(!short, |bar| bar.py_1())
+                .child(Input::new(&self.query).small().flex_1().min_w_0())
                 .child(self.button("Go", "submit", cx))
                 .child(self.button("Cancel", "dismiss", cx))
                 .into_any_element();

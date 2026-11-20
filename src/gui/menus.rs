@@ -577,3 +577,107 @@ impl Shell {
             .request_open(requested)
     }
 }
+
+pub(super) struct NavigatorMenu {
+    menu: Entity<PopupMenu>,
+    position: Point<Pixels>,
+    _dismiss: Subscription,
+}
+
+impl Shell {
+    pub(super) fn navigator_menu_from_keyboard(
+        &mut self,
+        visible: &[usize],
+        index: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = index else {
+            return;
+        };
+        let position = self.scrolls.get(&self.current).map(|scroll| {
+            let scroll = scroll.0.borrow();
+            let bounds = scroll.base_handle.bounds();
+            let row_height = scroll
+                .last_item_size
+                .map_or(px(0.), |size| size.item.height);
+            let y = (bounds.top() + scroll.base_handle.offset().y + row_height * (index + 1))
+                .clamp(bounds.top(), bounds.bottom());
+            point(bounds.left() + px(12. * self.settings.ui_scale), y)
+        });
+        self.show_navigator_menu(
+            self.entries[visible[index]].path.clone(),
+            position.unwrap_or_default(),
+            window,
+            cx,
+        );
+    }
+
+    pub(super) fn show_navigator_menu(
+        &mut self,
+        path: PathBuf,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.decision.is_some() || self.preferences.is_some() {
+            return;
+        }
+        let title = format!("Actions for {}", paths::name(&path));
+        self.selection = Some(path.clone());
+        self.search_ui.picker_selection = Some(path);
+        window.focus(&self.nav_focus);
+        let shell = cx.weak_entity();
+        let disabled = self.disabled_commands();
+        let menu = PopupMenu::build(window, cx, |menu, window, _| {
+            let mut menu = menu
+                .accessible_name(title)
+                .action_context(self.nav_focus.clone())
+                .scrollable(true)
+                .max_h(window.viewport_size().height - px(24.));
+            let actions = [
+                ("rename", "Rename…", "F2"),
+                ("trash", "Move to Trash", "Delete"),
+                ("copy-path", "Copy Path", ""),
+                ("finder", "Reveal in File Manager", ""),
+            ];
+            let mut first = None;
+            for (index, (id, label, key)) in actions.into_iter().enumerate() {
+                let enabled = !disabled.contains(id);
+                if enabled && first.is_none() {
+                    first = Some(index);
+                }
+                menu = menu.item(
+                    command_item(shell.clone(), id, label.into(), !enabled)
+                        .when(!key.is_empty(), |item| item.shortcut_hint(key)),
+                );
+            }
+            menu.when_some(first, |menu, index| menu.highlight(index))
+        });
+        let dismiss = cx.subscribe_in(&menu, window, |this, _, _: &DismissEvent, _, cx| {
+            this.navigator_menu = None;
+            cx.notify();
+        });
+        window.focus(&menu.focus_handle(cx));
+        self.navigator_menu = Some(NavigatorMenu {
+            menu,
+            position,
+            _dismiss: dismiss,
+        });
+        cx.notify();
+    }
+
+    pub(super) fn navigator_menu_view(&self) -> Option<impl IntoElement> {
+        self.navigator_menu.as_ref().map(|menu| {
+            deferred(
+                div().absolute().inset_0().occlude().child(
+                    anchored()
+                        .position(menu.position)
+                        .snap_to_window_with_margin(px(8.))
+                        .child(menu.menu.clone()),
+                ),
+            )
+            .with_priority(1)
+        })
+    }
+}

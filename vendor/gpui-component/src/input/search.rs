@@ -936,12 +936,29 @@ impl Render for SearchPanel {
 
         // Rows never wrap: the options share the query row only when the panel is wide enough
         // for both, measured from the previous frame, and the replace row always fits.
-        let one_row = !compact && self.width >= rem * 36.;
+        let one_row = !compact && self.width >= rem * 38.;
         let options = (!compact).then(|| {
             h_flex()
                 .flex_shrink_0()
                 .gap_2()
                 .when(!one_row, |row| row.w_full())
+                .child(
+                    Button::new("case-sensitive")
+                        .small()
+                        .map(|button| {
+                            if self.case_insensitive {
+                                button.outline()
+                            } else {
+                                button.primary()
+                            }
+                        })
+                        .icon(IconName::CaseSensitive)
+                        .tooltip("Match case")
+                        .accessibility_toggled(!self.case_insensitive)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.toggle_case(window, cx);
+                        })),
+                )
                 .child(
                     Button::new("whole-word")
                         .small()
@@ -1056,26 +1073,6 @@ impl Render for SearchPanel {
                     .when(compact, |query| query.gap_1())
                     .child(
                         Input::new(&self.search_input)
-                            .when(!compact, |input| {
-                                input.suffix(
-                                    Button::new("case-insensitive")
-                                        .accessibility_toggled(!self.case_insensitive)
-                                        .small()
-                                        .compact()
-                                        .map(|button| {
-                                            if self.case_insensitive {
-                                                button.outline()
-                                            } else {
-                                                button.primary()
-                                            }
-                                        })
-                                        .icon(IconName::CaseSensitive)
-                                        .tooltip("Match case")
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.toggle_case(window, cx);
-                                        })),
-                                )
-                            })
                             .small()
                             .flex_1()
                             .min_w_0()

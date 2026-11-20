@@ -494,6 +494,19 @@ impl RenderOnce for Button {
         let clickable = self.clickable();
         let is_disabled = self.disabled;
         let hoverable = self.hoverable();
+        let focus_gap = if !self.outline
+            && matches!(
+                style,
+                ButtonVariant::Primary
+                    | ButtonVariant::Danger
+                    | ButtonVariant::Info
+                    | ButtonVariant::Success
+                    | ButtonVariant::Warning
+            ) {
+            px(2.)
+        } else {
+            px(0.)
+        };
         let normal_style = style.normal(self.outline, cx);
         let icon_size = match self.size {
             Size::Size(v) => Size::Size(v * 0.75),
@@ -718,7 +731,7 @@ impl RenderOnce for Button {
                         .build(window, cx)
                 })
             })
-            .focus_ring(is_focused, px(0.), window, cx);
+            .focus_ring(is_focused, focus_gap, window, cx);
         gpui::accessible(semantic_id, rendered, move |_, window, _| {
             use gpui::accesskit::{Action, Node};
             let mut node = Node::new(semantic_role);

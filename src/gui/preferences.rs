@@ -5,7 +5,7 @@ use gpui_component::{
     ActiveTheme, Disableable, Selectable, Sizable,
     button::{Button, ButtonVariants},
     checkbox::Checkbox,
-    input::{Input, InputState},
+    input::{Input, InputEvent, InputState},
     menu::{DropdownMenu, PopupMenuItem},
     scroll::{Scrollbar, ScrollbarShow},
 };
@@ -44,7 +44,7 @@ impl Page {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum Field {
     Font,
     Size,
@@ -83,6 +83,30 @@ impl Field {
             Self::Keymaps => "Shortcut overrides (JSON)",
         }
     }
+    fn page(self) -> Page {
+        match self {
+            Self::Scale => Page::Appearance,
+            Self::Font | Self::Size | Self::Height | Self::Markdown => Page::Text,
+            Self::Indent => Page::Editing,
+            Self::FileLimit | Self::Exclusions => Page::Search,
+            Self::Keymaps => Page::Shortcuts,
+        }
+    }
+
+    fn hint(self) -> &'static str {
+        match self {
+            Self::Font => "Leave blank to use system monospace.",
+            Self::Size => "10–32 px",
+            Self::Height => "1.2–2.0 times the font size",
+            Self::Scale => "0.8–2.0 times the default interface size",
+            Self::Markdown => "12–28 px",
+            Self::Indent => "1–8 columns",
+            Self::FileLimit => "1–10 MiB per saved file",
+            Self::Exclusions => "One glob per line.",
+            Self::Keymaps => "Use command names from the list below.",
+        }
+    }
+
     fn value(self, settings: &Settings) -> String {
         match self {
             Self::Font => settings.font_family.clone(),
@@ -103,12 +127,14 @@ pub struct Preferences {
     fields: Vec<Entity<InputState>>,
     page: Page,
     focus: FocusHandle,
+    shortcuts_focus: FocusHandle,
     row_focus: Vec<FocusHandle>,
     theme_focus: [FocusHandle; 3],
     page_focus: [FocusHandle; 5],
     scroll: ScrollHandle,
     _subscriptions: Vec<Subscription>,
     error: String,
+    field_error: Option<(Field, String)>,
     pending: bool,
 }
 
@@ -116,7 +142,7 @@ impl EventEmitter<Event> for Preferences {}
 
 impl Preferences {
     pub fn new(settings: Settings, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let fields = Field::ALL
+        let fields: Vec<_> = Field::ALL
             .into_iter()
             .map(|field| {
                 cx.new(|cx| {
@@ -136,6 +162,7 @@ impl Preferences {
             })
             .collect();
         let focus = cx.focus_handle();
+        let shortcuts_focus = cx.focus_handle().tab_stop(true);
         window.focus(&focus);
         let scroll = ScrollHandle::new();
         let row_focus: Vec<_> = (0..10).map(|_| cx.focus_handle()).collect();
@@ -149,6 +176,25 @@ impl Preferences {
                 })
             })
             .collect();
+        subscriptions.extend(Field::ALL.into_iter().zip(&fields).map(|(field, input)| {
+            cx.subscribe(input, move |this, _, event, cx| {
+                if matches!(event, InputEvent::Change)
+                    && this
+                        .field_error
+                        .as_ref()
+                        .is_some_and(|(failed, _)| *failed == field)
+                {
+                    this.field_error = None;
+                    cx.notify();
+                }
+            })
+        }));
+        subscriptions.push(
+            cx.on_focus_in(&shortcuts_focus, window, |this, window, cx| {
+                this.scroll.scroll_to_top_of_item(2);
+                cx.defer_in(window, |_, _, cx| cx.notify());
+            }),
+        );
         let view = cx.weak_entity();
         let owner = window.window_handle();
         subscriptions.push(cx.intercept_keystrokes(move |event, window, cx| {
@@ -244,10 +290,12 @@ impl Preferences {
         }));
         Self {
             error: settings.warning.clone().unwrap_or_default(),
+            field_error: None,
             draft: settings,
             fields,
             page: Page::Appearance,
             focus,
+            shortcuts_focus,
             row_focus,
             theme_focus: [cx.focus_handle(), cx.focus_handle(), cx.focus_handle()],
             page_focus: std::array::from_fn(|_| cx.focus_handle()),
@@ -275,32 +323,37 @@ impl Preferences {
         cx.notify();
     }
 
-    fn apply(&mut self, cx: &mut Context<Self>) {
-        let result = self.candidate(cx);
-        match result {
+    fn apply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.error.clear();
+        self.field_error = None;
+        match self.candidate(cx) {
             Ok(settings) => {
                 self.pending = true;
-                self.error.clear();
                 cx.emit(Event::Apply(Box::new(settings)));
             }
-            Err(error) => self.error = error,
+            Err((Some(field), error)) => {
+                self.field_error = Some((field, error));
+                self.select_page(field.page(), cx);
+                self.fields[field as usize].focus_handle(cx).focus(window);
+            }
+            Err((None, error)) => self.error = error,
         }
         cx.notify();
     }
 
-    fn candidate(&self, cx: &App) -> Result<Settings, String> {
+    fn candidate(&self, cx: &App) -> Result<Settings, (Option<Field>, String)> {
         let value = |field: Field| self.fields[field as usize].read(cx).value().to_string();
         let number = |field: Field| {
             value(field)
                 .trim()
                 .parse::<f32>()
-                .map_err(|_| format!("Enter a number for {}.", field.label()))
+                .map_err(|_| (Some(field), "Enter a number.".into()))
         };
         let integer = |field: Field| {
             value(field)
                 .trim()
                 .parse::<usize>()
-                .map_err(|_| format!("Enter a whole number for {}.", field.label()))
+                .map_err(|_| (Some(field), "Enter a whole number.".into()))
         };
         let mut settings = self.draft.clone();
         settings.font_family = value(Field::Font).trim().to_owned();
@@ -311,7 +364,10 @@ impl Preferences {
                 .iter()
                 .any(|name| name.eq_ignore_ascii_case(&settings.font_family))
         {
-            return Err("Source font family is unavailable. Enter an installed family or clear the field for system monospace.".into());
+            return Err((
+                Some(Field::Font),
+                "Choose an installed font or leave blank.".into(),
+            ));
         }
         settings.font_size = number(Field::Size)?;
         settings.line_height = number(Field::Height)?;
@@ -320,8 +376,15 @@ impl Preferences {
         settings.indent = integer(Field::Indent)?;
         settings.search_file_mib = integer(Field::FileLimit)?;
         settings.search_exclude = value(Field::Exclusions);
-        settings.keymaps = serde_json::from_str(&value(Field::Keymaps))
-            .map_err(|error| format!("Check {}. {error}", Field::Keymaps.label()))?;
+        settings.keymaps = serde_json::from_str(&value(Field::Keymaps)).map_err(|error| {
+            (
+                Some(Field::Keymaps),
+                format!(
+                    "Expected a JSON object. Check line {}.",
+                    error.line().max(1)
+                ),
+            )
+        })?;
         for (value, lower, upper, field) in [
             (settings.font_size, 10., 32., Field::Size),
             (settings.line_height, 1.2, 2., Field::Height),
@@ -329,35 +392,52 @@ impl Preferences {
             (settings.markdown_font_size, 12., 28., Field::Markdown),
         ] {
             if !(lower..=upper).contains(&value) {
-                return Err(format!(
-                    "Choose a value in the indicated range for {}.",
-                    field.label()
+                return Err((
+                    Some(field),
+                    format!("Enter a value from {lower} to {upper}."),
                 ));
             }
         }
         if !(1..=8).contains(&settings.indent) {
-            return Err(format!(
-                "Choose a value in the indicated range for {}.",
-                Field::Indent.label()
-            ));
+            return Err((Some(Field::Indent), "Enter a value from 1 to 8.".into()));
         }
         if !(1..=10).contains(&settings.search_file_mib) {
-            return Err(format!(
-                "Choose a value in the indicated range for {}.",
-                Field::FileLimit.label()
-            ));
+            return Err((Some(Field::FileLimit), "Enter a value from 1 to 10.".into()));
         }
         settings.warning = None;
-        settings.validate()?;
+        settings.validate().map_err(|error| {
+            if glimpse::commands::bindings(&settings.keymaps).is_err() {
+                (Some(Field::Keymaps), error)
+            } else if let Err((line, pattern_error)) = settings.validate_exclusion_patterns() {
+                let reason = match pattern_error {
+                    ignore::Error::Glob { err, .. } => err,
+                    error => error.to_string(),
+                };
+                (Some(Field::Exclusions), format!("Line {line} · {reason}"))
+            } else {
+                (None, error)
+            }
+        })?;
         Ok(settings)
     }
 
-    fn field(&self, field: Field) -> AnyElement {
+    fn field(&self, field: Field, cx: &App) -> AnyElement {
+        let error = self
+            .field_error
+            .as_ref()
+            .filter(|(failed, _)| *failed == field);
+        let hint = error.map_or_else(|| field.hint().to_owned(), |(_, error)| error.clone());
+        let tooltip = hint.clone();
+        let label = field
+            .label()
+            .split_once(" (")
+            .map_or(field.label(), |(label, _)| label);
         div()
+            .id(field.label())
             .flex()
             .flex_col()
-            .gap(px(4.))
-            .child(field.label())
+            .gap(px(2.))
+            .child(label)
             .child(
                 Input::new(&self.fields[field as usize])
                     .disabled(self.pending)
@@ -367,7 +447,61 @@ impl Preferences {
                         32. * self.draft.ui_scale
                     })),
             )
+            .child(super::accessibility::status(
+                "preferences-field-hint",
+                hint.clone(),
+                div()
+                    .id("field-hint")
+                    .text_sm()
+                    .truncate()
+                    .text_color(if error.is_some() {
+                        cx.theme().danger
+                    } else {
+                        cx.theme().muted_foreground
+                    })
+                    .child(hint)
+                    .tooltip(move |window, cx| {
+                        gpui_component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx)
+                    }),
+                error.is_some(),
+            ))
             .into_any_element()
+    }
+
+    fn scroll_shortcuts(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = &event.keystroke;
+        if key.modifiers.control || key.modifiers.alt || key.modifiers.platform {
+            return;
+        }
+        let scroll = &self.scroll;
+        let position = scroll.offset();
+        let step = px(24. * self.draft.ui_scale);
+        let page = (scroll.bounds().size.height - step).max(step);
+        match key.key.as_str() {
+            "home" => scroll.scroll_to_top_of_item(2),
+            "end" => scroll.scroll_to_bottom(),
+            key => {
+                let delta = match key {
+                    "up" => step,
+                    "down" => -step,
+                    "pageup" => page,
+                    "pagedown" => -page,
+                    _ => return,
+                };
+                scroll.set_offset(point(
+                    position.x,
+                    (position.y + delta).clamp(-scroll.max_offset().height, px(0.)),
+                ));
+            }
+        }
+        window.prevent_default();
+        cx.stop_propagation();
+        cx.notify();
     }
 
     fn toggle(
@@ -401,65 +535,67 @@ impl Render for Preferences {
         match self.page {
             Page::Appearance => {
                 rows.push(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .gap_2()
-                        .children(
-                            [
-                                ("System", None),
-                                ("Light", Some(false)),
-                                ("Dark", Some(true)),
-                            ]
-                            .into_iter()
-                            .enumerate()
-                            .map(|(index, (label, dark))| {
-                                let chosen = if let Some(dark) = dark {
-                                    !self.draft.system_theme && self.draft.dark == dark
-                                } else {
-                                    self.draft.system_theme
-                                };
-                                Button::new(label)
-                                    .with_focus_handle(self.theme_focus[index].clone())
-                                    .tab_stop(chosen)
-                                    .small()
-                                    .compact()
-                                    .label(label)
-                                    .accessibility_role(gpui::accesskit::Role::RadioButton)
-                                    .accessibility_toggled(chosen)
-                                    .map(|button| {
-                                        if chosen {
-                                            button.primary()
-                                        } else {
-                                            button.outline()
-                                        }
-                                    })
-                                    .disabled(self.pending)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.draft.system_theme = dark.is_none();
-                                        if let Some(dark) = dark {
-                                            this.draft.dark = dark;
-                                        }
-                                        cx.notify();
-                                    }))
-                            }),
-                        )
-                        .into_any_element(),
+                    super::accessibility::group(
+                        "theme-group",
+                        "Theme".into(),
+                        div().flex().flex_col().gap_1().child("Theme").child(
+                            div().flex().flex_wrap().gap_2().children(
+                                [
+                                    ("System", None),
+                                    ("Light", Some(false)),
+                                    ("Dark", Some(true)),
+                                ]
+                                .into_iter()
+                                .enumerate()
+                                .map(|(index, (label, dark))| {
+                                    let chosen = if let Some(dark) = dark {
+                                        !self.draft.system_theme && self.draft.dark == dark
+                                    } else {
+                                        self.draft.system_theme
+                                    };
+                                    Button::new(label)
+                                        .with_focus_handle(self.theme_focus[index].clone())
+                                        .tab_stop(chosen)
+                                        .small()
+                                        .compact()
+                                        .label(label)
+                                        .accessibility_role(gpui::accesskit::Role::RadioButton)
+                                        .accessibility_toggled(chosen)
+                                        .map(|button| {
+                                            if chosen {
+                                                button.primary()
+                                            } else {
+                                                button.outline()
+                                            }
+                                        })
+                                        .disabled(self.pending)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.draft.system_theme = dark.is_none();
+                                            if let Some(dark) = dark {
+                                                this.draft.dark = dark;
+                                            }
+                                            cx.notify();
+                                        }))
+                                }),
+                            ),
+                        ),
+                    )
+                    .into_any_element(),
                 );
-                rows.push(self.field(Field::Scale));
+                rows.push(self.field(Field::Scale, cx));
                 rows.push(self.toggle("Compact file rows", |s| &mut s.compact, cx));
                 rows.push(self.toggle("Reduce motion", |s| &mut s.reduce_motion, cx));
                 rows.push(self.toggle("Remember locations", |s| &mut s.remember_locations, cx));
             }
             Page::Text => {
-                rows.push(self.field(Field::Font));
-                rows.push(self.field(Field::Size));
-                rows.push(self.field(Field::Height));
-                rows.push(self.field(Field::Markdown));
+                rows.push(self.field(Field::Font, cx));
+                rows.push(self.field(Field::Size, cx));
+                rows.push(self.field(Field::Height, cx));
+                rows.push(self.field(Field::Markdown, cx));
                 rows.push(self.toggle("Proportional plain text", |s| &mut s.proportional, cx));
             }
             Page::Editing => {
-                rows.push(self.field(Field::Indent));
+                rows.push(self.field(Field::Indent, cx));
                 rows.push(self.toggle("Use tabs for indentation", |s| &mut s.tabs, cx));
                 rows.push(self.toggle("Wrap long lines", |s| &mut s.wrap, cx));
                 rows.push(self.toggle("Line numbers", |s| &mut s.line_numbers, cx));
@@ -477,47 +613,96 @@ impl Render for Preferences {
                     |s| &mut s.search_directory_links,
                     cx,
                 ));
-                rows.push(self.field(Field::FileLimit));
-                rows.push(self.field(Field::Exclusions));
+                rows.push(self.field(Field::FileLimit, cx));
+                rows.push(self.field(Field::Exclusions, cx));
             }
             Page::Shortcuts => {
-                rows.push(div().child("Override shortcuts with a JSON object from command name to keys, for example {\"find-files\": \"Cmd+Shift+O\"}. In this file Cmd means Control on Linux and Command on macOS. An empty value disables a shortcut. Text editing keys remain reserved.").into_any_element());
-                rows.push(self.field(Field::Keymaps));
-                let muted = cx.theme().muted_foreground;
+                let guidance = "Enter a JSON object that maps command names to keys, such as {\"find-files\": \"Cmd+Shift+O\"}. Cmd means Control on Linux and Command on macOS. Use an empty value to disable a shortcut. Text editing keys are reserved.";
                 rows.push(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(2.))
-                        .child(
-                            div()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child("Current shortcuts"),
-                        )
-                        .children(glimpse::commands::COMMANDS.iter().filter_map(|command| {
-                            let key = self
-                                .draft
-                                .keymaps
-                                .get(command.id)
-                                .map(String::as_str)
-                                .unwrap_or(command.shortcut);
-                            (!key.is_empty()).then(|| {
+                    super::accessibility::label(
+                        "keymap-help",
+                        guidance.into(),
+                        div().child(guidance),
+                    )
+                    .into_any_element(),
+                );
+                rows.push(self.field(Field::Keymaps, cx));
+                let muted = cx.theme().muted_foreground;
+                let focus = self.shortcuts_focus.clone();
+                let action_focus = focus.clone();
+                rows.push(
+                    accessible(
+                        "current-shortcuts-region",
+                        div()
+                            .id("current-shortcuts")
+                            .track_focus(&focus)
+                            .border_1()
+                            .rounded_md()
+                            .border_color(gpui::transparent_black())
+                            .focus(|style| style.border_color(cx.theme().ring))
+                            .px_1()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .on_key_down(cx.listener(Self::scroll_shortcuts))
+                            .child(
                                 div()
-                                    .flex()
-                                    .items_baseline()
-                                    .gap(px(8.))
-                                    .child(div().flex_1().min_w_0().truncate().child(command.label))
-                                    .child(div().text_color(muted).text_sm().child(command.id))
-                                    .child(
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Current shortcuts"),
+                            )
+                            .children(glimpse::commands::COMMANDS.iter().filter_map(|command| {
+                                let key = self
+                                    .draft
+                                    .keymaps
+                                    .get(command.id)
+                                    .map(String::as_str)
+                                    .unwrap_or(command.shortcut);
+                                (!key.is_empty()).then(|| {
+                                    let shortcut = super::platform::shortcut_label(key);
+                                    let label =
+                                        format!("{} ({}) · {shortcut}", command.label, command.id);
+                                    super::accessibility::label(
+                                        command.id,
+                                        label,
                                         div()
-                                            .w(px(150.))
-                                            .flex_shrink_0()
-                                            .text_right()
-                                            .child(super::platform::shortcut_label(key)),
+                                            .flex()
+                                            .items_baseline()
+                                            .gap(px(8.))
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .truncate()
+                                                    .child(command.label),
+                                            )
+                                            .child(
+                                                div().text_color(muted).text_sm().child(command.id),
+                                            )
+                                            .child(
+                                                div()
+                                                    .w(px(150.))
+                                                    .flex_shrink_0()
+                                                    .text_right()
+                                                    .child(shortcut),
+                                            ),
                                     )
-                            })
-                        }))
-                        .into_any_element(),
+                                })
+                            })),
+                        move |_, window, _| {
+                            let mut node = gpui::accesskit::Node::new(gpui::accesskit::Role::Group);
+                            node.set_label("Current shortcuts");
+                            node.add_action(gpui::accesskit::Action::Focus);
+                            let mut info = AccessibilityInfo::new(node);
+                            info.focused = focus.is_focused(window);
+                            info
+                        },
+                    )
+                    .on_action(move |request, _, window, _| {
+                        if request.action == gpui::accesskit::Action::Focus {
+                            action_focus.focus(window);
+                        }
+                    })
+                    .into_any_element(),
                 );
             }
         }
@@ -745,7 +930,9 @@ impl Render for Preferences {
                                     .label(if self.pending { "Saving…" } else { "Apply" })
                                     .primary()
                                     .disabled(self.pending)
-                                    .on_click(cx.listener(|this, _, _, cx| this.apply(cx))),
+                                    .on_click(
+                                        cx.listener(|this, _, window, cx| this.apply(window, cx)),
+                                    ),
                             ),
                     ),
             );
