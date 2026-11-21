@@ -63,8 +63,53 @@ impl Inline {
         }
     }
 
+    pub(super) fn text_runs(
+        text: &str,
+        text_style: &gpui::TextStyle,
+        highlights: &[(Range<usize>, HighlightStyle)],
+    ) -> Vec<gpui::TextRun> {
+        let mut runs = Vec::new();
+        let mut ix = 0;
+        for (range, highlight) in highlights {
+            if ix < range.start {
+                runs.push(text_style.to_run(range.start - ix));
+            }
+            runs.push(text_style.clone().highlight(*highlight).to_run(range.len()));
+            ix = range.end;
+        }
+        if ix < text.len() {
+            runs.push(text_style.to_run(text.len() - ix));
+        }
+        runs
+    }
+
     pub(super) fn accessible(self) -> gpui::Accessible {
-        crate::semantic_text::text(self.id.clone(), self.text.clone(), self)
+        if self.links.is_empty() {
+            return crate::semantic_text::text(self.id.clone(), self.text.clone(), self);
+        }
+        let links: Vec<_> = self
+            .links
+            .iter()
+            .filter(|(range, _)| range.end <= self.text.len())
+            .map(|(range, link)| (range.clone(), link.url.clone()))
+            .collect();
+        let urls: Vec<_> = links.iter().map(|(_, url)| url.clone()).collect();
+        let on_link = self.on_link.clone();
+        crate::semantic_text::text_with_links(
+            self.id.clone(),
+            self.text.clone(),
+            links,
+            self,
+            move |index, window, cx| {
+                if let Some(url) = urls.get(index) {
+                    if let Some(on_link) = &on_link {
+                        on_link(url, window, cx);
+                    } else {
+                        cx.open_url(url);
+                    }
+                }
+            },
+        )
     }
 
     /// Get link at given mouse position.
@@ -251,20 +296,7 @@ impl Element for Inline {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        let text_style = window.text_style();
-
-        let mut runs = Vec::new();
-        let mut ix = 0;
-        for (range, highlight) in self.highlights.iter() {
-            if ix < range.start {
-                runs.push(text_style.clone().to_run(range.start - ix));
-            }
-            runs.push(text_style.clone().highlight(*highlight).to_run(range.len()));
-            ix = range.end;
-        }
-        if ix < self.text.len() {
-            runs.push(text_style.to_run(self.text.len() - ix));
-        }
+        let runs = Self::text_runs(&self.text, &window.text_style(), &self.highlights);
 
         self.styled_text = StyledText::new(self.text.clone()).with_runs(runs);
         let (layout_id, _) =

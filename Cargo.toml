@@ -1,7 +1,7 @@
 [workspace]
 members = ["vendor/gpui-component", "vendor/accesskit", "vendor/accesskit_atspi_common", "vendor/accesskit_consumer"]
 default-members = ["."]
-exclude = ["vendor/gpui"]
+exclude = ["vendor/accesskit_unix", "vendor/gpui", "vendor/pulldown-cmark", "vendor/ropey", "vendor/zvariant", "vendor/zbus"]
 resolver = "3"
 
 [package]
@@ -9,6 +9,9 @@ name = "glimpse"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
+license = "MIT"
+description = "A native file navigator and UTF-8 text editor"
+repository = "https://github.com/philippesic/Glimpse"
 
 [features]
 test-support = ["gpui/accessibility-test-hooks"]
@@ -25,14 +28,16 @@ libc = "0.2"
 base64 = "0.22"
 percent-encoding = "2"
 regex = "1"
-two-face = {version="0.5",default-features=false,features=["syntect-fancy"]}
-syntect = {version="5.3",default-features=false,features=["parsing","regex-fancy"]}
+two-face = {version="0.5",default-features=false,features=["syntect-onig"]}
+syntect = {version="5.3",default-features=false,features=["parsing","regex-onig"]}
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
+sha2 = "0.11.1"
 ignore = "0.4"
 notify = "8.2"
 unicode-segmentation = "1.12"
-pulldown-cmark = { version = "0.13", default-features = false }
+simdutf8 = { version = "0.1", default-features = false }
+pulldown-cmark = { version = "0.13", default-features = false, features = ["compact-tree"] }
 
 image = {version="0.25",default-features=false,features=["png","jpeg","gif","webp"]}
 
@@ -50,9 +55,14 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 accesskit = { path = "vendor/accesskit" }
 accesskit_atspi_common = { path = "vendor/accesskit_atspi_common" }
 accesskit_consumer = { path = "vendor/accesskit_consumer" }
+accesskit_unix = { path = "vendor/accesskit_unix" }
 gpui = { path = "vendor/gpui" }
 xattr = { path = "vendor/xattr" }
 gpui-component = { path = "vendor/gpui-component" }
+pulldown-cmark = { path = "vendor/pulldown-cmark" }
+ropey = { path = "vendor/ropey" }
+zvariant = { path = "vendor/zvariant" }
+zbus = { path = "vendor/zbus" }
 
 [dev-dependencies]
 egui = "0.37.0"

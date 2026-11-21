@@ -164,6 +164,24 @@ enum ListItem {
 }
 
 impl ListItem {
+    fn unmeasured_tree(mut count: usize) -> SumTree<Self> {
+        let mut items = SumTree::default();
+        if count == 0 {
+            return items;
+        }
+        let mut block = SumTree::from_item(Self::Unmeasured { focus_handle: None }, ());
+        loop {
+            if count & 1 != 0 {
+                items.append(block.clone(), ());
+            }
+            count >>= 1;
+            if count == 0 {
+                return items;
+            }
+            block.append(block.clone(), ());
+        }
+    }
+
     fn size(&self) -> Option<Size<Pixels>> {
         if let ListItem::Measured { size, .. } = self {
             Some(*size)
@@ -214,10 +232,10 @@ impl ListState {
     /// be measured even though they are not visible. This can help ensure
     /// that the list doesn't flicker or pop in when scrolling.
     pub fn new(item_count: usize, alignment: ListAlignment, overdraw: Pixels) -> Self {
-        let this = Self(Rc::new(RefCell::new(StateInner {
+        Self(Rc::new(RefCell::new(StateInner {
             last_layout_bounds: None,
             last_padding: None,
-            items: SumTree::default(),
+            items: ListItem::unmeasured_tree(item_count),
             logical_scroll_top: None,
             alignment,
             overdraw,
@@ -225,9 +243,7 @@ impl ListState {
             reset: false,
             scrollbar_drag_start_height: None,
             measuring_behavior: ListMeasuringBehavior::default(),
-        })));
-        this.splice(0..0, item_count);
-        this
+        })))
     }
 
     /// Set the list to measure all items in the list in the first layout phase.
@@ -242,16 +258,12 @@ impl ListState {
     ///
     /// Note that this will cause scroll events to be dropped until the next paint.
     pub fn reset(&self, element_count: usize) {
-        let old_count = {
-            let state = &mut *self.0.borrow_mut();
-            state.reset = true;
-            state.measuring_behavior.reset();
-            state.logical_scroll_top = None;
-            state.scrollbar_drag_start_height = None;
-            state.items.summary().count
-        };
-
-        self.splice(0..old_count, element_count);
+        let state = &mut *self.0.borrow_mut();
+        state.reset = true;
+        state.measuring_behavior.reset();
+        state.logical_scroll_top = None;
+        state.scrollbar_drag_start_height = None;
+        state.items = ListItem::unmeasured_tree(element_count);
     }
 
     /// The number of items in this list.
@@ -1026,15 +1038,19 @@ impl Element for List {
         if state
             .last_layout_bounds
             .is_none_or(|last_bounds| last_bounds.size.width != bounds.size.width)
+            && state.items.summary().rendered_count != 0
         {
-            let new_items = SumTree::from_iter(
-                state.items.iter().map(|item| ListItem::Unmeasured {
-                    focus_handle: item.focus_handle(),
-                }),
-                (),
-            );
-
-            state.items = new_items;
+            let summary = state.items.summary();
+            state.items = if summary.has_focus_handles {
+                SumTree::from_iter(
+                    state.items.iter().map(|item| ListItem::Unmeasured {
+                        focus_handle: item.focus_handle(),
+                    }),
+                    (),
+                )
+            } else {
+                ListItem::unmeasured_tree(summary.count)
+            };
         }
 
         let padding = style

@@ -137,6 +137,7 @@ impl BladePipelines {
     fn new(gpu: &gpu::Context, surface_info: gpu::SurfaceInfo, path_sample_count: u32) -> Self {
         use gpu::ShaderData as _;
 
+        let _work = crate::work_trace::Span::new("blade_pipelines");
         log::info!(
             "Initializing Blade pipelines for surface {:?}",
             surface_info
@@ -166,8 +167,8 @@ impl BladePipelines {
             write_mask: gpu::ColorWrites::default(),
         }];
 
-        Self {
-            quads: gpu.create_render_pipeline(gpu::RenderPipelineDesc {
+        let descriptors = [
+            gpu::RenderPipelineDesc {
                 name: "quads",
                 data_layouts: &[&ShaderQuadsData::layout()],
                 vertex: shader.at("vs_quad"),
@@ -175,13 +176,13 @@ impl BladePipelines {
                 primitive: gpu::PrimitiveState {
                     topology: gpu::PrimitiveTopology::TriangleStrip,
                     ..Default::default()
-                },
+            },
                 depth_stencil: None,
                 fragment: Some(shader.at("fs_quad")),
                 color_targets,
                 multisample_state: gpu::MultisampleState::default(),
-            }),
-            shadows: gpu.create_render_pipeline(gpu::RenderPipelineDesc {
+            },
+            gpu::RenderPipelineDesc {
                 name: "shadows",
                 data_layouts: &[&ShaderShadowsData::layout()],
                 vertex: shader.at("vs_shadow"),
@@ -189,13 +190,13 @@ impl BladePipelines {
                 primitive: gpu::PrimitiveState {
                     topology: gpu::PrimitiveTopology::TriangleStrip,
                     ..Default::default()
-                },
+            },
                 depth_stencil: None,
                 fragment: Some(shader.at("fs_shadow")),
                 color_targets,
                 multisample_state: gpu::MultisampleState::default(),
-            }),
-            path_rasterization: gpu.create_render_pipeline(gpu::RenderPipelineDesc {
+            },
+            gpu::RenderPipelineDesc {
                 name: "path_rasterization",
                 data_layouts: &[&ShaderPathRasterizationData::layout()],
                 vertex: shader.at("vs_path_rasterization"),
@@ -203,7 +204,7 @@ impl BladePipelines {
                 primitive: gpu::PrimitiveState {
                     topology: gpu::PrimitiveTopology::TriangleList,
                     ..Default::default()
-                },
+            },
                 depth_stencil: None,
                 fragment: Some(shader.at("fs_path_rasterization")),
                 // The original implementation was using ADDITIVE blende mode,
@@ -221,9 +222,9 @@ impl BladePipelines {
                 multisample_state: gpu::MultisampleState {
                     sample_count: path_sample_count,
                     ..Default::default()
-                },
-            }),
-            paths: gpu.create_render_pipeline(gpu::RenderPipelineDesc {
+            },
+            },
+            gpu::RenderPipelineDesc {
                 name: "paths",
                 data_layouts: &[&ShaderPathsData::layout()],
                 vertex: shader.at("vs_path"),
@@ -231,7 +232,7 @@ impl BladePipelines {
                 primitive: gpu::PrimitiveState {
                     topology: gpu::PrimitiveTopology::TriangleStrip,
                     ..Default::default()
-                },
+            },
                 depth_stencil: None,
                 fragment: Some(shader.at("fs_path")),
                 color_targets: &[gpu::ColorTargetState {
@@ -243,8 +244,8 @@ impl BladePipelines {
                     write_mask: gpu::ColorWrites::default(),
                 }],
                 multisample_state: gpu::MultisampleState::default(),
-            }),
-            underlines: gpu.create_render_pipeline(gpu::RenderPipelineDesc {
+            },
+            gpu::RenderPipelineDesc {
                 name: "underlines",
                 data_layouts: &[&ShaderUnderlinesData::layout()],
                 vertex: shader.at("vs_underline"),
@@ -252,13 +253,13 @@ impl BladePipelines {
                 primitive: gpu::PrimitiveState {
                     topology: gpu::PrimitiveTopology::TriangleStrip,
                     ..Default::default()
-                },
+            },
                 depth_stencil: None,
                 fragment: Some(shader.at("fs_underline")),
                 color_targets,
                 multisample_state: gpu::MultisampleState::default(),
-            }),
-            mono_sprites: gpu.create_render_pipeline(gpu::RenderPipelineDesc {
+            },
+            gpu::RenderPipelineDesc {
                 name: "mono-sprites",
                 data_layouts: &[&ShaderMonoSpritesData::layout()],
                 vertex: shader.at("vs_mono_sprite"),
@@ -266,13 +267,13 @@ impl BladePipelines {
                 primitive: gpu::PrimitiveState {
                     topology: gpu::PrimitiveTopology::TriangleStrip,
                     ..Default::default()
-                },
+            },
                 depth_stencil: None,
                 fragment: Some(shader.at("fs_mono_sprite")),
                 color_targets,
                 multisample_state: gpu::MultisampleState::default(),
-            }),
-            poly_sprites: gpu.create_render_pipeline(gpu::RenderPipelineDesc {
+            },
+            gpu::RenderPipelineDesc {
                 name: "poly-sprites",
                 data_layouts: &[&ShaderPolySpritesData::layout()],
                 vertex: shader.at("vs_poly_sprite"),
@@ -280,13 +281,13 @@ impl BladePipelines {
                 primitive: gpu::PrimitiveState {
                     topology: gpu::PrimitiveTopology::TriangleStrip,
                     ..Default::default()
-                },
+            },
                 depth_stencil: None,
                 fragment: Some(shader.at("fs_poly_sprite")),
                 color_targets,
                 multisample_state: gpu::MultisampleState::default(),
-            }),
-            surfaces: gpu.create_render_pipeline(gpu::RenderPipelineDesc {
+            },
+            gpu::RenderPipelineDesc {
                 name: "surfaces",
                 data_layouts: &[&ShaderSurfacesData::layout()],
                 vertex: shader.at("vs_surface"),
@@ -294,12 +295,26 @@ impl BladePipelines {
                 primitive: gpu::PrimitiveState {
                     topology: gpu::PrimitiveTopology::TriangleStrip,
                     ..Default::default()
-                },
+            },
                 depth_stencil: None,
                 fragment: Some(shader.at("fs_surface")),
                 color_targets,
                 multisample_state: gpu::MultisampleState::default(),
-            }),
+            },
+        ];
+        let [
+            quads, shadows, path_rasterization, paths, underlines, mono_sprites, poly_sprites,
+            surfaces,
+        ] = compile_render_pipelines(gpu, descriptors);
+        Self {
+            quads,
+            shadows,
+            path_rasterization,
+            paths,
+            underlines,
+            mono_sprites,
+            poly_sprites,
+            surfaces,
         }
     }
 
@@ -312,6 +327,34 @@ impl BladePipelines {
         gpu.destroy_render_pipeline(&mut self.mono_sprites);
         gpu.destroy_render_pipeline(&mut self.poly_sprites);
         gpu.destroy_render_pipeline(&mut self.surfaces);
+    }
+}
+
+fn compile_render_pipelines(
+    gpu: &gpu::Context,
+    descriptors: [gpu::RenderPipelineDesc<'_>; 8],
+) -> [gpu::RenderPipeline; 8] {
+    #[cfg(target_os = "linux")]
+    {
+        let pending = std::sync::Mutex::new(descriptors.into_iter().enumerate());
+        let finished = std::sync::Mutex::new([const { None }; 8]);
+        let compile = || loop {
+            let next = pending.lock().unwrap().next();
+            let Some((index, descriptor)) = next else {
+                break;
+            };
+            let pipeline = gpu.create_render_pipeline(descriptor);
+            finished.lock().unwrap()[index] = Some(pipeline);
+        };
+        std::thread::scope(|scope| {
+            let _ = std::thread::Builder::new().spawn_scoped(scope, &compile);
+            compile();
+        });
+        finished.into_inner().unwrap().map(Option::unwrap)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        descriptors.map(|desc| gpu.create_render_pipeline(desc))
     }
 }
 
@@ -513,6 +556,7 @@ impl BladeRenderer {
 
     pub fn update_transparency(&mut self, transparent: bool) {
         if transparent != self.surface_config.transparent {
+            let _work = crate::work_trace::Span::new("blade_transparency");
             self.wait_for_gpu();
             self.surface_config.transparent = transparent;
             self.gpu

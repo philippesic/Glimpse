@@ -44,7 +44,7 @@ impl Key {
         &self.0
     }
 }
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Action {
     New,
@@ -53,6 +53,9 @@ pub enum Action {
     Save,
     SaveAs,
     SaveCopy,
+    CompareConflict,
+    ReloadDiskVersion,
+    OverwriteDiskVersion,
     Close,
     Quit,
     Back,
@@ -100,6 +103,15 @@ pub enum Action {
     Line,
     Filter,
     KeepPreview,
+    OpenDocuments,
+    NextDocument,
+    PreviousDocument,
+    Undo,
+    Redo,
+    Cut,
+    Copy,
+    Paste,
+    SelectAll,
     RefreshVolumes,
 }
 pub struct Command {
@@ -116,6 +128,19 @@ commands![
     (Save, "save", "Save", "Cmd+S"),
     (SaveAs, "save-as", "Save As…", "Cmd+Shift+S"),
     (SaveCopy, "save-copy", "Save Copy…", "Cmd+Alt+S"),
+    (
+        CompareConflict,
+        "compare",
+        "Compare Local and Disk Text",
+        ""
+    ),
+    (ReloadDiskVersion, "reload", "Reload Disk Version…", ""),
+    (
+        OverwriteDiskVersion,
+        "overwrite",
+        "Overwrite Disk Version…",
+        ""
+    ),
     (Close, "close", "Close Document", "Cmd+W"),
     (Quit, "quit", "Quit", "Cmd+Q"),
     (Back, "back", "Back", "Cmd+Alt+ArrowLeft"),
@@ -123,8 +148,8 @@ commands![
     (Home, "home", "Home", "Cmd+Shift+H"),
     (Parent, "parent", "Parent Folder", "Cmd+Alt+ArrowUp"),
     (Refresh, "refresh", "Refresh Folder", "Cmd+R"),
-    (Files, "find-files", "Find Files in Search Folder", "Cmd+P"),
-    (Text, "find-text", "Find Text in Saved Files", "Cmd+Shift+F"),
+    (Files, "find-files", "Find Files", "Cmd+P"),
+    (Text, "find-text", "Find Text", "Cmd+Shift+F"),
     (Find, "find", "Find / Replace in Document", "Cmd+F"),
     (Read, "read", "Read / Edit Markdown", ""),
     (Settings, "settings", "Preferences", "Cmd+Comma"),
@@ -139,8 +164,32 @@ commands![
         "Cmd+Alt+E"
     ),
     (Line, "line", "Go to Line…", "Cmd+G"),
-    (Filter, "filter", "Filter This Folder", ""),
+    (Filter, "filter", "Filter This Folder", "Cmd+Shift+L"),
     (KeepPreview, "keep-tab", "Keep Preview Tab", ""),
+    (
+        OpenDocuments,
+        "open-documents",
+        "Open Documents",
+        "Cmd+Alt+O"
+    ),
+    (Undo, "undo", "Undo", ""),
+    (Redo, "redo", "Redo", ""),
+    (Cut, "cut", "Cut", ""),
+    (Copy, "copy", "Copy", ""),
+    (Paste, "paste", "Paste", ""),
+    (SelectAll, "select-all", "Select All", ""),
+    (
+        NextDocument,
+        "next-document",
+        "Next Document",
+        "Cmd+PageDown"
+    ),
+    (
+        PreviousDocument,
+        "previous-document",
+        "Previous Document",
+        "Cmd+PageUp"
+    ),
     (
         RefreshVolumes,
         "refresh-volumes",
@@ -174,7 +223,7 @@ commands![
     (NewFolder, "new-folder", "New Folder…", "Cmd+Shift+N"),
     (NamedFile, "named-file", "New Named File…", ""),
     (Rename, "rename", "Rename Selected…", ""),
-    (Trash, "trash", "Move Selected to Trash…", ""),
+    (Trash, "trash", "Move Selected to Trash", ""),
     (
         Finish,
         "finish",
@@ -195,6 +244,19 @@ commands![
         ""
     ),
 ];
+/// Text-editing commands keep the editor's standard keys; they are listed in menus and
+/// Commands with these hints but are not app shortcuts, so they cannot be rebound.
+pub fn editing_hint(id: &str) -> Option<&'static str> {
+    Some(match id {
+        "undo" => "Cmd+Z",
+        "redo" => "Cmd+Shift+Z",
+        "cut" => "Cmd+X",
+        "copy" => "Cmd+C",
+        "paste" => "Cmd+V",
+        "select-all" => "Cmd+A",
+        _ => return None,
+    })
+}
 #[derive(Clone, PartialEq)]
 pub struct Binding {
     pub action: Action,
@@ -244,13 +306,35 @@ pub fn parse(value: &str) -> Result<(Modifiers, Key), String> {
     }
     Ok((modifiers, key))
 }
-pub fn bindings(overrides: &BTreeMap<String, String>) -> Result<Vec<Binding>, String> {
-    for id in overrides.keys() {
-        if !COMMANDS.iter().any(|c| c.id == id) {
-            return Err(format!("Unknown command: {id}"));
+#[derive(Debug)]
+pub enum BindingError {
+    Invalid(String),
+    Conflict {
+        shortcut: String,
+        command: &'static str,
+    },
+}
+
+impl std::fmt::Display for BindingError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(message) => formatter.write_str(message),
+            Self::Conflict { shortcut, command } => {
+                write!(formatter, "{shortcut} is already used by {command}.")
+            }
         }
     }
-    let mut used = HashSet::new();
+}
+
+impl std::error::Error for BindingError {}
+
+pub fn bindings(overrides: &BTreeMap<String, String>) -> Result<Vec<Binding>, BindingError> {
+    for id in overrides.keys() {
+        if !COMMANDS.iter().any(|c| c.id == id) {
+            return Err(BindingError::Invalid(format!("Unknown command: {id}")));
+        }
+    }
+    let mut used = HashMap::<_, (&Command, &str)>::new();
     let mut result = vec![];
     for command in COMMANDS {
         let value = overrides
@@ -260,10 +344,19 @@ pub fn bindings(overrides: &BTreeMap<String, String>) -> Result<Vec<Binding>, St
         if value.is_empty() {
             continue;
         }
-        let (modifiers, key) = parse(value)?;
+        let (modifiers, key) = parse(value).map_err(BindingError::Invalid)?;
         let signature = format!("{:?}:{:?}", modifiers, key);
-        if !used.insert(signature) {
-            return Err(format!("Duplicate shortcut: {value}"));
+        if let Some((earlier, earlier_value)) = used.insert(signature, (command, value)) {
+            let (owner, shortcut) =
+                if overrides.contains_key(earlier.id) && !overrides.contains_key(command.id) {
+                    (command, value)
+                } else {
+                    (earlier, earlier_value)
+                };
+            return Err(BindingError::Conflict {
+                shortcut: shortcut.to_owned(),
+                command: owner.label,
+            });
         }
         result.push(Binding {
             action: command.action,

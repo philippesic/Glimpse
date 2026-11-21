@@ -81,7 +81,7 @@ The product targets macOS, Windows, and Linux. Development and the first vertica
 
 Each normal editing session defaults to **one OS window with two resizable panes**: navigator on the left, document area on the right. Separate CLI editing and picker requests may have their own windows. Detaching a pane into a second window is an extra. Either pane can fill the window; the navigator is not permanently constrained to a narrow sidebar. Narrow layouts show one surface at a time with an explicit switch.
 
-The navigator displays one vertically scrollable directory list, starting at Home (`~/`) unless a launch path is supplied. Entering a directory replaces the list in place. Directory history, per-folder selections and scroll positions survive navigation and document editing. Back and Forward traverse visited directories; Parent reaches the containing directory, including beyond the initial folder. The current folder is never an access boundary.
+The navigator displays one vertically scrollable directory list. The terminal starts in its working directory unless a launch path supplies the initial folder. The desktop launcher starts at the last available folder or Home (`~/`). Entering a directory replaces the list in place. Directory history, per-folder selections and scroll positions survive navigation and document editing. Back and Forward traverse visited directories; Parent reaches the containing directory, including beyond the initial folder. The current folder is never an access boundary.
 
 Opening or focusing a document leaves the directory list in place. Favorites occupy a compact menu, with no permanent Favorites rail. Home, mounted volumes and frequent/recent locations remain explicit navigation commands. The document area contains tabs and one source editor or Markdown reading view. Search results appear in a panel anchored to the toolbar search field; they do not replace either main pane.
 
@@ -325,7 +325,7 @@ Measure optimized release builds on a named reference machine, OS, display refre
 | Idle, ten small files open, no search | Aspirational base RSS at most 50 MB excluding document text; report total RSS and define any subtraction. Average idle CPU at most 0.1% of one core over 60 seconds |
 | Base desktop distribution | Compressed release package target at most 30 MiB per platform; symbols and optional assets measured separately |
 
-Also measure a genuinely cold launch, content-search throughput, first result versus complete results, save/recovery latency, GPU memory where available, and repeated open/close/search cycles. Search cache, undo, decoded images, and recovery history require explicit bounds. Report missed budgets and their cause; changing a target requires an explicit design decision. Initial development measurements and their limits are documented in README; they do not qualify release budgets.
+Also measure a genuinely cold launch, content-search throughput, first result versus complete results, save/recovery latency, GPU memory where available, and repeated open/close/search cycles. Search cache, undo, decoded images, and recovery history require explicit bounds. Report missed budgets and their cause; changing a target requires an explicit design decision. [Platform qualification](docs/qualification.md) records the available evidence and its limits.
 
 ### Correctness and release gates
 

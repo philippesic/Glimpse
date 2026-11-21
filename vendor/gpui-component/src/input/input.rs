@@ -12,7 +12,7 @@ use crate::scroll::Scrollbar;
 use crate::spinner::Spinner;
 use crate::{ActiveTheme, v_flex};
 use crate::{IconName, Size};
-use crate::{Selectable, StyledExt, h_flex};
+use crate::{FocusableExt as _, Selectable, StyledExt, h_flex};
 use crate::{Sizable, StyleSized};
 
 use super::InputState;
@@ -195,7 +195,15 @@ impl Input {
 
         v_flex()
             .size_full()
-            .children(state.search_panel.clone())
+            .children(state.search_panel.clone().map(|panel| {
+                // The Find bar spans the editor pane edge to edge, outside the text inset.
+                div()
+                    .ml(-paddings.left)
+                    .mr(-paddings.right)
+                    .mt(-paddings.top)
+                    .mb(paddings.top)
+                    .child(panel)
+            }))
             .child(div().flex_1().child(input_state.clone()).map(|this| {
                 if let Some(last_layout) = state.last_layout.as_ref() {
                     let left = if last_layout.line_number_width.is_zero() {
@@ -389,6 +397,10 @@ impl RenderOnce for Input {
                             })
                     })
             })
+            .when(
+                self.appearance && self.bordered && self.focus_bordered,
+                |this| this.relative().focus_ring(focused, px(0.), window, cx),
+            )
             .items_center()
             .gap(gap_x)
             .refine_style(&self.style)

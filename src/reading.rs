@@ -1,10 +1,12 @@
-use pulldown_cmark::{Event, Options, Parser, Tag};
+use gpui_component::{highlighter::HighlightTheme, text::ParsedMarkdown};
 use std::{
     collections::HashMap,
     io::Read,
     path::{Path, PathBuf},
-    sync::Arc,
 };
+
+const MAX_READ_IMAGES: usize = 32;
+const MAX_UNSUPPORTED_IMAGE_NOTICES: usize = 32;
 
 pub struct Raster {
     pub width: u32,
@@ -12,7 +14,7 @@ pub struct Raster {
     pub bgra: Vec<u8>,
 }
 pub struct Prepared {
-    pub source: Arc<str>,
+    pub markdown: ParsedMarkdown,
     pub images: HashMap<String, Raster>,
     pub notes: Vec<String>,
 }
@@ -26,8 +28,11 @@ pub fn resolve_link(base: &Path, value: &str) -> Link {
     if value.chars().any(char::is_control) || value.starts_with('#') || value.starts_with("//") {
         return Link::Unsupported;
     }
-    let scheme = value.split(':').next().unwrap_or("").to_ascii_lowercase();
-    if value.contains(':') && matches!(scheme.as_str(), "http" | "https" | "mailto") {
+    if let Some((scheme, _)) = value.split_once(':')
+        && ["http", "https", "mailto"]
+            .iter()
+            .any(|prefix| scheme.eq_ignore_ascii_case(prefix))
+    {
         return Link::External(value.into());
     }
     let path = value.split(['#', '?']).next().unwrap_or(value);
@@ -51,39 +56,59 @@ fn decoded_path(value: &str) -> Option<PathBuf> {
     let bytes: Vec<_> = percent_encoding::percent_decode_str(value).collect();
     (!bytes.contains(&0)).then(|| PathBuf::from(std::ffi::OsString::from_vec(bytes)))
 }
-pub fn prepare(source: Arc<str>, path: &Path) -> Prepared {
-    let mut images = HashMap::new();
-    let mut notes = vec![];
-    let mut total = 0;
-    let mut attempted = std::collections::HashSet::new();
-    for event in Parser::new_ext(
-        &source,
-        Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS | Options::ENABLE_STRIKETHROUGH,
-    ) {
-        let Event::Start(Tag::Image { dest_url, .. }) = event else {
-            continue;
-        };
-        if !attempted.insert(dest_url.to_string()) {
-            continue;
+pub fn prepare(source: impl AsRef<str>, path: &Path, theme: &HighlightTheme) -> Prepared {
+    let mut local = Vec::new();
+    let mut unsupported = Vec::new();
+    let mut additional_local = false;
+    let mut additional_unsupported = false;
+    let mut markdown = ParsedMarkdown::new(source.as_ref(), theme, |url| {
+        if local.iter().any(|(resource, _)| resource == url)
+            || unsupported.iter().any(|resource| resource == url)
+        {
+            return;
         }
-        if attempted.len() > 32 {
-            notes.push("Additional images omitted: at most 32 local images per document.".into());
-            break;
-        }
-        let resource: &str = &dest_url;
-        let result = match resolve_link(path, &dest_url) {
-            Link::Local(path) => raster(&path),
-            _ => {
-                notes.push(format!(
-                    "Remote or unsupported image omitted: {resource:?}; no network request was made."
-                ));
-                continue;
+        match resolve_link(path, url) {
+            Link::Local(path) => {
+                if local.len() < MAX_READ_IMAGES {
+                    local.push((url.to_owned(), path));
+                } else {
+                    additional_local = true;
+                }
             }
-        };
-        match result {
+            _ => {
+                if unsupported.len() < MAX_UNSUPPORTED_IMAGE_NOTICES {
+                    unsupported.push(url.to_owned());
+                } else {
+                    additional_unsupported = true;
+                }
+            }
+        }
+    });
+    drop(source);
+    markdown.share_reading_text_storage();
+    let mut images = HashMap::new();
+    let mut notes: Vec<_> = unsupported
+        .into_iter()
+        .map(|resource| {
+            format!(
+                "Remote or unsupported image omitted: {resource:?}; no network request was made."
+            )
+        })
+        .collect();
+    if additional_unsupported {
+        notes.push(
+            "Additional remote or unsupported images omitted without network requests.".into(),
+        );
+    }
+    if additional_local {
+        notes.push("Additional images omitted: at most 32 local images per document.".into());
+    }
+    let mut total = 0;
+    for (resource, path) in local {
+        match raster(&path) {
             Ok(image) if total + image.bgra.len() <= 32 * 1024 * 1024 => {
                 total += image.bgra.len();
-                images.insert(dest_url.to_string(), image);
+                images.insert(resource, image);
             }
             Ok(_) => notes.push(format!(
                 "Local image omitted: {resource:?}. The document image cache is limited to 32 MiB."
@@ -94,7 +119,7 @@ pub fn prepare(source: Arc<str>, path: &Path) -> Prepared {
     notes.sort();
     notes.dedup();
     Prepared {
-        source,
+        markdown,
         images,
         notes,
     }
@@ -178,11 +203,12 @@ mod tests {
         image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]))
             .save(dir.path().join("local.png"))
             .unwrap();
-        let source: Arc<str> =
-            "![local](local.png)\n![remote](http://127.0.0.1:1/trap.png)\n<script>raw</script>\n"
-                .into();
-        let prepared = prepare(source.clone(), &dir.path().join("read.md"));
-        assert_eq!(prepared.source, source);
+        let source =
+            "![local](local.png)\n![remote](http://127.0.0.1:1/trap.png)\n<script>raw</script>\n";
+        let path = dir.path().join("read.md");
+        std::fs::write(&path, source).unwrap();
+        let prepared = prepare(source, &path, &HighlightTheme::default_light());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), source);
         assert_eq!(
             (
                 prepared.images["local.png"].width,
@@ -204,5 +230,55 @@ mod tests {
             .set_len(8 * 1024 * 1024 + 1)
             .unwrap();
         assert!(raster(&file).err().unwrap().contains("8 MiB"));
+    }
+
+    #[test]
+    fn image_limit_counts_distinct_destinations() {
+        let dir = tempfile::tempdir().unwrap();
+        let initial = dir.path().join("0.png");
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]))
+            .save(&initial)
+            .unwrap();
+        let mut source = "![repeat][first]\n\n".repeat(40);
+        for index in 1..=MAX_READ_IMAGES {
+            let name = format!("{index}.png");
+            std::fs::copy(&initial, dir.path().join(&name)).unwrap();
+            source.push_str(&format!("![image]({name})\n\n"));
+        }
+        source.push_str("[first]: 0.png\n");
+        let prepared = prepare(
+            source,
+            &dir.path().join("read.md"),
+            &HighlightTheme::default_light(),
+        );
+        assert_eq!(prepared.images.len(), MAX_READ_IMAGES);
+        assert!(prepared.images.contains_key("0.png"));
+        assert!(!prepared.images.contains_key("32.png"));
+        assert_eq!(
+            prepared.notes,
+            ["Additional images omitted: at most 32 local images per document."]
+        );
+    }
+
+    #[test]
+    fn unsupported_images_cannot_displace_local_images() {
+        let dir = tempfile::tempdir().unwrap();
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 255, 255]))
+            .save(dir.path().join("local.png"))
+            .unwrap();
+        let mut markdown = String::new();
+        for index in 0..40 {
+            markdown.push_str(&format!("![remote](http://127.0.0.1/{index}.png)\n\n"));
+        }
+        markdown.push_str("![local](local.png)\n");
+        let prepared = prepare(
+            &markdown,
+            &dir.path().join("read.md"),
+            &HighlightTheme::default_light(),
+        );
+        assert_eq!(prepared.images.len(), 1);
+        assert_eq!(prepared.images["local.png"].bgra, [255, 0, 0, 255]);
+        assert_eq!(prepared.notes.len(), MAX_UNSUPPORTED_IMAGE_NOTICES + 1);
+        assert!(prepared.notes.iter().all(|note| note.contains("network")));
     }
 }

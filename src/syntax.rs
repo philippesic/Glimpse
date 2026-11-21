@@ -1,5 +1,6 @@
 //! Highlighting runs outside the event loop; obsolete documents never recolor a newer edit.
 use crate::wake;
+use gpui_component::input::{LineType, Rope};
 use std::{
     sync::{
         Arc, Mutex,
@@ -9,7 +10,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use syntect::{easy::HighlightLines, util::LinesWithEndings};
+use syntect::easy::HighlightLines;
 
 fn luminance(rgb: [u8; 3]) -> f64 {
     let linear = rgb.map(|c| {
@@ -26,12 +27,18 @@ fn contrast(a: [u8; 3], b: [u8; 3]) -> f64 {
     let (a, b) = (luminance(a), luminance(b));
     (a.max(b) + 0.05) / (a.min(b) + 0.05)
 }
-/// Retain a grammar's hue while meeting normal-text contrast on the actual canvas.
-pub fn readable_rgb(rgb: [u8; 3], canvas: [u8; 3]) -> [u8; 3] {
-    if contrast(rgb, canvas) >= 4.5 {
+pub fn readable_rgb(rgb: [u8; 3], canvases: &[[u8; 3]]) -> [u8; 3] {
+    const CONTRAST_TARGET: f64 = 4.6;
+    let minimum_contrast = |color| {
+        canvases
+            .iter()
+            .map(|canvas| contrast(color, *canvas))
+            .fold(f64::INFINITY, f64::min)
+    };
+    if minimum_contrast(rgb) >= CONTRAST_TARGET {
         return rgb;
     }
-    let target = if contrast([0; 3], canvas) >= contrast([255; 3], canvas) {
+    let target = if minimum_contrast([0; 3]) >= minimum_contrast([255; 3]) {
         [0; 3]
     } else {
         [255; 3]
@@ -44,7 +51,7 @@ pub fn readable_rgb(rgb: [u8; 3], canvas: [u8; 3]) -> [u8; 3] {
     let (mut low, mut high) = (0., 1.);
     for _ in 0..12 {
         let middle = (low + high) / 2.;
-        if contrast(mix(middle), canvas) >= 4.5 {
+        if minimum_contrast(mix(middle)) >= CONTRAST_TARGET {
             high = middle;
         } else {
             low = middle;
@@ -52,6 +59,17 @@ pub fn readable_rgb(rgb: [u8; 3], canvas: [u8; 3]) -> [u8; 3] {
     }
     mix(high)
 }
+/// Source colours by TextMate scope (light, dark), shared with the Reading view's code blocks.
+pub const SOURCE_COLORS: [(&str, u32, u32); 7] = [
+    ("keyword, storage", 0x7c3aed, 0xc4a7ff),
+    ("entity.name.function, support.function", 0x1d4ed8, 0x7aa2ff),
+    ("entity.name.type, support.type", 0x0e7490, 0x5ccfe6),
+    ("string", 0x15803d, 0x86d993),
+    ("constant.numeric, constant.language", 0xb45309, 0xf5b06a),
+    ("comment", 0x71717a, 0x80808a),
+    ("entity.name.tag", 0x7c3aed, 0xc4a7ff),
+];
+
 /// Reference-inspired source colors with contrast correction applied on the actual canvas.
 fn source_theme(dark: bool) -> syntect::highlighting::Theme {
     use syntect::highlighting::{Color, StyleModifier, Theme, ThemeItem, ThemeSettings};
@@ -63,20 +81,12 @@ fn source_theme(dark: bool) -> syntect::highlighting::Theme {
     };
     let mut theme = Theme {
         settings: ThemeSettings {
-            foreground: Some(color(if dark { 0xd4dcee } else { 0x17335c })),
+            foreground: Some(color(if dark { 0xe4e4e7 } else { 0x27272a })),
             ..Default::default()
         },
         ..Default::default()
     };
-    for (scope, light, night) in [
-        ("keyword, storage", 0x004dff, 0x34aaff),
-        ("entity.name.function, support.function", 0x0059d9, 0x51acff),
-        ("entity.name.type, support.type", 0x006c8f, 0x52c9ed),
-        ("string", 0x08732b, 0xa9da73),
-        ("constant.numeric, constant.language", 0x7145b8, 0xcba3fa),
-        ("comment", 0x717f91, 0x939eaf),
-        ("entity.name.tag", 0x004dff, 0x34aaff),
-    ] {
+    for (scope, light, night) in SOURCE_COLORS {
         theme.scopes.push(ThemeItem {
             scope: scope.parse().expect("static syntax scope"),
             style: StyleModifier {
@@ -109,11 +119,18 @@ pub struct Highlight {
 struct Request {
     id: u64,
     generation: u64,
-    text: Arc<str>,
+    text: Rope,
     extension: &'static str,
     dark: bool,
     token: u64,
 }
+
+#[derive(Default)]
+struct Work {
+    request: Option<Request>,
+    after_retirement: Option<fn()>,
+}
+
 pub fn grammar_extension(path: &std::path::Path, text: &str) -> Option<&'static str> {
     let extension = path.extension().and_then(|s| s.to_str()).unwrap_or("");
     let extension = match extension.to_ascii_lowercase().as_str() {
@@ -164,85 +181,143 @@ pub fn grammar_extension(path: &std::path::Path, text: &str) -> Option<&'static 
     }
     None
 }
+
+pub fn grammar_for_text(path: &std::path::Path, text: &Rope) -> Option<&'static str> {
+    if let Some(extension) = grammar_extension(path, "") {
+        return Some(extension);
+    }
+    if !text.chunks().next()?.starts_with('#') {
+        return None;
+    }
+    let mut prefix = Vec::with_capacity(256);
+    for chunk in text.chunks() {
+        let count = (256 - prefix.len()).min(chunk.len());
+        prefix.extend_from_slice(&chunk.as_bytes()[..count]);
+        if prefix.len() == 256 {
+            break;
+        }
+    }
+    grammar_extension(path, &String::from_utf8_lossy(&prefix))
+}
 pub struct Syntax {
-    pending: Arc<Mutex<Option<Request>>>,
+    pending: Arc<Mutex<Work>>,
     ready: Arc<Mutex<Option<Highlight>>>,
     wake: Option<mpsc::SyncSender<()>>,
     token: Arc<AtomicU64>,
 }
 impl Syntax {
     pub fn new(ctx: wake::Context) -> Self {
-        let pending = Arc::new(Mutex::new(None::<Request>));
+        let pending = Arc::new(Mutex::new(Work::default()));
         let ready = Arc::new(Mutex::new(None));
         let token = Arc::new(AtomicU64::new(0));
         let (wake, rx) = mpsc::sync_channel(1);
         let (input, output, current) = (pending.clone(), ready.clone(), token.clone());
         thread::spawn(move || {
             let mut assets = None;
+            let mut superseded = false;
             while rx.recv().is_ok() {
-                let Some(request) = input.lock().unwrap().take() else {
-                    continue;
-                };
-                let syntaxes = assets.get_or_insert_with(two_face::syntax::extra_newlines);
-                let syntax = syntaxes
-                    .find_syntax_by_extension(request.extension)
-                    .unwrap_or_else(|| syntaxes.find_syntax_plain_text());
-                let theme = source_theme(request.dark);
-                let mut parser = HighlightLines::new(syntax, &theme);
-                let mut spans = Vec::new();
-                let mut offset = 0;
-                let started = Instant::now();
-                let mut state = syntax.name.clone();
-                for line in LinesWithEndings::from(request.text.as_ref()) {
-                    if current.load(Ordering::Relaxed) != request.token {
-                        break;
-                    }
-                    if line.len() > 32768
-                        || started.elapsed() > Duration::from_millis(200)
-                        || spans.len() >= 30000
-                    {
-                        state.push_str(" · partial highlighting (work limit)");
-                        break;
-                    }
-                    match parser.highlight_line(line, syntaxes) {
-                        Ok(parts) => {
-                            for (style, part) in parts {
-                                if spans.len() == 30000 {
-                                    state.push_str(" · partial highlighting (span limit)");
-                                    break;
-                                }
-                                let length = part.len();
-                                spans.push(Span {
-                                    start: offset,
-                                    length,
-                                    italic: style
-                                        .font_style
-                                        .contains(syntect::highlighting::FontStyle::ITALIC),
-                                    rgb: [
-                                        style.foreground.r,
-                                        style.foreground.g,
-                                        style.foreground.b,
-                                    ],
-                                });
-                                offset += length;
-                            }
+                let mut work = std::mem::take(&mut *input.lock().unwrap());
+                while superseded
+                    && work.after_retirement.is_none()
+                    && work.request.as_ref().is_some_and(|request| {
+                        request.generation != 0 && request.text.len() >= 1024 * 1024
+                    })
+                {
+                    match rx.recv_timeout(Duration::from_millis(24)) {
+                        Ok(()) => {
+                            let next = std::mem::take(&mut *input.lock().unwrap());
+                            work.request = next.request.or(work.request);
+                            work.after_retirement = next.after_retirement;
                         }
-                        Err(_) => {
-                            state.push_str(" · plain fallback (grammar failed)");
-                            break;
-                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => break,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
                     }
                 }
-                let mut ready = output.lock().unwrap();
-                if current.load(Ordering::Relaxed) == request.token {
-                    *ready = Some(Highlight {
-                        id: request.id,
-                        generation: request.generation,
-                        revision: request.token,
-                        spans,
-                        state,
-                    });
-                    ctx.request_repaint();
+                superseded = false;
+                if let Some(request) = work
+                    .request
+                    .filter(|request| current.load(Ordering::Relaxed) == request.token)
+                {
+                    let _work = gpui::work_trace::Span::new("syntax_worker");
+                    let syntaxes = assets.get_or_insert_with(two_face::syntax::extra_newlines);
+                    let syntax = syntaxes
+                        .find_syntax_by_extension(request.extension)
+                        .unwrap_or_else(|| syntaxes.find_syntax_plain_text());
+                    let theme = source_theme(request.dark);
+                    let mut parser = HighlightLines::new(syntax, &theme);
+                    let mut spans = Vec::new();
+                    let mut offset = 0;
+                    let started = Instant::now();
+                    let mut state = syntax.name.clone();
+                    for line in request
+                        .text
+                        .lines(LineType::LF)
+                        .filter(|line| line.len() != 0)
+                    {
+                        if current.load(Ordering::Relaxed) != request.token {
+                            break;
+                        }
+                        if line.len() > 32768
+                            || started.elapsed() > Duration::from_millis(200)
+                            || spans.len() >= 30000
+                        {
+                            state.push_str(" · partial highlighting (work limit)");
+                            break;
+                        }
+                        let line = line.as_str().map_or_else(
+                            || std::borrow::Cow::Owned(line.to_string()),
+                            std::borrow::Cow::Borrowed,
+                        );
+                        match parser.highlight_line(&line, syntaxes) {
+                            Ok(parts) => {
+                                for (style, part) in parts {
+                                    if spans.len() == 30000 {
+                                        state.push_str(" · partial highlighting (span limit)");
+                                        break;
+                                    }
+                                    let length = part.len();
+                                    spans.push(Span {
+                                        start: offset,
+                                        length,
+                                        italic: style
+                                            .font_style
+                                            .contains(syntect::highlighting::FontStyle::ITALIC),
+                                        rgb: [
+                                            style.foreground.r,
+                                            style.foreground.g,
+                                            style.foreground.b,
+                                        ],
+                                    });
+                                    offset += length;
+                                }
+                            }
+                            Err(_) => {
+                                state.push_str(" · plain fallback (grammar failed)");
+                                break;
+                            }
+                        }
+                    }
+                    let mut ready = output.lock().unwrap();
+                    if current.load(Ordering::Relaxed) == request.token {
+                        *ready = Some(Highlight {
+                            id: request.id,
+                            generation: request.generation,
+                            revision: request.token,
+                            spans,
+                            state,
+                        });
+                        ctx.request_repaint();
+                    } else {
+                        superseded = true;
+                    }
+                }
+                if let Some(after_retirement) = work.after_retirement {
+                    {
+                        let _work = gpui::work_trace::Span::new("syntax_assets_retire");
+                        assets = None;
+                    }
+                    let _work = gpui::work_trace::Span::new("syntax_memory_release");
+                    after_retirement();
                 }
             }
         });
@@ -257,14 +332,13 @@ impl Syntax {
         &self,
         id: u64,
         generation: u64,
-        text: impl Into<Arc<str>>,
+        text: Rope,
         path: &std::path::Path,
         dark: bool,
     ) {
         let token = self.token.fetch_add(1, Ordering::Relaxed) + 1;
-        let text = text.into();
-        let Some(extension) = grammar_extension(path, &text) else {
-            self.pending.lock().unwrap().take();
+        let Some(extension) = grammar_for_text(path, &text) else {
+            self.pending.lock().unwrap().request.take();
             *self.ready.lock().unwrap() = Some(Highlight {
                 id,
                 generation,
@@ -274,14 +348,24 @@ impl Syntax {
             });
             return;
         };
-        *self.pending.lock().unwrap() = Some(Request {
-            id,
-            generation,
-            text,
-            extension,
-            dark,
-            token,
-        });
+        *self.pending.lock().unwrap() = Work {
+            request: Some(Request {
+                id,
+                generation,
+                text,
+                extension,
+                dark,
+                token,
+            }),
+            after_retirement: None,
+        };
+        self.signal();
+    }
+    pub fn retire_assets(&self, after_retirement: fn()) {
+        self.pending.lock().unwrap().after_retirement = Some(after_retirement);
+        self.signal();
+    }
+    fn signal(&self) {
         if let Some(wake) = &self.wake {
             let _ = wake.try_send(());
         }
@@ -302,13 +386,25 @@ mod tests {
     #[test]
     fn plain_text_is_immediate_and_invalidates_pending_grammar_work() {
         let syntax = Syntax::new(wake::Context::default());
-        syntax.request(1, 1, "fn old() {}", std::path::Path::new("x.rs"), true);
-        syntax.request(1, 2, "plain 🦀", std::path::Path::new("x.txt"), false);
+        syntax.request(
+            1,
+            1,
+            Rope::from("fn old() {}"),
+            std::path::Path::new("x.rs"),
+            true,
+        );
+        syntax.request(
+            1,
+            2,
+            Rope::from("plain 🦀"),
+            std::path::Path::new("x.txt"),
+            false,
+        );
         let result = syntax.take().unwrap();
         assert_eq!(result.generation, 2);
         assert_eq!(result.state, "Plain text");
         assert!(result.spans.is_empty());
-        assert!(syntax.pending.lock().unwrap().is_none());
+        assert!(syntax.pending.lock().unwrap().request.is_none());
         assert_eq!(
             grammar_extension(std::path::Path::new(".zshrc"), ""),
             Some("sh")
@@ -328,31 +424,107 @@ mod tests {
     }
     #[test]
     fn syntax_colors_remain_readable_on_light_and_dark_canvases() {
-        for canvas in [[255; 3], [250, 249, 247], [22, 25, 30], [0; 3]] {
+        let themes = [
+            [[255; 3]; 4],
+            [[250, 249, 247]; 4],
+            [[22, 25, 30]; 4],
+            [[0; 3]; 4],
+            [[255; 3], [240; 3], [184, 208, 238], [140, 174, 224]],
+            [[10; 3], [24; 3], [37, 53, 98], [49, 77, 147]],
+        ];
+        for canvases in themes {
             for rgb in [
                 [150, 163, 180],
                 [192, 197, 206],
                 [143, 161, 179],
                 [208, 135, 112],
+                [106, 120, 137],
+                [147, 158, 175],
+                [0, 77, 255],
+                [8, 115, 43],
                 [20, 80, 100],
             ] {
-                let adjusted = readable_rgb(rgb, canvas);
+                let adjusted = readable_rgb(rgb, &canvases);
                 assert!(
-                    contrast(adjusted, canvas) >= 4.5,
-                    "{adjusted:?} on {canvas:?}"
+                    canvases
+                        .iter()
+                        .all(|&canvas| contrast(adjusted, canvas) >= 4.5),
+                    "{adjusted:?} on {canvases:?}"
                 );
-                if contrast(rgb, canvas) >= 4.5 {
+                if canvases.iter().all(|&canvas| contrast(rgb, canvas) >= 4.6) {
                     assert_eq!(adjusted, rgb);
                 }
             }
         }
     }
     #[test]
+    fn large_edit_burst_publishes_the_latest_syntax() {
+        let syntax = Syntax::new(wake::Context::default());
+        let reference = Syntax::new(wake::Context::default());
+        let path = std::path::Path::new("notes.rs");
+        let source = Rope::from("let earlier = 0; // comment\r\n".repeat(50_000));
+        let wait_for = |syntax: &Syntax, generation| {
+            let until = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(result) = syntax.take()
+                    && result.generation == generation
+                {
+                    break result;
+                }
+                assert!(Instant::now() < until);
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+
+        syntax.request(1, 0, source.clone(), path, true);
+        assert!(!wait_for(&syntax, 0).spans.is_empty());
+        for generation in 1..12 {
+            let mut revision = source.clone();
+            revision.insert(0, &format!("// pending {generation}\n"));
+            syntax.request(1, generation, revision, path, true);
+            thread::sleep(Duration::from_millis(2));
+        }
+        let prefix = "fn newest() { let value = \"café\"; }\r\n";
+        let mut latest = source;
+        latest.insert(0, prefix);
+        syntax.request(1, 12, latest, path, true);
+        reference.request(1, 12, Rope::from(prefix), path, true);
+        let result = wait_for(&syntax, 12);
+        let expected = wait_for(&reference, 12);
+        let spans = |highlight: Highlight| {
+            highlight
+                .spans
+                .into_iter()
+                .take_while(|span| span.start < prefix.len())
+                .map(|span| (span.start, span.length, span.italic, span.rgb))
+                .collect::<Vec<_>>()
+        };
+        let expected = spans(expected);
+        assert!(!expected.is_empty());
+        assert_eq!(spans(result), expected);
+    }
+
+    #[test]
     fn latest_generation_has_matching_byte_ranges() {
         let syntax = Syntax::new(wake::Context::default());
-        syntax.request(1, 1, "obsolete", std::path::Path::new("x.rs"), true);
-        let text = "let 🦀 = \"café 中文 é\";\r\n";
-        syntax.request(1, 2, text, std::path::Path::new("x.rs"), true);
+        syntax.request(
+            1,
+            1,
+            Rope::from("obsolete"),
+            std::path::Path::new("x.rs"),
+            true,
+        );
+        let text = format!(
+            "let 🦀 = \"café 中文 é\";\r\n// {}\r\nlet done = true;\n",
+            "é 字 café ".repeat(450)
+        );
+        syntax.request(
+            1,
+            2,
+            Rope::from(text.as_str()),
+            std::path::Path::new("x.rs"),
+            true,
+        );
         let until = Instant::now() + Duration::from_secs(5);
         loop {
             if let Some(result) = syntax.take() {

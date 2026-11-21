@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::Write,
@@ -6,23 +7,24 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub fn data_dir() -> PathBuf {
+mod revisions;
+
+pub fn data_dir() -> Result<PathBuf, &'static str> {
     if let Some(path) = std::env::var_os("GLIMPSE_DATA_DIR") {
-        return path.into();
+        return Ok(path.into());
     }
     #[cfg(target_os = "linux")]
-    {
-        std::env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| std::env::home_dir().unwrap().join(".local/share"))
-            .join("glimpse")
+    if let Some(path) = std::env::var_os("XDG_DATA_HOME") {
+        return Ok(PathBuf::from(path).join("glimpse"));
     }
+    let home = std::env::home_dir().ok_or(
+        "Glimpse needs a home folder for settings and recovery. Set HOME or GLIMPSE_DATA_DIR and try again.",
+    )?;
+    #[cfg(target_os = "linux")]
+    let data = home.join(".local/share/glimpse");
     #[cfg(target_os = "macos")]
-    {
-        std::env::home_dir()
-            .unwrap()
-            .join("Library/Application Support/Glimpse")
-    }
+    let data = home.join("Library/Application Support/Glimpse");
+    Ok(data)
 }
 pub fn private_dir(path: &Path) -> Result<(), String> {
     fs::DirBuilder::new()
@@ -36,12 +38,35 @@ pub fn atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
         file.write_all(bytes).map_err(|error| error.to_string())
     })
 }
-fn atomic_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
+struct RecordWriter<'a> {
+    file: &'a mut fs::File,
+    hash: &'a mut Sha256,
+}
+
+impl Write for RecordWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.file.write(bytes)?;
+        self.hash.update(&bytes[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+fn atomic_json(path: &Path, value: &impl Serialize) -> Result<[u8; 32], String> {
+    let mut hash = Sha256::new();
     atomic_write(path, |file| {
-        let mut writer = std::io::BufWriter::with_capacity(65536, file);
+        let output = RecordWriter {
+            file,
+            hash: &mut hash,
+        };
+        let mut writer = std::io::BufWriter::with_capacity(65536, output);
         serde_json::to_writer(&mut writer, value).map_err(|error| error.to_string())?;
         writer.flush().map_err(|error| error.to_string())
-    })
+    })?;
+    Ok(hash.finalize().into())
 }
 fn atomic_write(
     path: &Path,
@@ -98,6 +123,11 @@ pub struct Settings {
         deserialize_with = "native_path::deserialize_many"
     )]
     pub recents: Vec<PathBuf>,
+    #[serde(
+        serialize_with = "native_path::serialize_optional",
+        deserialize_with = "native_path::deserialize_optional"
+    )]
+    pub last_location: Option<PathBuf>,
     pub location_visits: Vec<LocationVisit>,
     pub keymaps: std::collections::BTreeMap<String, String>,
     pub font_family: String,
@@ -108,6 +138,8 @@ pub struct Settings {
     pub markdown_font_size: f32,
     pub remember_locations: bool,
     pub search_metadata: bool,
+    pub search_mounts: bool,
+    pub search_directory_links: bool,
     pub search_exclude: String,
     pub search_file_mib: usize,
     #[serde(skip)]
@@ -134,6 +166,7 @@ impl Default for Settings {
             search_ignored: false,
             pins: Vec::new(),
             recents: Vec::new(),
+            last_location: None,
             location_visits: Vec::new(),
             keymaps: Default::default(),
             font_family: String::new(),
@@ -144,6 +177,8 @@ impl Default for Settings {
             markdown_font_size: 16.,
             remember_locations: true,
             search_metadata: false,
+            search_mounts: false,
+            search_directory_links: false,
             search_exclude: String::new(),
             search_file_mib: 1,
             disk_base: None,
@@ -229,15 +264,25 @@ impl Settings {
         {
             return Err("Settings exceed 64 KiB; the saved settings are retained.".into());
         }
-        crate::commands::bindings(&self.keymaps)?;
+        crate::commands::bindings(&self.keymaps).map_err(|error| error.to_string())?;
+        self.validate_exclusion_patterns()
+            .map_err(|(_, error)| error.to_string())
+    }
+
+    pub fn validate_exclusion_patterns(&self) -> Result<(), (usize, ignore::Error)> {
         let mut globs = ignore::overrides::OverrideBuilder::new("/");
-        for line in self.search_exclude.lines().filter(|s| !s.trim().is_empty()) {
-            globs.add(&format!("!{line}")).map_err(|e| e.to_string())?;
+        for (index, line) in self.search_exclude.lines().enumerate() {
+            if !line.trim().is_empty() {
+                globs
+                    .add(&format!("!{line}"))
+                    .map_err(|error| (index + 1, error))?;
+            }
         }
         Ok(())
     }
+
     pub fn load() -> Result<Self, String> {
-        Self::load_in(&data_dir())
+        Self::load_in(&data_dir()?)
     }
     pub(crate) fn load_in(root: &Path) -> Result<Self, String> {
         use std::io::Read;
@@ -345,10 +390,10 @@ impl Settings {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct Draft {
+pub struct Draft<Text = std::sync::Arc<str>> {
     #[serde(with = "native_path")]
     pub path: PathBuf,
-    pub text: std::sync::Arc<str>,
+    pub text: Text,
     #[serde(with = "encoded_bytes")]
     pub base: crate::document::FileBytes,
     #[serde(
@@ -358,6 +403,18 @@ pub struct Draft {
     )]
     pub target: Option<PathBuf>,
     pub generation: u64,
+}
+
+impl<Text> Draft<Text> {
+    pub(crate) fn map_text<Output>(self, map: impl FnOnce(Text) -> Output) -> Draft<Output> {
+        Draft {
+            path: self.path,
+            text: map(self.text),
+            base: self.base,
+            target: self.target,
+            generation: self.generation,
+        }
+    }
 }
 #[derive(Clone)]
 pub struct Record {
@@ -454,18 +511,30 @@ pub fn inventory(root: &Path) -> Result<Inventory, String> {
                 result.usage.partial = true;
                 continue;
             };
+            let path = file.path();
+            let revision = !history && kind.is_dir() && revisions::is_revision(&path);
             // Do not follow symlinks out of private recovery storage.
-            if !kind.is_file() {
+            if !kind.is_file() && !revision {
                 continue;
             }
             let Ok(meta) = file.metadata() else {
                 result.usage.partial = true;
                 continue;
             };
-            result.usage.bytes = result.usage.bytes.saturating_add(meta.len());
-            result.usage.files += 1;
-            let path = file.path();
-            if !available || path.extension().is_none_or(|e| e != "json") {
+            let (files, bytes) = if revision {
+                match revisions::sizes(&path) {
+                    Ok(sizes) => sizes,
+                    Err(_) => {
+                        result.usage.partial = true;
+                        (0, 0)
+                    }
+                }
+            } else {
+                (1, meta.len())
+            };
+            result.usage.bytes = result.usage.bytes.saturating_add(bytes);
+            result.usage.files += files;
+            if !available || !revision && path.extension().is_none_or(|e| e != "json") {
                 continue;
             }
             if result.records.len() >= 256 {
@@ -474,7 +543,9 @@ pub fn inventory(root: &Path) -> Result<Inventory, String> {
             }
             let candidate =
                 !history && file.file_name().to_string_lossy().starts_with("candidate-");
-            let header = if meta.len() <= 70 * 1024 * 1024 {
+            let header = if revision {
+                revisions::header(&path).ok()
+            } else if bytes <= MAX_RECOVERY_RECORD_BYTES {
                 fs::File::open(&path).ok().and_then(|f| {
                     serde_json::from_reader::<_, Header>(std::io::BufReader::new(f)).ok()
                 })
@@ -487,7 +558,7 @@ pub fn inventory(root: &Path) -> Result<Inventory, String> {
             result.records.push(Record {
                 path,
                 original,
-                bytes: meta.len(),
+                bytes,
                 generation,
                 history,
                 candidate,
@@ -507,9 +578,9 @@ pub fn inventory(root: &Path) -> Result<Inventory, String> {
 }
 const MAX_RECOVERY_RECORD_BYTES: u64 = 70 * 1024 * 1024;
 
-fn read_recovery_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+fn open_recovery(path: &Path) -> std::io::Result<(fs::File, u64)> {
     use std::{
-        io::{Error, ErrorKind, Read},
+        io::{Error, ErrorKind},
         os::unix::fs::OpenOptionsExt,
     };
     let file = fs::OpenOptions::new()
@@ -529,7 +600,13 @@ fn read_recovery_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
             "Recovery record exceeds the supported size",
         ));
     }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    Ok((file, metadata.len()))
+}
+
+fn read_recovery_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::{Error, ErrorKind, Read};
+    let (file, length) = open_recovery(path)?;
+    let mut bytes = Vec::with_capacity(length as usize);
     file.take(MAX_RECOVERY_RECORD_BYTES + 1)
         .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_RECOVERY_RECORD_BYTES {
@@ -541,7 +618,28 @@ fn read_recovery_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+fn read_recovery_json<T: serde::de::DeserializeOwned>(path: &Path) -> std::io::Result<T> {
+    use std::io::{BufReader, Error, ErrorKind, Read};
+    let (file, _) = open_recovery(path)?;
+    let limit = MAX_RECOVERY_RECORD_BYTES + 1;
+    let mut limited = file.take(limit);
+    let result = serde_json::from_reader(BufReader::with_capacity(64 * 1024, &mut limited));
+    if limited.limit() == 0 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "Recovery record exceeds the supported size",
+        ));
+    }
+    result.map_err(Into::into)
+}
+
 fn read_draft(path: &Path) -> Result<Draft, String> {
+    if revisions::is_revision(path) {
+        if !fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir()) {
+            return Err("Recovery draft is not a directory".into());
+        }
+        return revisions::read(path);
+    }
     let bytes = read_recovery_bytes(path).map_err(|e| e.to_string())?;
     let draft: Draft = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
     validate_record_limits(draft.generation, draft.text.len(), draft.base.len())?;
@@ -563,12 +661,30 @@ fn validate_record_limits(
     Ok(())
 }
 
+fn recovery_text_length<'de, D: serde::Deserializer<'de>>(d: D) -> Result<usize, D::Error> {
+    struct TextLength;
+
+    impl serde::de::Visitor<'_> for TextLength {
+        type Value = usize;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("recovered document text")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<usize, E> {
+            Ok(value.len())
+        }
+    }
+
+    d.deserialize_str(TextLength)
+}
+
 #[derive(Deserialize)]
-struct RecoveryHeader<'a> {
+struct RecoveryHeader {
     #[serde(rename = "path", with = "native_path")]
     _path: PathBuf,
-    #[serde(borrow)]
-    text: std::borrow::Cow<'a, str>,
+    #[serde(deserialize_with = "recovery_text_length", rename = "text")]
+    text_bytes: usize,
     #[serde(deserialize_with = "encoded_bytes::decoded_len", rename = "base")]
     base_bytes: usize,
     #[serde(
@@ -581,10 +697,9 @@ struct RecoveryHeader<'a> {
 }
 
 fn read_recovery_header(path: &Path, validate_limits: bool) -> std::io::Result<u64> {
-    let bytes = read_recovery_bytes(path)?;
-    let header: RecoveryHeader<'_> = serde_json::from_slice(&bytes)?;
+    let header: RecoveryHeader = read_recovery_json(path)?;
     if validate_limits {
-        validate_record_limits(header.generation, header.text.len(), header.base_bytes)
+        validate_record_limits(header.generation, header.text_bytes, header.base_bytes)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     }
     Ok(header.generation)
@@ -599,7 +714,7 @@ pub fn restore_snapshot(path: &Path, observed: bool) -> Result<Draft, String> {
     let mut draft = read_draft(path)?;
     if observed {
         let bom = draft.base.has_bom();
-        draft.text = std::str::from_utf8(draft.base.content_bytes(bom))
+        draft.text = std::str::from_utf8(&draft.base.content_bytes(bom))
             .map_err(|_| "Observed disk version is not UTF-8")?
             .into();
         draft.base = if bom {
@@ -621,10 +736,67 @@ pub fn trash_record(path: &Path) -> Result<(), String> {
     };
     crate::fileops::trash(path)
 }
+pub(crate) trait RecoveryText: Serialize {
+    fn byte_len(&self) -> usize;
+}
+
+impl RecoveryText for str {
+    fn byte_len(&self) -> usize {
+        self.len()
+    }
+}
+
+impl RecoveryText for std::sync::Arc<str> {
+    fn byte_len(&self) -> usize {
+        self.len()
+    }
+}
+
+impl<Text: RecoveryText + ?Sized> RecoveryText for &Text {
+    fn byte_len(&self) -> usize {
+        RecoveryText::byte_len(*self)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct WrittenRecord {
+    digest: [u8; 32],
+    generation: u64,
+    text_bytes: usize,
+    base_bytes: usize,
+}
+
+fn record_digest(path: &Path) -> std::io::Result<[u8; 32]> {
+    use std::io::{Error, ErrorKind, Read};
+    let (file, _) = open_recovery(path)?;
+    let mut stream = file.take(MAX_RECOVERY_RECORD_BYTES + 1);
+    let mut hash = Sha256::new();
+    let mut buffer = [0; 65536];
+    loop {
+        let bytes = match stream.read(&mut buffer) {
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            count => count?,
+        };
+        if bytes == 0 {
+            break;
+        }
+        hash.update(&buffer[..bytes]);
+    }
+    if stream.limit() == 0 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "Recovery record exceeds the supported size",
+        ));
+    }
+    Ok(hash.finalize().into())
+}
+
 pub struct Recovery {
     pub directory: PathBuf,
     _lock: fs::File,
     io: std::sync::Mutex<std::collections::HashMap<u64, u64>>,
+    recent: std::sync::Mutex<std::collections::VecDeque<(PathBuf, WrittenRecord)>>,
+    anchors: std::sync::Mutex<std::collections::HashMap<u64, revisions::Anchor>>,
 }
 impl Recovery {
     pub fn new(root: &Path) -> Result<Self, String> {
@@ -652,9 +824,82 @@ impl Recovery {
             directory,
             _lock: lock,
             io: std::sync::Mutex::new(std::collections::HashMap::new()),
+            recent: Default::default(),
+            anchors: Default::default(),
         })
     }
-    pub fn write(&self, id: u64, draft: &Draft) -> Result<(), String> {
+
+    fn write_record(&self, path: &Path, draft: &Draft<impl RecoveryText>) -> Result<(), String> {
+        let digest = atomic_json(path, draft)?;
+        let record = WrittenRecord {
+            digest,
+            generation: draft.generation,
+            text_bytes: draft.text.byte_len(),
+            base_bytes: draft.base.len(),
+        };
+        let mut recent = self.recent.lock().unwrap();
+        recent.retain(|(entry, _)| entry != path);
+        if recent.len() == 64 {
+            recent.pop_front();
+        }
+        recent.push_back((path.to_owned(), record));
+        Ok(())
+    }
+
+    fn known_record(&self, path: &Path) -> std::io::Result<Option<WrittenRecord>> {
+        let record = self
+            .recent
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|(entry, record)| (entry == path).then_some(*record));
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        Ok((record.digest == record_digest(path)?).then_some(record))
+    }
+
+    fn generation(&self, path: &Path) -> std::io::Result<u64> {
+        if let Some(record) = self.known_record(path)? {
+            return Ok(record.generation);
+        }
+        #[derive(Deserialize)]
+        struct Generation {
+            generation: u64,
+        }
+        Ok(read_recovery_json::<Generation>(path)?.generation)
+    }
+
+    fn verified_header(&self, path: &Path, validate_limits: bool) -> std::io::Result<u64> {
+        let Some(record) = self.known_record(path)? else {
+            return read_recovery_header(path, validate_limits);
+        };
+        if validate_limits {
+            validate_record_limits(record.generation, record.text_bytes, record.base_bytes)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        }
+        Ok(record.generation)
+    }
+
+    pub(crate) fn write(&self, id: u64, draft: &Draft<impl RecoveryText>) -> Result<(), String> {
+        self.write_draft(id, draft, None)
+    }
+
+    pub(crate) fn write_revision(
+        &self,
+        id: u64,
+        draft: &Draft<impl RecoveryText>,
+        text: &gpui_component::input::Rope,
+    ) -> Result<(), String> {
+        self.write_draft(id, draft, Some(text))
+    }
+
+    fn write_draft(
+        &self,
+        id: u64,
+        draft: &Draft<impl RecoveryText>,
+        text: Option<&gpui_component::input::Rope>,
+    ) -> Result<(), String> {
         let finished = self.io.lock().unwrap();
         if finished
             .get(&id)
@@ -663,22 +908,58 @@ impl Recovery {
             return Ok(());
         }
         let path = self.directory.join(format!("{id}.json"));
-        #[derive(Deserialize)]
-        struct Generation {
-            generation: u64,
+        let revision_path = self.directory.join(format!("{id}.draft"));
+        let existing_revision = has_revision(&revision_path)?;
+        if existing_revision
+            || text.is_some_and(|text| text.len() >= revisions::MIN_SNAPSHOT_BYTES)
+                && !path.try_exists().map_err(|error| error.to_string())?
+        {
+            validate_record_limits(draft.generation, draft.text.byte_len(), draft.base.len())?;
+            let mut anchors = self.anchors.lock().unwrap();
+            let anchor = anchors.get(&id);
+            if existing_revision {
+                let generation = match anchor {
+                    Some(anchor) => anchor.generation(&revision_path)?,
+                    None => revisions::generation(&revision_path)?,
+                };
+                if generation >= draft.generation {
+                    return Ok(());
+                }
+                if let Some((anchor, text)) = anchor.zip(text)
+                    && anchor.write_edit(&revision_path, draft, text)?
+                {
+                    return Ok(());
+                }
+            }
+            anchors.remove(&id);
+            let digest = if existing_revision {
+                revisions::full(&revision_path, draft)?
+            } else {
+                revisions::create(&revision_path, draft)?
+            };
+            crate::metrics::event(
+                "recovery-checkpoint-bytes",
+                draft.generation,
+                (draft.text.byte_len() + draft.base.len()) as u64,
+            );
+            if let Some(text) = text {
+                anchors.insert(
+                    id,
+                    revisions::Anchor::capture(&revision_path, draft, text, digest)?,
+                );
+            }
+            return Ok(());
         }
-        match read_recovery_bytes(&path) {
-            Ok(bytes) => {
-                let existing: Generation = serde_json::from_slice(&bytes)
-                    .map_err(|error| format!("Previous recovery record was retained: {error}"))?;
-                if existing.generation > draft.generation {
+        match self.generation(&path) {
+            Ok(existing) => {
+                if existing > draft.generation {
                     return Ok(());
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(format!("Previous recovery record was retained: {error}")),
         }
-        atomic_json(&path, draft)
+        self.write_record(&path, draft)
     }
     pub fn claim(&self, source: &Path, id: u64) -> Result<(Draft, Option<String>), String> {
         let parent = source.parent().ok_or("Invalid recovery record")?;
@@ -697,16 +978,29 @@ impl Recovery {
             return Err("This recovery session is active; nothing was imported.".into());
         }
         let draft = read_draft(source)?;
-        let destination = self.directory.join(format!("{id}.json"));
+        let extension = if revisions::is_revision(source) {
+            "draft"
+        } else {
+            "json"
+        };
+        let destination = self.directory.join(format!("{id}.{extension}"));
         crate::fileops::rename(source, &destination)?;
         let warning=fs::File::open(&destination).and_then(|f|f.sync_all()).err().map(|e|format!("Draft restored into this session, but its sync failed: {e}. Save a copy elsewhere."));
         Ok((draft, warning))
     }
-    pub fn checkpoint(&self, id: u64, draft: &Draft) -> Result<PathBuf, String> {
+    pub(crate) fn checkpoint(
+        &self,
+        id: u64,
+        draft: &Draft<impl RecoveryText>,
+    ) -> Result<PathBuf, String> {
         self.write(id, draft)?;
         self.checkpoint_version(id, draft)
     }
-    pub fn checkpoint_version(&self, id: u64, draft: &Draft) -> Result<PathBuf, String> {
+    pub(crate) fn checkpoint_version(
+        &self,
+        id: u64,
+        draft: &Draft<impl RecoveryText>,
+    ) -> Result<PathBuf, String> {
         let path = self.directory.join(format!(
             "candidate-{id}-{}-{}.json",
             draft.generation,
@@ -715,7 +1009,7 @@ impl Recovery {
                 .unwrap()
                 .as_nanos()
         ));
-        atomic_json(&path, draft)?;
+        self.write_record(&path, draft)?;
         Ok(path)
     }
     pub fn resolved(&self, candidate: &Path) -> Result<(), String> {
@@ -772,7 +1066,13 @@ impl Recovery {
         to: &crate::document::DiskFile,
     ) -> Result<(), String> {
         let _finished = self.io.lock().unwrap();
-        let path = self.directory.join(format!("{id}.json"));
+        let revision_path = self.directory.join(format!("{id}.draft"));
+        let revision = has_revision(&revision_path)?;
+        let path = if revision {
+            revision_path
+        } else {
+            self.directory.join(format!("{id}.json"))
+        };
         let mut draft = match read_draft(&path) {
             Ok(draft) => draft,
             Err(_) if !path.try_exists().map_err(|error| error.to_string())? => return Ok(()),
@@ -787,7 +1087,12 @@ impl Recovery {
             draft.path = to.path.clone();
             draft.target = Some(to.target.clone());
             draft.base = to.bytes.clone();
-            atomic_json(&path, &draft)?;
+            if revision {
+                self.anchors.lock().unwrap().remove(&id);
+                revisions::full(&path, &draft)?;
+            } else {
+                self.write_record(&path, &draft)?;
+            }
         }
         Ok(())
     }
@@ -797,8 +1102,20 @@ impl Recovery {
             .entry(id)
             .and_modify(|g| *g = (*g).max(generation))
             .or_insert(generation);
+        let revision_path = self.directory.join(format!("{id}.draft"));
+        if has_revision(&revision_path)? {
+            let mut anchors = self.anchors.lock().unwrap();
+            let recovered_generation = match anchors.get(&id) {
+                Some(anchor) => anchor.generation(&revision_path)?,
+                None => revisions::generation(&revision_path)?,
+            };
+            if recovered_generation <= generation {
+                revisions::retire(&revision_path)?;
+                anchors.remove(&id);
+            }
+        }
         let path = self.directory.join(format!("{id}.json"));
-        match read_recovery_header(&path, false) {
+        match self.verified_header(&path, false) {
             Ok(recovered_generation) => {
                 if recovered_generation <= generation {
                     fs::remove_file(path).map_err(|e| e.to_string())?;
@@ -830,7 +1147,11 @@ impl Recovery {
                 continue;
             }
             let path = entry.path();
-            if read_recovery_header(&path, true).map_err(|error| error.to_string())? <= generation {
+            if self
+                .verified_header(&path, true)
+                .map_err(|error| error.to_string())?
+                <= generation
+            {
                 self.resolved(&path)?;
             }
         }
@@ -865,13 +1186,11 @@ impl Recovery {
             }
             if let Ok(entries) = fs::read_dir(session.path()) {
                 for entry in entries.flatten().filter(|e| {
-                    e.path().extension().is_some_and(|e| e == "json")
+                    (e.path().extension().is_some_and(|e| e == "json")
+                        || revisions::is_revision(&e.path()))
                         && !e.file_name().to_string_lossy().starts_with("candidate-")
                 }) {
-                    if let Ok(bytes) = fs::read(entry.path())
-                        && bytes.len() < 70 * 1024 * 1024
-                        && let Ok(draft) = serde_json::from_slice(&bytes)
-                    {
+                    if let Ok(draft) = read_draft(&entry.path()) {
                         drafts.push((entry.path(), draft));
                     }
                 }
@@ -880,6 +1199,16 @@ impl Recovery {
         drafts
     }
 }
+
+fn has_revision(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(true),
+        Ok(_) => Err("Recovery draft is not a directory; the existing entry was retained".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 impl Drop for Recovery {
     fn drop(&mut self) {
         if fs::read_dir(&self.directory)
@@ -925,10 +1254,13 @@ mod tests {
         assert_eq!(draft.text.as_ref(), "local β\r\n");
         assert_eq!(draft.base.as_bytes().as_ref(), b"\xef\xbb\xbfbase\r\n");
         let disk = crate::document::DiskFile::restore(&draft);
-        assert!(std::ptr::eq(draft.base.parts().1, disk.bytes.parts().1));
         assert!(std::ptr::eq(
-            disk.content_bytes(),
-            disk.clone().content_bytes()
+            draft.base.as_bytes().as_ref(),
+            disk.bytes.as_bytes().as_ref()
+        ));
+        assert!(std::ptr::eq(
+            disk.content_bytes().as_ref(),
+            disk.clone().content_bytes().as_ref()
         ));
         let serialized = serde_json::to_value(&draft).unwrap();
         assert_eq!(serialized["text"], "local β\r\n");
@@ -965,19 +1297,23 @@ mod tests {
         let bytes = [crate::document::BOM, text.as_bytes()].concat();
         fs::write(&source, &bytes).unwrap();
         let (disk, value) = crate::document::DiskFile::open(source).unwrap();
-        let draft = Draft {
-            base: disk.bytes,
-            ..draft(8)
-        };
-        assert!(std::ptr::eq(draft.base.parts().1, value.as_bytes()));
-        atomic_json(&path, &draft).unwrap();
-        let stored: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(
-            stored["base"],
-            base64::engine::general_purpose::STANDARD.encode(bytes)
-        );
-        let restored: Draft = serde_json::from_value(stored).unwrap();
-        assert_eq!(restored.base, draft.base);
+        assert!(std::ptr::eq(
+            disk.content_bytes().as_ref(),
+            value.as_bytes()
+        ));
+        let revision = gpui_component::input::Rope::from(value.as_ref());
+        for base in [disk.bytes.clone(), disk.share_revision(revision).bytes] {
+            let draft = Draft { base, ..draft(8) };
+            atomic_json(&path, &draft).unwrap();
+            let stored: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(
+                stored["base"],
+                base64::engine::general_purpose::STANDARD.encode(&bytes)
+            );
+            let restored: Draft = serde_json::from_value(stored).unwrap();
+            assert_eq!(restored.base, draft.base);
+        }
     }
 
     #[test]
@@ -985,7 +1321,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("record.json");
         for generation in [u64::MAX, u64::MAX - 1] {
-            let draft = Draft {
+            let draft: Draft = Draft {
                 path: "original".into(),
                 text: "local β".into(),
                 base: Default::default(),
@@ -1041,6 +1377,7 @@ mod tests {
 
     #[test]
     fn frequent_locations_coalesce_visits_and_decay_old_usage() {
+        use std::os::unix::ffi::OsStringExt;
         let mut settings = Settings::default();
         let a = Path::new("/projects/a");
         let b = Path::new("/projects/b");
@@ -1052,11 +1389,16 @@ mod tests {
         assert_eq!(settings.location_visits[0].path, a);
         assert!(settings.record_location(b, 12001 + 86400 * 28));
         assert_eq!(settings.location_visits[0].path, b);
+        let last = PathBuf::from(std::ffi::OsString::from_vec(
+            b"/projects/last-\xff".to_vec(),
+        ));
+        settings.last_location = Some(last.clone());
         settings.remember_locations = false;
         assert!(!settings.record_location(a, 9999999));
         let serialized = serde_json::to_vec(&settings).unwrap();
         let restored: Settings = serde_json::from_slice(&serialized).unwrap();
         assert_eq!(restored.location_visits.len(), 2);
+        assert_eq!(restored.last_location, Some(last));
     }
 
     #[test]
@@ -1150,6 +1492,30 @@ mod tests {
             .unwrap();
         assert_eq!(read_draft(&history.path).unwrap().text, draft(3).text);
         assert_eq!(read_draft(&history.path).unwrap().base, draft(3).base);
+    }
+
+    #[test]
+    fn written_record_with_unchanged_timestamp_is_revalidated_after_corruption() {
+        let root = tempfile::tempdir().unwrap();
+        let recovery = Recovery::new(root.path()).unwrap();
+        let id = 7;
+        let generation = 4;
+        recovery.write(id, &draft(generation)).unwrap();
+        let path = recovery.directory.join("7.json");
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let mut corrupt = fs::read(&path).unwrap();
+        let last = corrupt.len() - 1;
+        assert_eq!(corrupt[last], b'}');
+        corrupt[last] = b'?';
+        fs::write(&path, &corrupt).unwrap();
+        fs::File::open(&path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+        assert!(recovery.write(id, &draft(generation + 1)).is_err());
+        assert!(recovery.saved(id, generation).is_err());
+        assert_eq!(fs::read(&path).unwrap(), corrupt);
     }
 
     #[test]
@@ -1415,17 +1781,41 @@ mod native_path {
 mod encoded_bytes {
     use super::*;
     use base64::Engine;
+    use std::{fmt, io};
+
+    struct FormatWriter<'a, 'b>(&'a mut fmt::Formatter<'b>);
+
+    impl io::Write for FormatWriter<'_, '_> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let encoded = std::str::from_utf8(bytes).map_err(io::Error::other)?;
+            self.0.write_str(encoded).map_err(io::Error::other)?;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct EncodedBytes<'a>(&'a crate::document::FileBytes);
+
+    impl fmt::Display for EncodedBytes<'_> {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            let mut encoder = base64::write::EncoderWriter::new(
+                FormatWriter(formatter),
+                &base64::engine::general_purpose::STANDARD,
+            );
+            self.0.write_to(&mut encoder).map_err(|_| fmt::Error)?;
+            encoder.finish().map_err(|_| fmt::Error)?;
+            Ok(())
+        }
+    }
+
     pub fn serialize<S: serde::Serializer>(
         bytes: &crate::document::FileBytes,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
-        let (prefix, body) = bytes.parts();
-        let engine = &base64::engine::general_purpose::STANDARD;
-        serializer.collect_str(&format_args!(
-            "{}{}",
-            base64::display::Base64Display::new(prefix, engine),
-            base64::display::Base64Display::new(body, engine),
-        ))
+        serializer.collect_str(&EncodedBytes(bytes))
     }
     pub fn deserialize<'de, D: serde::Deserializer<'de>>(
         deserializer: D,

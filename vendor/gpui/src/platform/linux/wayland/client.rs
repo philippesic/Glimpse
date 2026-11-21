@@ -829,7 +829,7 @@ impl LinuxClient for WaylandClient {
         };
         if state.mouse_focused_window.is_some() || state.keyboard_focused_window.is_some() {
             state.clipboard.set_primary(item);
-            let serial = state.serial_tracker.get(SerialKind::KeyPress);
+            let serial = state.serial_tracker.latest_input();
             let data_source = primary_selection_manager.create_source(&state.globals.qh, ());
             for mime_type in TEXT_MIME_TYPES {
                 data_source.offer(mime_type.to_string());
@@ -849,7 +849,7 @@ impl LinuxClient for WaylandClient {
         };
         if state.mouse_focused_window.is_some() || state.keyboard_focused_window.is_some() {
             state.clipboard.set(item);
-            let serial = state.serial_tracker.get(SerialKind::KeyPress);
+            let serial = state.serial_tracker.latest_input();
             let data_source = data_device_manager.create_data_source(&state.globals.qh, ());
             for mime_type in TEXT_MIME_TYPES {
                 data_source.offer(mime_type.to_string());
@@ -1589,7 +1589,8 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 ..
             } => {
                 state.serial_tracker.update(SerialKind::MouseEnter, serial);
-                state.mouse_location = Some(point(px(surface_x as f32), px(surface_y as f32)));
+                let position = point(px(surface_x as f32), px(surface_y as f32));
+                state.mouse_location = Some(position);
                 state.button_pressed = None;
 
                 if let Some(window) = get_window(&mut state, &surface.id()) {
@@ -1614,8 +1615,14 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                                 .set_icon(wl_pointer, serial, style.to_icon_names(), scale);
                         }
                     }
+                    let modifiers = state.modifiers;
                     drop(state);
                     window.set_hovered(true);
+                    window.handle_input(PlatformInput::MouseMove(MouseMoveEvent {
+                        position,
+                        pressed_button: None,
+                        modifiers,
+                    }));
                 }
             }
             wl_pointer::Event::Leave { .. } => {

@@ -319,6 +319,7 @@ struct TextLayoutInner {
     truncate_width: Option<Pixels>,
     size: Option<Size<Pixels>>,
     bounds: Option<Bounds<Pixels>>,
+    probe_text: Option<SharedString>,
 }
 
 impl TextLayout {
@@ -380,6 +381,11 @@ impl TextLayout {
                 }
 
                 let mut runs = runs.clone();
+                static PROBE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+                let probe = PROBE
+                    .get_or_init(|| std::env::var("GLIMPSE_TEXT_PROBE").ok())
+                    .as_ref()
+                    .is_some_and(|patterns| patterns.split('|').any(|pattern| text.contains(pattern)));
                 let mut line_wrapper = cx.text_system().line_wrapper(text_style.font(), font_size);
                 let text = if let Some(truncate_width) = truncate_width {
                     line_wrapper.truncate_line(
@@ -392,6 +398,7 @@ impl TextLayout {
                     text.clone()
                 };
                 let len = text.len();
+                let probe_text = probe.then(|| text.clone());
 
                 let Some(lines) = window
                     .text_system()
@@ -412,6 +419,7 @@ impl TextLayout {
                         truncate_width,
                         size: Some(Size::default()),
                         bounds: None,
+                        probe_text: None,
                     });
                     return Size::default();
                 };
@@ -431,6 +439,7 @@ impl TextLayout {
                     truncate_width,
                     size: Some(size),
                     bounds: None,
+                    probe_text,
                 });
 
                 size
@@ -457,6 +466,27 @@ impl TextLayout {
             .bounds
             .with_context(|| format!("prepaint has not been performed on {text}"))
             .unwrap();
+        if let Some(rendered) = &element_state.probe_text
+            && let Some(measured) = element_state.size
+        {
+            let mask = window.content_mask().bounds;
+            let available = bounds.intersect(&mask);
+            let tolerance = crate::px(1.);
+            let fits = bounds.origin.x + tolerance >= available.origin.x
+                && bounds.origin.y + tolerance >= available.origin.y
+                && bounds.origin.x + measured.width <= available.right() + tolerance
+                && bounds.origin.y + measured.height <= available.bottom() + tolerance;
+            eprintln!(
+                "GLIMPSE_TEXT_PROBE {}",
+                serde_json::json!({
+                    "source": text,
+                    "painted": rendered.as_ref(),
+                    "fits": fits,
+                    "x": f32::from(bounds.left()),
+                    "y": f32::from(bounds.top()),
+                })
+            );
+        }
 
         let line_height = element_state.line_height;
         let mut line_origin = bounds.origin;

@@ -24,15 +24,15 @@ pub struct Request {
 }
 pub fn parse(args: Vec<OsString>, cwd: PathBuf) -> Result<Request, String> {
     let mut request = Request {
-        desktop: args.is_empty(),
         line: 1,
         column: 1,
         ..Default::default()
     };
     let mut args = args.into_iter().peekable();
+    let desktop_launch = args.next_if(|arg| arg == "--desktop").is_some();
     let command = args.peek().and_then(|s| s.to_str()).unwrap_or("");
-    let open = command == "open";
-    if open || command == "pick" {
+    let open = !desktop_launch && command == "open";
+    if open || (!desktop_launch && command == "pick") {
         request.pick = command == "pick";
         args.next();
     }
@@ -107,6 +107,7 @@ pub fn parse(args: Vec<OsString>, cwd: PathBuf) -> Result<Request, String> {
     if open && request.files.is_empty() {
         return Err("open requires at least one file".into());
     }
+    request.desktop = desktop_launch && request.folder.is_none() && request.files.is_empty();
     if !request.desktop && request.folder.is_none() && request.files.is_empty() {
         request.folder = Some(cwd);
     }
@@ -115,7 +116,8 @@ pub fn parse(args: Vec<OsString>, cwd: PathBuf) -> Result<Request, String> {
     }
     if request.wait {
         for path in &request.files {
-            crate::document::DiskFile::open(path.clone())?;
+            crate::document::DiskFile::open(path.clone())
+                .map_err(|error| format!("{}: {error}", crate::paths::display(path)))?;
         }
     }
     Ok(request)
@@ -133,11 +135,22 @@ pub fn selection_json(path: &std::path::Path, directory: bool) -> serde_json::Va
 mod tests {
     use super::*;
     #[test]
-    fn only_a_plain_desktop_launch_restores_abandoned_work() {
+    fn terminal_starts_at_its_folder_and_only_an_empty_desktop_launcher_restores() {
         let root = tempfile::tempdir().unwrap();
-        let desktop = parse(vec![], root.path().into()).unwrap();
+        let bare = parse(vec![], root.path().into()).unwrap();
+        assert!(!bare.desktop);
+        assert_eq!(bare.folder.as_deref(), Some(root.path()));
+        let desktop = parse(vec!["--desktop".into(), "--".into()], root.path().into()).unwrap();
         assert!(desktop.desktop);
         assert!(desktop.folder.is_none());
+        std::fs::write(root.path().join("open"), "contents").unwrap();
+        let associated_file = parse(
+            vec!["--desktop".into(), "--".into(), "open".into()],
+            root.path().into(),
+        )
+        .unwrap();
+        assert!(!associated_file.desktop);
+        assert_eq!(associated_file.files, [root.path().join("open")]);
         let explicit = parse(vec![".".into()], root.path().into()).unwrap();
         assert!(!explicit.desktop);
         assert_eq!(explicit.folder, Some(root.path().join(".")));

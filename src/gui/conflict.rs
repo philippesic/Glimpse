@@ -43,6 +43,7 @@ impl Shell {
         );
         if command == "compare" {
             let observed = text.clone();
+            let name = paths::name(&doc.disk.path);
             self.ask_decision(
                 DecisionAction::Compare,
                 "Compare local and disk text".into(),
@@ -52,7 +53,12 @@ impl Shell {
                 cx,
             );
             if let Some(view) = &self.decision {
-                view.update(cx, |view, cx| view.compare(&local, &observed, window, cx));
+                view.update(cx, |view, cx| {
+                    view.set_lead(format!(
+                        "{name} changed on disk while you were editing. Neither version has been changed."
+                    ));
+                    view.compare(&local, &observed, window, cx)
+                });
             }
             return;
         }
@@ -68,18 +74,22 @@ impl Shell {
                 Resolution::Overwrite
             },
         };
-        let (title, detail, action) = match snapshot.resolution {
+        let destructive = matches!(snapshot.resolution, Resolution::Overwrite);
+        let name = paths::name(&snapshot.disk.target);
+        let (title, lead, detail, action) = match snapshot.resolution {
             Resolution::Reload => (
                 "Reload Disk Version?",
+                format!("The local text of {name} will be replaced by the version on disk."),
                 format!(
-                    "{detail}\nThe local text will be replaced by this observed disk version. Its automatic draft will be retired after recovery storage acknowledges the operation. The local text remains in history and Undo."
+                    "{detail}\nIts automatic draft will be retired after recovery storage acknowledges the operation. The local text remains in history and Undo."
                 ),
                 "Reload Disk Version",
             ),
             Resolution::Overwrite => (
                 "Overwrite Disk Version?",
+                format!("The version of {name} on disk will be replaced by the local text."),
                 format!(
-                    "{detail}\nThis replaces only the observed disk version with the local text. Both versions must be preserved in recovery first."
+                    "{detail}\nOnly the observed disk version is replaced. Both versions are preserved in recovery first."
                 ),
                 "Overwrite Disk Version",
             ),
@@ -92,13 +102,22 @@ impl Shell {
             window,
             cx,
         );
+        if let Some(view) = &self.decision {
+            view.update(cx, |decision, _| {
+                decision.set_lead(lead);
+                if destructive {
+                    decision.mark_destructive(1);
+                }
+            });
+        }
     }
     pub(super) fn resolve_conflict(
         &mut self,
         snapshot: Snapshot,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let reading = self.reading();
         let Some(doc) = self.documents.iter_mut().find(|doc| doc.id == snapshot.id) else {
             return;
         };
@@ -112,6 +131,13 @@ impl Shell {
         doc.deferred_external = None;
         doc.saving = true;
         self.checks.invalidate(doc.id);
+        if self.active == Some(doc.id) {
+            if reading {
+                window.focus(&self.reading_focus);
+            } else {
+                doc.input.update(cx, |input, cx| input.focus(window, cx));
+            }
+        }
         match snapshot.resolution {
             Resolution::Reload => self.io.send(Job::Reload(Box::new(glimpse::io::Reload {
                 id: doc.id,
@@ -125,7 +151,7 @@ impl Shell {
                 id: doc.id,
                 generation: snapshot.generation,
                 disk: snapshot.disk,
-                text: snapshot.local.into(),
+                text: glimpse::io::TextSnapshot::Flat(snapshot.local.into()),
                 without_recovery: false,
             }),
         }

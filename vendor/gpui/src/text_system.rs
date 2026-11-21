@@ -335,11 +335,45 @@ pub struct WindowTextSystem {
     text_system: Arc<TextSystem>,
 }
 
+/// Immutable unwrapped text layouts prepared outside the frame cache.
+pub struct PreparedTextLines {
+    text_system: Arc<TextSystem>,
+    lines: line_layout::PreparedLines,
+}
+
 impl WindowTextSystem {
     pub(crate) fn new(text_system: Arc<TextSystem>) -> Self {
         Self {
             line_layout_cache: LineLayoutCache::new(text_system.platform_text_system.clone()),
             text_system,
+        }
+    }
+
+    /// Make an independent cache for worker shaping without changing frame accounting.
+    pub fn prepare_in_separate_cache(&self) -> Self {
+        Self::new(self.text_system.clone())
+    }
+
+    /// Finish worker preparation and discard any width-specific layouts.
+    pub fn into_prepared_lines(self) -> PreparedTextLines {
+        PreparedTextLines {
+            text_system: self.text_system,
+            lines: self.line_layout_cache.into_prepared_lines(),
+        }
+    }
+
+    /// Keep a bounded set of lines from the most recent frame for a view transition.
+    pub fn retain_recent_lines(&self) -> PreparedTextLines {
+        PreparedTextLines {
+            text_system: self.text_system.clone(),
+            lines: self.line_layout_cache.retain_recent_lines(),
+        }
+    }
+
+    /// Offer exact layouts for frame lookup without marking them as used.
+    pub fn adopt_prepared_lines(&self, prepared: &PreparedTextLines) {
+        if Arc::ptr_eq(&self.text_system, &prepared.text_system) {
+            self.line_layout_cache.adopt_prepared_lines(&prepared.lines);
         }
     }
 

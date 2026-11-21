@@ -1,9 +1,15 @@
 use crate::wake;
-use crate::{document::DiskFile, fileops, storage};
-use gpui_component::input::PreparedInput;
+use crate::{
+    document::{DiskFile, Observation},
+    fileops, storage,
+};
+use gpui_component::{
+    highlighter::HighlightTheme,
+    input::{PreparedInput, Rope},
+};
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -18,14 +24,22 @@ pub enum Job {
     HoldMaintenance(mpsc::Sender<()>, mpsc::Receiver<()>),
     #[cfg(test)]
     HoldRead(mpsc::Sender<()>, mpsc::Receiver<()>),
-    ReadMarkdown(u64, u64, Arc<str>, PathBuf),
+    ReadMarkdown {
+        request: u64,
+        source: Rope,
+        path: PathBuf,
+        theme: Arc<HighlightTheme>,
+        code_canvases: [[u8; 3]; 2],
+        layout: Box<gpui_component::text::MarkdownLayout>,
+        reclaim: Option<fn()>,
+    },
     CompletePath(u64, String, PathBuf),
     Visit(PathBuf),
     RecentLocation(Vec<PathBuf>),
     Volumes,
     External(PathBuf, bool),
-    Create(PathBuf, bool, String),
-    Rename(PathBuf, PathBuf),
+    Create(u64, PathBuf, bool),
+    Rename(u64, PathBuf, PathBuf),
     Trash(PathBuf),
     TrashRecord(PathBuf),
     Prepare(SaveDestination),
@@ -41,14 +55,14 @@ pub enum Job {
     ClearThrough(u64, u64),
     Settings(storage::Settings),
     LoadSettings,
-    Check(u64, PathBuf, u64),
+    Check(u64, DiskFile, u64),
     Finish(u64, u64, u64, DiskFile, Vec<PathBuf>),
     Choose(PathBuf, bool),
     Open(PathBuf, u64, bool),
     Save {
         id: u64,
         disk: DiskFile,
-        text: Arc<str>,
+        text: TextSnapshot,
         generation: u64,
         without_recovery: bool,
     },
@@ -75,13 +89,14 @@ pub struct SaveDestination {
     pub recovery_copy: bool,
 }
 pub enum Reply {
-    Markdown(u64, u64, PathBuf, Result<crate::reading::Prepared, String>),
+    Markdown(u64, Result<Box<crate::reading::Prepared>, String>),
     PathCompleted(u64, String, Result<crate::path_completion::Matches, String>),
     RecentLocation(Option<PathBuf>),
     Volumes(Result<crate::locations::Volumes, String>),
     SettingsLoaded(Result<storage::Settings, String>),
     SettingsSaved(Result<storage::Settings, String>),
-    Changed(Result<(), String>),
+    Trashed(PathBuf, Result<(), String>),
+    NamedChange(u64, PathBuf, Result<(), String>),
     Records(Result<storage::Inventory, String>),
     Finished(u64, u64, u64, DiskFile, Result<(), String>),
     Chosen(PathBuf, Result<(), String>),
@@ -96,10 +111,10 @@ pub enum Reply {
     Done(Result<(), String>),
     Visit(PathBuf, bool),
     SavedTo(Box<SaveDestination>, Result<DiskFile, String>),
-    Checked(u64, u64, Result<(DiskFile, Arc<str>), String>),
+    Checked(u64, u64, Result<Observation, String>),
     CheckDeferred(u64, u64),
     Open(PathBuf, u64, Result<(DiskFile, PreparedInput), String>),
-    Save(u64, u64, Arc<str>, Result<DiskFile, String>),
+    Save(u64, u64, Result<DiskFile, String>),
 }
 
 struct Rebinding {
@@ -109,7 +124,7 @@ struct Rebinding {
     to: DiskFile,
 }
 impl Rebinding {
-    fn apply(&self, draft: &mut storage::Draft) {
+    fn apply(&self, draft: &mut storage::Draft<impl Sized>) {
         if draft.generation > self.generation
             && draft.generation <= self.through.load(Ordering::Acquire)
             && draft.path == self.from.path
@@ -132,15 +147,39 @@ pub struct IoWorker {
     maintenance: Option<mpsc::SyncSender<Job>>,
     pub replies: mpsc::Receiver<Reply>,
     errors: mpsc::Sender<Reply>,
-    drafts: Arc<Mutex<HashMap<u64, storage::Draft>>>,
+    drafts: Arc<Mutex<HashMap<u64, storage::Draft<TextSnapshot>>>>,
     handles: Vec<thread::JoinHandle<()>>,
     clears: Arc<Mutex<HashMap<u64, u64>>>,
     cleared_through: Arc<Mutex<HashMap<u64, u64>>>,
     pending: Arc<AtomicUsize>,
     preview: Arc<AtomicU64>,
+    reading: Arc<AtomicU64>,
     wake: wake::Context,
     rebindings: Arc<Rebindings>,
 }
+
+pub enum TextSnapshot {
+    Flat(Arc<str>),
+    Revision(Rope),
+}
+
+impl serde::Serialize for TextSnapshot {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Flat(text) => serializer.serialize_str(text),
+            Self::Revision(text) => serializer.collect_str(text),
+        }
+    }
+}
+impl storage::RecoveryText for TextSnapshot {
+    fn byte_len(&self) -> usize {
+        match self {
+            Self::Flat(text) => text.len(),
+            Self::Revision(text) => text.len(),
+        }
+    }
+}
+
 struct RecoveryStore {
     root: PathBuf,
     session: Mutex<Option<Arc<storage::Recovery>>>,
@@ -183,8 +222,8 @@ fn tracked(job: &Job) -> bool {
     )
 }
 impl IoWorker {
-    pub fn new(ctx: wake::Context) -> Self {
-        Self::new_in(ctx, storage::data_dir().join("recovery"))
+    pub fn new(ctx: wake::Context, data_dir: &Path) -> Self {
+        Self::new_in(ctx, data_dir.join("recovery"))
     }
     fn new_in(ctx: wake::Context, root: PathBuf) -> Self {
         let (jobs, writes) = mpsc::sync_channel(16);
@@ -192,8 +231,11 @@ impl IoWorker {
         let (maintenance, maintenance_jobs) = mpsc::sync_channel(16);
         let (results, replies) = mpsc::channel();
         let errors = results.clone();
-        let drafts = Arc::new(Mutex::new(HashMap::<u64, storage::Draft>::new()));
+        let drafts = Arc::new(Mutex::new(
+            HashMap::<u64, storage::Draft<TextSnapshot>>::new(),
+        ));
         let preview = Arc::new(AtomicU64::new(0));
+        let reading = Arc::new(AtomicU64::new(0));
         let rebindings = Arc::new(Rebindings::default());
         let recovery_store = Arc::new(RecoveryStore {
             root: root.clone(),
@@ -214,6 +256,7 @@ impl IoWorker {
             let count = pending.clone();
             let root = root.clone();
             let preview = preview.clone();
+            let reading = reading.clone();
             let settings_root = root.parent().unwrap_or(&root).to_owned();
             thread::spawn(move || {
                 let rx = Requests(requests);
@@ -277,7 +320,10 @@ impl IoWorker {
                             .as_ref()
                             .as_ref()
                             .map_err(Clone::clone)
-                            .and_then(|r| r.write(id, &draft))
+                            .and_then(|r| match &draft.text {
+                                TextSnapshot::Flat(_) => r.write(id, &draft),
+                                TextSnapshot::Revision(text) => r.write_revision(id, &draft, text),
+                            })
                             .map_err(|error| format!("Recovery failed: {error}"));
                         crate::metrics::event("recovery-worker-done", id, draft.generation);
                         let _ = results.send(Reply::Recovered(id, draft.generation, result));
@@ -393,17 +439,65 @@ impl IoWorker {
                             crate::metrics::event("finish-worker-done", id, generation);
                             Reply::Finished(id, generation, attempt, disk, result)
                         }
-                        Job::ReadMarkdown(id, generation, source, path) => Reply::Markdown(
-                            id,
-                            generation,
-                            path.clone(),
-                            Ok(crate::reading::prepare(source, &path)),
-                        ),
-                        Job::Check(id, path, generation) => {
+                        Job::ReadMarkdown {
+                            request,
+                            source,
+                            path,
+                            theme,
+                            code_canvases,
+                            layout,
+                            reclaim,
+                        } => {
+                            if reading.load(Ordering::Relaxed) != request {
+                                continue;
+                            }
+                            #[cfg(feature = "test-support")]
+                            {
+                                crate::metrics::event("reading-request-held", request, 0);
+                                crate::metrics::delay("READ_MARKDOWN");
+                                if reading.load(Ordering::Relaxed) != request {
+                                    crate::metrics::event("reading-request-cancelled", request, 0);
+                                    continue;
+                                }
+                            }
+                            if let Some(reclaim) = reclaim {
+                                let _work =
+                                    gpui::work_trace::Span::new("reading_source_memory_release");
+                                reclaim();
+                            }
+                            let mut prepared = match source.shared_str() {
+                                Some(text) => crate::reading::prepare(text.clone(), &path, &theme),
+                                None => {
+                                    crate::reading::prepare(String::from(source), &path, &theme)
+                                }
+                            };
+                            if reading.load(Ordering::Relaxed) != request {
+                                continue;
+                            }
+                            prepared.markdown.map_code_colors(|color| {
+                                let color = color.to_rgb();
+                                let channels = [color.r, color.g, color.b]
+                                    .map(|channel| (channel * 255.).round() as u8);
+                                let [red, green, blue] =
+                                    crate::syntax::readable_rgb(channels, &code_canvases);
+                                gpui::rgb(u32::from_be_bytes([0, red, green, blue])).into()
+                            });
+                            layout.prepare(&mut prepared.markdown);
+                            if reading.load(Ordering::Relaxed) != request {
+                                continue;
+                            }
+                            if let Some(reclaim) = reclaim {
+                                let _work =
+                                    gpui::work_trace::Span::new("reading_prepare_memory_release");
+                                reclaim();
+                            }
+                            Reply::Markdown(request, Ok(Box::new(prepared)))
+                        }
+                        Job::Check(id, disk, generation) => {
                             crate::metrics::event("check-worker", id, generation);
                             #[cfg(feature = "test-support")]
                             crate::metrics::delay("CHECK");
-                            let result = DiskFile::open(path);
+                            let result = disk.observe();
                             crate::metrics::event("check-worker-done", id, generation);
                             Reply::Checked(id, generation, result)
                         }
@@ -438,24 +532,23 @@ impl IoWorker {
                                 .as_ref()
                                 .map_or(Ok(()), |r| r.saved(id, generation)),
                         ),
-                        Job::Create(path, folder, text) => {
-                            Reply::Changed(fileops::create(&path, folder, &text))
+                        Job::Create(ticket, path, folder) => {
+                            let result = fileops::create(&path, folder, "");
+                            Reply::NamedChange(ticket, path, result)
                         }
-                        Job::Rename(from, to) => Reply::Changed(fileops::rename(&from, &to)),
+                        Job::Rename(ticket, from, to) => {
+                            let result = fileops::rename(&from, &to);
+                            Reply::NamedChange(ticket, to, result)
+                        }
                         Job::TrashRecord(path) => {
                             Reply::RecordTrashed(storage::trash_record(&path))
                         }
-                        Job::Trash(path) => Reply::Changed(fileops::trash(&path)),
+                        Job::Trash(path) => {
+                            let result = fileops::trash(&path);
+                            Reply::Trashed(path, result)
+                        }
                         Job::Prepare(destination) => {
-                            let result = match std::fs::symlink_metadata(&destination.path) {
-                                Ok(_) => {
-                                    DiskFile::open(destination.path.clone()).map(|v| Some(v.0))
-                                }
-                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                                    Ok(None)
-                                }
-                                Err(error) => Err(error.to_string()),
-                            };
+                            let result = DiskFile::prepare_destination(destination.path.clone());
                             Reply::Prepared(Box::new(destination), result)
                         }
                         Job::SaveTo(destination) => {
@@ -505,14 +598,17 @@ impl IoWorker {
                         {
                             Reply::OpenDirectory(path, token)
                         }
-                        Job::Open(path, token, transient) => Reply::Open(
-                            path.clone(),
-                            token,
-                            DiskFile::open_cancellable(path, &|| {
+                        Job::Open(path, token, transient) => {
+                            let _work = gpui::work_trace::Span::new("open_document_worker");
+                            let result = DiskFile::open_cancellable(path.clone(), &|| {
                                 transient && preview.load(Ordering::Relaxed) != token
                             })
-                            .map(|(disk, text)| (disk, PreparedInput::new(text))),
-                        ),
+                            .map(|(disk, text)| {
+                                let input = PreparedInput::new(text);
+                                (disk.share_revision(input.text_revision().clone()), input)
+                            });
+                            Reply::Open(path, token, result)
+                        }
                         Job::Reload(reload) => {
                             crate::metrics::event("reload-worker", reload.id, reload.generation);
                             #[cfg(feature = "test-support")]
@@ -543,8 +639,12 @@ impl IoWorker {
                             crate::metrics::event("save-worker", id, generation);
                             #[cfg(feature = "test-support")]
                             crate::metrics::delay("SAVE");
+                            let save = || match &text {
+                                TextSnapshot::Flat(text) => disk.save_snapshot(text.clone()),
+                                TextSnapshot::Revision(text) => disk.save_revision(text.clone()),
+                            };
                             let result = if without_recovery {
-                                disk.save_snapshot(text.clone())
+                                save()
                             } else {
                                 recovery
                                     .as_ref()
@@ -556,7 +656,7 @@ impl IoWorker {
                                                 id,
                                                 &storage::Draft {
                                                     path: disk.path.clone(),
-                                                    text: text.clone(),
+                                                    text: &text,
                                                     base: disk.bytes.clone(),
                                                     target: Some(disk.target.clone()),
                                                     generation,
@@ -565,7 +665,7 @@ impl IoWorker {
                                             .map_err(|e| format!("Recovery unavailable: {e}"))?;
                                         let _ =
                                             results.send(Reply::Recovered(id, generation, Ok(())));
-                                        let saved = disk.save_snapshot(text.clone())?;
+                                        let saved = save()?;
                                         if let Err(error) = r.saved(id, generation) {
                                             let _ = results.send(Reply::HistoryWarning(format!(
                                                 "Saved {}. Recovery maintenance failed: {error}",
@@ -597,7 +697,7 @@ impl IoWorker {
                                 )
                             });
                             crate::metrics::event("save-worker-done", id, generation);
-                            Reply::Save(id, generation, text, result)
+                            Reply::Save(id, generation, result)
                         }
                     };
                     if was_tracked {
@@ -630,6 +730,7 @@ impl IoWorker {
             cleared_through,
             pending,
             preview,
+            reading,
             wake: ctx,
             rebindings,
         }
@@ -639,6 +740,9 @@ impl IoWorker {
     }
     pub fn cancel_previews(&self, token: u64) {
         self.preview.store(token, Ordering::Relaxed);
+    }
+    pub fn cancel_reading(&self) {
+        self.reading.store(0, Ordering::Relaxed);
     }
     pub fn send(&self, job: Job) {
         if let Job::BindingApplied(id, saved, adopted) = &job
@@ -656,6 +760,9 @@ impl IoWorker {
         }
         if let Job::Open(_, token, _) = &job {
             self.preview.store(*token, Ordering::Relaxed);
+        }
+        if let Job::ReadMarkdown { request, .. } = &job {
+            self.reading.store(*request, Ordering::Relaxed);
         }
         let clearing = match &job {
             Job::ClearThrough(id, generation) => Some((*id, *generation)),
@@ -691,27 +798,7 @@ impl IoWorker {
             return;
         }
         let job = if let Job::Recover(id, draft) = job {
-            if self
-                .cleared_through
-                .lock()
-                .unwrap()
-                .get(&id)
-                .is_some_and(|g| *g >= draft.generation)
-            {
-                return;
-            }
-            let generation = draft.generation;
-            self.drafts.lock().unwrap().insert(id, draft);
-            if let Some(tx) = &self.maintenance
-                && let Err(mpsc::TrySendError::Disconnected(_)) = tx.try_send(Job::Wake)
-            {
-                let _ = self.errors.send(Reply::Recovered(
-                    id,
-                    generation,
-                    Err("Recovery service stopped; local text remains in memory".into()),
-                ));
-                self.wake.request_repaint();
-            }
+            self.queue_recovery(id, draft.map_text(TextSnapshot::Flat));
             return;
         } else {
             job
@@ -722,7 +809,7 @@ impl IoWorker {
             #[cfg(test)]
             Job::HoldMaintenance(..) => &self.maintenance,
             Job::Volumes
-            | Job::ReadMarkdown(..)
+            | Job::ReadMarkdown { .. }
             | Job::CompletePath(..)
             | Job::Open(..)
             | Job::Choose(..)
@@ -759,21 +846,14 @@ impl IoWorker {
                 let reply = match job {
                     Job::Check(id, _, token) if full => Reply::CheckDeferred(id, token),
                     Job::Check(id, _, token) => Reply::Checked(id, token, Err(message)),
-                    Job::ReadMarkdown(id, generation, _, path) => {
-                        Reply::Markdown(id, generation, path, Err(message))
-                    }
+                    Job::ReadMarkdown { request, .. } => Reply::Markdown(request, Err(message)),
                     Job::CompletePath(token, value, _) => {
                         Reply::PathCompleted(token, value, Err(message))
                     }
                     Job::RecentLocation(_) => Reply::RecentLocation(None),
                     Job::Volumes => Reply::Volumes(Err(message)),
                     Job::Settings(_) => Reply::SettingsSaved(Err(message)),
-                    Job::Save {
-                        id,
-                        generation,
-                        text,
-                        ..
-                    } => Reply::Save(id, generation, text, Err(message)),
+                    Job::Save { id, generation, .. } => Reply::Save(id, generation, Err(message)),
                     Job::SaveTo(d) | Job::Prepare(d) => Reply::SavedTo(Box::new(d), Err(message)),
                     Job::Choose(path, _) => Reply::Chosen(path, Err(message)),
                     Job::Finish(id, generation, attempt, disk, _) => {
@@ -783,7 +863,11 @@ impl IoWorker {
                     Job::Import(id, _)
                     | Job::RestoreHistory(id, _)
                     | Job::RestoreObserved(id, _) => Reply::Imported(id, Err(message)),
+                    Job::Create(ticket, path, _) | Job::Rename(ticket, _, path) => {
+                        Reply::NamedChange(ticket, path, Err(message))
+                    }
                     Job::TrashRecord(_) => Reply::RecordTrashed(Err(message)),
+                    Job::Trash(path) => Reply::Trashed(path, Err(message)),
                     Job::Reload(reload) => Reply::Reloaded(reload, Err(message)),
                     Job::BindingApplied(..) => Reply::Done(Ok(())),
                     _ => Reply::Done(Err(message)),
@@ -791,6 +875,34 @@ impl IoWorker {
                 let _ = self.errors.send(reply);
                 self.wake.request_repaint();
             }
+        }
+    }
+
+    pub fn recover_edit(&self, id: u64, draft: storage::Draft<Rope>) {
+        self.queue_recovery(id, draft.map_text(TextSnapshot::Revision));
+    }
+
+    fn queue_recovery(&self, id: u64, draft: storage::Draft<TextSnapshot>) {
+        if self
+            .cleared_through
+            .lock()
+            .unwrap()
+            .get(&id)
+            .is_some_and(|generation| *generation >= draft.generation)
+        {
+            return;
+        }
+        let generation = draft.generation;
+        self.drafts.lock().unwrap().insert(id, draft);
+        if let Some(tx) = &self.maintenance
+            && let Err(mpsc::TrySendError::Disconnected(_)) = tx.try_send(Job::Wake)
+        {
+            let _ = self.errors.send(Reply::Recovered(
+                id,
+                generation,
+                Err("Recovery service stopped; local text remains in memory".into()),
+            ));
+            self.wake.request_repaint();
         }
     }
 }
@@ -832,7 +944,7 @@ fn reload_document(
             &storage::Draft {
                 path: reload.original.path.clone(),
                 target: Some(reload.original.target.clone()),
-                text: reload.local.clone().into(),
+                text: reload.local.as_str(),
                 base: reload.original.bytes.clone(),
                 generation: reload.generation,
             },
@@ -881,7 +993,7 @@ fn save_destination(
         let r = recovery
             .as_ref()
             .map_err(|e| format!("Recovery unavailable: {e}"))?;
-        let draft = storage::Draft {
+        let draft: storage::Draft = storage::Draft {
             path: destination.original.path.clone(),
             text: destination.text.clone().into(),
             base: destination.original.bytes.clone(),
@@ -895,7 +1007,7 @@ fn save_destination(
                 destination.id,
                 &storage::Draft {
                     path: destination.path.clone(),
-                    text: destination.text.clone().into(),
+                    text: destination.text.as_str(),
                     base: destination
                         .expected
                         .as_ref()
@@ -958,6 +1070,17 @@ impl Drop for IoWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_editor_recovery_preserves_the_wire_text() {
+        let text = "\u{feff}café 👩‍👩‍👧‍👦 \"quoted\" \\ path\r\nline\rthird\n".repeat(450);
+        let revision = Rope::from(text.as_str());
+        assert!(revision.chunks().count() > 1);
+        assert_eq!(
+            serde_json::to_vec(&TextSnapshot::Revision(revision)).unwrap(),
+            serde_json::to_vec(&text).unwrap()
+        );
+    }
     #[test]
     fn recovery_copies_are_new_files_and_never_replace_or_rebind() {
         let root = tempfile::tempdir().unwrap();
@@ -1038,7 +1161,7 @@ mod tests {
         io.send(Job::Save {
             id: 7,
             disk: disk.clone(),
-            text: "saved snapshot\n".into(),
+            text: TextSnapshot::Revision(Rope::from("saved snapshot\n")),
             generation: 8,
             without_recovery: false,
         });
@@ -1048,8 +1171,8 @@ mod tests {
                 .recv_timeout(std::time::Duration::from_secs(5))
                 .unwrap()
             {
-                Reply::Save(7, 8, _, Ok(_)) => break,
-                Reply::Save(_, _, _, Err(error)) => panic!("{error}"),
+                Reply::Save(7, 8, Ok(_)) => break,
+                Reply::Save(_, _, Err(error)) => panic!("{error}"),
                 _ => {}
             }
         }
@@ -1164,7 +1287,7 @@ mod tests {
             disk,
             text,
         };
-        let draft = |generation, text: &str| storage::Draft {
+        let draft = |generation, text: &str| storage::Draft::<Arc<str>> {
             path: path.clone(),
             text: text.into(),
             base: reload.original.bytes.clone(),
@@ -1556,6 +1679,8 @@ mod tests {
     fn full_read_queue_returns_a_typed_deferred_check_without_losing_queued_reads() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("source.txt");
+        std::fs::write(&path, "original bytes").unwrap();
+        let (disk, _) = DiskFile::open(path.clone()).unwrap();
         std::fs::write(&path, "disk bytes").unwrap();
         let io = IoWorker::new_in(wake::Context::default(), root.path().join("recovery"));
         let (entered, seen) = mpsc::channel();
@@ -1570,9 +1695,9 @@ mod tests {
                 .unwrap();
         }
         for id in 0..32 {
-            io.send(Job::Check(id, path.clone(), id));
+            io.send(Job::Check(id, disk.clone(), id));
         }
-        io.send(Job::Check(99, path, 500));
+        io.send(Job::Check(99, disk, 500));
         assert!(matches!(
             io.replies
                 .recv_timeout(std::time::Duration::from_secs(2))
@@ -1590,7 +1715,10 @@ mod tests {
                 panic!("Expected checked file");
             };
             assert_eq!(id, token);
-            assert_eq!(result.unwrap().1.as_ref(), "disk bytes");
+            let Observation::Changed(_, text) = result.unwrap() else {
+                panic!("Expected changed bytes");
+            };
+            assert_eq!(text.as_ref(), "disk bytes");
             completed.insert(id);
         }
         assert_eq!(completed.len(), 32);

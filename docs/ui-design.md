@@ -66,28 +66,33 @@ Default to System appearance with explicit Light and Dark choices. Every surface
 
 | Role | Light | Dark | Use |
 | --- | --- | --- | --- |
-| Canvas | `#FFFFFF` | `#15181E` | Source and reading surface |
-| Chrome | `#F2F4F7` | `#1D2027` | Toolbar, tabs and status |
-| Sidebar | `#F1F6FA` | `#1C2027` | Navigator |
-| Raised | `#FFFFFF` | `#252A33` | Controls and dialogs |
-| Faint | `#E6E8EC` | `#343B45` | Code blocks and quiet groups |
-| Text | `#17213A` | `#F1F3F5` | Primary content |
-| Secondary | `#647085` | `#B5BEC9` | Paths, metadata and hints |
-| Separator | `#E1E6ED` | `#343B45` | Decorative region boundaries |
-| Control border | `#CBD3DF` | `#8B96A5` | Necessary control boundaries |
-| Hover | `#E1E7EE` | `#39424F` | Pointer feedback |
-| Selection | `#DCEBFC` | `#243E60` | Active selection, normal text |
-| Inactive selection | `#E5EBF2` | `#3A424D` | Selection outside the focused pane |
-| Accent | `#007AFF` | `#409CFF` | Focus, links and modified indicator |
-| Warning | `#805600` | `#EBC378` | Partial coverage, recovery concerns |
-| Error | `#B42332` | `#FF9EAA` | Failed actions and conflicts |
-| Success | `#256B3D` | `#89D6A3` | Confirmed successful outcomes |
+| Canvas | `#FFFFFF` | `#0A0A0A` | Source and reading surface |
+| Chrome | `#F6F6F7` | `#111111` | Toolbar, path bar, tabs, search panel and status |
+| Sidebar | `#F6F6F7` | `#111111` | Navigator |
+| Raised | `#FFFFFF` | `#171717` | Menus, popovers and dialogs |
+| Faint | `#EDEDEF` | `#1F1F1F` | Secondary button fill, code blocks and quiet groups |
+| Text | `#27272A` | `#F5F5F5` | Primary content |
+| Secondary | `#5C5C65` | `#9C9C9C` | Paths, metadata, hints and resting toolbar labels |
+| Separator | `#E4E4E7` | `#1F1F1F` | Decorative region boundaries |
+| Border | `#E4E4E7` | `#2A2A2A` | Outlines of menus, popovers and dialogs |
+| Control border | `#8B8B94` | `#6B6B6B` | Necessary control boundaries such as text fields |
+| Hover | `#E4E4E7` | `#262626` | Pointer feedback |
+| Pressed | `#D4D4D8` | `#323232` | Pressed buttons |
+| Selection | `#E2E8F8` | `#1A2747` | Active selection, normal text |
+| Inactive selection | `#E9E9EC` | `#232323` | Selection outside the focused pane |
+| Accent | `#1D4ED8` | `#6B98FF` | Focus, links and modified indicator |
+| Action fill | `#1D4ED8` | `#2F63E6` | Primary button behind white text |
+| Warning | `#9A5800` | `#F5A524` | Partial coverage, recovery concerns |
+| Error | `#C81E2B` | `#FF5C63` | Failed actions and conflicts |
+| Success | `#0F7A55` | `#34D399` | Confirmed successful outcomes |
+
+The palette follows T3 Code's neutral design language: near-white and near-black surfaces without a colour cast, one blue accent, hairline separators, and depth from soft shadows on floating surfaces rather than outlines on resting controls.
 
 Ordinary text must meet 4.5:1 contrast against its rendered background; necessary control boundaries and focus indicators target at least 3:1. Decorative separators are not sufficient control boundaries. Verify actual compositing, disabled controls, syntax colors and custom themes separately; palette calculations alone do not qualify accessibility. Keep secondary text readable instead of fading essential information.
 
 Keep resting chrome quiet. Use grouping, fill and spacing to establish controls; draw an outline where a boundary is needed, rather than boxing every action. Strong keyboard focus remains explicit. Material highlights and translucency must not weaken text or focus contrast.
 
-Selection is a tinted fill; keyboard focus adds a 2-point accent outline. Focus remains visible on selected items and in every theme. Inactive selection retains its shape and normal text with a neutral fill. A modified tab adds a dot and an accessible “Modified” state. A conflict uses an explicit label and actionable notice. Hover, activation, modification and conflict must never collapse into the same signal. Colored text always has a label, shape or other non-color equivalent.
+Selection is a rounded tinted fill with a leading marker that is accent-coloured while its list has keyboard focus and secondary-coloured otherwise. The active tab carries the same signal on its top edge for the document area. Buttons, fields and tabs show a 2-point accent ring drawn inside their own edges when focused, so no container clips it; filled buttons keep a separate ring outside the fill. Focus remains visible on selected items and in every theme. Inactive selection retains its shape and normal text with a neutral fill. A modified tab adds a dot and an accessible “Modified” state. A conflict uses an explicit label and actionable notice. Hover, activation, modification and conflict must never collapse into the same signal. Colored text always has a label, shape or other non-color equivalent.
 
 Use a crafted, consistent symbol family with optically balanced strokes, sizes and baseline alignment. Start with 16-point file/folder symbols and disclosure chevrons with separate hit targets. Use platform symbols where supported and permitted, or carefully drawn bundled equivalents. Avoid emoji substitutes, ornamental badges, and icons that require filesystem inspection to paint. Tooltips explain a control and its shortcut; they do not substitute for accessible names.
 
@@ -95,11 +100,11 @@ Use a crafted, consistent symbol family with optically balanced strokes, sizes a
 
 Display one directory list at a stable width. Entering a folder replaces that list; opening a file leaves it visible beside the editor. Back/Forward and horizontal gestures share directory history. One gesture emits one step regardless of speed, travel or momentum. Retain per-folder selection and vertical scrolling. Respect Reduce motion and keep vertical scrolling independent.
 
-Toolbar controls share one fixed-height centered row. Breadcrumb names navigate immediately; unused path-bar space and Command-L enter a path. Keep favorites in a compact menu. Anchor search results to the search field without replacing the navigator or document. Command-F opens a small floating panel with optional Replace; Escape returns to editing. Source text and gutter labels share actual layout baselines, and tab stops derive from font metrics and indentation settings.
+Toolbar controls share a centered row where space permits. A short window with one pane shows the path bar in Browse and makes the document area available for Source or Reading. Command-L opens inline path entry in either pane. The path bar keeps the current folder visible and offers a scrollable menu for ancestors that do not fit. Visible breadcrumbs navigate directly, and unused path-bar space opens path entry. In this layout, Reading keeps Edit Source beside the tabs and groups Links and image actions together. Keep favorites in a compact menu. Anchor search results to the search field without replacing the navigator or document. Command-F opens Find above Source. The query and Close share a row, options wrap with the pane width, and a short window places secondary options in a menu. Replace has its own input. Resizing preserves the query and replacement fields. Escape returns to editing. Source text and gutter labels share actual layout baselines, and tab stops derive from font metrics and indentation settings.
 
 Show the location basename prominently and make the full native path available through path entry, copy and disclosure. Truncate names only for display; preserve extensions and sufficient parent context for disambiguation. Long names, unusual paths and symlink indicators must not push actions offscreen. Never derive path identity from display text.
 
-Tabs form one continuous strip. Each tab groups its file label, state and close control; the close button has a filename-specific accessible name. Active tabs visually connect to the document canvas. A preview uses italic text and an accessible Preview state, while editing pins it immediately. Modified tabs retain a dot independently of hover. Duplicate basenames include parent context. Overflow scrolls and keeps the active tab reachable; it does not shrink labels to illegibility. Tab switching preserves selection, caret, scroll and undo.
+Tabs form one continuous strip. Each tab groups its file label, state and close control; the close button has a filename-specific accessible name. Active tabs visually connect to the document canvas. A preview uses italic text and an accessible Preview state, while editing pins it immediately. Modified tabs retain a dot independently of hover. Duplicate basenames include parent context. Overflow shows whole tabs around the active one, and the Documents control counts the tabs that do not fit; it does not shrink labels to illegibility. Tab switching preserves selection, caret, scroll and undo.
 
 Keep a predictable keyboard path among navigation controls, directory list, tabs and editor. Arrow keys move within composite controls; Tab moves between controls. Custom-painted rows still need semantic selection and focus. Return activates; Escape cancels a transient operation and restores the invoker's focus. A dialog contains keyboard focus, and cancelling it returns focus without changing the document. Do not interpret an unrelated toolbar click as editor focus or interfere with IME composition.
 

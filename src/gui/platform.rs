@@ -28,11 +28,45 @@ pub fn shortcut(expected: &commands::Modifiers, actual: &Modifiers) -> bool {
 }
 
 pub fn shortcut_label(value: &str) -> String {
+    let keys = value
+        .split('+')
+        .map(|key| match key {
+            "ArrowLeft" => "Left",
+            "ArrowRight" => "Right",
+            "ArrowUp" => "Up",
+            "ArrowDown" => "Down",
+            "PageUp" => "Page Up",
+            "PageDown" => "Page Down",
+            "Comma" => ",",
+            other => other,
+        })
+        .collect::<Vec<_>>()
+        .join("+");
     if cfg!(target_os = "macos") {
-        value.replace("Cmd", "⌘").replace("Alt", "Option")
+        keys.replace("Cmd", "⌘").replace("Alt", "Option")
     } else {
-        value.replace("Cmd", "Ctrl")
+        keys.replace("Cmd", "Ctrl")
     }
+}
+
+pub fn portable_shortcut(value: &str) -> String {
+    value
+        .split('+')
+        .map(|part| match part.trim() {
+            "Ctrl" if !cfg!(target_os = "macos") => "Cmd",
+            "⌘" => "Cmd",
+            "Option" => "Alt",
+            "Left" => "ArrowLeft",
+            "Right" => "ArrowRight",
+            "Up" => "ArrowUp",
+            "Down" => "ArrowDown",
+            "Page Up" => "PageUp",
+            "Page Down" => "PageDown",
+            "," => "Comma",
+            other => other,
+        })
+        .collect::<Vec<_>>()
+        .join("+")
 }
 
 #[cfg(target_os = "macos")]
@@ -50,12 +84,16 @@ pub const MONOSPACE_FAMILIES: &[&str] = &[
 
 pub(super) fn configure_allocations() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    for (option, variable) in [
-        (libc::M_MMAP_THRESHOLD, "MALLOC_MMAP_THRESHOLD_"),
-        (libc::M_TRIM_THRESHOLD, "MALLOC_TRIM_THRESHOLD_"),
+    for (option, variable, bytes) in [
+        (libc::M_MMAP_THRESHOLD, "MALLOC_MMAP_THRESHOLD_", 512 * 1024),
+        (
+            libc::M_TRIM_THRESHOLD,
+            "MALLOC_TRIM_THRESHOLD_",
+            1024 * 1024,
+        ),
     ] {
         if std::env::var_os(variable).is_none() {
-            unsafe { libc::mallopt(option, 1024 * 1024) };
+            unsafe { libc::mallopt(option, bytes) };
         }
     }
 }

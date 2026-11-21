@@ -45,6 +45,9 @@ features = ["macros"]
 [dependencies.serde]
 version = "1.0"
 
+[dependencies.unicode-segmentation]
+version = "1.12"
+
 [dependencies.zvariant]
 version = "5.15"
 default-features = false

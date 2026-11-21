@@ -817,6 +817,8 @@ enum Flag {
     IsGrammarError,
     IsSearchMatch,
     IsSuggestion,
+    TextRunContinuesBefore,
+    TextRunContinuesAfter,
 }
 
 impl Flag {
@@ -852,19 +854,39 @@ pub struct TextDecoration {
 // The following is based on the technique described here:
 // https://viruta.org/reducing-memory-consumption-in-librsvg-2.html
 
+#[derive(Clone, Debug)]
+struct SharedValue {
+    text: Arc<str>,
+    range: core::ops::Range<u32>,
+}
+
+impl SharedValue {
+    fn as_str(&self) -> &str {
+        &self.text[self.range.start as usize..self.range.end as usize]
+    }
+}
+
+impl PartialEq for SharedValue {
+    fn eq(&self, other: &Self) -> bool {
+        (Arc::ptr_eq(&self.text, &other.text) && self.range == other.range)
+            || self.as_str() == other.as_str()
+    }
+}
+
 #[derive(Debug, PartialEq)]
 enum PropertyValue {
     None,
     NodeIdVec(Vec<NodeId>),
     NodeId(NodeId),
     String(String),
+    SharedValue(SharedValue),
     F64(f64),
     F32(f32),
     Usize(usize),
     Color(Color),
     TextDecoration(TextDecoration),
-    LengthVec(Vec<u8>),
-    WordIndexVec(Vec<u16>),
+    LengthVec(Arc<Vec<u8>>),
+    WordIndexVec(Arc<Vec<u16>>),
     CoordVec(Vec<f32>),
     Bool(bool),
     Invalid(Invalid),
@@ -1006,9 +1028,20 @@ enum PropertyId {
     CustomActions,
     TreeId,
     WideWordStarts,
+    HardLineStarts,
+
+    TextContentRoot,
 
     // This MUST be last.
     Unset,
+}
+
+fn clone_shared_values<T: Clone>(destination: &mut Arc<Vec<T>>, source: &Arc<Vec<T>>) {
+    if let Some(values) = Arc::get_mut(destination) {
+        values.clone_from(source);
+    } else {
+        destination.clone_from(source);
+    }
 }
 
 impl Clone for PropertyValue {
@@ -1018,6 +1051,7 @@ impl Clone for PropertyValue {
             Self::NodeIdVec(v) => Self::NodeIdVec(v.clone()),
             Self::NodeId(v) => Self::NodeId(*v),
             Self::String(v) => Self::String(v.clone()),
+            Self::SharedValue(v) => Self::SharedValue(v.clone()),
             Self::F64(v) => Self::F64(*v),
             Self::F32(v) => Self::F32(*v),
             Self::Usize(v) => Self::Usize(*v),
@@ -1051,8 +1085,11 @@ impl Clone for PropertyValue {
         match (self, source) {
             (Self::NodeIdVec(dest), Self::NodeIdVec(source)) => dest.clone_from(source),
             (Self::String(dest), Self::String(source)) => dest.clone_from(source),
-            (Self::LengthVec(dest), Self::LengthVec(source)) => dest.clone_from(source),
-            (Self::WordIndexVec(dest), Self::WordIndexVec(source)) => dest.clone_from(source),
+            (Self::SharedValue(dest), Self::SharedValue(source)) => dest.clone_from(source),
+            (Self::LengthVec(dest), Self::LengthVec(source)) => clone_shared_values(dest, source),
+            (Self::WordIndexVec(dest), Self::WordIndexVec(source)) => {
+                clone_shared_values(dest, source)
+            }
             (Self::CoordVec(dest), Self::CoordVec(source)) => dest.clone_from(source),
             (Self::CustomActionVec(dest), Self::CustomActionVec(source)) => dest.clone_from(source),
             (Self::Affine(dest), Self::Affine(source)) => dest.clone_from(source),
@@ -1144,7 +1181,15 @@ impl PartialEq for Properties {
             if matches!(value, PropertyValue::None) {
                 continue;
             }
-            if value != value_at(&other.values, other.indices.index(id)) {
+            let other = value_at(&other.values, other.indices.index(id));
+            let equal = match (value, other) {
+                (PropertyValue::String(text), PropertyValue::SharedValue(shared))
+                | (PropertyValue::SharedValue(shared), PropertyValue::String(text)) => {
+                    text == shared.as_str()
+                }
+                _ => value == other,
+            };
+            if !equal {
                 return false;
             }
             matched += 1;
@@ -2073,14 +2118,54 @@ flag_methods! {
     /// Whether this node represents text matching the current search.
     (IsSearchMatch, is_search_match, set_is_search_match, clear_is_search_match),
     /// Whether this node's text is a suggested replacement.
-    (IsSuggestion, is_suggestion, set_is_suggestion, clear_is_suggestion)
+    (IsSuggestion, is_suggestion, set_is_suggestion, clear_is_suggestion),
+    /// This text run starts on the same line as the immediately preceding
+    /// sibling text run. An explicit previous-on-line link takes precedence.
+    (TextRunContinuesBefore, text_run_continues_before, set_text_run_continues_before, clear_text_run_continues_before),
+    /// This text run ends on the same line as the immediately following
+    /// sibling text run. An explicit next-on-line link takes precedence.
+    (TextRunContinuesAfter, text_run_continues_after, set_text_run_continues_after, clear_text_run_continues_after)
 }
 
 option_ref_type_getters! {
     (get_affine_property, Affine, Affine),
-    (get_string_property, str, String),
     (get_coord_vec_property, [f32], CoordVec),
     (get_text_selection_property, TextSelection, TextSelection)
+}
+
+impl PropertyIndices {
+    fn get_string_property<'a>(
+        &self,
+        values: &'a [PropertyValue],
+        id: PropertyId,
+    ) -> Option<&'a str> {
+        match self.get(values, id) {
+            PropertyValue::String(value) => Some(value),
+            PropertyValue::SharedValue(value) => Some(value.as_str()),
+            _ => None,
+        }
+    }
+}
+
+impl Node {
+    /// Use a UTF-8 byte range in shared text as the value. An invalid range leaves the value unchanged.
+    pub fn set_shared_value(&mut self, text: Arc<str>, range: core::ops::Range<usize>) -> bool {
+        let Some(value) = text.get(range.clone()) else {
+            return false;
+        };
+        let (Ok(start), Ok(end)) = (u32::try_from(range.start), u32::try_from(range.end)) else {
+            self.set_value(value);
+            return true;
+        };
+        Arc::make_mut(&mut self.properties).set(
+            PropertyId::Value,
+            PropertyValue::SharedValue(SharedValue {
+                text,
+                range: start..end,
+            }),
+        );
+        true
+    }
 }
 
 slice_type_getters! {
@@ -2103,10 +2188,20 @@ copy_type_getters! {
 owned_type_setters! {
     (set_affine_property, Box<Affine>, Affine),
     (set_string_property, String, String),
-    (set_length_vec_property, Vec<u8>, LengthVec),
-    (set_word_index_vec_property, Vec<u16>, WordIndexVec),
     (set_coord_vec_property, Vec<f32>, CoordVec),
     (set_text_selection_property, Box<TextSelection>, TextSelection)
+}
+
+impl Node {
+    fn set_length_vec_property(&mut self, id: PropertyId, value: impl Into<Vec<u8>>) {
+        let value = PropertyValue::LengthVec(Arc::new(value.into()));
+        Arc::make_mut(&mut self.properties).set(id, value);
+    }
+
+    fn set_word_index_vec_property(&mut self, id: PropertyId, value: impl Into<Vec<u16>>) {
+        let value = PropertyValue::WordIndexVec(Arc::new(value.into()));
+        Arc::make_mut(&mut self.properties).set(id, value);
+    }
 }
 
 copy_type_setters! {
@@ -2195,7 +2290,9 @@ node_id_property_methods! {
     /// [`Node::next_on_line`] should point back to this node.
     (PreviousOnLine, previous_on_line, set_previous_on_line, clear_previous_on_line),
     /// The node for which this node is a popup.
-    (PopupFor, popup_for, set_popup_for, clear_popup_for)
+    (PopupFor, popup_for, set_popup_for, clear_popup_for),
+    /// A child whose text runs define the text range independently of other descendants.
+    (TextContentRoot, text_content_root, set_text_content_root, clear_text_content_root)
 }
 
 string_property_methods! {
@@ -2497,7 +2594,14 @@ length_vec_property_methods! {
 property_methods! {
     /// Word boundaries for a run with more than 255 characters.
     /// A nonempty wide list takes precedence over [`Node::word_starts`].
-    (WideWordStarts, wide_word_starts, get_word_index_vec_property, &[u16], set_wide_word_starts, set_word_index_vec_property, impl Into<Vec<u16>>, clear_wide_word_starts)
+    (WideWordStarts, wide_word_starts, get_word_index_vec_property, &[u16], set_wide_word_starts, set_word_index_vec_property, impl Into<Vec<u16>>, clear_wide_word_starts),
+
+    /// Hard line starts inside a text run, expressed as sorted, distinct
+    /// nonzero indices into [`Node::character_lengths`]. Each index follows a
+    /// newline and precedes at least one character in this run. The first and
+    /// last lines use the ordinary adjacent-run links if they span runs.
+    /// Include these indices in the word starts when providing word navigation.
+    (HardLineStarts, hard_line_starts, get_word_index_vec_property, &[u16], set_hard_line_starts, set_word_index_vec_property, impl Into<Vec<u16>>, clear_hard_line_starts)
 }
 
 coord_vec_property_methods! {
@@ -2895,6 +2999,9 @@ impl fmt::Debug for Node {
         if !self.wide_word_starts().is_empty() {
             fmt.field("wide_word_starts", &self.wide_word_starts());
         }
+        if !self.hard_line_starts().is_empty() {
+            fmt.field("hard_line_starts", &self.hard_line_starts());
+        }
         self.debug_coord_vec_properties(&mut fmt);
         self.debug_bool_properties(&mut fmt);
         self.debug_unique_enum_properties(&mut fmt);
@@ -2914,6 +3021,9 @@ macro_rules! serialize_property {
     ($self:ident, $map:ident, $index:ident, $id:ident, { $($variant:ident),+ }) => {
         match &$self.values[$index as usize] {
             PropertyValue::None => (),
+            PropertyValue::SharedValue(value) => {
+                $map.serialize_entry(&$id, value.as_str())?;
+            }
             $(PropertyValue::$variant(value) => {
                 $map.serialize_entry(&$id, &value)?;
             })*
@@ -3027,7 +3137,8 @@ impl<'de> Visitor<'de> for PropertiesVisitor {
                     MemberOf,
                     NextOnLine,
                     PreviousOnLine,
-                    PopupFor
+                    PopupFor,
+                    TextContentRoot
                 },
                 String {
                     Label,
@@ -3095,7 +3206,7 @@ impl<'de> Visitor<'de> for PropertiesVisitor {
                     CharacterLengths,
                     WordStarts
                 },
-                WordIndexVec { WideWordStarts },
+                WordIndexVec { WideWordStarts, HardLineStarts },
                 CoordVec {
                     CharacterPositions,
                     CharacterWidths
@@ -3182,7 +3293,8 @@ impl JsonSchema for Properties {
                 MemberOf,
                 NextOnLine,
                 PreviousOnLine,
-                PopupFor
+                PopupFor,
+                TextContentRoot
             },
             String {
                 Label,
@@ -3250,7 +3362,7 @@ impl JsonSchema for Properties {
                 CharacterLengths,
                 WordStarts
             },
-            Vec<u16> { WideWordStarts },
+            Vec<u16> { WideWordStarts, HardLineStarts },
             Vec<f32> {
                 CharacterPositions,
                 CharacterWidths
@@ -3607,17 +3719,23 @@ mod tests {
         let mut node = Node::new(Role::TextRun);
         node.set_word_starts([2, 5]);
         node.set_wide_word_starts([2, 300]);
+        node.set_hard_line_starts([8, 310]);
         let wire = serde_json::to_value(&node).unwrap();
         assert_eq!(wire["properties"]["wordStarts"], serde_json::json!([2, 5]));
         assert_eq!(
             wire["properties"]["wideWordStarts"],
             serde_json::json!([2, 300])
         );
+        assert_eq!(
+            wire["properties"]["hardLineStarts"],
+            serde_json::json!([8, 310])
+        );
         let mut decoded: Node = serde_json::from_value(wire).unwrap();
         assert_eq!(decoded, node);
         decoded.clear_wide_word_starts();
         assert_eq!(decoded.word_starts(), [2, 5]);
         assert!(decoded.wide_word_starts().is_empty());
+        assert_eq!(decoded.hard_line_starts(), [8, 310]);
     }
 
     #[test]
@@ -3661,6 +3779,26 @@ mod tests {
         dest.clone_from(&source);
 
         assert_eq!(dest, source.clone());
+    }
+
+    #[test]
+    fn shared_value_keeps_the_original_utf8_slice() {
+        let text: Arc<str> = Arc::from("a café z");
+        let mut node = Node::new(Role::TextRun);
+        assert!(node.set_shared_value(text.clone(), 2..7));
+        assert_eq!(node.value(), Some("café"));
+        assert_eq!(node.value().unwrap().as_ptr(), text[2..].as_ptr());
+        assert!(!node.set_shared_value(text, 2..6));
+        let mut owned = Node::new(Role::TextRun);
+        owned.set_value("café");
+        assert_eq!(node, owned);
+        #[cfg(feature = "serde")]
+        {
+            let encoded = serde_json::to_value(&node).unwrap();
+            assert_eq!(encoded, serde_json::to_value(&owned).unwrap());
+            let decoded: Node = serde_json::from_value(encoded).unwrap();
+            assert_eq!(node, decoded);
+        }
     }
 
     #[test]

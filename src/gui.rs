@@ -4,9 +4,12 @@ mod conflict;
 mod decision;
 mod destination;
 mod external;
+mod keyboard;
+mod labels;
 mod menus;
 mod modal;
-mod open_failure;
+mod notice;
+mod panel;
 mod panes;
 mod path;
 mod platform;
@@ -19,80 +22,96 @@ mod theme;
 use glimpse::directory::Entry;
 use glimpse::{
     cli, directory,
-    document::DiskFile,
+    document::{DiskFile, Observation},
     io::{IoWorker, Job, Reply, SaveDestination},
     lifecycle, observe, paths, search, storage, wake,
 };
 use gpui::{prelude::*, *};
 use gpui_component::{
-    ActiveTheme, Disableable, Root, Selectable, Sizable,
+    ActiveTheme, Disableable, FocusableExt as _, IconName, Root, Selectable, Sizable,
     button::{Button, ButtonVariants},
-    input::{Input, InputEvent, InputState, Position, PreparedInput},
-    text::TextView,
+    input::{Input, InputEvent, InputState, LineType, Position, PreparedInput, Rope},
 };
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
-pub fn run(request: cli::Request) {
+/// Component icons plus the few the component set lacks.
+struct Assets;
+
+impl gpui::AssetSource for Assets {
+    fn load(&self, path: &str) -> gpui::Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        match path {
+            "icons/whole-word.svg" => Ok(Some(std::borrow::Cow::Borrowed(include_bytes!(
+                "../assets/icons/whole-word.svg"
+            )))),
+            _ => gpui_component_assets::Assets.load(path),
+        }
+    }
+
+    fn list(&self, path: &str) -> gpui::Result<Vec<SharedString>> {
+        gpui_component_assets::Assets.list(path)
+    }
+}
+
+pub fn run(request: cli::Request, data_dir: PathBuf, launch_folder: PathBuf) {
     platform::configure_allocations();
-    Application::new()
-        .with_assets(gpui_component_assets::Assets)
-        .run(move |cx| {
-            gpui_component::init(cx);
-            #[cfg(target_os = "linux")]
-            cx.bind_keys([
-                KeyBinding::new(
-                    "ctrl-home",
-                    gpui_component::input::MoveToStart,
-                    Some("Input"),
-                ),
-                KeyBinding::new("ctrl-end", gpui_component::input::MoveToEnd, Some("Input")),
-                KeyBinding::new(
-                    "ctrl-shift-home",
-                    gpui_component::input::SelectToStart,
-                    Some("Input"),
-                ),
-                KeyBinding::new(
-                    "ctrl-shift-end",
-                    gpui_component::input::SelectToEnd,
-                    Some("Input"),
-                ),
-            ]);
-            gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
-            let bounds = Bounds::centered(None, size(px(1280.), px(844.)), cx);
-            cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    app_id: Some("glimpse".into()),
-                    window_min_size: Some(size(px(520.), px(400.))),
-                    ..Default::default()
-                },
-                move |window, cx| {
-                    window.set_window_title("Glimpse");
-                    let view = cx.new(|cx| Shell::new(request, window, cx));
-                    let weak = view.downgrade();
-                    window.on_window_should_close(cx, move |window, cx| {
-                        weak.update(cx, |shell, cx| {
-                            shell.close(true, window, cx);
-                            false
-                        })
-                        .unwrap_or(true)
-                    });
-                    cx.new(|cx| Root::new(view, window, cx))
-                },
-            )
-            .expect("Cannot open GPUI window");
-            cx.activate(true);
-        });
+    let startup = StartupIo::new(&request, &data_dir);
+    Application::new().with_assets(Assets).run(move |cx| {
+        gpui_component::init(cx);
+        #[cfg(target_os = "linux")]
+        cx.bind_keys([
+            KeyBinding::new(
+                "ctrl-home",
+                gpui_component::input::MoveToStart,
+                Some("Input"),
+            ),
+            KeyBinding::new("ctrl-end", gpui_component::input::MoveToEnd, Some("Input")),
+            KeyBinding::new(
+                "ctrl-shift-home",
+                gpui_component::input::SelectToStart,
+                Some("Input"),
+            ),
+            KeyBinding::new(
+                "ctrl-shift-end",
+                gpui_component::input::SelectToEnd,
+                Some("Input"),
+            ),
+        ]);
+        gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+        let bounds = Bounds::centered(None, size(px(1280.), px(844.)), cx);
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                app_id: Some("glimpse".into()),
+                window_min_size: Some(size(px(520.), px(400.))),
+                ..Default::default()
+            },
+            move |window, cx| {
+                window.set_window_title("Glimpse");
+                let view = cx.new(|cx| Shell::new(request, startup, launch_folder, window, cx));
+                let weak = view.downgrade();
+                window.on_window_should_close(cx, move |window, cx| {
+                    weak.update(cx, |shell, cx| {
+                        shell.close(true, None, window, cx);
+                        false
+                    })
+                    .unwrap_or(true)
+                });
+                cx.new(|cx| Root::new(view, window, cx))
+            },
+        )
+        .expect("Cannot open GPUI window");
+        cx.activate(true);
+    });
 }
 struct Document {
     id: u64,
     disk: DiskFile,
     input: Entity<InputState>,
-    verified_clean: RefCell<Option<SharedString>>,
+    disk_comparison: RefCell<Option<(Rope, bool)>>,
     status_cursor: usize,
     generation: u64,
     preview: bool,
@@ -124,54 +143,72 @@ impl Document {
     }
     fn information(&self, cx: &App, reading: bool) -> String {
         let input = self.input.read(cx);
-        let position = input.cursor_position();
         let endings = input.line_endings();
+        let encoding = if self.disk.bom { "UTF-8 BOM" } else { "UTF-8" };
+        if reading {
+            return format!("Read · {encoding} · {endings}");
+        }
+        let position = input.cursor_position();
         format!(
-            "{}Ln {}, Col {} · UTF-8{} · {endings}",
-            if reading { "Read · " } else { "" },
+            "Ln {}, Col {} · {encoding} · {endings}",
             position.line + 1,
             position.character + 1,
-            if self.disk.bom { " BOM" } else { "" }
         )
     }
     fn dirty(&self, cx: &App) -> bool {
         if self.restored {
             return true;
         }
-        let value = self.input.read(cx).value();
-        let mut verified = self.verified_clean.borrow_mut();
-        if verified
-            .as_ref()
-            .is_some_and(|saved| std::ptr::eq(saved.as_str(), value.as_str()))
+        let input = self.input.read(cx);
+        let mut comparison = self.disk_comparison.borrow_mut();
+        if let Some((revision, clean)) = comparison.as_ref()
+            && input.has_text_revision(revision)
         {
-            return false;
+            return !clean;
         }
-        let clean = self.disk.content_bytes() == value.as_bytes();
-        *verified = clean.then_some(value);
+        let text = input.text();
+        let clean = self
+            .disk
+            .text_revision()
+            .is_some_and(|revision| input.has_text_revision(revision))
+            || self.disk.matches_revision(text);
+        *comparison = Some((text.clone(), clean));
         !clean
     }
 
     fn set_disk(&mut self, disk: DiskFile) {
         self.disk = disk;
-        self.verified_clean.get_mut().take();
+        self.disk_comparison.get_mut().take();
+    }
+
+    fn markdown(&self) -> bool {
+        self.disk
+            .path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                ["md", "markdown", "mdown", "mkd", "mkdn"]
+                    .iter()
+                    .any(|known| extension.eq_ignore_ascii_case(known))
+            })
     }
 
     fn grammar(&self, cx: &App) -> Option<&'static str> {
         if self.restored {
-            return glimpse::syntax::grammar_extension(
-                &self.disk.path,
-                &self.input.read(cx).value(),
-            );
+            return glimpse::syntax::grammar_for_text(&self.disk.path, self.input.read(cx).text());
         }
-        let content = self.disk.content_bytes();
+        let content = self.disk.content_prefix(256);
         let first_line = if content.starts_with(b"#!") {
-            String::from_utf8_lossy(&content[..content.len().min(256)])
+            String::from_utf8_lossy(&content)
         } else {
             "".into()
         };
         glimpse::syntax::grammar_extension(&self.disk.path, &first_line)
     }
 }
+/// Active or focused tab index, window size, and each document's label-changing states.
+type TabReveal = (usize, Size<Pixels>, Vec<(u64, bool, bool, bool)>);
+
 #[derive(Clone, Copy, PartialEq)]
 enum Panel {
     Path,
@@ -190,6 +227,10 @@ struct OpenIntent {
     position: Option<(usize, usize)>,
     interaction: u64,
 }
+struct TrashRequest {
+    path: PathBuf,
+    adjacent: Option<PathBuf>,
+}
 struct CloseDecision {
     quit: bool,
     documents: Vec<u64>,
@@ -207,7 +248,7 @@ enum DecisionAction {
     ReplaceDestination(Box<SaveDestination>),
     UnrecoveredSave(Box<recovery::UnrecoveredSave>),
     RecoveryOptions(u64),
-    FailureDetails(u64),
+    FailureDetails(Box<destination::Failure>),
     Warnings,
     Notice,
     FolderError,
@@ -232,7 +273,10 @@ enum SettingsWrite {
     Preferences,
     Live,
     Pin,
-    Visits(Vec<PathBuf>),
+    Locations {
+        visits: Vec<PathBuf>,
+        last: Option<PathBuf>,
+    },
 }
 
 struct Shell {
@@ -246,18 +290,31 @@ struct Shell {
     search_id: u64,
     hits: std::sync::Arc<Vec<search::Hit>>,
     search_ui: searching::State,
+    palette: panel::PaletteState,
     scope: Option<PathBuf>,
     current: PathBuf,
+    launch_folder: PathBuf,
     history: Vec<PathBuf>,
     gesture: glimpse::gesture::Gesture,
     future: Vec<PathBuf>,
     nav_focus: FocusHandle,
+    open_documents_requested: bool,
+    main_menu_requested: bool,
+    navigator_menu: Option<menus::NavigatorMenu>,
+    query_error: Option<String>,
+    panel_revision: u64,
+    name_request: Option<u64>,
+    rename_path: Option<PathBuf>,
+    conflict_focus: FocusHandle,
+    edit_state: std::cell::Cell<[bool; 3]>,
     reading_focus: FocusHandle,
     pane_state: Entity<panes::Divider>,
     navigation_only: bool,
     navigator_visible: bool,
     scrolls: HashMap<PathBuf, UniformListScrollHandle>,
     selection: Option<PathBuf>,
+    trash_pending: Option<TrashRequest>,
+    trash_needs_selection: bool,
     reveal_pending: Option<PathBuf>,
     selections: HashMap<PathBuf, PathBuf>,
     entries: std::sync::Arc<Vec<Entry>>,
@@ -265,6 +322,7 @@ struct Shell {
     visible_key: Option<(u64, String, bool)>,
     visible_entries: std::sync::Arc<Vec<usize>>,
     listing_buffer: Vec<Entry>,
+    navigation_hints: HashMap<String, paths::LabelCue>,
     listing_streaming: bool,
     listing_error: Option<String>,
     listing_waiter: Option<Task<()>>,
@@ -272,27 +330,38 @@ struct Shell {
     listing_paused: bool,
     listing_id: u64,
     listing_done: bool,
+    restoring_location: bool,
     filter: String,
     documents: Vec<Document>,
     active: Option<u64>,
     tab_scroll: ScrollHandle,
-    breadcrumb_scroll: ScrollHandle,
-    breadcrumb_view: Option<(PathBuf, Pixels, f32)>,
+    tab_widths: HashMap<u64, Pixels>,
+    tab_room: Pixels,
+    tab_hidden: usize,
+    tab_reveal: Option<TabReveal>,
     next_id: u64,
     open_token: u64,
     interaction: u64,
     path_request: Option<u64>,
     path_completion_token: u64,
     path_completions: Option<path::Completions>,
+    path_hint: Option<String>,
+    path_scroll: ScrollHandle,
+    panel_return: Option<FocusHandle>,
+    type_ahead: (String, Option<std::time::Instant>),
     opening: HashMap<u64, OpenIntent>,
     hit_versions: HashMap<u64, (u64, u64)>,
     panel: Option<Panel>,
     query: Entity<InputState>,
-    reading: bool,
+    reading_documents: HashSet<u64>,
     reading_view: Option<reading::View>,
+    reading_request: u64,
     memory_release: Option<Task<()>>,
     status: String,
-    open_failure: Option<open_failure::Failure>,
+    last_saved: Option<(u64, u64)>,
+    open_failure: Option<notice::Failure>,
+    notice_focus: FocusHandle,
+    notice_details_focus: FocusHandle,
     font_warning: Option<String>,
     window_title: String,
     warnings: Vec<String>,
@@ -303,6 +372,7 @@ struct Shell {
     settings_loaded: bool,
     settings_reloading: bool,
     location_visits_pending: Vec<PathBuf>,
+    last_location_pending: Option<PathBuf>,
     preferences: Option<Entity<preferences::Preferences>>,
     preferences_subscription: Option<Subscription>,
     preferences_return: Option<FocusHandle>,
@@ -323,23 +393,73 @@ struct Shell {
     importing: bool,
     startup_recovery: Option<recovery::Startup>,
     ready: bool,
-    startup_failed: bool,
+    startup_error: Option<String>,
     requested: Vec<(u64, PathBuf)>,
     finished: bool,
     validation_disks: HashMap<u64, DiskFile>,
-    cleanup_texts: HashMap<u64, (u64, String)>,
+    cleanup_texts: HashMap<u64, (u64, Rope)>,
     completed: HashSet<u64>,
     validated: HashSet<u64>,
     keep_after_cleanup: HashSet<u64>,
     finishing: glimpse::validation::Validations,
 }
-impl Shell {
-    fn new(request: cli::Request, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let (tx, rx) = async_channel::bounded(1);
+struct StartupIo {
+    wake: wake::Context,
+    replies_ready: async_channel::Receiver<()>,
+    io: IoWorker,
+    opening: HashMap<u64, OpenIntent>,
+}
+
+impl StartupIo {
+    fn new(request: &cli::Request, data_dir: &Path) -> Self {
+        let (tx, replies_ready) = async_channel::bounded(1);
         let wake = wake::Context::new(move || {
             let _ = tx.try_send(());
         });
-        let io = IoWorker::new(wake.clone());
+        let io = IoWorker::new(wake.clone(), data_dir);
+        io.send(Job::LoadSettings);
+        io.send(Job::Volumes);
+        if request.desktop {
+            io.send(Job::Inventory);
+        }
+        let mut opening = HashMap::with_capacity(request.files.len());
+        for (index, path) in request.files.iter().enumerate() {
+            let token = index as u64 + 1;
+            let position = (index == 0).then_some((request.line, request.column));
+            opening.insert(
+                token,
+                OpenIntent {
+                    preview: false,
+                    position,
+                    interaction: 0,
+                },
+            );
+            io.send(Job::Open(path.clone(), token, false));
+        }
+        Self {
+            wake,
+            replies_ready,
+            io,
+            opening,
+        }
+    }
+}
+
+impl Shell {
+    fn new(
+        request: cli::Request,
+        startup: StartupIo,
+        launch_folder: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let StartupIo {
+            wake,
+            replies_ready,
+            io,
+            opening,
+        } = startup;
+        let open_token = request.files.len() as u64;
         let directories = directory::Directories::new(wake.clone());
         let observer = observe::Observer::new(wake.clone());
         let syntax = glimpse::syntax::Syntax::new(wake.clone());
@@ -353,7 +473,8 @@ impl Shell {
                     .first()
                     .and_then(|p| p.parent().map(|p| p.to_owned()))
             })
-            .unwrap_or_else(|| std::env::home_dir().unwrap());
+            .or_else(std::env::home_dir)
+            .unwrap_or_else(|| launch_folder.clone());
         let query = cx.new(|cx| {
             let mut input = InputState::new(window, cx).placeholder("Enter a path");
             input.set_external_highlights(Vec::new(), cx);
@@ -365,6 +486,9 @@ impl Shell {
                 this.submit(window, cx);
             }
             if matches!(event, InputEvent::Change) && this.panel == Some(Panel::Path) {
+                if let Some(token) = this.path_request.take() {
+                    this.opening.remove(&token);
+                }
                 if this
                     .path_completions
                     .as_ref()
@@ -380,6 +504,13 @@ impl Shell {
             {
                 this.search_changed(cx);
             }
+            if matches!(event, InputEvent::Change) && this.query_error.take().is_some() {
+                cx.notify();
+            }
+            if matches!(event, InputEvent::Change) && this.panel == Some(Panel::Palette) {
+                this.palette.selection = 0;
+                this.palette.scroll.scroll_to_item(0);
+            }
             if matches!(event, InputEvent::Change)
                 && matches!(this.panel, Some(Panel::Palette | Panel::Recovery))
             {
@@ -387,6 +518,20 @@ impl Shell {
             }
             if matches!(event, InputEvent::Change) && this.panel == Some(Panel::Filter) {
                 this.filter = this.query.read(cx).value().to_string();
+                // Keep the row Enter opens visible and selected while the filter narrows.
+                let visible = this.visible_rows();
+                let rows = this.entries.clone();
+                if !visible
+                    .iter()
+                    .any(|&i| Some(&rows[i].path) == this.selection.as_ref())
+                    && let Some(&first) = visible.first()
+                {
+                    this.selection = Some(rows[first].path.clone());
+                    this.search_ui.picker_selection = this.selection.clone();
+                    if let Some(scroll) = this.scrolls.get(&this.current) {
+                        scroll.scroll_to_item(0, ScrollStrategy::Top);
+                    }
+                }
                 cx.notify();
             }
         });
@@ -396,12 +541,12 @@ impl Shell {
             if window.window_handle() == shortcut_window {
                 let _ = shortcut_view.update(cx, |this: &mut Self, cx| {
                     this.interaction += 1;
-                    this.shortcut(&event.keystroke, window, cx)
+                    this.route_key(event, window, cx)
                 });
             }
         });
         cx.spawn_in(window, async move |this, cx| {
-            while rx.recv().await.is_ok() {
+            while replies_ready.recv().await.is_ok() {
                 if this
                     .update_in(cx, |this, window, cx| this.receive(window, cx))
                     .is_err()
@@ -422,10 +567,20 @@ impl Shell {
             search,
             syntax,
             current,
+            launch_folder,
             history: vec![],
             gesture: glimpse::gesture::Gesture::default(),
             future: vec![],
             nav_focus: cx.focus_handle().tab_stop(true),
+            open_documents_requested: false,
+            main_menu_requested: false,
+            navigator_menu: None,
+            query_error: None,
+            panel_revision: 0,
+            name_request: None,
+            rename_path: None,
+            conflict_focus: cx.focus_handle(),
+            edit_state: Default::default(),
             reading_focus: cx.focus_handle().tab_stop(true),
             pane_state: cx.new(panes::Divider::new),
             navigation_only: false,
@@ -433,12 +588,15 @@ impl Shell {
             scrolls: HashMap::new(),
             selection: None,
             reveal_pending: None,
+            trash_pending: None,
+            trash_needs_selection: false,
             selections: HashMap::new(),
             entries: Default::default(),
             entries_revision: 0,
             visible_key: None,
             visible_entries: Default::default(),
             listing_buffer: vec![],
+            navigation_hints: Default::default(),
             listing_streaming: true,
             listing_error: None,
             listing_waiter: None,
@@ -446,27 +604,38 @@ impl Shell {
             listing_paused: false,
             listing_id: 0,
             listing_done: false,
+            restoring_location: false,
             filter: String::new(),
             documents: vec![],
             active: None,
             tab_scroll: ScrollHandle::new(),
-            breadcrumb_scroll: ScrollHandle::new(),
-            breadcrumb_view: None,
+            tab_widths: HashMap::new(),
+            tab_room: px(0.),
+            tab_hidden: 0,
+            tab_reveal: None,
             next_id: 1,
-            open_token: 0,
+            open_token,
             interaction: 0,
             path_request: None,
             path_completion_token: 0,
             path_completions: None,
-            opening: HashMap::new(),
+            path_hint: None,
+            path_scroll: ScrollHandle::new(),
+            panel_return: None,
+            type_ahead: (String::new(), None),
+            opening,
             hit_versions: HashMap::new(),
             panel: None,
             query,
-            reading: false,
+            reading_documents: HashSet::new(),
             reading_view: None,
+            reading_request: 0,
             memory_release: None,
             status: String::new(),
+            last_saved: None,
             open_failure: None,
+            notice_focus: cx.focus_handle(),
+            notice_details_focus: cx.focus_handle().tab_stop(true),
             font_warning: None,
             window_title: String::new(),
             warnings: Vec::new(),
@@ -477,6 +646,7 @@ impl Shell {
             settings_loaded: false,
             settings_reloading: true,
             location_visits_pending: Vec::new(),
+            last_location_pending: None,
             preferences: None,
             preferences_subscription: None,
             preferences_return: None,
@@ -497,7 +667,7 @@ impl Shell {
             importing: false,
             startup_recovery,
             ready: false,
-            startup_failed: false,
+            startup_error: None,
             requested: vec![],
             finished: false,
             validation_disks: HashMap::new(),
@@ -509,25 +679,23 @@ impl Shell {
             search_id: 0,
             hits: Default::default(),
             search_ui: searching::State::new(cx),
+            palette: panel::PaletteState::new(cx),
         };
         window.focus(&this.nav_focus);
         this.refresh();
         this.subscriptions
             .push(cx.observe(&this.pane_state, |_, _, cx| cx.notify()));
-        this.io.send(Job::LoadSettings);
-        this.io.send(Job::Volumes);
-        if this.startup_recovery.is_some() {
-            this.io.send(Job::Inventory);
-        }
-        let files = this.request.files.clone();
-        for (index, path) in files.into_iter().enumerate() {
-            let position = (index == 0).then_some((this.request.line, this.request.column));
-            this.open(path, false, position);
-        }
+        this.subscriptions
+            .push(cx.observe_window_activation(window, |this, window, cx| {
+                if this.reading() {
+                    this.prepare_inactive_reading(window, cx);
+                }
+            }));
         this
     }
     fn report_startup_ready(&mut self, source_visible: bool, window: &mut Window, cx: &App) {
         if !self.ready
+            && (!self.request.desktop || self.settings_loaded)
             && self.listing_done
             && self.opening.is_empty()
             && self.startup_recovery.is_none()
@@ -537,17 +705,22 @@ impl Shell {
                 }))
         {
             self.ready = true;
-            let failed = self.startup_failed;
+            let error = self.startup_error.take().or_else(|| {
+                self.listing_error
+                    .as_ref()
+                    .map(|error| format!("{}: {error}", paths::display(&self.current)))
+            });
             let timing = std::env::var_os("GLIMPSE_TIMING").is_some();
             window.on_next_frame(move |window, _| {
-                if timing && !failed {
+                if timing && error.is_none() {
                     eprintln!("GLIMPSE_EDITABLE_FRAME");
                 }
                 window.on_next_frame(move |_, _| {
-                    let _ = lifecycle::notify(if failed { b'2' } else { b'0' });
-                    if failed {
+                    if let Some(error) = error {
+                        let _ = lifecycle::notify_startup_failure(&error);
                         eprintln!("GLIMPSE_STARTUP_FAILED");
                     } else {
+                        let _ = lifecycle::notify(b'0');
                         eprintln!("GLIMPSE_READY");
                     }
                 })
@@ -579,6 +752,7 @@ impl Shell {
                     settings.disk_base = this.settings.disk_base.clone();
                     settings.pins = this.settings.pins.clone();
                     settings.recents = this.settings.recents.clone();
+                    settings.last_location = this.settings.last_location.clone();
                     settings.location_visits = this.settings.location_visits.clone();
                     if let Err(error) = this.queue_settings(settings, SettingsWrite::Preferences)
                         && let Some(view) = &this.preferences
@@ -646,20 +820,28 @@ impl Shell {
         }
         if !self.settings.remember_locations {
             self.location_visits_pending.clear();
+            self.last_location_pending = None;
             return;
         }
         let visits = std::mem::take(&mut self.location_visits_pending);
         let mut settings = self.settings.clone();
+        let last = self
+            .last_location_pending
+            .take()
+            .filter(|path| settings.last_location.as_ref() != Some(path));
+        if let Some(path) = &last {
+            settings.last_location = Some(path.clone());
+        }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let mut changed = false;
+        let mut changed = last.is_some();
         for path in &visits {
             changed |= settings.record_location(path, now);
         }
         if changed {
-            let _ = self.queue_settings(settings, SettingsWrite::Visits(visits));
+            let _ = self.queue_settings(settings, SettingsWrite::Locations { visits, last });
         }
     }
 
@@ -669,11 +851,38 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if settings.remember_locations
+            && !self.settings.remember_locations
+            && self.listing_done
+            && self.listing_error.is_none()
+            && !self.request.pick
+        {
+            self.last_location_pending = Some(self.current.clone());
+        }
         self.settings = settings;
         if let Some(warning) = &self.settings.warning {
             self.status = warning.clone();
         }
         self.font_warning = theme::apply(&self.settings, window, cx);
+        // The minimum window grows with the interface scale so every scale keeps the room of
+        // the 520×400 layout, capped at the display size.
+        let scale = self.settings.ui_scale;
+        let mut minimum = size(px(520. * scale), px(400. * scale));
+        if let Some(display) = window.display(cx) {
+            let available = display.bounds().size;
+            minimum = size(
+                minimum.width.min(available.width),
+                minimum.height.min(available.height),
+            );
+        }
+        window.set_window_min_size(minimum);
+        let current = window.viewport_size();
+        if current.width < minimum.width || current.height < minimum.height {
+            window.resize(size(
+                current.width.max(minimum.width),
+                current.height.max(minimum.height),
+            ));
+        }
         self.reset_search("Search settings changed; press Enter to search");
         for doc in &self.documents {
             doc.input.update(cx, |input, cx| {
@@ -692,7 +901,6 @@ impl Shell {
                 }
             });
         }
-        self.refresh();
         self.focus(window, cx);
         cx.notify();
     }
@@ -714,7 +922,7 @@ impl Shell {
         let view = cx.new(|cx| {
             let mut decision = decision::Decision::new(title, detail, actions, window, cx);
             if closing {
-                decision.close_actions();
+                decision.close_actions(window, cx);
             }
             decision
         });
@@ -776,12 +984,12 @@ impl Shell {
                                 _ => this.focus(window, cx),
                             }
                         }
-                        Some(DecisionAction::FailureDetails(id))
-                            if this.documents.iter().any(|doc| doc.id == id) =>
+                        Some(DecisionAction::FailureDetails(failure))
+                            if this.documents.iter().any(|doc| doc.id == failure.id) =>
                         {
-                            this.active = Some(id);
+                            this.active = Some(failure.id);
                             match choice.0 {
-                                1 => this.retry_operation(window, cx),
+                                1 => this.retry_failure(*failure, window, cx),
                                 2 => this.save_as(DestinationKind::Copy, window, cx),
                                 _ => this.focus(window, cx),
                             }
@@ -853,7 +1061,7 @@ impl Shell {
             };
             let doc = self.documents.iter().find(|doc| doc.id == id).unwrap();
             glimpse::metrics::event("check-request", id, token);
-            self.io.send(Job::Check(id, doc.disk.path.clone(), token));
+            self.io.send(Job::Check(id, doc.disk.clone(), token));
         }
     }
     fn visible_rows(&mut self) -> std::sync::Arc<Vec<usize>> {
@@ -901,7 +1109,11 @@ impl Shell {
             Err(error) => {
                 self.listing_id = 0;
                 self.listing_done = true;
-                self.startup_failed |= !self.ready;
+                if !self.ready && (!self.request.desktop || self.settings_loaded) {
+                    self.startup_error.get_or_insert_with(|| {
+                        format!("{}: {error}", paths::display(&self.current))
+                    });
+                }
                 self.listing_error = Some(error);
             }
         }
@@ -914,7 +1126,18 @@ impl Shell {
             self.change_location(path);
         }
     }
+    fn set_initial_location(&mut self, path: PathBuf) {
+        self.current = path;
+        self.entries = Default::default();
+        self.entries_revision += 1;
+        self.selection = None;
+        self.last_location_pending = None;
+        self.refresh();
+    }
     fn change_location(&mut self, path: PathBuf) {
+        self.restoring_location = false;
+        self.clear_open_failure();
+        self.trash_needs_selection = false;
         let old_scope = self.effective_scope().clone();
         if let Some(selection) = self.selection.take() {
             self.selections.insert(self.current.clone(), selection);
@@ -951,6 +1174,78 @@ impl Shell {
             })
             .cloned()
     }
+    fn path_is_open(&self, path: &Path) -> bool {
+        self.documents
+            .iter()
+            .any(|doc| doc.disk.path.starts_with(path) || doc.disk.target.starts_with(path))
+    }
+
+    fn select_navigation(&mut self, path: PathBuf) {
+        if self
+            .open_failure
+            .as_ref()
+            .is_some_and(|failure| failure.path != path)
+        {
+            self.clear_open_failure();
+        }
+        self.selection = Some(path.clone());
+        self.search_ui.picker_selection = Some(path);
+        if self.trash_needs_selection && self.status == Self::TRASH_SELECTION_GUIDANCE {
+            self.status.clear();
+        }
+        self.trash_needs_selection = false;
+    }
+
+    const TRASH_SELECTION_GUIDANCE: &str =
+        "Press Space to select the item before moving it to Trash.";
+
+    fn file_action_blocker(&self, path: &Path, needs_selection: bool) -> Option<&'static str> {
+        if self.trash_pending.is_some() {
+            Some("Wait for the move to Trash to finish.")
+        } else if needs_selection && self.trash_needs_selection {
+            Some(Self::TRASH_SELECTION_GUIDANCE)
+        } else if self.path_is_open(path) {
+            Some("Close open documents in this item first.")
+        } else {
+            None
+        }
+    }
+
+    fn move_to_trash(&mut self, path: PathBuf, needs_selection: bool) {
+        if self.request.pick {
+            return;
+        }
+        if let Some(reason) = self.file_action_blocker(&path, needs_selection) {
+            self.status = reason.into();
+        } else {
+            self.trash_selection(path);
+        }
+    }
+
+    fn navigation_row_height(&self) -> Pixels {
+        px(if self.settings.compact { 28. } else { 32. } * self.settings.ui_scale)
+    }
+
+    fn trash_selection(&mut self, path: PathBuf) {
+        let visible = self.visible_rows();
+        let adjacent = visible
+            .iter()
+            .position(|&index| self.entries[index].path == path)
+            .and_then(|index| {
+                visible
+                    .get(index + 1)
+                    .or_else(|| index.checked_sub(1).and_then(|index| visible.get(index)))
+            })
+            .map(|&index| self.entries[index].path.clone());
+        self.trash_pending = Some(TrashRequest {
+            path: path.clone(),
+            adjacent,
+        });
+        self.trash_needs_selection = true;
+        self.type_ahead.0.clear();
+        self.io.send(Job::Trash(path));
+    }
+
     fn open(
         &mut self,
         path: PathBuf,
@@ -985,6 +1280,9 @@ impl Shell {
         let OpenIntent {
             preview, position, ..
         } = intent;
+        if activate {
+            self.clear_open_failure();
+        }
         if activate && self.request.pick {
             self.search_ui.picker_selection = Some(disk.path.clone());
         }
@@ -1032,9 +1330,13 @@ impl Shell {
                 .soft_wrap(self.settings.wrap)
                 .defer_large_wrapped_layout()
                 .default_prepared_value(text);
+            if disk.text_revision().is_some() {
+                input.release_value_cache(cx);
+            }
             input.set_external_highlights(Vec::new(), cx);
             input.set_cursor_blink(false, cx);
-            input.set_accessibility_label(format!("Source: {}", paths::display(&disk.path)), cx);
+            input.set_accessibility_label(format!("Source: {}", paths::name(&disk.path)), cx);
+            input.set_accessibility_description(paths::display(&disk.path), cx);
             input.set_tab_size(
                 gpui_component::input::TabSize {
                     tab_size: self.settings.indent,
@@ -1048,7 +1350,7 @@ impl Shell {
         let subscription = cx.subscribe_in(&input, window, move |this, _, event, window, cx| {
             if matches!(event, InputEvent::InitialLayoutReady) {
                 let source_visible =
-                    !this.reading && (!this.narrow(window) || !this.navigation_only);
+                    !this.reading() && (!this.narrow(window) || !this.navigation_only);
                 this.report_startup_ready(source_visible, window, cx);
                 cx.notify();
                 return;
@@ -1081,23 +1383,23 @@ impl Shell {
                 if !this.request.pick && !doc.dirty(cx) {
                     this.io.send(Job::ClearThrough(id, doc.generation));
                 } else if !this.request.pick {
-                    this.io.send(Job::Recover(
+                    this.io.recover_edit(
                         id,
                         storage::Draft {
                             path: doc.disk.path.clone(),
                             target: Some(doc.disk.target.clone()),
-                            text: doc.input.read(cx).value().into(),
+                            text: doc.input.read(cx).text().clone(),
                             base: doc.disk.bytes.clone(),
                             generation: doc.generation,
                         },
-                    ));
+                    );
                 }
             }
             if let Some(doc) = this.documents.iter().find(|d| d.id == id) {
                 this.syntax.request(
                     id,
                     doc.generation,
-                    std::sync::Arc::<str>::from(doc.input.read(cx).value()),
+                    doc.input.read(cx).text().clone(),
                     &doc.disk.path,
                     cx.theme().is_dark(),
                 );
@@ -1130,7 +1432,7 @@ impl Shell {
             id,
             disk,
             input: input.clone(),
-            verified_clean: RefCell::default(),
+            disk_comparison: RefCell::default(),
             status_cursor: 0,
             generation: 0,
             preview,
@@ -1152,14 +1454,14 @@ impl Shell {
         self.syntax.request(
             id,
             0,
-            std::sync::Arc::<str>::from(input.read(cx).value()),
+            input.read(cx).text().clone(),
             &disk_path(&self.documents, id),
             cx.theme().is_dark(),
         );
         self.watch();
         if activate {
             self.active = Some(id);
-            self.reading = false;
+            self.set_reading(false);
             self.navigation_only = false;
         }
         if activate || position.is_some() {
@@ -1183,20 +1485,14 @@ impl Shell {
         else {
             return;
         };
-        let text = input.read(cx).value();
-        let (position, clamped) = glimpse::editor::position(&text, line, column);
-        let byte = text
-            .char_indices()
-            .nth(position)
-            .map_or(text.len(), |(byte, _)| byte);
-        let prefix = &text[..byte];
-        let row = prefix.bytes().filter(|&byte| byte == b'\n').count() as u32;
-        let column = prefix.rsplit('\n').next().unwrap_or("").chars().count() as u32;
-        input.update(cx, |input, cx| {
-            input.set_cursor_position_unfocused(Position::new(row, column), cx);
+        let clamped = input.update(cx, |input, cx| {
+            let _work = gpui::work_trace::Span::new("editor_position");
+            let (offset, clamped) = glimpse::editor::source_position(input.text(), line, column);
+            let cursor = input.set_cursor_offset_unfocused(offset, cx);
             if focus {
                 input.focus(window, cx);
             }
+            clamped || cursor != offset
         });
         if clamped {
             self.status = "Requested position clamped to a text boundary".into();
@@ -1214,9 +1510,39 @@ impl Shell {
         self.memory_release = Some(cx.background_spawn(async move {
             if rendered.recv().await.is_ok() {
                 Timer::after(std::time::Duration::from_millis(200)).await;
+                let _work = gpui::work_trace::Span::new("view_memory_release");
                 platform::release_unused_memory();
             }
         }));
+    }
+    /// Whether the active document is shown in Reading; each document keeps its own view.
+    fn reading(&self) -> bool {
+        self.active
+            .is_some_and(|id| self.reading_documents.contains(&id))
+    }
+    fn set_reading(&mut self, reading: bool) {
+        if let Some(id) = self.active {
+            if reading {
+                self.reading_documents.insert(id);
+            } else {
+                self.reading_documents.remove(&id);
+            }
+        }
+    }
+    /// Whether a focus target is still on screen: hidden documents' editors and tabs, and the
+    /// Reading view of a document shown as source, are not.
+    fn shown(&self, handle: &FocusHandle, cx: &App) -> bool {
+        let hidden_document = self.documents.iter().any(|doc| {
+            Some(doc.id) != self.active
+                && (&doc.tab_focus == handle || &doc.input.focus_handle(cx) == handle)
+        });
+        let hidden_reading = handle == &self.reading_focus && !self.reading();
+        let hidden_source = self.reading()
+            && self
+                .documents
+                .iter()
+                .any(|doc| Some(doc.id) == self.active && &doc.input.focus_handle(cx) == handle);
+        !(hidden_document || hidden_reading || hidden_source)
     }
     fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(index) = self
@@ -1230,17 +1556,25 @@ impl Shell {
             self.syntax.request(
                 doc.id,
                 doc.generation,
-                std::sync::Arc::<str>::from(doc.input.read(cx).value()),
+                doc.input.read(cx).text().clone(),
                 &doc.disk.path,
                 cx.theme().is_dark(),
             );
-            doc.input.update(cx, |input, cx| input.focus(window, cx));
+            if self.reading() {
+                window.focus(&self.reading_focus);
+            } else {
+                doc.input.update(cx, |input, cx| input.focus(window, cx));
+            }
         } else {
             window.focus(&self.nav_focus);
         }
     }
     fn panel(&mut self, panel: Panel, window: &mut Window, cx: &mut Context<Self>) {
+        if self.panel.is_none() {
+            self.panel_return = window.focused(cx);
+        }
         self.path_completions = None;
+        self.path_hint = None;
         self.path_completion_token += 1;
         if panel == Panel::Palette && matches!(self.panel, Some(Panel::Files | Panel::Text)) {
             self.search_ui.suspended = self
@@ -1254,7 +1588,13 @@ impl Shell {
             self.reset_search("Enter a query, then press Enter to search");
             self.search_ui.query.clear();
         }
+        if let Some(token) = self.path_request.take() {
+            self.opening.remove(&token);
+        }
         self.panel = Some(panel);
+        self.panel_revision += 1;
+        self.query_error = None;
+        self.rename_path = None;
         let value = if panel == Panel::Path {
             paths::entry(&self.current)
         } else {
@@ -1270,7 +1610,8 @@ impl Shell {
                     Panel::Palette => "Search commands",
                     Panel::Recovery => "Search recovery records",
                     Panel::Line => "Line number",
-                    Panel::NewFile | Panel::NewFolder | Panel::Rename => "One filename",
+                    Panel::NewFile | Panel::NewFolder => "One filename",
+                    Panel::Rename => "New Name",
                 },
                 window,
                 cx,
@@ -1290,11 +1631,12 @@ impl Shell {
         let value = self.query.read(cx).value().to_string();
         match self.panel {
             Some(Panel::Palette) => {
-                let query = value.to_lowercase();
-                if let Some(command) = glimpse::commands::COMMANDS.iter().find(|command| {
-                    command.label.to_lowercase().contains(&query) || command.id.contains(&query)
-                }) {
-                    self.palette_command(command.id, window, cx);
+                let matches = self.palette_matches(cx);
+                if let Some(id) = matches
+                    .get(self.palette.selection.min(matches.len().saturating_sub(1)))
+                    .copied()
+                {
+                    self.palette_command(id, window, cx);
                 }
             }
             Some(Panel::Path) => match paths::parse_entry(&value, &self.current) {
@@ -1302,46 +1644,100 @@ impl Shell {
                     if let Some(old) = self.path_request.take() {
                         self.opening.remove(&old);
                     }
+                    self.query_error = None;
+                    self.path_completions = None;
+                    self.path_hint = None;
                     self.path_request = self.open(path, false, None);
                 }
-                Err(error) => self.status = error,
+                Err(error) => self.query_error = Some(error),
             },
+            Some(Panel::Files)
+                if self.search_ui.started
+                    && !self.search_ui.running
+                    && self.search_ui.query == value =>
+            {
+                if let Some(index) = self.search_ui.selection {
+                    self.open_hit(index, cx);
+                }
+            }
+            Some(Panel::Files) if self.search_ui.running && self.search_ui.query == value => {}
             Some(Panel::Files | Panel::Text) => self.start_search(cx),
+            Some(Panel::Filter) => {
+                let visible = self.visible_rows();
+                let rows = self.entries.clone();
+                let path = visible
+                    .iter()
+                    .map(|&i| &rows[i].path)
+                    .find(|path| Some(*path) == self.selection.as_ref())
+                    .or_else(|| visible.first().map(|&i| &rows[i].path))
+                    .cloned();
+                if let Some(path) = path {
+                    self.select_navigation(path.clone());
+                    self.open(path, false, None);
+                }
+            }
             Some(Panel::NewFile | Panel::NewFolder | Panel::Rename) => {
-                let path = self.current.join(&value);
-                if !paths::single_name(&value) {
-                    self.status = "Enter one filename".into();
+                if self.name_request.is_some() {
+                    return;
+                }
+                let ticket = self.panel_revision;
+                let job = if value.is_empty() {
+                    self.query_error = Some("Enter a name.".into());
+                    None
+                } else if !paths::single_name(&value) {
+                    self.query_error = Some("Enter a single name without a folder path.".into());
+                    None
                 } else if self.panel == Some(Panel::Rename) {
-                    if let Some(source) = self.selected_path() {
-                        if self.documents.iter().any(|doc| doc.disk.path == source) {
-                            self.status = "Close the file before renaming".into();
+                    self.rename_path.clone().and_then(|source| {
+                        let destination = source.with_file_name(&value);
+                        if self.path_is_open(&source) {
+                            self.query_error =
+                                Some("Close documents in this item before renaming it.".into());
+                            None
+                        } else if destination == source {
+                            self.command("dismiss", window, cx);
+                            None
                         } else {
-                            let destination = source.with_file_name(&value);
-                            self.io.send(Job::Rename(source, destination));
-                            self.panel = None;
+                            Some(Job::Rename(ticket, source, destination))
                         }
-                    }
+                    })
                 } else {
-                    self.io.send(Job::Create(
-                        path,
+                    Some(Job::Create(
+                        ticket,
+                        self.current.join(&value),
                         self.panel == Some(Panel::NewFolder),
-                        String::new(),
-                    ));
-                    self.panel = None;
+                    ))
+                };
+                if let Some(job) = job {
+                    self.query_error = None;
+                    self.name_request = Some(ticket);
+                    self.io.send(job);
                 }
             }
             Some(Panel::Line) => {
-                if let Ok(line) = value.parse::<u32>() {
-                    if let Some(doc) = self.documents.iter().find(|d| Some(d.id) == self.active) {
-                        doc.input.update(cx, |input, cx| {
-                            input.set_cursor_position(
-                                Position::new(line.saturating_sub(1), 0),
-                                window,
-                                cx,
-                            )
-                        });
+                if let Some(doc) = self.documents.iter().find(|d| Some(d.id) == self.active) {
+                    let lines = doc.input.read(cx).text().len_lines(LineType::LF);
+                    match value.trim().parse::<u32>() {
+                        Ok(line) if (1..=lines).contains(&(line as usize)) => {
+                            self.panel = None;
+                            self.panel_return = None;
+                            let input = doc.input.clone();
+                            self.set_reading(false);
+                            self.navigation_only = false;
+                            input.update(cx, |input, cx| {
+                                input.set_cursor_position(Position::new(line - 1, 0), window, cx);
+                            });
+                        }
+                        _ => {
+                            let message = if lines == 1 {
+                                "Enter 1. This file has one line.".into()
+                            } else {
+                                format!("Enter a whole number from 1 to {lines}.")
+                            };
+                            self.query_error = Some(message);
+                            self.query.update(cx, |input, cx| input.focus(window, cx));
+                        }
                     }
-                    self.panel = None;
                 }
             }
             _ => {}
@@ -1353,6 +1749,7 @@ impl Shell {
             .then(|| window.focused(cx))
             .flatten();
         let mut listing_changed = false;
+        let mut navigation_hints = HashMap::new();
         while let Ok(batch) = self.directories.replies.try_recv() {
             if batch.path == self.current && batch.generation == self.listing_id {
                 if self.listing_buffer.is_empty() && !batch.entries.is_empty() {
@@ -1365,6 +1762,7 @@ impl Shell {
                 self.listing_buffer.extend(batch.entries);
                 listing_changed = true;
                 self.listing_done = batch.done;
+                navigation_hints = batch.filename_hints;
                 if batch.done {
                     glimpse::metrics::event(
                         "directory-complete",
@@ -1373,8 +1771,30 @@ impl Shell {
                     );
                 }
                 if let Some(error) = batch.error {
-                    self.startup_failed |= !self.ready;
+                    if self.restoring_location {
+                        self.restoring_location = false;
+                        if let Some(home) = std::env::home_dir() {
+                            self.set_initial_location(home);
+                            self.status = "The last folder is unavailable. Showing Home.".into();
+                        } else {
+                            self.set_initial_location(self.launch_folder.clone());
+                            self.status =
+                                "The last folder is unavailable. Showing the launch folder.".into();
+                        }
+                        listing_changed = false;
+                        continue;
+                    }
+                    if !self.ready && (!self.request.desktop || self.settings_loaded) {
+                        self.startup_error.get_or_insert_with(|| {
+                            format!("{}: {error}", paths::display(&self.current))
+                        });
+                    }
                     self.listing_error = Some(error);
+                } else if batch.done {
+                    self.restoring_location = false;
+                    if !self.request.pick && self.listing_error.is_none() {
+                        self.last_location_pending = Some(self.current.clone());
+                    }
                 }
             }
         }
@@ -1393,6 +1813,7 @@ impl Shell {
                 } else {
                     self.listing_buffer.clone()
                 });
+                self.navigation_hints = navigation_hints;
                 self.entries_revision += 1;
                 glimpse::metrics::event(
                     "directory-installed",
@@ -1403,9 +1824,7 @@ impl Shell {
         }
         while let Ok(reply) = self.io.replies.try_recv() {
             match reply {
-                Reply::Markdown(id, generation, path, result) => {
-                    self.reading_ready(id, generation, path, result, cx)
-                }
+                Reply::Markdown(request, result) => self.reading_ready(request, result, cx),
                 Reply::PathCompleted(token, value, result) => {
                     self.path_completed(token, value, result, window, cx)
                 }
@@ -1415,12 +1834,23 @@ impl Shell {
                 },
                 Reply::OpenDirectory(path, token) => {
                     if let Some(intent) = self.opening.remove(&token) {
-                        if !self.ready && self.request.files.contains(&path) {
-                            self.startup_failed = true;
+                        let search_generation =
+                            self.search_ui.file_opens.remove(&token).or_else(|| {
+                                self.hit_versions
+                                    .remove(&token)
+                                    .map(|(_, generation)| generation)
+                            });
+                        if let Some(generation) = search_generation {
+                            if generation == self.search_id {
+                                self.search_ui.status = "This result is now a folder. Search again for current results.".into();
+                            }
+                        } else if !self.ready && self.request.files.contains(&path) {
                             self.status = format!(
                                 "Requested file became a directory: {}",
                                 paths::display(&path)
                             );
+                            self.startup_error
+                                .get_or_insert_with(|| self.status.clone());
                         } else if intent.interaction == self.interaction && token == self.open_token
                         {
                             if self.path_request == Some(token) {
@@ -1435,6 +1865,10 @@ impl Shell {
                 }
                 Reply::Open(path, token, result) => {
                     let expected = self.hit_versions.remove(&token);
+                    let file_search_generation = self.search_ui.file_opens.remove(&token);
+                    let search_generation = expected
+                        .map(|(_, generation)| generation)
+                        .or(file_search_generation);
                     if let Some(OpenIntent {
                         preview,
                         position,
@@ -1442,6 +1876,16 @@ impl Shell {
                     }) = self.opening.remove(&token)
                     {
                         let activate = interaction == self.interaction
+                            && search_generation.is_none_or(|generation| {
+                                token == self.open_token
+                                    && generation == self.search_id
+                                    && self.panel
+                                        == Some(if file_search_generation.is_some() {
+                                            Panel::Files
+                                        } else {
+                                            Panel::Text
+                                        })
+                            })
                             && self.preferences.is_none()
                             && self.decision.is_none();
                         if preview && (!activate || token != self.open_token) {
@@ -1453,33 +1897,43 @@ impl Shell {
                         }
                         match result {
                             Ok((disk, text)) => {
-                                if self
-                                    .open_failure
-                                    .as_ref()
-                                    .is_some_and(|failure| failure.path == path)
-                                {
-                                    self.open_failure = None;
-                                }
                                 if self.destination_busy {
                                     continue;
                                 }
-                                if let Some((expected, search_generation)) = expected
-                                    && (expected
-                                        != search::fingerprint_body(disk.content_bytes(), disk.bom)
-                                        || self
-                                            .documents
-                                            .iter()
-                                            .any(|doc| doc.disk.same_file(&disk) && doc.dirty(cx)))
-                                {
-                                    let message = "Failed to open result — disk changed or the document has unsaved edits. Search again before jumping.";
-                                    self.status = message.into();
-                                    if search_generation == self.search_id {
-                                        self.search_ui.status = message.into();
+                                if let Some((expected, search_generation)) = expected {
+                                    let dirty = self
+                                        .documents
+                                        .iter()
+                                        .any(|doc| doc.disk.same_file(&disk) && doc.dirty(cx));
+                                    let changed = expected
+                                        != search::fingerprint_body(
+                                            text.value().as_bytes(),
+                                            disk.bom,
+                                        );
+                                    if dirty || changed {
+                                        if search_generation == self.search_id {
+                                            self.search_ui.status = if dirty {
+                                                "Failed to open result. Save edits, then search again."
+                                            } else {
+                                                "Failed to open result. File changed. Search again."
+                                            }
+                                            .into();
+                                        }
+                                        continue;
                                     }
-                                    continue;
                                 }
-                                if from_path && activate {
-                                    self.panel = None;
+                                if activate {
+                                    if file_search_generation.is_some() && !self.request.pick {
+                                        self.panel = None;
+                                        self.panel_return = None;
+                                        self.search_ui.temporary = None;
+                                        self.reset_search("Search closed");
+                                    } else if search_generation.is_some() {
+                                        self.search_ui.collapsed = self.search_ui.takeover;
+                                    } else if from_path {
+                                        self.panel = None;
+                                        self.panel_return = None;
+                                    }
                                 }
                                 self.add_document(
                                     disk,
@@ -1495,42 +1949,45 @@ impl Shell {
                                 )
                             }
                             Err(e) => {
-                                self.startup_failed |=
-                                    !self.ready && self.request.files.contains(&path);
-                                if expected
-                                    .is_some_and(|(_, generation)| generation == self.search_id)
-                                {
+                                if !self.ready && self.request.files.contains(&path) {
+                                    self.startup_error.get_or_insert_with(|| {
+                                        format!("{}: {e}", paths::display(&path))
+                                    });
+                                }
+                                if search_generation == Some(self.search_id) {
                                     self.search_ui.status = format!("Failed to open result: {e}");
                                 }
-                                self.open_failure = Some(open_failure::Failure {
-                                    path,
-                                    message: e.clone(),
-                                });
-                                self.status = e;
-                                if !from_path && activate {
-                                    self.focus(window, cx);
+                                if from_path && activate {
+                                    self.query_error =
+                                        Some(format!("Could not open this path. {e}"));
+                                } else if activate {
+                                    self.record_open_failure(path, e, window, cx);
                                 }
                             }
                         }
                     }
                 }
                 Reply::Cleared(id, generation, result) => {
+                    let _work = gpui::work_trace::Span::new("close_cleanup_acknowledge");
                     if let Some((pending_generation, text)) = self.cleanup_texts.get(&id)
                         && *pending_generation == generation
                         && let Some(doc) = self.documents.iter_mut().find(|doc| doc.id == id)
-                        && doc.input.read(cx).value().as_str() != text
+                        && {
+                            let input = doc.input.read(cx);
+                            !input.has_text_revision(text) && input.text() != text
+                        }
                     {
                         doc.generation += 1;
-                        self.io.send(Job::Recover(
+                        self.io.recover_edit(
                             id,
                             storage::Draft {
                                 path: doc.disk.path.clone(),
                                 target: Some(doc.disk.target.clone()),
-                                text: doc.input.read(cx).value().into(),
+                                text: doc.input.read(cx).text().clone(),
                                 base: doc.disk.bytes.clone(),
                                 generation: doc.generation,
                             },
-                        ));
+                        );
                     }
                     let current = self
                         .documents
@@ -1567,12 +2024,17 @@ impl Shell {
                                 }
                                 self.checks.invalidate(id);
                                 self.watch();
+                                self.reading_documents.remove(&id);
                                 if self.active == Some(id) {
                                     self.active = self.documents.last().map(|d| d.id);
                                 }
                             }
                             self.complete_request();
-                            self.focus(window, cx);
+                            if self.reading() {
+                                window.focus(&self.reading_focus);
+                            } else {
+                                self.focus(window, cx);
+                            }
                             self.finish_close(cx);
                         }
                         glimpse::closing::Outcome::Changed => {
@@ -1590,7 +2052,7 @@ impl Shell {
                         glimpse::closing::Outcome::Ignored => {}
                     }
                 }
-                Reply::Save(id, generation, _, result) => {
+                Reply::Save(id, generation, result) => {
                     glimpse::metrics::event("save-reply", id, generation);
                     let succeeded = result.is_ok();
                     if let Some(doc) = self.documents.iter_mut().find(|d| d.id == id) {
@@ -1606,25 +2068,30 @@ impl Shell {
                                     doc.recovery_error = None;
                                 }
                                 doc.set_disk(disk);
+                                if doc.disk.text_revision().is_some() {
+                                    doc.input
+                                        .update(cx, |input, cx| input.release_value_cache(cx));
+                                }
                                 doc.restored = false;
                                 doc.external = None;
                                 doc.generation += 1;
                                 if doc.dirty(cx) {
-                                    self.io.send(Job::Recover(
+                                    self.io.recover_edit(
                                         id,
                                         storage::Draft {
                                             path: doc.disk.path.clone(),
                                             target: Some(doc.disk.target.clone()),
-                                            text: doc.input.read(cx).value().into(),
+                                            text: doc.input.read(cx).text().clone(),
                                             base: doc.disk.bytes.clone(),
                                             generation: doc.generation,
                                         },
-                                    ));
+                                    );
                                 } else {
                                     self.io.send(Job::ClearThrough(id, doc.generation));
                                 }
                                 self.io
                                     .send(Job::BindingApplied(id, generation, doc.generation));
+                                self.last_saved = Some((id, doc.generation));
                                 self.status = match (unrecovered, doc.dirty(cx)) {
                                     (true, true) => {
                                         "Saved without recovery. Newer edits are still unsaved."
@@ -1686,9 +2153,13 @@ impl Shell {
                                 doc.set_disk(disk);
                                 doc.input.update(cx, |input, cx| {
                                     input.set_accessibility_label(
-                                        format!("Source: {}", paths::display(&doc.disk.path)),
+                                        format!("Source: {}", paths::name(&doc.disk.path)),
                                         cx,
-                                    )
+                                    );
+                                    input.set_accessibility_description(
+                                        paths::display(&doc.disk.path),
+                                        cx,
+                                    );
                                 });
                                 doc.external = None;
                                 doc.restored = false;
@@ -1712,6 +2183,7 @@ impl Shell {
                                     destination.generation,
                                     doc.generation,
                                 ));
+                                self.last_saved = Some((id, doc.generation));
                             }
                             if !destination.copy
                                 && self.abandon_destination.as_ref().is_some_and(
@@ -1802,7 +2274,9 @@ impl Shell {
                             self.status = "File access restored".into();
                         }
                         match result {
-                            Ok((disk, text)) if disk.target != doc.disk.target => {
+                            Ok(Observation::Changed(disk, text))
+                                if disk.target != doc.disk.target =>
+                            {
                                 doc.deferred_external = None;
                                 self.status = format!(
                                     "Destination changed from {} to {}. Local text retained; use Save Copy or explicitly Reload disk.",
@@ -1811,10 +2285,15 @@ impl Shell {
                                 );
                                 doc.external = Some((disk, text));
                             }
-                            Ok((disk, text)) if disk.bytes != doc.disk.bytes => {
+                            Ok(Observation::Changed(disk, text))
+                                if disk.bytes != doc.disk.bytes =>
+                            {
                                 doc.deferred_external = Some((disk, text));
                             }
-                            Ok((mut disk, _)) => {
+                            Ok(
+                                Observation::Unchanged(mut disk)
+                                | Observation::Changed(mut disk, _),
+                            ) => {
                                 if doc.disk.bom == disk.bom {
                                     disk.bytes = doc.disk.bytes.clone();
                                 }
@@ -1848,9 +2327,20 @@ impl Shell {
                 Reply::Reloaded(reload, result) => self.reloaded(*reload, result, window, cx),
                 Reply::SettingsLoaded(result) => {
                     self.settings_reloading = false;
+                    let restore_location =
+                        self.request.desktop && !self.settings_loaded && self.interaction == 0;
                     self.settings_loaded = true;
                     match result {
                         Ok(settings) => {
+                            if restore_location
+                                && settings.remember_locations
+                                && let Some(path) = settings.last_location.as_ref()
+                                && path.is_absolute()
+                                && path != &self.current
+                            {
+                                self.restoring_location = true;
+                                self.set_initial_location(path.clone());
+                            }
                             self.apply_settings(settings, window, cx);
                             if self.preferences.is_some() {
                                 self.open_preferences(self.settings.clone(), window, cx);
@@ -1884,7 +2374,7 @@ impl Shell {
                                     self.settings = settings;
                                     self.status = "Pinned locations saved".into();
                                 }
-                                SettingsWrite::Visits(_) => self.settings = settings,
+                                SettingsWrite::Locations { .. } => self.settings = settings,
                             }
                             self.flush_locations();
                         }
@@ -1895,7 +2385,10 @@ impl Shell {
                                         view.update(cx, |view, cx| view.failed(error.clone(), cx));
                                     }
                                 }
-                                SettingsWrite::Visits(visits) => {
+                                SettingsWrite::Locations { visits, last } => {
+                                    if self.last_location_pending.is_none() {
+                                        self.last_location_pending = last;
+                                    }
                                     let mut pending = visits;
                                     for path in std::mem::take(&mut self.location_visits_pending) {
                                         pending.retain(|older| *older != path);
@@ -1941,7 +2434,9 @@ impl Shell {
                             .is_some_and(|startup| startup.inventory_pending)
                         {
                             self.startup_recovery = None;
-                            self.startup_failed = true;
+                            self.startup_error.get_or_insert_with(|| {
+                                format!("Startup recovery could not be read: {error}")
+                            });
                             self.warnings.push(format!("Startup recovery could not be read: {error}. Open Recovery to retry."));
                         }
                         self.status = error;
@@ -2015,7 +2510,12 @@ impl Shell {
                             self.status = error;
                             if automatic && let Some(startup) = &mut self.startup_recovery {
                                 startup.failed += 1;
-                                self.startup_failed = true;
+                                self.startup_error.get_or_insert_with(|| {
+                                    format!(
+                                        "Startup recovery could not restore a document: {}",
+                                        self.status
+                                    )
+                                });
                             }
                         }
                     }
@@ -2091,15 +2591,62 @@ impl Shell {
                 }
                 Reply::Done(Err(error)) => self.status = error,
                 Reply::HistoryWarning(error) => self.warn(error),
-                Reply::Changed(result) => match result {
-                    Ok(()) => {
-                        self.refresh();
-                        window.focus(&self.nav_focus);
+                Reply::NamedChange(ticket, path, result) => {
+                    self.name_request = None;
+                    let current_form = self.panel_revision == ticket
+                        && matches!(
+                            self.panel,
+                            Some(Panel::NewFile | Panel::NewFolder | Panel::Rename)
+                        );
+                    match result {
+                        Ok(()) => {
+                            if path.parent() == Some(self.current.as_path()) {
+                                self.selection = Some(path.clone());
+                                self.reveal_pending = Some(path);
+                                self.refresh();
+                            }
+                            if current_form {
+                                self.panel = None;
+                                self.panel_return = None;
+                                self.rename_path = None;
+                                window.focus(&self.nav_focus);
+                            }
+                        }
+                        Err(error) if current_form => {
+                            self.query_error = Some(error);
+                            self.query.update(cx, |input, cx| input.focus(window, cx));
+                        }
+                        Err(error) => self.status = error,
                     }
-                    Err(e) => self.status = e,
-                },
+                }
+                Reply::Trashed(path, result) => {
+                    if let Some(request) = self.trash_pending.take() {
+                        match result {
+                            Ok(()) => {
+                                if path.parent() == Some(self.current.as_path()) {
+                                    if self.selection.as_ref() == Some(&path) {
+                                        self.selection = request.adjacent;
+                                        self.search_ui.picker_selection = self.selection.clone();
+                                    }
+                                    self.refresh();
+                                }
+                                self.status = format!("Moved to Trash: {}", paths::name(&path));
+                            }
+                            Err(error) => {
+                                self.trash_needs_selection = false;
+                                self.status = format!(
+                                    "Could not move to Trash. {error}\n{}",
+                                    paths::name(&path)
+                                );
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
+        }
+        if listing_changed && !self.restoring_location {
+            self.flush_locations();
         }
         while let Ok(result) = self.search.replies.try_recv() {
             if result.generation == self.search_id {
@@ -2117,12 +2664,21 @@ impl Shell {
                     .selection
                     .and_then(|i| self.hits.get(i))
                     .map(|hit| (hit.path.clone(), hit.line));
+                self.search_ui.duplicate_parents = std::sync::Arc::new(result.duplicate_parents);
+                self.search_ui.filename_hints = std::sync::Arc::new(result.filename_hints);
                 self.hits = std::sync::Arc::new(result.hits);
-                self.search_ui.selection = selected.and_then(|(path, line)| {
-                    self.hits
-                        .iter()
-                        .position(|hit| hit.path == path && hit.line == line)
-                });
+                self.search_ui.selection = selected
+                    .and_then(|(path, line)| {
+                        self.hits
+                            .iter()
+                            .position(|hit| hit.path == path && hit.line == line)
+                    })
+                    .or_else(|| {
+                        (result.completed
+                            && self.panel == Some(Panel::Files)
+                            && !self.hits.is_empty())
+                        .then_some(0)
+                    });
                 self.search_ui.status = result.state;
                 self.search_ui.running = !result.completed;
                 if result.completed && self.search_ui.building {
@@ -2142,6 +2698,7 @@ impl Shell {
                         }
                     }
                 }
+                self.announce_search_when_quiet(cx);
             }
         }
         if let Some(change) = self.observer.changed() {
@@ -2174,14 +2731,15 @@ impl Shell {
                 .iter()
                 .find(|d| d.id == highlight.id && d.generation == highlight.generation)
         {
-            let canvas = theme::canvas(cx);
+            let canvases = theme::source_canvases(cx);
             let mut colors = HashMap::new();
             let spans = highlight
                 .spans
                 .into_iter()
                 .map(|span| {
                     let color = *colors.entry(span.rgb).or_insert_with(|| {
-                        let color = glimpse::syntax::readable_rgb(span.rgb, canvas);
+                        let color =
+                            glimpse::syntax::readable_rgb(span.rgb, canvases.as_flattened());
                         rgb(((color[0] as u32) << 16) | ((color[1] as u32) << 8) | color[2] as u32)
                             .into()
                     });
@@ -2234,10 +2792,14 @@ impl Shell {
             self.checks.invalidate(doc.id);
             doc.deferred_external = None;
             doc.saving = true;
+            let text = doc.input.update(cx, |input, _| {
+                input.begin_undo_group();
+                glimpse::io::TextSnapshot::Revision(input.text().clone())
+            });
             self.io.send(Job::Save {
                 id: doc.id,
                 disk: doc.disk.clone(),
-                text: doc.input.read(cx).value().into(),
+                text,
                 generation: doc.generation,
                 without_recovery: false,
             });
@@ -2314,7 +2876,7 @@ impl Shell {
         })
         .detach();
     }
-    fn close(&mut self, quit: bool, window: &mut Window, cx: &mut Context<Self>) {
+    fn close(&mut self, quit: bool, tab: Option<u64>, window: &mut Window, cx: &mut Context<Self>) {
         if self.decision.is_some() {
             return;
         }
@@ -2338,7 +2900,7 @@ impl Shell {
         let documents = self
             .documents
             .iter()
-            .filter(|d| quit || Some(d.id) == self.active)
+            .filter(|d| quit || Some(d.id) == tab)
             .map(|d| d.id)
             .collect();
         self.close_pending = Some(CloseDecision {
@@ -2377,8 +2939,14 @@ impl Shell {
                     cx.notify();
                     return;
                 }
+                let retained = self.active.filter(|active| {
+                    !decision.quit && !decision.finish && !decision.documents.contains(active)
+                });
                 self.active = Some(id);
                 self.save(window, cx);
+                if let Some(retained) = retained {
+                    self.active = Some(retained);
+                }
             } else if self.decision.is_none() {
                 let paths = self
                     .documents
@@ -2386,25 +2954,23 @@ impl Shell {
                     .filter(|doc| decision.documents.contains(&doc.id) && doc.dirty(cx))
                     .map(|doc| doc.disk.path.as_path())
                     .collect::<Vec<_>>();
-                let labels = paths
-                    .iter()
-                    .map(|path| paths::tab_label(path, paths.iter().copied()))
-                    .collect::<Vec<_>>();
-                let names = paths
+                let subjects = decision::Decision::unsaved_subjects(&paths);
+                let details = paths
                     .iter()
                     .map(|path| paths::display(path))
                     .collect::<Vec<_>>()
                     .join("\n");
                 let finish = decision.finish;
+                let title = match (finish, paths.len()) {
+                    (true, 0..=1) => "Finish Editing?".into(),
+                    (false, 0..=1) => "Close with unsaved changes?".into(),
+                    (true, count) => format!("Finish editing {count} unsaved documents?"),
+                    (false, count) => format!("Close {count} unsaved documents?"),
+                };
                 self.ask_decision(
                     DecisionAction::Close,
-                    if finish {
-                        "Finish Editing?"
-                    } else {
-                        "Close with unsaved changes?"
-                    }
-                    .into(),
-                    format!("Full paths:\n{names}"),
+                    title,
+                    details,
                     vec![
                         "Cancel",
                         if finish {
@@ -2418,7 +2984,7 @@ impl Shell {
                     cx,
                 );
                 if let Some(view) = &self.decision {
-                    view.update(cx, |view, cx| view.set_subjects(labels, cx));
+                    view.update(cx, |view, cx| view.set_subjects(subjects, window, cx));
                 }
             }
         } else {
@@ -2427,6 +2993,7 @@ impl Shell {
         cx.notify();
     }
     fn commit_close(&mut self, discard: bool, cx: &mut Context<Self>) {
+        let _work = gpui::work_trace::Span::new("close_request");
         if let Some(decision) = self.close_pending.as_mut() {
             decision.discard = discard;
         }
@@ -2444,10 +3011,8 @@ impl Shell {
                 if decision.finish && !discard {
                     self.keep_after_cleanup.insert(doc.id);
                 }
-                self.cleanup_texts.insert(
-                    doc.id,
-                    (doc.generation, doc.input.read(cx).value().to_string()),
-                );
+                self.cleanup_texts
+                    .insert(doc.id, (doc.generation, doc.input.read(cx).text().clone()));
                 self.io.send(Job::ClearThrough(doc.id, doc.generation));
             }
         }
@@ -2467,78 +3032,6 @@ impl Shell {
             cx.quit();
         }
     }
-    fn shortcut(&mut self, key: &Keystroke, window: &mut Window, cx: &mut Context<Self>) {
-        if matches!(self.panel, Some(Panel::Files | Panel::Text))
-            && self.preferences.is_none()
-            && self.decision.is_none()
-            && self.query.focus_handle(cx).is_focused(window)
-            && key.key == "down"
-            && !key.modifiers.control
-            && !key.modifiers.platform
-            && !self.hits.is_empty()
-        {
-            self.focus_results(window, cx);
-            window.prevent_default();
-            cx.stop_propagation();
-            return;
-        }
-        if self.panel == Some(Panel::Path)
-            && self.preferences.is_none()
-            && self.decision.is_none()
-            && self.query.focus_handle(cx).is_focused(window)
-            && key.key == "tab"
-            && !key.modifiers.control
-            && !key.modifiers.platform
-        {
-            self.complete_path(key.modifiers.shift, window, cx);
-            window.prevent_default();
-            cx.stop_propagation();
-            return;
-        }
-        if self.decision.is_some()
-            || self.preferences.is_some()
-            || (!key.modifiers.control && !key.modifiers.platform)
-        {
-            return;
-        }
-        let bindings = glimpse::commands::bindings(&self.settings.keymaps).unwrap_or_default();
-        let command = bindings
-            .iter()
-            .find(|binding| {
-                let name = match binding.key.name() {
-                    "ArrowLeft" => "left",
-                    "ArrowRight" => "right",
-                    "ArrowUp" => "up",
-                    "ArrowDown" => "down",
-                    "Comma" => ",",
-                    other => other,
-                };
-                name.eq_ignore_ascii_case(&key.key)
-                    && platform::shortcut(&binding.modifiers, &key.modifiers)
-            })
-            .and_then(|binding| {
-                glimpse::commands::COMMANDS
-                    .iter()
-                    .find(|command| command.action == binding.action)
-            });
-        if let Some(command) = command {
-            self.command(command.id, window, cx);
-            window.prevent_default();
-            cx.stop_propagation();
-        } else if key.key.eq_ignore_ascii_case("f")
-            && platform::shortcut(
-                &glimpse::commands::Modifiers {
-                    command: true,
-                    ..Default::default()
-                },
-                &key.modifiers,
-            )
-        {
-            window.prevent_default();
-            cx.stop_propagation();
-        }
-    }
-
     fn command(&mut self, command: &str, window: &mut Window, cx: &mut Context<Self>) {
         glimpse::metrics::event(command, self.active.unwrap_or(0), 0);
         if self.request.pick
@@ -2547,6 +3040,7 @@ impl Shell {
                 "named-file"
                     | "new-folder"
                     | "rename"
+                    | "keep-tab"
                     | "recovery"
                     | "settings"
                     | "pin"
@@ -2562,6 +3056,11 @@ impl Shell {
             return;
         }
         match command {
+            "open-documents" if self.documents.len() > 1 && !self.request.pick => {
+                self.navigation_only = false;
+                self.open_documents_requested = true;
+            }
+            "open-documents" => {}
             "cancel" if self.request.pick => {
                 crate::EXIT_STATUS.store(1, std::sync::atomic::Ordering::Relaxed);
                 cx.quit();
@@ -2575,7 +3074,37 @@ impl Shell {
             }
             "named-file" => self.panel(Panel::NewFile, window, cx),
             "new-folder" => self.panel(Panel::NewFolder, window, cx),
-            "rename" => self.panel(Panel::Rename, window, cx),
+            "rename" => {
+                if let Some(path) = self.selected_path() {
+                    if let Some(reason) = self.file_action_blocker(&path, false) {
+                        self.status = reason.into();
+                        cx.notify();
+                        return;
+                    }
+                    self.panel(Panel::Rename, window, cx);
+                    if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+                        let directory = self
+                            .entries
+                            .iter()
+                            .any(|entry| entry.path == path && entry.directory);
+                        let stem = if directory {
+                            name
+                        } else {
+                            path.file_stem()
+                                .and_then(|stem| stem.to_str())
+                                .unwrap_or(name)
+                        };
+                        self.query.update(cx, |input, cx| {
+                            input.set_value(name.to_owned(), window, cx);
+                            input.set_cursor_offset_unfocused(0, cx);
+                            input.select_to(stem.len(), cx);
+                        });
+                    }
+                    self.rename_path = Some(path);
+                } else {
+                    self.status = "Select a file or folder to rename.".into();
+                }
+            }
             "navigator" => {
                 self.navigation_only = true;
                 self.navigator_visible = true;
@@ -2586,6 +3115,8 @@ impl Shell {
                     self.navigation_only = !self.navigation_only;
                     if self.navigation_only {
                         window.focus(&self.nav_focus);
+                    } else if self.reading() {
+                        self.reading_focus.focus(window);
                     } else {
                         self.focus(window, cx);
                     }
@@ -2594,7 +3125,7 @@ impl Shell {
                 }
             }
             "find" => {
-                self.reading = false;
+                self.set_reading(false);
                 self.navigation_only = false;
                 self.focus(window, cx);
                 if let Some(doc) = self
@@ -2606,7 +3137,24 @@ impl Shell {
                         .update(cx, |input, cx| input.show_search(window, cx));
                 }
             }
+            "submit" if self.panel == Some(Panel::Files) => self.start_search(cx),
             "submit" => self.submit(window, cx),
+            "next-document" | "previous-document" => {
+                if let Some(index) = self
+                    .documents
+                    .iter()
+                    .position(|doc| Some(doc.id) == self.active)
+                {
+                    let count = self.documents.len();
+                    let next = if command == "next-document" {
+                        (index + 1) % count
+                    } else {
+                        (index + count - 1) % count
+                    };
+                    let id = self.documents[next].id;
+                    self.select_tab(id, false, window, cx);
+                }
+            }
             "dismiss" => {
                 if self.panel == Some(Panel::Palette) && self.resume_search(window, cx) {
                     cx.notify();
@@ -2618,10 +3166,23 @@ impl Shell {
                 if self.panel == Some(Panel::Filter) {
                     self.filter.clear();
                 }
+                // Focus returns to the control that opened the panel only when it is still in
+                // the panel; after opening a result the user is already where they work.
+                let inside = self.query.focus_handle(cx).contains_focused(window, cx)
+                    || self.search_ui.focus.contains_focused(window, cx)
+                    || self.palette.overlay.contains_focused(window, cx)
+                    || self.palette.focus.contains_focused(window, cx)
+                    || (self.panel == Some(Panel::Filter) && self.nav_focus.is_focused(window));
                 self.panel = None;
+                self.query_error = None;
+                self.path_hint = None;
                 self.search_ui.temporary = None;
                 self.reset_search("Search closed");
-                self.focus(window, cx);
+                match self.panel_return.take() {
+                    Some(invoker) if inside && self.shown(&invoker, cx) => window.focus(&invoker),
+                    _ if inside => self.focus(window, cx),
+                    _ => {}
+                }
             }
             "cancel-close" | "cancel-closing" => {
                 self.finishing.invalidate();
@@ -2765,7 +3326,13 @@ impl Shell {
                 .detach();
             }
             "path" => self.panel(Panel::Path, window, cx),
-            "filter" => self.panel(Panel::Filter, window, cx),
+            "filter" => {
+                self.navigator_visible = true;
+                if self.narrow(window) {
+                    self.navigation_only = true;
+                }
+                self.panel(Panel::Filter, window, cx);
+            }
             "find-files" => self.panel(Panel::Files, window, cx),
             "find-text" => self.panel(Panel::Text, window, cx),
             "commands" => self.panel(Panel::Palette, window, cx),
@@ -2775,7 +3342,7 @@ impl Shell {
                 self.io.send(Job::Inventory);
             }
             "line" => {
-                self.reading = false;
+                self.set_reading(false);
                 self.navigation_only = false;
                 self.panel(Panel::Line, window, cx);
             }
@@ -2784,7 +3351,20 @@ impl Shell {
                     self.navigate(path);
                 }
             }
-            "home" => self.navigate(std::env::home_dir().unwrap()),
+            "home" => {
+                if let Some(home) = std::env::home_dir() {
+                    self.navigate(home);
+                } else {
+                    self.ask_decision(
+                        DecisionAction::Notice,
+                        "Home folder is unavailable".into(),
+                        "Choose another folder from Locations or enter its path.".into(),
+                        vec!["Close"],
+                        window,
+                        cx,
+                    );
+                }
+            }
             "back" => {
                 if let Some(path) = self.history.pop() {
                     self.future.push(self.current.clone());
@@ -2810,7 +3390,14 @@ impl Shell {
                 self.listing_buffer.clear();
                 self.listing_error =
                     Some("Folder reading was cancelled. Refresh to read again.".into());
-                self.startup_failed |= !self.ready;
+                if !self.ready {
+                    self.startup_error.get_or_insert_with(|| {
+                        format!(
+                            "Folder reading was cancelled: {}",
+                            paths::display(&self.current)
+                        )
+                    });
+                }
             }
             "folder-error" => {
                 if let Some(error) = &self.listing_error {
@@ -2822,8 +3409,23 @@ impl Shell {
                 self.status =
                     "Refreshing mounted locations; reopen Locations for the result".into();
             }
+            "undo" | "redo" | "cut" | "copy" | "paste" | "select-all" => {
+                if self.reading() {
+                    return;
+                }
+                self.focus(window, cx);
+                let action: Box<dyn Action> = match command {
+                    "undo" => Box::new(gpui_component::input::Undo),
+                    "redo" => Box::new(gpui_component::input::Redo),
+                    "cut" => Box::new(gpui_component::input::Cut),
+                    "copy" => Box::new(gpui_component::input::Copy),
+                    "paste" => Box::new(gpui_component::input::Paste),
+                    _ => Box::new(gpui_component::input::SelectAll),
+                };
+                window.dispatch_action(action, cx);
+            }
             "indent" | "outdent" => {
-                if self.reading {
+                if self.reading() {
                     return;
                 }
                 self.focus(window, cx);
@@ -2835,8 +3437,10 @@ impl Shell {
                 window.dispatch_action(action, cx);
             }
             "read" => {
-                self.reading = !self.reading;
-                if self.reading {
+                let reading = !self.reading();
+                self.set_reading(reading);
+                self.navigation_only = false;
+                if self.reading() {
                     self.reading_focus.focus(window);
                 } else {
                     if let Some(doc) = self
@@ -2847,16 +3451,29 @@ impl Shell {
                         doc.input.read(cx).focus_handle(cx).focus(window);
                     }
                 }
+                self.prepare_inactive_reading(window, cx);
             }
-            "reading-retry" => self.reading_view = None,
+            "reading-retry" => {
+                self.io.cancel_reading();
+                self.reading_view = None;
+                self.prepare_inactive_reading(window, cx);
+            }
             "reading-notices" => self.reading_notices(window, cx),
             "keep-tab" => {
-                if let Some(doc) = self
+                let Some(doc) = self
                     .documents
                     .iter_mut()
-                    .find(|doc| Some(doc.id) == self.active)
-                {
-                    doc.preview = false;
+                    .find(|doc| doc.preview && Some(doc.id) == self.active)
+                else {
+                    return;
+                };
+                doc.preview = false;
+                if !self.navigation_only {
+                    if self.reading() {
+                        self.reading_focus.focus(window);
+                    } else {
+                        self.focus(window, cx);
+                    }
                 }
             }
             "search-here" => {
@@ -2888,8 +3505,8 @@ impl Shell {
                 self.search_ui.temporary = None;
                 self.reset_search("Search scope changed; press Enter to search");
             }
-            "close" => self.close(false, window, cx),
-            "quit" => self.close(true, window, cx),
+            "close" => self.close(false, self.active, window, cx),
+            "quit" => self.close(true, None, window, cx),
             "abort" => {
                 self.finishing.invalidate();
                 self.close_pending = None;
@@ -2916,11 +3533,9 @@ impl Shell {
             }
             "trash" if !self.request.pick => {
                 if let Some(path) = self.selected_path() {
-                    if self.documents.iter().any(|d| d.disk.path == path) {
-                        self.status = "Close this file before moving it to Trash".into();
-                    } else {
-                        self.io.send(Job::Trash(path));
-                    }
+                    self.move_to_trash(path, true);
+                } else {
+                    self.status = "Select a file or folder to move to Trash.".into();
                 }
             }
             "reload" | "overwrite" | "compare" => self.conflict_action(command, window, cx),
@@ -3010,6 +3625,7 @@ impl Shell {
                     | "new-folder"
                     | "rename"
                     | "trash"
+                    | "keep-tab"
                     | "settings"
                     | "wrap"
                     | "indent"
@@ -3021,18 +3637,32 @@ impl Shell {
             return false;
         }
         match command {
+            "open-documents" | "next-document" | "previous-document" => {
+                self.documents.len() > 1 && !self.request.pick
+            }
             "save" => document.is_some_and(|doc| !doc.saving && doc.external.is_none()),
             "save-as" | "save-copy" => {
                 document.is_some_and(|doc| !doc.saving) && !self.destination_busy
             }
-            "find" | "line" | "read" | "close" | "keep-tab" => document.is_some(),
-            "indent" | "outdent" => document.is_some() && !self.reading,
+            "find" | "line" | "close" => document.is_some(),
+            "read" => document.is_some_and(Document::markdown),
+            "keep-tab" => document.is_some_and(|doc| doc.preview),
+            "indent" | "outdent" | "paste" | "select-all" => document.is_some() && !self.reading(),
+            "undo" => document.is_some() && !self.reading() && self.edit_state.get()[0],
+            "redo" => document.is_some() && !self.reading() && self.edit_state.get()[1],
+            "cut" | "copy" => document.is_some() && !self.reading() && self.edit_state.get()[2],
             "reload" | "reveal" => {
                 document.is_some_and(|doc| !doc.disk.target.as_os_str().is_empty() && !doc.saving)
             }
             "compare" | "overwrite" => {
                 document.is_some_and(|doc| doc.external.is_some() && !doc.saving)
             }
+            "rename" | "trash" => self
+                .selection
+                .as_ref()
+                .is_some_and(|path| self.file_action_blocker(path, command == "trash").is_none()),
+            "stop-search" => self.search_ui.running,
+            "remove-index" => self.search.index_status(self.effective_scope()).is_some(),
             "back" => !self.history.is_empty(),
             "forward" => !self.future.is_empty(),
             "parent" => self.current.parent().is_some(),
@@ -3057,26 +3687,219 @@ impl Shell {
         command: &'static str,
         cx: &Context<Self>,
     ) -> Button {
+        let enabled = self.command_enabled(command);
+        let dirty_save = command == "save"
+            && enabled
+            && self
+                .documents
+                .iter()
+                .any(|doc| Some(doc.id) == self.active && doc.dirty(cx));
         Button::new(id)
             .label(label)
             .small()
             .compact()
-            .ghost()
-            .disabled(!self.command_enabled(command))
-            .when(
-                command == "save"
-                    && self.command_enabled(command)
-                    && self
-                        .documents
-                        .iter()
-                        .any(|doc| Some(doc.id) == self.active && doc.dirty(cx)),
-                |button| button.primary(),
-            )
+            .disabled(!enabled)
+            .map(|button| if dirty_save { button.primary() } else { button })
             .on_click(cx.listener(move |this, _, window, cx| this.command(command, window, cx)))
+    }
+    /// F6 moves between the main areas, as in other desktop applications, so the
+    /// keyboard can leave the source editor where Tab inserts indentation.
+    fn cycle_focus(&mut self, reverse: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let narrow = self.narrow(window);
+        let mut areas: Vec<u8> = Vec::new();
+        if self.panel.is_some() {
+            areas.push(0);
+        }
+        if self.navigator_visible && (!narrow || self.navigation_only || self.active.is_none()) {
+            areas.push(1);
+        }
+        if self.active.is_some() && (!narrow || !self.navigation_only) {
+            if self
+                .documents
+                .iter()
+                .any(|doc| Some(doc.id) == self.active && doc.external.is_some())
+            {
+                areas.push(3);
+            }
+            areas.push(2);
+        }
+        if let Some(failure) = &self.open_failure {
+            let anchor = match &failure.return_focus {
+                Some(focus) if focus == &self.nav_focus => 1,
+                Some(focus)
+                    if focus == &self.search_ui.focus || focus == &self.query.focus_handle(cx) =>
+                {
+                    0
+                }
+                _ => 2,
+            };
+            let position = areas
+                .iter()
+                .position(|&area| area == anchor)
+                .map_or(areas.len(), |index| index + 1);
+            areas.insert(position, 4);
+        }
+        if areas.is_empty() {
+            return;
+        }
+        let current = if self.notice_focus.contains_focused(window, cx) {
+            Some(4)
+        } else if self.query.focus_handle(cx).contains_focused(window, cx)
+            || self.search_ui.focus.is_focused(window)
+        {
+            Some(0)
+        } else if self.nav_focus.is_focused(window) {
+            Some(1)
+        } else if self.conflict_focus.is_focused(window) {
+            Some(3)
+        } else if self.reading_focus.contains_focused(window, cx)
+            || self.documents.iter().any(|doc| {
+                doc.input.focus_handle(cx).contains_focused(window, cx)
+                    || doc.tab_focus.contains_focused(window, cx)
+            })
+        {
+            Some(2)
+        } else {
+            None
+        };
+        let position = current.and_then(|area| areas.iter().position(|a| *a == area));
+        let next = match position {
+            Some(index) if reverse => areas[(index + areas.len() - 1) % areas.len()],
+            Some(index) => areas[(index + 1) % areas.len()],
+            None => areas[0],
+        };
+        match next {
+            0 => self.query.update(cx, |input, cx| input.focus(window, cx)),
+            1 => window.focus(&self.nav_focus),
+            3 => window.focus(&self.conflict_focus),
+            4 => window.focus(&self.notice_details_focus),
+            _ => {
+                if self.reading() {
+                    self.reading_focus.focus(window);
+                } else {
+                    self.focus(window, cx);
+                }
+            }
+        }
+        cx.notify();
+    }
+    /// How many optional toolbar groups fit, measured from the labels at the current
+    /// scale: 0 shows everything; higher tiers move Commands, then Filter and Find Text,
+    /// then Open, then Back/Forward/Parent into the menu, and finally show Find Files,
+    /// the view switch and Locations as icons.
+    fn toolbar_tier(&self, narrow: bool, window: &Window) -> usize {
+        let rem = window.rem_size();
+        let gap = px(4. * self.settings.ui_scale);
+        let text = |label: &str| {
+            let label = SharedString::from(label.to_owned());
+            let run = window.text_style().to_run(label.len());
+            window
+                .text_system()
+                .shape_line(label, rem * 0.875, &[run], None)
+                .width
+                + rem * 1.75
+        };
+        let icon = rem * 1.5;
+        let with_icon = |label: &str| text(label) + rem + gap;
+        let toggle = if narrow {
+            with_icon("Navigator").max(text("Open…"))
+        } else {
+            icon
+        };
+        let mut required =
+            rem * 2. + toggle + gap * 2. + with_icon("Locations") + with_icon("Find Files") + icon;
+        if self.request.pick {
+            required += text("Choose") + text("Cancel") + gap * 2.;
+        }
+        let optional = [
+            text("Commands") + gap * 2.,
+            text("Filter This Folder") + text("Find Text") + gap * 2.,
+            text("Open…") + gap,
+            icon * 3. + gap * 4.,
+            with_icon("Find Files") - icon,
+            if narrow { toggle - icon } else { px(0.) },
+            with_icon("Locations") - icon,
+        ];
+        let width = window.viewport_size().width;
+        let mut total = required + optional.iter().copied().fold(px(0.), |sum, w| sum + w);
+        for (tier, item) in optional.iter().enumerate() {
+            if total <= width {
+                return tier;
+            }
+            total -= *item;
+        }
+        optional.len()
+    }
+    fn tool_button(
+        &self,
+        command: &'static str,
+        label: &'static str,
+        icon: Option<IconName>,
+        cx: &Context<Self>,
+    ) -> Button {
+        Button::new(SharedString::from(format!("tool-{command}")))
+            .label(label)
+            .when_some(icon, |button, icon| button.icon(icon))
+            .ghost()
+            .when(self.command_enabled(command), |button| {
+                button.text_color(cx.theme().muted_foreground)
+            })
+            .small()
+            .disabled(!self.command_enabled(command))
+            .on_click(cx.listener(move |this, _, window, cx| this.command(command, window, cx)))
+    }
+    fn icon_button(
+        &self,
+        command: &'static str,
+        label: &'static str,
+        icon: IconName,
+        cx: &Context<Self>,
+    ) -> Button {
+        Button::new(command)
+            .icon(icon)
+            .tooltip(label)
+            .ghost()
+            .when(self.command_enabled(command), |button| {
+                button.text_color(cx.theme().muted_foreground)
+            })
+            .small()
+            .disabled(!self.command_enabled(command))
+            .on_click(cx.listener(move |this, _, window, cx| this.command(command, window, cx)))
+    }
+    fn select_tab(&mut self, id: u64, keep: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(document) = self.documents.iter_mut().find(|doc| doc.id == id) else {
+            return;
+        };
+        if keep {
+            document.preview = false;
+        }
+        self.clear_open_failure();
+        self.active = Some(id);
+        self.navigation_only = false;
+        self.focus(window, cx);
+        cx.notify();
     }
 }
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.edit_state.set(
+            self.documents
+                .iter()
+                .find(|doc| Some(doc.id) == self.active)
+                .map(|doc| {
+                    let input = doc.input.read(cx);
+                    [input.can_undo(), input.can_redo(), input.has_selection()]
+                })
+                .unwrap_or_default(),
+        );
+        if self.reading()
+            && !self
+                .documents
+                .iter()
+                .any(|doc| Some(doc.id) == self.active && doc.markdown())
+        {
+            self.set_reading(false);
+        }
         self.prepare_reading(window, cx);
         let title = self
             .documents
@@ -3098,7 +3921,10 @@ impl Render for Shell {
             self.window_title = title;
         }
         let narrow = self.narrow(window);
-        let source_visible = !self.reading && (!narrow || !self.navigation_only);
+        let short = narrow && window.viewport_size().height < px(280. * self.settings.ui_scale);
+        let compact_document =
+            short && !self.navigation_only && self.active.is_some() && !self.request.pick;
+        let source_visible = !self.reading() && (!narrow || !self.navigation_only);
         self.report_startup_ready(source_visible, window, cx);
         if !self.listing_done && self.listing_waiter.is_none() {
             let id = self.listing_id;
@@ -3118,53 +3944,88 @@ impl Render for Shell {
                     .update(cx, |input, _| input.release_accessibility_cache());
             }
         }
+        let scale = self.settings.ui_scale;
+        let main_menu_requested = std::mem::take(&mut self.main_menu_requested);
         let mut toolbar = div()
             .flex()
-            .flex_wrap()
-            .gap(px(8.))
-            .p(px(8.))
-            .bg(cx.theme().muted);
-        if narrow {
-            toolbar = toolbar
-                .child(self.button(
-                    if self.navigation_only && self.active.is_some() {
-                        "Edit"
-                    } else {
-                        "Browse"
-                    },
-                    "toggle-navigator",
-                    cx,
-                ))
-                .child(self.locations_menu(cx))
-                .child(self.main_menu(cx));
+            .items_center()
+            .gap(px(4. * scale))
+            .px(px(8. * scale))
+            .py(px(6. * scale))
+            .when(short, |toolbar| toolbar.py(px(3. * scale)))
+            .bg(cx.theme().title_bar)
+            .when(compact_document, |toolbar| {
+                toolbar
+                    .border_b_1()
+                    .border_color(cx.theme().title_bar_border)
+            });
+        let tier = self.toolbar_tier(narrow, window);
+        toolbar = if narrow && self.active.is_none() && !self.request.pick {
+            toolbar.child(self.tool_button("open", "Open…", None, cx))
+        } else if narrow {
+            let (label, icon) = if self.navigation_only {
+                ("Document", IconName::File)
+            } else {
+                ("Navigator", IconName::Folder)
+            };
+            if tier >= 6 {
+                toolbar.child(self.icon_button("toggle-navigator", label, icon, cx))
+            } else {
+                toolbar.child(self.tool_button("toggle-navigator", label, Some(icon), cx))
+            }
         } else {
-            toolbar = toolbar
-                .child(self.main_menu(cx))
-                .child(self.button("‹", "back", cx))
-                .child(self.button("›", "forward", cx))
-                .child(self.button("↑", "parent", cx))
-                .child(self.locations_menu(cx))
-                .child(self.button(
-                    if self.navigator_visible {
-                        "Hide files"
-                    } else {
-                        "Show files"
-                    },
-                    "toggle-navigator",
-                    cx,
-                ))
-                .child(self.button("Open", "open", cx))
-                .child(self.button("Filter folder", "filter", cx))
-                .child(self.button("Find files", "find-files", cx))
-                .child(self.button("Find text", "find-text", cx))
-                .child(self.button("Commands", "commands", cx));
-        }
+            toolbar.child(self.icon_button(
+                "toggle-navigator",
+                if self.navigator_visible {
+                    "Hide Navigator"
+                } else {
+                    "Show Navigator"
+                },
+                if self.navigator_visible {
+                    IconName::PanelLeftClose
+                } else {
+                    IconName::PanelLeftOpen
+                },
+                cx,
+            ))
+        };
+        toolbar = toolbar
+            .when(tier <= 3, |toolbar| {
+                toolbar
+                    .child(div().w(px(4. * scale)))
+                    .child(self.icon_button("back", "Back", IconName::ArrowLeft, cx))
+                    .child(self.icon_button("forward", "Forward", IconName::ArrowRight, cx))
+                    .child(self.icon_button("parent", "Parent Folder", IconName::ArrowUp, cx))
+            })
+            .child(div().w(px(4. * scale)))
+            .child(self.locations_menu(tier >= 7, cx))
+            .when(tier <= 2 && !(narrow && self.active.is_none()), |toolbar| {
+                toolbar.child(self.tool_button("open", "Open…", None, cx))
+            })
+            .child(div().flex_1())
+            .when(tier <= 1, |toolbar| {
+                toolbar.child(self.tool_button("filter", "Filter This Folder", None, cx))
+            })
+            .child(if tier >= 5 {
+                self.icon_button("find-files", "Find Files", IconName::Search, cx)
+            } else {
+                self.tool_button("find-files", "Find Files", None, cx)
+            })
+            .when(tier <= 1, |toolbar| {
+                toolbar.child(self.tool_button("find-text", "Find Text", None, cx))
+            })
+            .when(tier == 0, |toolbar| {
+                toolbar
+                    .child(div().w(px(4. * scale)))
+                    .child(self.tool_button("commands", "Commands", None, cx))
+            })
+            .child(self.main_menu(main_menu_requested, cx));
         if self.request.pick {
             toolbar = toolbar
                 .child(self.button("Choose", "choose", cx))
                 .child(self.button("Cancel", "cancel", cx));
         }
-        let mut root = div()
+        let root = div()
             .size_full()
             .relative()
             .on_modifiers_changed(
@@ -3222,7 +4083,10 @@ impl Render for Shell {
             .text_color(cx.theme().foreground)
             .text_size(px(14. * self.settings.ui_scale))
             .child(toolbar)
-            .child(self.path_bar(window, cx))
+            .relative()
+            .when(!compact_document, |root| {
+                root.child(self.path_bar(short, window, cx))
+            })
             .when(self.request.pick, |root| {
                 let candidate = if self.request.directory {
                     Some(self.current.clone())
@@ -3247,111 +4111,58 @@ impl Render for Shell {
                     },
                 ))
             });
-        if self.open_failure.is_some() {
-            root = root.child(self.open_failure_view(cx));
+        let takeover = self.panel_takes_over(narrow, window);
+        self.search_ui.takeover = takeover;
+        if self.search_ui.focus.is_focused(window)
+            && self.search_ui.selection.is_none()
+            && !self.hits.is_empty()
+        {
+            self.search_ui.selection = Some(0);
+            self.search_ui.picker_selection = Some(self.hits[0].path.clone());
         }
+        let mut main = div().flex_1().min_h_0().overflow_hidden().flex().flex_col();
+        // Commands and path completions float above the panes so typing never moves
+        // the document; search panels keep a fixed height while open.
+        let mut floating = None;
         if self.panel == Some(Panel::Path) {
-            root = root.child(self.path_matches(cx));
+            if takeover {
+                main = main.child(self.path_matches(window, cx));
+            } else {
+                floating = Some(self.path_matches(window, cx));
+            }
         }
         if let Some(panel) = self.panel.filter(|panel| *panel != Panel::Path) {
-            let title = match panel {
-                Panel::Path => "Location",
-                Panel::Filter => "Filter this folder",
-                Panel::Files => "Find files",
-                Panel::Text => "Find saved text",
-                Panel::Palette => "Commands",
-                Panel::Recovery => "Recovery",
-                Panel::Line => "Go to line",
-                Panel::NewFile => "New file name",
-                Panel::NewFolder => "New folder name",
-                Panel::Rename => "New name",
-            };
-            root = root.child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .p_2()
-                    .child(title)
-                    .child(Input::new(&self.query).flex_1().min_w_0())
-                    .when(!matches!(panel, Panel::Recovery | Panel::Filter), |row| {
-                        row.child(self.button(
-                            if matches!(panel, Panel::Files | Panel::Text) {
-                                "Search"
-                            } else {
-                                "Apply"
-                            },
-                            "submit",
-                            cx,
-                        ))
-                    })
-                    .child(self.button("Close", "dismiss", cx)),
-            );
-            if matches!(panel, Panel::Files | Panel::Text) {
-                root = root.child(self.search_view(window, cx));
-            }
-            if panel == Panel::Palette {
-                let query = self.query.read(cx).value().to_lowercase();
-                root = root.child(
-                    div()
-                        .id("palette")
-                        .max_h(px(240.))
-                        .overflow_y_scroll()
-                        .children(
-                            glimpse::commands::COMMANDS
-                                .iter()
-                                .filter(|c| {
-                                    c.label.to_lowercase().contains(&query) || c.id.contains(&query)
-                                })
-                                .map(|command| {
-                                    let key = self
-                                        .settings
-                                        .keymaps
-                                        .get(command.id)
-                                        .map(String::as_str)
-                                        .unwrap_or(command.shortcut);
-                                    let label = if key.is_empty() {
-                                        command.label.to_owned()
-                                    } else {
-                                        format!(
-                                            "{}  {}",
-                                            command.label,
-                                            platform::shortcut_label(key)
-                                        )
-                                    };
-                                    self.command_button(
-                                        SharedString::from(format!("palette-{}", command.id)),
-                                        label,
-                                        command.id,
-                                        cx,
-                                    )
-                                    .on_click(cx.listener(
-                                        move |this, _, window, cx| {
-                                            this.palette_command(command.id, window, cx)
-                                        },
-                                    ))
-                                }),
-                        ),
-                );
-            }
-            if panel == Panel::Recovery {
-                root = root.child(self.recovery_view(cx));
+            self.palette.floating = panel == Panel::Palette && !takeover;
+            if self.palette.floating {
+                floating = Some(self.palette_overlay(window, cx));
+            } else if panel == Panel::Filter {
+                // Filtering belongs to the navigator; it opens there and leaves the document still.
+            } else {
+                main = main.child(self.panel_view(panel, takeover, window, cx));
             }
         }
-
         if self.finishing.pending() {
-            root = root.child(
+            main = main.child(
                 div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
                     .p_2()
+                    .flex_shrink_0()
                     .child("Validating requested destinations…")
                     .child(self.button("Cancel completion", "cancel-close", cx)),
             );
         }
         if !self.closings.is_empty() {
-            root = root.child(
+            main = main.child(
                 div()
                     .flex()
+                    .flex_wrap()
+                    .items_center()
                     .gap_2()
                     .p_2()
+                    .flex_shrink_0()
                     .child("Resolving recovery before completing the decision")
                     .child(self.button("Retry cleanup", "retry-close", cx))
                     .child(self.button("Keep open", "cancel-close", cx)),
@@ -3360,28 +4171,48 @@ impl Render for Shell {
 
         let visible = self.visible_rows();
         let entries = self.entries.clone();
+        // A focused list always has a current row, so screen readers announce a file rather
+        // than only the list.
+        if self.nav_focus.is_focused(window)
+            && self.listing_done
+            && self.reveal_pending.is_none()
+            && self
+                .trash_pending
+                .as_ref()
+                .is_none_or(|request| Some(&request.path) != self.selection.as_ref())
+            && !visible
+                .iter()
+                .any(|&i| Some(&entries[i].path) == self.selection.as_ref())
+            && let Some(&first) = visible.first()
+        {
+            self.selection = Some(entries[first].path.clone());
+            self.search_ui.picker_selection = self.selection.clone();
+        }
         let scroll = self
             .scrolls
             .entry(self.current.clone())
             .or_default()
             .clone();
         if self.listing_done
-            && let Some(path) = self.reveal_pending.take()
+            && let Some(path) = self.reveal_pending.as_ref()
             && let Some(index) = visible
                 .iter()
-                .position(|&index| entries[index].path == path)
+                .position(|&index| &entries[index].path == path)
         {
+            self.reveal_pending = None;
             scroll.scroll_to_item(index, ScrollStrategy::Top);
         }
+        let nav_width = if narrow {
+            window.viewport_size().width
+        } else {
+            self.pane_state.read(cx).width(window)
+        };
         let navigator = div()
             .id("navigator")
             .track_focus(&self.nav_focus)
             .w_full()
             .h_full()
             .bg(cx.theme().sidebar)
-            .border_2()
-            .border_color(cx.theme().sidebar)
-            .focus(|style| style.border_color(cx.theme().foreground))
             .flex()
             .flex_col()
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
@@ -3427,60 +4258,117 @@ impl Render for Shell {
                 } else {
                     "No filenames match the filter".into()
                 };
+                let failed = self.listing_error.is_some();
+                let scale = self.settings.ui_scale;
                 navigator.child(
-                    div().p_2().text_sm()
-                        .child(div().id("listing-state").truncate().child(message.clone())
-                            .tooltip(move |window,cx| gpui_component::tooltip::Tooltip::new(message.clone()).build(window,cx)))
-                        .child(self.button("Refresh", "refresh", cx))
-                        .when(!self.listing_done, |row| row.child(self.button("Stop Reading", "stop-listing", cx)))
-                        .when(self.listing_error.is_some(), |row| row.child(self.button("Details…", "folder-error", cx)))
+                    div().m(px(6. * scale)).px(px(10. * scale)).py(px(8. * scale)).text_sm()
+                        .rounded(px(7. * scale))
+                        .when(failed, |notice| notice.bg(cx.theme().warning.opacity(0.1)).border_l(px(3. * scale)).border_color(cx.theme().warning))
+                        .when(!failed, |notice| notice.text_color(cx.theme().muted_foreground))
+                        .child(accessibility::label("listing-state-text", message.clone(), div().id("listing-state").whitespace_normal().line_clamp(4).child(message.clone())
+                            .tooltip(move |window,cx| gpui_component::tooltip::Tooltip::new(message.clone()).build(window,cx))))
+                        .child(
+                            div().flex().flex_wrap().gap_1().mt_1()
+                                .child(self.button("Refresh", "refresh", cx))
+                                .when(!self.listing_done, |row| row.child(self.button("Stop Reading", "stop-listing", cx)))
+                                .when(self.listing_error.is_some(), |row| row.child(self.button("Details…", "folder-error", cx))),
+                        )
                 )
             })
             .when(!visible.is_empty(), |navigator| navigator.child(
                 uniform_list(
                     "entries",
                     visible.len(),
-                    cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                    cx.processor(move |this, range: std::ops::Range<usize>, window, cx| {
+                        let scale = this.settings.ui_scale;
+                        let focused = this.nav_focus.is_focused(window);
+                        let name_width = nav_width - px((12. + 3. + 9. + 12. + 16. + 8. + 4.) * scale);
+                        let font_size = px(14. * scale);
+                        let measure = |text: &SharedString| {
+                            let run = window.text_style().to_run(text.len());
+                            window
+                                .text_system()
+                                .shape_line(text.clone(), font_size, &[run], None)
+                                .width
+                        };
                         range
                             .map(|i| {
                                 let entry = &entries[visible[i]];
                                 let path = entry.path.clone();
-                                let selected = this.selection.as_ref() == Some(&path);
+                                let cursor = this.selection.as_ref() == Some(&path);
+                                let selected = cursor && !this.trash_needs_selection;
+                                let cursor_border = if cursor && (focused || this.navigator_menu.is_some()) && !selected {
+                                    cx.theme().ring
+                                } else {
+                                    gpui::transparent_black()
+                                };
                                 let tooltip = paths::display(&path);
+                                let name = paths::name(&path);
+                                let caption = labels::filename(
+                                    &name, "", this.navigation_hints.get(&name), name_width, &measure,
+                                );
+                                let icon = if entry.symlink {
+                                    IconName::ExternalLink
+                                } else if entry.directory {
+                                    IconName::Folder
+                                } else {
+                                    IconName::File
+                                };
+                                let (marker, fill) = theme::list_row(selected, focused, cx);
+                                let context_path = path.clone();
                                 let row=div()
                                     .id(("entry", i))
-                                    .h(px(if this.settings.compact { 28. } else { 32. }
-                                        * this.settings.ui_scale))
-                                    .border_l(px(3. * this.settings.ui_scale))
-                                    .border_color(if selected {
-                                        cx.theme().foreground
-                                    } else {
-                                        gpui::transparent_black()
+                                    .h_full()
+                                    .w_full()
+                                    .rounded(px(6. * scale))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8. * scale))
+                                    .border_l(px(3. * scale))
+                                    .border_y_1()
+                                    .border_r_1()
+                                    .border_color(if selected { marker } else { cursor_border })
+                                    .when(selected, |row| row.border_y_0().border_r_0())
+                                    .pl(px(9. * scale))
+                                    .pr(px(12. * scale))
+                                    .bg(fill.unwrap_or(cx.theme().sidebar))
+                                    .hover(|row| if selected { row } else { row.bg(cx.theme().list_hover) })
+                                    .when(this.navigator_menu.is_none(), |row| {
+                                        row.tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx))
                                     })
-                                    .px_3()
-                                    .py_1()
-                                    .bg(if selected {
-                                        cx.theme().selection
-                                    } else {
-                                        cx.theme().sidebar
-                                    })
-                                    .truncate()
-                                    .tooltip(move |window,cx| gpui_component::tooltip::Tooltip::new(tooltip.clone()).build(window,cx))
                                     .cursor_pointer()
-                                    .child(format!(
-                                        "{} {}",
-                                        if entry.symlink { "↗" } else if entry.directory { "▸" } else { "·" },
-                                        paths::name(&path)
+                                    .child(
+                                        gpui_component::Icon::new(icon)
+                                            .with_size(px(16. * scale))
+                                            .flex_shrink_0()
+                                            .text_color(if entry.directory && !entry.symlink {
+                                                cx.theme().ring
+                                            } else {
+                                                cx.theme().muted_foreground
+                                            }),
+                                    )
+                                    .child(div().min_w_0().flex_1().truncate().child(caption))
+                                    .on_mouse_down(MouseButton::Right, cx.listener(
+                                        move |this, event: &MouseDownEvent, window, cx| {
+                                            this.navigator_menu_from_pointer(context_path.clone(), event.position, window, cx);
+                                            cx.stop_propagation();
+                                        },
                                     ))
                                     .on_click(cx.listener(
-                                        move |this, event: &ClickEvent, _, cx| {
-                                            this.selection = Some(path.clone());
-                                            this.search_ui.picker_selection = Some(path.clone());
+                                        move |this, event: &ClickEvent, window, cx| {
+                                            this.select_navigation(path.clone());
+                                            window.focus(&this.nav_focus);
                                             this.open(path.clone(), event.click_count() < 2, None);
                                             cx.notify();
                                         },
                                     ));
-                                this.navigation_row(entry,(i,visible.len()),selected,row,cx)
+                                let row = div()
+                                    .h(this.navigation_row_height())
+                                    .w_full()
+                                    .px(px(6. * scale))
+                                    .py(px(1. * scale))
+                                    .child(row);
+                                this.navigation_row(entry,(i,visible.len()),cursor,row,cx)
                             })
                             .collect::<Vec<_>>()
                     }),
@@ -3495,60 +4383,402 @@ impl Render for Shell {
             navigator,
             self.nav_focus.clone(),
         );
+        let focused_tab = self
+            .documents
+            .iter()
+            .position(|doc| doc.tab_focus.contains_focused(window, cx));
+        let shown_tab = focused_tab.or_else(|| {
+            self.documents
+                .iter()
+                .position(|doc| Some(doc.id) == self.active)
+        });
+        if let Some(index) = shown_tab {
+            let states = self
+                .documents
+                .iter()
+                .map(|doc| (doc.id, doc.dirty(cx), doc.preview, doc.external.is_some()))
+                .collect();
+            let reveal = (index, window.viewport_size(), states);
+            if self.tab_reveal.as_ref() != Some(&reveal) {
+                self.tab_reveal = Some(reveal);
+                self.tab_scroll.scroll_to_item(index);
+            }
+        }
+        let edit_source = compact_document && self.reading();
+        let show_documents_menu = self.documents.len() > 1 && !self.request.pick;
+        let tab_conflict = short
+            && self
+                .documents
+                .iter()
+                .any(|doc| Some(doc.id) == self.active && doc.external.is_some());
+        let rem = window.rem_size();
+        // The trigger carries the hidden-tab count from the last layout, so tab labels are sized
+        // for the width it actually takes.
+        let documents_label = match self.tab_hidden {
+            0 => "Documents".to_owned(),
+            hidden => format!("Documents +{hidden}"),
+        };
+        let documents_full =
+            Self::path_label_width(window, &documents_label.into()) + rem * 3. + px(2.);
+        let edit_full = Self::path_label_width(window, &"Edit Source".into()) + rem * 2.;
+        let close_width = if self.request.pick { px(0.) } else { rem * 1.5 };
+        let conflict_width = if tab_conflict {
+            rem * 1.5 + px(10. * scale)
+        } else {
+            px(0.)
+        };
+        let active_markdown = self
+            .documents
+            .iter()
+            .any(|doc| Some(doc.id) == self.active && doc.markdown());
+        let document_actions = !self.request.pick && !short && self.active.is_some();
+        let read_label = if self.reading() {
+            "Edit Source"
+        } else {
+            "Read"
+        };
+        let keep_tab = self.command_enabled("keep-tab");
+        let actions_width = if document_actions {
+            let gap = px(8. * scale);
+            let button = |label: &str| {
+                Self::path_label_width(window, &SharedString::from(label.to_owned()))
+                    + rem * 0.75
+                    + px(2.)
+                    + gap
+            };
+            button("Save")
+                + if active_markdown {
+                    button(read_label)
+                } else {
+                    px(0.)
+                }
+                + if keep_tab {
+                    button("Keep Preview Tab")
+                } else {
+                    px(0.)
+                }
+                + rem * 1.5
+                + gap
+        } else {
+            px(0.)
+        };
+        // The strip's leading inset is wider than its trailing one.
+        let controls_width = |documents: Pixels, edit: Pixels| {
+            actions_width
+                + px(6. * scale)
+                + (if show_documents_menu {
+                    documents + px(8. * scale)
+                } else {
+                    px(0.)
+                })
+                + (if edit_source {
+                    edit + px(8. * scale)
+                } else {
+                    px(0.)
+                })
+                + conflict_width
+                + px(10. * scale)
+        };
+        // Keep room for a recognizable active tab: shorten the controls beside the tabs
+        // before the tab itself.
+        let compact_tab_controls = narrow
+            && window.viewport_size().width
+                - controls_width(documents_full, edit_full)
+                - close_width
+                < rem * 10.;
+        let tab_controls_width = if compact_tab_controls {
+            controls_width(
+                rem * 2.,
+                Self::path_label_width(window, &"Edit".into()) + rem * 2.,
+            )
+        } else {
+            controls_width(documents_full, edit_full)
+        };
+        let navigator_width = if !narrow && self.navigator_visible {
+            nav_width + px(8.)
+        } else {
+            px(0.)
+        };
+        let tab_width =
+            (window.viewport_size().width - navigator_width - tab_controls_width - close_width)
+                .max(rem * 1.5);
+        let tab_parents =
+            paths::parent_hints(self.documents.iter().map(|doc| doc.disk.path.as_path()));
+        let tab_filenames = paths::filename_hints(
+            self.documents
+                .iter()
+                .filter_map(|doc| doc.disk.path.file_name()),
+        );
+        // Like a scrolling notebook, the strip shows the current tab and as many neighbours as
+        // fit whole, from widths measured in the last frame, so no fragment of a tab is left at
+        // an edge. Hidden tabs stay reachable with Ctrl+Tab, the arrow keys and Documents.
+        for (index, doc) in self.documents.iter().enumerate() {
+            if let Some(bounds) = self.tab_scroll.bounds_for_item(index)
+                && bounds.size.width > px(0.)
+                && self.tab_widths.insert(doc.id, bounds.size.width) != Some(bounds.size.width)
+            {
+                cx.notify();
+            }
+        }
+        self.tab_widths
+            .retain(|id, _| self.documents.iter().any(|doc| doc.id == *id));
+        let room = self.tab_scroll.bounds().size.width - px(8. * scale);
+        // The strip's width is known only after layout, so a resize refills it on the next frame.
+        if room != self.tab_room && !self.documents.is_empty() {
+            self.tab_room = room;
+            cx.notify();
+        }
+        let shown_tabs = shown_tab.filter(|_| room > px(0.)).map(|center| {
+            let width = |index: usize| {
+                self.tab_widths
+                    .get(&self.documents[index].id)
+                    .copied()
+                    .unwrap_or_default()
+            };
+            let gap = px(2. * scale);
+            let (mut first, mut last, mut used) = (center, center, width(center));
+            loop {
+                let mut grew = false;
+                if last + 1 < self.documents.len() && used + gap + width(last + 1) <= room {
+                    last += 1;
+                    used += gap + width(last);
+                    grew = true;
+                }
+                if first > 0 && used + gap + width(first - 1) <= room {
+                    first -= 1;
+                    used += gap + width(first);
+                    grew = true;
+                }
+                if !grew {
+                    break first..=last;
+                }
+            }
+        });
+        let document_focused = self.reading_focus.contains_focused(window, cx)
+            || self.documents.iter().any(|doc| {
+                doc.input.focus_handle(cx).contains_focused(window, cx)
+                    || doc.tab_focus.contains_focused(window, cx)
+            });
+        // Narrow strips keep every pixel for the tab label, so they show no count.
+        let hidden_tabs = shown_tabs.as_ref().filter(|_| !narrow).map_or(0, |shown| {
+            self.documents.len() - (shown.end() + 1 - shown.start())
+        });
+        if hidden_tabs != self.tab_hidden && !self.documents.is_empty() {
+            self.tab_hidden = hidden_tabs;
+            cx.notify();
+        }
         let tabs = div()
             .id("tabs")
             .w_full()
             .flex()
-            .gap_1()
-            .p(px(4.))
+            .items_end()
+            .gap(px(2. * scale))
+            .pl(px(10. * scale))
+            .pr(px(4. * scale))
+            .pt(px(4. * scale))
+            .when(short, |tabs| tabs.pt_0())
             .overflow_x_scroll()
             .flex_shrink_0()
             .track_scroll(&self.tab_scroll)
-            .children(self.documents.iter().map(|doc| {
+            .children(self.documents.iter().enumerate().map(|(index, doc)| {
                 let id = doc.id;
-                let title = format!(
-                    "{}{}{}{}",
-                    paths::tab_label(
-                        &doc.disk.path,
-                        self.documents.iter().map(|doc| doc.disk.path.as_path())
-                    ),
-                    if doc.dirty(cx) { " •" } else { "" },
-                    if doc.preview { " (preview)" } else { "" },
-                    if doc.external.is_some() {
-                        " (conflict)"
-                    } else {
-                        ""
-                    }
+                let hidden = shown_tabs
+                    .as_ref()
+                    .is_some_and(|shown| !shown.contains(&index));
+                let name = paths::tab_label(
+                    &doc.disk.path,
+                    self.documents.iter().map(|doc| doc.disk.path.as_path()),
                 );
-                div().track_focus(&doc.tab_focus).flex_shrink_0().child(
-                    Button::new(("tab", id))
-                        .accessibility_role(gpui::accesskit::Role::Tab)
-                        .label(title)
-                        .tooltip(paths::display(&doc.disk.path))
-                        .small()
-                        .compact()
-                        .selected(Some(id) == self.active)
-                        .when(Some(id) == self.active, |tab| tab.primary())
-                        .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                            this.active = Some(id);
-                            if event.click_count() > 1
-                                && let Some(doc) =
-                                    this.documents.iter_mut().find(|doc| doc.id == id)
-                            {
-                                doc.preview = false;
-                            }
-                            this.reading = false;
-                            this.navigation_only = false;
-                            this.focus(window, cx);
-                            cx.notify();
-                        })),
-                )
+                let dirty = doc.dirty(cx);
+                let active = Some(id) == self.active;
+                let suffix = match (dirty, doc.external.is_some() && !(active && tab_conflict)) {
+                    (false, false) => "",
+                    (true, false) => " •",
+                    (false, true) => " (conflict)",
+                    (true, true) => " • (conflict)",
+                };
+                let filename = paths::name(&doc.disk.path);
+                let measure = |text: &SharedString| Self::path_label_width(window, text);
+                let text_width = (tab_width - rem * 0.75 - px(2.)).max(px(0.));
+                let caption = match tab_parents.get(&doc.disk.path) {
+                    // State marks follow the whole label, after the distinguishing folder.
+                    Some(folder) => {
+                        let room = (text_width - measure(&suffix.into())).max(px(0.));
+                        let label = labels::document(&filename, "", folder, " — ", room, &measure);
+                        format!("{label}{suffix}")
+                    }
+                    None => labels::filename(
+                        &filename,
+                        suffix,
+                        tab_filenames.get(&filename),
+                        text_width,
+                        &measure,
+                    ),
+                };
+                let spoken = [
+                    Some(name.as_str()),
+                    dirty.then_some("unsaved changes"),
+                    doc.preview.then_some("preview"),
+                    doc.external.is_some().then_some("changed on disk"),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(", ");
+                let tab = Button::new(("tab", id))
+                    .with_focus_handle(doc.tab_focus.clone())
+                    .tab_stop(active)
+                    .accessibility_role(gpui::accesskit::Role::Tab)
+                    .label(spoken)
+                    .max_w(tab_width)
+                    .display_label(caption)
+                    .tooltip(paths::display(&doc.disk.path))
+                    .ghost()
+                    .parent_decorates()
+                    .small()
+                    .compact()
+                    .text_color(if active {
+                        cx.theme().tab_active_foreground
+                    } else {
+                        cx.theme().tab_foreground
+                    })
+                    .when(active, |tab| tab.bg(cx.theme().tab_active))
+                    .selected(active)
+                    .when(doc.preview, |tab| tab.italic_label())
+                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                        this.select_tab(id, event.click_count() > 1, window, cx);
+                    }));
+                let tab_focused = doc.tab_focus.is_focused(window);
+                div()
+                    .id(("tab-frame", id))
+                    .relative()
+                    .flex()
+                    .when(hidden, |tab| tab.hidden())
+                    .items_center()
+                    .flex_shrink_0()
+                    .h_full()
+                    .px(px(2. * scale))
+                    .rounded_t(px(7. * scale))
+                    // One hover shape and one focus ring cover the label and its close button;
+                    // the ring sits on the tab's own edges so it neither doubles nor clips.
+                    .when(!active, |tab| {
+                        tab.hover(|tab| tab.bg(cx.theme().list_hover))
+                    })
+                    .border_t_2()
+                    .border_color(match (active, document_focused) {
+                        (true, true) => cx.theme().ring,
+                        (true, false) => cx.theme().muted_foreground,
+                        _ => gpui::transparent_black(),
+                    })
+                    .when(active, |tab| tab.bg(cx.theme().tab_active))
+                    .child(tab)
+                    .when(!self.request.pick, |tab| {
+                        tab.child(
+                            Button::new(("close-tab", id))
+                                .icon(IconName::Close)
+                                .tab_stop(false)
+                                .small()
+                                .ghost()
+                                .text_color(if active {
+                                    cx.theme().tab_active_foreground
+                                } else {
+                                    cx.theme().tab_foreground
+                                })
+                                .when(active, |close| close.bg(cx.theme().tab_active))
+                                .tooltip(format!("Close {name}"))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.close(false, Some(id), window, cx);
+                                })),
+                        )
+                    })
+                    // Added last, after the border and children, so it spans the whole tab and
+                    // their fills never cover it.
+                    .focus_ring(tab_focused, px(0.), window, cx)
             }));
         let tabs = accessible("open-documents", tabs, |_, _, _| {
             let mut node = gpui::accesskit::Node::new(gpui::accesskit::Role::TabList);
             node.set_label("Open documents");
             AccessibilityInfo::new(node)
         });
+        let status = if self.status == "Saved"
+            && !self.documents.iter().any(|doc| {
+                self.active == Some(doc.id) && self.last_saved == Some((doc.id, doc.generation))
+            }) {
+            ""
+        } else {
+            self.status.as_str()
+        };
+        let has_status = !status.is_empty() || self.font_warning.is_some();
+        let footer_height = if narrow { 28. } else { 36. };
+        let footer_height = px(footer_height * self.settings.ui_scale);
+        let open_documents_requested = std::mem::take(&mut self.open_documents_requested);
+        let tabs = div()
+            .flex()
+            .items_center()
+            .flex_shrink_0()
+            .when(self.documents.is_empty(), |row| row.hidden())
+            .gap(px(8. * scale))
+            .bg(cx.theme().tab_bar)
+            .border_b_1()
+            .border_color(cx.theme().title_bar_border)
+            .when(
+                show_documents_menu || edit_source || tab_conflict || document_actions,
+                |row| row.pr(px(12. * scale)),
+            )
+            .child(div().flex_1().min_w_0().child(tabs))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_shrink_0()
+                    .gap(px(8. * scale))
+                    // Centre the controls on the tab labels, which sit below a 2-point top edge.
+                    .pt(px(if short { 2. } else { 6. } * scale))
+                    .when(tab_conflict, |row| {
+                        row.child(accessibility::message(
+                            "external-conflict",
+                            "Changed on disk. Local text retained; ordinary Save is blocked."
+                                .into(),
+                            div().size_0(),
+                        ))
+                        .child(self.conflict_menu(true, cx))
+                    })
+                    .when(show_documents_menu, |row| {
+                        row.child(self.open_documents_menu(
+                            open_documents_requested,
+                            footer_height,
+                            compact_tab_controls,
+                            &tab_parents,
+                            &tab_filenames,
+                            cx,
+                        ))
+                    })
+                    .when(document_actions, |row| {
+                        row.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .flex_shrink_0()
+                                .gap(px(8. * scale))
+                                .child(self.button("Save", "save", cx))
+                                .when(active_markdown, |row| {
+                                    row.child(self.button(read_label, "read", cx))
+                                })
+                                .when(keep_tab, |row| {
+                                    row.child(self.button("Keep Preview Tab", "keep-tab", cx))
+                                }),
+                        )
+                    })
+                    .when(edit_source, |row| {
+                        row.child(
+                            self.button("Edit Source", "read", cx)
+                                .when(compact_tab_controls, |button| button.display_label("Edit"))
+                                .flex_shrink_0(),
+                        )
+                    })
+                    .when(document_actions, |row| row.child(self.document_menu(cx))),
+            )
+            .into_any_element();
         let mut content = div()
             .flex_1()
             .h_full()
@@ -3556,92 +4786,102 @@ impl Render for Shell {
             .flex()
             .flex_col()
             .child(tabs);
-        if !self.request.pick {
-            let actions = div().flex().flex_wrap().gap_2().p_1();
-            content = content.child(if narrow {
-                actions
-                    .child(self.button("Save", "save", cx))
-                    .child(
-                        self.button(if self.reading { "Edit" } else { "Read" }, "read", cx)
-                            .selected(self.reading),
-                    )
-                    .child(self.button("Close", "close", cx))
-            } else {
-                actions
-                    .child(self.button("New", "new", cx))
-                    .child(self.button("Save", "save", cx))
-                    .child(self.button("Save As", "save-as", cx))
-                    .child(self.button("Save Copy", "save-copy", cx))
-                    .child(
-                        self.button(if self.reading { "Edit" } else { "Read" }, "read", cx)
-                            .selected(self.reading),
-                    )
-                    .child(self.button("Go to line", "line", cx))
-                    .child(self.button("Close tab", "close", cx))
-                    .child(self.button("Reload disk", "reload", cx))
+        // Scope membership matters while searching or with a pinned scope, not while browsing.
+        let outside_scope = (matches!(self.panel, Some(Panel::Files | Panel::Text))
+            || self.scope.is_some()
+            || self.search_ui.temporary.is_some())
+            && self.documents.iter().any(|doc| {
+                Some(doc.id) == self.active
+                    && !doc.disk.target.as_os_str().is_empty()
+                    && !doc.disk.path.starts_with(self.effective_scope())
             });
-        }
-        if let Some(doc) = self.documents.iter().find(|d| Some(d.id) == self.active) {
-            if !doc.disk.target.as_os_str().is_empty()
-                && !doc.disk.path.starts_with(self.effective_scope())
-            {
-                content = content.child(
-                    div().px_2().py_1().text_sm().child(
-                        self.command_button(
-                            "document-search-scope",
-                            format!(
+        if document_actions && outside_scope {
+            content = content.child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .flex_shrink_0()
+                    .px(px(8. * scale))
+                    .pt(px(4. * scale))
+                    .child(
+                        Button::new("document-search-scope")
+                            .label(format!(
                                 "Outside search folder: {}",
                                 paths::name(self.effective_scope())
-                            ),
-                            "search-details",
-                            cx,
-                        )
-                        .tooltip(paths::display(self.effective_scope())),
+                            ))
+                            .tooltip(paths::display(self.effective_scope()))
+                            .ghost()
+                            .small()
+                            .min_w_0()
+                            .flex_shrink()
+                            .text_color(cx.theme().muted_foreground)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.command("search-details", window, cx)
+                            })),
                     ),
-                );
-            }
-            if doc.recovery_error.is_none() && doc.error.is_some() {
-                content = content.child(
-                    div()
-                        .w_full()
-                        .flex_shrink_0()
-                        .p_2()
-                        .flex()
-                        .flex_wrap()
-                        .items_center()
-                        .gap_2()
-                        .child({
-                            let message = match doc.failure_action {
-                                FailureAction::Save => "Last save failed",
-                                FailureAction::Reload => "Reload stopped",
-                                FailureAction::Check => "File unavailable",
-                                FailureAction::Choose(_) => "Destination unavailable",
-                            };
-                            accessibility::message(
-                                "operation-failure",
-                                message.into(),
-                                div().child(message),
-                            )
-                        })
+            );
+        }
+        if let Some(doc) = self.documents.iter().find(|d| Some(d.id) == self.active) {
+            let mut notices = div()
+                .id("document-notices")
+                .flex()
+                .flex_col()
+                .flex_shrink_0()
+                .max_h(relative(0.5))
+                .overflow_y_scroll();
+            let mut has_notices = false;
+            if doc.recovery_error.is_none()
+                && let Some(error) = &doc.error
+            {
+                has_notices = true;
+                let title = match doc.failure_action {
+                    FailureAction::Save => "Last save failed",
+                    FailureAction::Reload => "Reload stopped",
+                    FailureAction::Check => "File unavailable",
+                    FailureAction::Choose(_) => "Destination unavailable",
+                };
+                notices = notices.child(
+                    self.notice(cx)
+                        .child(self.notice_label(
+                            "operation-failure",
+                            title.into(),
+                            error,
+                            true,
+                            cx,
+                        ))
                         .child(self.button("Details and Retry…", "failure-details", cx)),
                 );
             }
             if let Some((_, error)) = &doc.recovery_error {
-                content = content.child(self.recovery_failure_view(doc, error, cx));
+                has_notices = true;
+                notices = notices.child(self.recovery_failure_view(doc, error, cx));
             }
-            if doc.external.is_some() {
-                content = content.child(
-                    div()
-                        .w_full()
-                        .flex_shrink_0()
-                        .p_2()
-                        .child(accessibility::message(
+            let compact_notice =
+                narrow || window.viewport_size().height < px(560. * self.settings.ui_scale);
+            let conflict_reason = "Local text retained; ordinary Save is blocked.";
+            if doc.external.is_some() && compact_notice && !short {
+                has_notices = true;
+                notices = notices.child(
+                    self.notice(cx)
+                        .child(self.notice_label(
                             "external-conflict",
-                            "Changed on disk. Local text retained; ordinary Save is blocked."
-                                .into(),
-                            div().child(
-                                "Changed on disk. Local text retained; ordinary Save is blocked.",
-                            ),
+                            "Changed on disk".into(),
+                            conflict_reason,
+                            false,
+                            cx,
+                        ))
+                        .child(self.conflict_menu(false, cx)),
+                );
+            } else if doc.external.is_some() && !compact_notice {
+                has_notices = true;
+                notices = notices.child(
+                    self.notice(cx)
+                        .child(self.notice_label(
+                            "external-conflict",
+                            "Changed on disk".into(),
+                            conflict_reason,
+                            true,
+                            cx,
                         ))
                         .child(
                             div()
@@ -3650,7 +4890,12 @@ impl Render for Shell {
                                 .flex()
                                 .flex_wrap()
                                 .gap_2()
-                                .child(self.button("Compare", "compare", cx))
+                                .pl(px(24. * scale))
+                                .child(
+                                    self.button("Compare", "compare", cx)
+                                        .primary()
+                                        .with_focus_handle(self.conflict_focus.clone()),
+                                )
                                 .child(self.button("Keep Editing", "keep-editing", cx))
                                 .child(self.command_button(
                                     "conflict-reload",
@@ -3664,17 +4909,30 @@ impl Render for Shell {
                                     "save-copy",
                                     cx,
                                 ))
-                                .child(self.button("Overwrite Disk Version…", "overwrite", cx)),
+                                .child(
+                                    self.button("Overwrite Disk Version…", "overwrite", cx)
+                                        .when(self.command_enabled("overwrite"), |button| {
+                                            button.text_color(cx.theme().danger)
+                                        }),
+                                ),
                         ),
                 );
             }
-            if self.reading {
-                content = content.child(self.reading_element(window, cx));
+            if has_notices {
+                content = content.child(accessibility::group(
+                    "document-notices",
+                    "Document notices".into(),
+                    notices,
+                ));
+            }
+            if self.reading() {
+                content = content.child(self.reading_element(narrow, short, cx));
             } else {
                 content = content.child(
                     div()
                         .flex_1()
                         .min_h_0()
+                        .when(short, |editor| editor.pt(px(4. * scale)))
                         .font_family(if self.settings.proportional && doc.grammar(cx).is_none() {
                             cx.theme().font_family.clone()
                         } else {
@@ -3682,6 +4940,7 @@ impl Render for Shell {
                         })
                         .child(
                             Input::new(&doc.input)
+                                .bordered(false)
                                 .text_size(px(self.settings.font_size * self.settings.ui_scale))
                                 .line_height(relative(self.settings.line_height))
                                 .h_full()
@@ -3692,13 +4951,42 @@ impl Render for Shell {
         } else {
             content = content.child(
                 div()
-                    .p_4()
-                    .child("Select a file to preview, or open a file."),
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(12. * scale))
+                    .p(px(16. * scale))
+                    .child(
+                        div()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Select a file to edit"),
+                    )
+                    .when(!self.request.pick, |empty| {
+                        empty.child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .justify_center()
+                                .gap(px(8. * scale))
+                                .child(self.button("Open File…", "open", cx))
+                                .child(self.button("New File", "new", cx)),
+                        )
+                    }),
             );
         }
         let body = if narrow {
             if self.navigation_only || self.active.is_none() {
-                navigator.into_any_element()
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .when(self.panel == Some(Panel::Filter), |pane| {
+                        pane.child(self.navigator_filter(cx))
+                    })
+                    .child(div().flex_1().min_h_0().child(navigator))
+                    .into_any_element()
             } else {
                 content.into_any_element()
             }
@@ -3711,7 +4999,12 @@ impl Render for Shell {
                         .w(self.pane_state.read(cx).width(window))
                         .h_full()
                         .flex_shrink_0()
-                        .child(navigator),
+                        .flex()
+                        .flex_col()
+                        .when(self.panel == Some(Panel::Filter), |pane| {
+                            pane.child(self.navigator_filter(cx))
+                        })
+                        .child(div().flex_1().min_h_0().child(navigator)),
                 )
                 .child(self.pane_state.clone())
                 .child(content)
@@ -3719,118 +5012,269 @@ impl Render for Shell {
         } else {
             content.into_any_element()
         };
-        root.child(div().flex_1().min_h_0().child(body))
-            .child(
-                div()
-                    .h(px(if narrow { 48. } else { 36. } * self.settings.ui_scale))
-                    .flex_shrink_0()
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .text_size(px(12. * self.settings.ui_scale))
-                    .when(narrow, |footer| {
-                        footer.flex_col().items_start().justify_center().gap_0()
-                    })
-                    .when(!self.warnings.is_empty(), |footer| {
-                        footer.child(self.button("Warnings…", "warnings", cx))
-                    })
-                    .when(self.warnings.is_empty(), |footer| {
+        root.child(
+            main.relative()
+                .when(!takeover, |main| {
+                    main.child(div().flex_1().min_h_0().overflow_hidden().child(body))
+                })
+                .children(floating)
+                .when(self.open_failure.is_some(), |main| {
+                    main.child(self.open_failure_overlay(window, cx))
+                })
+                .when_some(
+                    self.query_error
+                        .clone()
+                        .filter(|_| self.panel == Some(Panel::Path)),
+                    |main, error| main.child(self.path_error_view(error, cx)),
+                ),
+        )
+        .child(
+            div()
+                .h(footer_height)
+                .flex_shrink_0()
+                .px_2()
+                .bg(cx.theme().title_bar)
+                .border_t_1()
+                .border_color(cx.theme().title_bar_border)
+                .text_color(cx.theme().muted_foreground)
+                .flex()
+                .items_center()
+                .gap_2()
+                .text_size(px(12. * self.settings.ui_scale))
+                .when(!self.warnings.is_empty(), |footer| {
+                    footer.child(self.button("Warnings…", "warnings", cx))
+                })
+                .when(
+                    self.warnings.is_empty() && (!narrow || has_status),
+                    |footer| {
                         let message = match &self.font_warning {
-                            Some(warning) if self.status.is_empty() => warning.clone(),
-                            Some(warning) => format!("{} · {warning}", self.status),
-                            None => self.status.clone(),
+                            Some(warning) if status.is_empty() => warning.clone(),
+                            Some(warning) => format!("{status} · {warning}"),
+                            None => status.to_owned(),
                         };
+                        let status = div()
+                            .id("status-message")
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .map(|status| {
+                                if let Some((reason, target)) = message.split_once('\n') {
+                                    let line = |text: &str| {
+                                        div()
+                                            .truncate()
+                                            .line_height(px(13.5 * scale))
+                                            .child(text.to_owned())
+                                    };
+                                    status.child(line(reason)).child(line(target))
+                                } else {
+                                    status.child(message.clone())
+                                }
+                            });
+                        let tooltip = message.clone();
                         footer.child(accessibility::message(
                             "application-status",
-                            message.clone(),
-                            div()
-                                .id("status-message")
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .child(message.clone())
-                                .tooltip(move |window, cx| {
-                                    gpui_component::tooltip::Tooltip::new(message.clone())
-                                        .build(window, cx)
-                                }),
+                            message,
+                            status.tooltip(move |window, cx| {
+                                gpui_component::tooltip::Tooltip::new(tooltip.clone())
+                                    .build(window, cx)
+                            }),
                         ))
-                    })
-                    .when_some(
-                        self.documents
-                            .iter()
-                            .find(|doc| Some(doc.id) == self.active),
-                        |footer, doc| {
-                            let information = doc.information(cx, self.reading);
-                            footer.child(accessible(
-                                "document-information",
-                                div().flex_shrink_0().child(information.clone()),
-                                move |_, _, _| {
-                                    let mut node =
-                                        gpui::accesskit::Node::new(gpui::accesskit::Role::Status);
-                                    node.set_label(information.clone());
-                                    AccessibilityInfo::new(node)
-                                },
-                            ))
-                        },
-                    ),
-            )
-            .children(self.preferences.clone())
-            .children(self.decision.clone())
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                if this.preferences.is_some() || this.decision.is_some() {
+                    },
+                )
+                .when(
+                    narrow && (!has_status || !self.warnings.is_empty()),
+                    |footer| footer.child(div().flex_1()),
+                )
+                .when_some(
+                    (!narrow || !self.navigation_only)
+                        .then(|| {
+                            self.documents
+                                .iter()
+                                .find(|doc| Some(doc.id) == self.active)
+                        })
+                        .flatten(),
+                    |footer, doc| {
+                        let information = doc.information(cx, self.reading());
+                        footer.child(accessible(
+                            "document-information",
+                            div()
+                                .truncate()
+                                .min_w_0()
+                                .when(has_status || !self.warnings.is_empty(), |info| {
+                                    info.max_w(relative(0.4))
+                                })
+                                .child(information.clone()),
+                            move |_, _, _| {
+                                let mut node =
+                                    gpui::accesskit::Node::new(gpui::accesskit::Role::Status);
+                                node.set_label(information.clone());
+                                AccessibilityInfo::new(node)
+                            },
+                        ))
+                    },
+                ),
+        )
+        .when(
+            compact_document && self.panel == Some(Panel::Path),
+            |root| {
+                root.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .occlude()
+                        .bg(cx.theme().background)
+                        .child(self.path_bar(short, window, cx)),
+                )
+            },
+        )
+        .children(self.navigator_menu_view())
+        .children(self.preferences.clone())
+        .children(self.decision.clone())
+        .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+            if this.preferences.is_some() || this.decision.is_some() {
+                return;
+            }
+            let key = &event.keystroke;
+            if this.palette.focus.is_focused(window) && this.palette_key(key, window, cx) {
+                return;
+            }
+            if this.search_ui.focus.is_focused(window) && this.search_key(key, window, cx) {
+                return;
+            }
+            if let Some(index) = this
+                .documents
+                .iter()
+                .position(|doc| doc.tab_focus.is_focused(window))
+                && !key.modifiers.control
+                && !key.modifiers.platform
+                && !key.modifiers.alt
+            {
+                let last = this.documents.len() - 1;
+                let next = match key.key.as_str() {
+                    "left" => Some(index.checked_sub(1).unwrap_or(last)),
+                    "right" => Some(if index == last { 0 } else { index + 1 }),
+                    "home" => Some(0),
+                    "end" => Some(last),
+                    _ => None,
+                };
+                if let Some(next) = next {
+                    let id = this.documents[next].id;
+                    this.clear_open_failure();
+                    this.active = Some(id);
+                    this.navigation_only = false;
+                    window.focus(&this.documents[next].tab_focus.clone());
+                    cx.notify();
                     return;
                 }
-                let key = &event.keystroke;
-                if this.search_ui.focus.is_focused(window) && this.search_key(key, window, cx) {
+            }
+            if this.nav_focus.is_focused(window)
+                && !key.modifiers.control
+                && !key.modifiers.platform
+            {
+                if key.modifiers.alt {
                     return;
                 }
-                if this.nav_focus.is_focused(window)
-                    && !key.modifiers.control
-                    && !key.modifiers.platform
-                {
-                    let visible = this.visible_rows();
-                    let rows = this.entries.clone();
-                    let index = visible
-                        .iter()
-                        .position(|&i| Some(&rows[i].path) == this.selection.as_ref());
-                    match key.key.as_str() {
-                        "up" | "down" if !visible.is_empty() => {
-                            let next = if key.key == "down" {
-                                index.map_or(0, |i| (i + 1).min(visible.len() - 1))
-                            } else {
-                                index.unwrap_or(0).saturating_sub(1)
-                            };
-                            this.selection = Some(rows[visible[next]].path.clone());
-                            this.search_ui.picker_selection = this.selection.clone();
-                            if let Some(scroll) = this.scrolls.get(&this.current) {
-                                scroll.scroll_to_item(next, ScrollStrategy::Top);
-                            }
-                            cx.notify();
-                            return;
+                let visible = this.visible_rows();
+                let rows = this.entries.clone();
+                let index = visible
+                    .iter()
+                    .position(|&i| Some(&rows[i].path) == this.selection.as_ref());
+                match key.key.as_str() {
+                    "f2" | "delete" if !key.modifiers.shift => {
+                        let command = if key.key == "f2" { "rename" } else { "trash" };
+                        if !event.is_held && !this.request.pick {
+                            this.command(command, window, cx);
                         }
-                        "left" => {
-                            this.command("parent", window, cx);
-                            return;
-                        }
-                        "right" | "enter" => {
-                            if let Some(path) = this.selected_path() {
-                                this.open(path, false, None);
-                            }
-                            cx.notify();
-                            return;
-                        }
-                        _ => {}
-                    }
-                }
-                if key.key == "escape" {
-                    if this.close_pending.is_some() || !this.closings.is_empty() {
-                        this.command("cancel-close", window, cx);
                         return;
                     }
-                    this.command("dismiss", window, cx);
+                    "space" if !key.modifiers.shift && this.trash_needs_selection => {
+                        if let Some(path) = this.selected_path() {
+                            this.select_navigation(path);
+                            cx.notify();
+                        }
+                        return;
+                    }
+                    "f10" if key.modifiers.shift => {
+                        this.navigator_menu_from_keyboard(&visible, index, window, cx);
+                        return;
+                    }
+                    "menu" if !key.modifiers.shift => {
+                        this.navigator_menu_from_keyboard(&visible, index, window, cx);
+                        return;
+                    }
+                    "up" | "down" | "home" | "end" | "pageup" | "pagedown"
+                        if !visible.is_empty() && !key.modifiers.shift =>
+                    {
+                        let Some(next) = keyboard::list_step(&key.key, index, visible.len(), 10)
+                        else {
+                            return;
+                        };
+                        this.select_navigation(rows[visible[next]].path.clone());
+                        if let Some(scroll) = this.scrolls.get(&this.current) {
+                            scroll.scroll_to_item(next, ScrollStrategy::Top);
+                        }
+                        cx.notify();
+                        return;
+                    }
+                    "left" => {
+                        this.command("parent", window, cx);
+                        return;
+                    }
+                    "right" | "enter"
+                        if key.key == "enter"
+                            || index.is_some_and(|index| rows[visible[index]].directory) =>
+                    {
+                        if let Some(path) = this.selected_path() {
+                            this.open(path, false, None);
+                        }
+                        cx.notify();
+                        return;
+                    }
+                    _ => {}
                 }
-            }))
+                // Type-ahead: printable keys select the first row whose name starts with
+                // the letters typed in quick succession.
+                if let Some(typed) = key
+                    .key_char
+                    .as_deref()
+                    .filter(|text| !key.modifiers.alt && text.chars().all(|c| !c.is_control()))
+                    .filter(|text| !text.is_empty() && *text != " ")
+                {
+                    let now = std::time::Instant::now();
+                    if this
+                        .type_ahead
+                        .1
+                        .is_none_or(|last| now - last > std::time::Duration::from_millis(900))
+                    {
+                        this.type_ahead.0.clear();
+                    }
+                    this.type_ahead.0.push_str(&typed.to_lowercase());
+                    this.type_ahead.1 = Some(now);
+                    let prefix = this.type_ahead.0.clone();
+                    if let Some(next) = visible.iter().position(|&i| {
+                        paths::name(&rows[i].path)
+                            .to_lowercase()
+                            .starts_with(&prefix)
+                    }) {
+                        this.select_navigation(rows[visible[next]].path.clone());
+                        if let Some(scroll) = this.scrolls.get(&this.current) {
+                            scroll.scroll_to_item(next, ScrollStrategy::Center);
+                        }
+                        cx.notify();
+                    }
+                    return;
+                }
+            }
+            if key.key == "escape" {
+                if this.close_pending.is_some() || !this.closings.is_empty() {
+                    this.command("cancel-close", window, cx);
+                    return;
+                }
+                this.command("dismiss", window, cx);
+            }
+        }))
     }
 }
 

@@ -13,6 +13,8 @@ pub use tree::{ChangeHandler as TreeChangeHandler, Tree, TreeState};
 pub(crate) mod node;
 pub use node::{FullNodeId, NodeRef};
 
+mod node_pages;
+
 pub(crate) mod filters;
 pub use filters::{FilterResult, common_filter, common_filter_with_root_exception};
 
@@ -21,7 +23,7 @@ pub(crate) mod iterators;
 pub(crate) mod text;
 pub use text::{
     Position as TextPosition, Range as TextRange, RangePropertyValue as TextRangePropertyValue,
-    WeakRange as WeakTextRange,
+    TextSnapshot, WeakRange as WeakTextRange,
 };
 
 #[cfg(test)]

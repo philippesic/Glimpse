@@ -20,6 +20,18 @@ impl LineEndings {
             crlf: bytes.windows(2).filter(|pair| *pair == b"\r\n").count(),
         }
     }
+    pub(super) fn from_rope(text: &Rope) -> Self {
+        let mut endings = Self::default();
+        let mut trailing_cr = false;
+        for chunk in text.chunks().filter(|chunk| !chunk.is_empty()) {
+            let counts = Self::new(chunk);
+            endings.lf += counts.lf;
+            endings.cr += counts.cr;
+            endings.crlf += counts.crlf + usize::from(trailing_cr && chunk.starts_with('\n'));
+            trailing_cr = chunk.ends_with('\r');
+        }
+        endings
+    }
     pub(super) fn replace(&mut self, before: &Rope, after: &Rope, range: &Range<usize>) {
         let start = before.clip_offset(range.start.saturating_sub(1), Bias::Left);
         let end = before.clip_offset(range.end.saturating_add(1), Bias::Right);

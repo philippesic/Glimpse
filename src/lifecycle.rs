@@ -1,11 +1,13 @@
 //! A private per-invocation socket separates request completion from GUI lifetime.
 use std::{
     io::{Read, Write},
+    net::Shutdown,
     os::unix::net::{UnixListener, UnixStream},
     sync::{Mutex, OnceLock},
     time::{Duration, Instant},
 };
 static CHANNEL: OnceLock<Mutex<UnixStream>> = OnceLock::new();
+const STARTUP_DIAGNOSTIC_LIMIT: usize = 16 * 1024;
 fn blocking_channel(stream: &UnixStream) -> std::io::Result<()> {
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(30)))
@@ -20,12 +22,26 @@ pub fn connect() -> Result<(), String> {
 }
 pub fn notify(status: u8) -> Result<(), String> {
     if let Some(channel) = CHANNEL.get() {
-        // Each session sends at most two one-byte messages; no document data enters this socket.
         channel
             .lock()
             .unwrap()
             .write_all(&[status])
             .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+pub fn notify_startup_failure(message: &str) -> Result<(), String> {
+    if let Some(channel) = CHANNEL.get() {
+        let mut stream = channel.lock().unwrap();
+        let end = message.floor_char_boundary(STARTUP_DIAGNOSTIC_LIMIT);
+        let result = stream
+            .set_nonblocking(false)
+            .and_then(|_| stream.set_write_timeout(Some(Duration::from_millis(250))))
+            .and_then(|_| stream.write_all(b"2"))
+            .and_then(|_| stream.write_all(&message.as_bytes()[..end]));
+        let _ = stream.shutdown(Shutdown::Write);
+        result.map_err(|error| error.to_string())?;
     }
     Ok(())
 }
@@ -73,6 +89,8 @@ pub fn launch(args: &[std::ffi::OsString], wait: bool, picker: bool) -> ! {
         }
         std::thread::sleep(Duration::from_millis(5));
     };
+    drop(listener);
+    drop(temporary);
     // Darwin can inherit the nonblocking listener flag on accepted sockets.
     // A readiness timeout must wait for the GUI instead of treating EAGAIN as failure.
     blocking_channel(&stream).unwrap_or_else(|e| fail(&e.to_string()));
@@ -83,6 +101,16 @@ pub fn launch(args: &[std::ffi::OsString], wait: bool, picker: bool) -> ! {
         fail(&format!("GUI did not acknowledge a usable frame: {e}"));
     }
     if message[0] != b'0' {
+        let mut diagnostic = String::new();
+        if message[0] == b'2'
+            && stream
+                .take(STARTUP_DIAGNOSTIC_LIMIT as u64)
+                .read_to_string(&mut diagnostic)
+                .is_ok()
+            && !diagnostic.is_empty()
+        {
+            fail(&diagnostic);
+        }
         fail("GUI could not open the requested files or folder; see its error message");
     }
     if !wait {

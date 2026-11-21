@@ -68,7 +68,7 @@ impl Shell {
                             .child(div().child(format!("{} · generation {} · {} bytes", if record.history { "History" } else if record.candidate { "Save candidate" } else { "Abandoned draft" }, record.generation, record.bytes)))
                             .child(div().child(paths::display(&record.original)))
                             .child(div().flex().flex_wrap().gap_2()
-                                .child(Button::new(("restore-record", i)).label(if snapshot { "Restore local copy" } else { "Restore draft" }).small().outline().disabled(self.importing)
+                                .child(Button::new(("restore-record", i)).label(if snapshot { "Restore local copy" } else { "Restore draft" }).small().disabled(self.importing)
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         if this.importing { return; }
                                         this.importing = true;
@@ -77,7 +77,7 @@ impl Shell {
                                         this.io.send(if snapshot { Job::RestoreHistory(id, restore.clone()) } else { Job::Import(id, restore.clone()) });
                                         cx.notify();
                                     })))
-                                .when(snapshot, |row| row.child(Button::new(("restore-observed", i)).label("Restore observed disk copy").small().outline().disabled(self.importing)
+                                .when(snapshot, |row| row.child(Button::new(("restore-observed", i)).label("Restore observed disk copy").small().disabled(self.importing)
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         if this.importing { return; }
                                         this.importing = true;
@@ -86,7 +86,7 @@ impl Shell {
                                         this.io.send(Job::RestoreObserved(id, observed.clone()));
                                         cx.notify();
                                     }))))
-                                .child(Button::new(("trash-record", i)).label("Move record to Trash").small().outline().disabled(self.importing)
+                                .child(Button::new(("trash-record", i)).label("Move record to Trash").small().disabled(self.importing)
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         this.ask_record_deletion(trash.clone(), window, cx);
                                     }))))
@@ -245,7 +245,7 @@ impl Shell {
         self.io.send(Job::Save {
             id: doc.id,
             generation: snapshot.generation,
-            text: snapshot.text.into(),
+            text: glimpse::io::TextSnapshot::Flat(snapshot.text.into()),
             disk: snapshot.disk,
             without_recovery: true,
         });

@@ -9,14 +9,14 @@ use std::{
 };
 
 use gpui::{
-    App, AppContext as _, Context, Empty, Entity, FocusHandle, Focusable, Half,
-    InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Pixels, Render, Styled,
-    Subscription, WeakEntity, Window, actions, canvas, div, prelude::FluentBuilder as _,
+    App, AppContext as _, Context, Empty, Entity, FocusHandle, Focusable, InteractiveElement as _,
+    IntoElement, KeyBinding, ParentElement as _, Render, Styled, Subscription, WeakEntity, Window,
+    actions, prelude::FluentBuilder as _, div, px, rems,
 };
-use ropey::Rope;
+use ropey::{LineType, Rope, RopeBuilder, extra::esoterica::ropes_are_instances};
 
 use crate::{
-    ActiveTheme, Disableable, IconName, Selectable, Sizable,
+    ActiveTheme, Disableable, IconName, Sizable,
     actions::SelectUp,
     button::{Button, ButtonVariants},
     h_flex,
@@ -25,11 +25,13 @@ use crate::{
         movement::MoveDirection,
     },
     label::Label,
+    menu::{DropdownMenu, PopupMenuItem},
     v_flex,
 };
 use super::state::PreparedReplacement;
 
 const CONTEXT: &'static str = "SearchPanel";
+const MATCH_SCAN_BYTES: usize = 64 * 1024;
 
 actions!(input, [Tab]);
 
@@ -131,6 +133,67 @@ impl MatchRanges {
     }
 }
 
+fn advance_source<'a>(
+    chunks: &mut impl Iterator<Item = &'a str>,
+    remaining: &mut &'a str,
+    mut length: usize,
+    mut visit: impl FnMut(&str),
+) {
+    while length != 0 {
+        if remaining.is_empty() {
+            *remaining = chunks.next().expect("Match ranges fit the source revision");
+        }
+        let count = length.min(remaining.len());
+        let (source, rest) = remaining.split_at(count);
+        visit(source);
+        *remaining = rest;
+        length -= count;
+    }
+}
+
+fn replace_matches(
+    source: &Rope,
+    ranges: &MatchRanges,
+    replacement: &str,
+    cancel: &AtomicBool,
+) -> Option<Rope> {
+    let mut chunks = source.chunks();
+    let mut remaining = "";
+    const CHUNK_BYTES: usize = 32 * 1024;
+    let mut output = RopeBuilder::new();
+    let mut batch = String::with_capacity(CHUNK_BYTES);
+    let mut append = |text: &str| {
+        if batch.len() + text.len() > CHUNK_BYTES {
+            output.append(&batch);
+            batch.clear();
+        }
+        if text.len() >= CHUNK_BYTES {
+            output.append(text);
+        } else {
+            batch.push_str(text);
+        }
+    };
+    let mut offset = 0;
+    for (index, range) in ranges.iter().enumerate() {
+        if index % 1024 == 0 && cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        advance_source(&mut chunks, &mut remaining, range.start - offset, |text| {
+            append(text);
+        });
+        advance_source(&mut chunks, &mut remaining, range.len(), |_| {});
+        append(replacement);
+        offset = range.end;
+    }
+    advance_source(&mut chunks, &mut remaining, source.len() - offset, |text| {
+        append(text);
+    });
+    (!cancel.load(Ordering::Relaxed)).then(|| {
+        output.append(&batch);
+        output.finish()
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct SearchMatcher {
     text: Rope,
@@ -169,26 +232,67 @@ impl SearchMatcher {
     }
 
     fn update_matches(&mut self) {
-        if self
-            .cancellation
-            .as_ref()
-            .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
-        {
+        let cancelled = || {
+            self.cancellation
+                .as_ref()
+                .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
+        };
+        if cancelled() {
             return;
         }
         let mut new_ranges = MatchRanges::new(self.text.len());
         if let Some(query) = &self.query {
-            let text = self.text.to_string();
-            for found in query.find_iter(&text) {
-                if new_ranges.len() % 1024 == 0
-                    && self
-                        .cancellation
-                        .as_ref()
-                        .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
-                {
+            let mut scan = |text: &str, offset: usize| {
+                for found in query.find_iter(text) {
+                    if new_ranges.len() % 1024 == 0 && cancelled() {
+                        return false;
+                    }
+                    new_ranges.push(offset + found.start()..offset + found.end());
+                }
+                true
+            };
+            if let Some(text) = self.text.as_str() {
+                if !scan(text, 0) {
                     return;
                 }
-                new_ranges.push(found.range());
+            } else if !query.as_str().contains('\n') && self.text.len_lines(LineType::LF) > 1 {
+                let mut buffer = String::with_capacity(MATCH_SCAN_BYTES);
+                let mut offset = 0;
+                let len = self.text.len();
+                while offset < len {
+                    if cancelled() {
+                        return;
+                    }
+                    let limit = offset.saturating_add(MATCH_SCAN_BYTES).min(len);
+                    let end = if limit == len {
+                        len
+                    } else {
+                        let line = self.text.byte_to_line_idx(limit, LineType::LF);
+                        let line_start = self.text.line_to_byte_idx(line, LineType::LF);
+                        if line_start == offset {
+                            self.text.line_to_byte_idx(line + 1, LineType::LF)
+                        } else {
+                            line_start
+                        }
+                    };
+                    let slice = self.text.slice(offset..end);
+                    let text = if let Some(text) = slice.as_str() {
+                        text
+                    } else {
+                        buffer.clear();
+                        buffer.reserve_exact(slice.len());
+                        for chunk in slice.chunks() {
+                            buffer.push_str(chunk);
+                        }
+                        &buffer
+                    };
+                    if !scan(text, offset) {
+                        return;
+                    }
+                    offset = end;
+                }
+            } else if !scan(&String::from(&self.text), 0) {
+                return;
             }
         }
         self.matched_ranges = Arc::new(new_ranges);
@@ -305,13 +409,18 @@ pub(super) struct SearchPanel {
     whole_word: bool,
     replace_mode: bool,
     matcher: SearchMatcher,
-    input_width: Pixels,
 
     open: bool,
     scan_running: bool,
     pending_scan: Option<SearchRequest>,
     cancellation: Arc<AtomicBool>,
     searching: bool,
+    /// Width of the panel in the last frame, which decides whether the options share the
+    /// query row.
+    width: gpui::Pixels,
+    /// Natural widths of the controls after the query and replacement fields in the last
+    /// frame; both rows reserve the larger so the two fields share a right edge.
+    trailing: [gpui::Pixels; 2],
     _subscriptions: Vec<Subscription>,
 }
 
@@ -395,8 +504,9 @@ impl SearchPanel {
                 scan_running: false,
                 pending_scan: None,
                 cancellation: Arc::new(AtomicBool::new(false)),
+                width: gpui::Pixels::ZERO,
+                trailing: [gpui::Pixels::ZERO; 2],
                 searching: false,
-                input_width: Pixels::ZERO,
                 _subscriptions,
             }
         })
@@ -525,7 +635,13 @@ impl SearchPanel {
     }
 
     fn on_action_next(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
-        self.next(window, cx);
+        if self.search_input.read(cx).focus_handle.is_focused(window)
+            || self.replace_input.read(cx).focus_handle.is_focused(window)
+        {
+            self.next(window, cx);
+        } else {
+            cx.propagate();
+        }
     }
 
     fn on_action_escape(&mut self, _: &Escape, window: &mut Window, cx: &mut Context<Self>) {
@@ -543,6 +659,85 @@ impl SearchPanel {
         _: &mut Context<Self>,
     ) {
         window.focus_prev();
+    }
+
+    fn toggle_case(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.case_insensitive = !self.case_insensitive;
+        self.update_search_query(cx);
+    }
+
+    fn toggle_whole_word(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.whole_word = !self.whole_word;
+        self.update_search_query(cx);
+    }
+
+    fn toggle_replace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.replace_mode = !self.replace_mode;
+        let input = if self.replace_mode {
+            &self.replace_input
+        } else {
+            &self.search_input
+        };
+        input.read(cx).focus_handle.focus(window);
+        cx.notify();
+    }
+
+    fn compact_options(&self, cx: &Context<Self>) -> impl IntoElement {
+        type Command = fn(&mut SearchPanel, &mut Window, &mut Context<SearchPanel>);
+        let commands: [(&str, Command, bool, bool); 5] = [
+            (
+                "Match case",
+                Self::toggle_case,
+                !self.case_insensitive,
+                false,
+            ),
+            (
+                "Match whole words",
+                Self::toggle_whole_word,
+                self.whole_word,
+                false,
+            ),
+            (
+                if self.replace_mode {
+                    "Hide replacement"
+                } else {
+                    "Show replacement"
+                },
+                Self::toggle_replace,
+                false,
+                false,
+            ),
+            ("Previous match", Self::prev, false, self.matcher.len() == 0),
+            ("Next match", Self::next, false, self.matcher.len() == 0),
+        ];
+        let panel = cx.entity().downgrade();
+        Button::new("find-options")
+            .small()
+            .ghost()
+            .icon(IconName::Ellipsis)
+            .tooltip("Find options")
+            .dropdown_menu(move |mut menu, window, _| {
+                menu = menu.scrollable(true).max_h(
+                    (window.viewport_size().height - window.rem_size() * 5.)
+                        .max(window.rem_size() * 4.),
+                );
+                for (label, command, checked, disabled) in commands {
+                    let panel = panel.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(label)
+                            .checked(checked)
+                            .disabled(disabled)
+                            .on_click(move |_, window, cx| {
+                                let panel = panel.clone();
+                                window.defer(cx, move |window, cx| {
+                                    let _ =
+                                        panel.update(cx, |panel, cx| command(panel, window, cx));
+                                });
+                            }),
+                    );
+                }
+                menu
+            })
     }
 
     fn prev(&mut self, _: &mut Window, cx: &mut Context<Self>) {
@@ -615,7 +810,6 @@ impl SearchPanel {
 
     fn replace_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let new_text = self.replace_input.read(cx).value();
-        self.matcher.replacing = true;
         let ranges = self.matcher.matched_ranges.clone();
         if ranges.is_empty() {
             return;
@@ -625,35 +819,37 @@ impl SearchPanel {
             return;
         };
         let state = editor.read(cx);
+        if !ropes_are_instances(&state.text, &self.matcher.text) {
+            return;
+        }
         let original = state.text.clone();
         let layout = state.replacement_layout();
-        let value = state.cached_value();
+        let viewport = state.last_layout.as_ref().map(|layout| {
+            let rows =
+                (f32::from(layout.viewport_height) / f32::from(layout.line_height)).ceil() as usize;
+            (
+                window.text_system().prepare_in_separate_cache(),
+                rows.saturating_add(2),
+            )
+        });
         let editor = self.editor.clone();
         let cancellation = self.cancellation.clone();
         let worker_cancel = cancellation.clone();
         let worker_original = original.clone();
         let text_system = cx.text_system().clone();
+        self.matcher.replacing = true;
         self.searching = true;
         self.matcher.matched_ranges = Arc::new(MatchRanges::new(0));
         let task = cx.background_spawn(async move {
-            let text = value.unwrap_or_else(|| worker_original.to_string().into());
-            let mut output = String::new();
-            let mut offset = 0;
-            for (index, range) in ranges.iter().enumerate() {
-                if index % 1024 == 0 && worker_cancel.load(Ordering::Relaxed) {
-                    return None;
-                }
-                output.push_str(&text[offset..range.start]);
-                output.push_str(new_text.as_str());
-                offset = range.end;
-            }
-            output.push_str(&text[offset..]);
+            let output =
+                replace_matches(&worker_original, &ranges, new_text.as_str(), &worker_cancel)?;
             if worker_cancel.load(Ordering::Relaxed) {
                 return None;
             }
-            let output: gpui::SharedString = output.into();
-            let prepared =
-                layout.map(|layout| PreparedReplacement::new(output.clone(), layout, &text_system));
+            let prepared = layout.map(|layout| {
+                PreparedReplacement::new(output.clone(), layout, &text_system)
+                    .with_viewport(viewport)
+            });
             (!worker_cancel.load(Ordering::Relaxed)).then_some((output, prepared))
         });
         cx.spawn_in(window, async move |_, cx| {
@@ -670,7 +866,12 @@ impl SearchPanel {
                         .is_some_and(|edit| state.apply_prepared_replacement(edit, window, cx))
                     {
                         let full_range = state.range_to_utf16(&(0..state.text.len()));
-                        state.replace_text_in_range_silent(Some(full_range), &replaced, window, cx);
+                        state.replace_text_in_range_silent(
+                            Some(full_range),
+                            &replaced.to_string(),
+                            window,
+                            cx,
+                        );
                     }
                     state.history.new_group();
                     state.scroll_to(0, Some(MoveDirection::Down), cx);
@@ -687,21 +888,221 @@ impl Focusable for SearchPanel {
     }
 }
 
+impl SearchPanel {
+    fn close_button(cx: &mut Context<Self>) -> Button {
+        Button::new("close")
+            .small()
+            .ghost()
+            .flex_shrink_0()
+            .icon(IconName::Close)
+            .tooltip("Close Find")
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.on_action_escape(&Escape, window, cx);
+            }))
+    }
+}
+
 impl Render for SearchPanel {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.open {
             return Empty.into_any_element();
         }
 
         let has_matches = self.matcher.len() > 0;
-        let match_label = if self.searching {
+        let match_label: gpui::SharedString = if self.searching {
             "Searching…".into()
+        } else if has_matches {
+            self.matcher.label().into()
+        } else if self.search_input.read(cx).value().is_empty() {
+            "".into()
         } else {
-            self.matcher.label()
+            "No matches".into()
         };
 
+        let viewport = window.viewport_size();
+        let rem = window.rem_size();
+        let compact = viewport.height < rem * 16. || viewport.width < rem * 28.;
+        let close_query = compact.then(|| Self::close_button(cx));
+        let close_options = (!compact).then(|| Self::close_button(cx));
+        let count = |compact| {
+            crate::semantic_text::text(
+                "match-count",
+                match_label.clone(),
+                Label::new(match_label.clone())
+                    .when(!has_matches, |label| {
+                        label.text_color(cx.theme().muted_foreground)
+                    })
+                    .text_left()
+                    .when(compact, |label| label.max_w(rems(4.5)).truncate())
+                    .when(!compact, |label| label.min_w_16()),
+            )
+        };
+
+        // Rows never wrap: the options share the query row only when the panel is wide enough
+        // for both, measured from the previous frame, and the replace row always fits.
+        let one_row = !compact && self.width >= rem * 38.;
+        let options = (!compact).then(|| {
+            h_flex()
+                .flex_shrink_0()
+                .gap_2()
+                .when(!one_row, |row| row.w_full())
+                .child(
+                    Button::new("case-sensitive")
+                        .small()
+                        .map(|button| {
+                            if self.case_insensitive {
+                                button.ghost()
+                            } else {
+                                button
+                                    .ghost()
+                                    .bg(cx.theme().selection)
+                                    .text_color(cx.theme().ring)
+                            }
+                        })
+                        .icon(IconName::CaseSensitive)
+                        .tooltip("Match case")
+                        .accessibility_toggled(!self.case_insensitive)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.toggle_case(window, cx);
+                        })),
+                )
+                .child(
+                    Button::new("whole-word")
+                        .small()
+                        .map(|button| {
+                            if self.whole_word {
+                                button
+                                    .ghost()
+                                    .bg(cx.theme().selection)
+                                    .text_color(cx.theme().ring)
+                            } else {
+                                button.ghost()
+                            }
+                        })
+                        .icon(IconName::WholeWord)
+                        .tooltip("Match whole words")
+                        .accessibility_toggled(self.whole_word)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.toggle_whole_word(window, cx);
+                        })),
+                )
+                .child(
+                    Button::new("replace-mode")
+                        .small()
+                        .map(|button| {
+                            if self.replace_mode {
+                                button
+                                    .ghost()
+                                    .bg(cx.theme().selection)
+                                    .text_color(cx.theme().ring)
+                            } else {
+                                button.ghost()
+                            }
+                        })
+                        .icon(IconName::Replace)
+                        .tooltip(if self.replace_mode {
+                            "Hide replacement"
+                        } else {
+                            "Show replacement"
+                        })
+                        .accessibility_expanded(self.replace_mode)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.toggle_replace(window, cx);
+                        })),
+                )
+                .child(
+                    Button::new("prev")
+                        .small()
+                        .ghost()
+                        .icon(IconName::ChevronLeft)
+                        .tooltip("Previous match")
+                        .disabled(!has_matches)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.prev(window, cx);
+                        })),
+                )
+                .child(
+                    Button::new("next")
+                        .small()
+                        .ghost()
+                        .icon(IconName::ChevronRight)
+                        .tooltip("Next match")
+                        .disabled(!has_matches)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.next(window, cx);
+                        })),
+                )
+                .child(count(false))
+                .when(!one_row, |row| row.child(div().flex_1()))
+                .children(close_options)
+        });
+        let (inline_options, row_options) = if one_row {
+            (options, None)
+        } else {
+            (None, options)
+        };
+        let align = one_row && self.replace_mode;
+        let reserved = self.trailing[0].max(self.trailing[1]);
+        let measured = cx.entity().downgrade();
+        let trailing = |index: usize, controls: gpui::AnyElement| {
+            let panel = measured.clone();
+            div()
+                .flex()
+                .justify_end()
+                .flex_shrink_0()
+                .when(align, |slot| slot.min_w(reserved))
+                .child(
+                    div().relative().child(controls).child(
+                        gpui::canvas(
+                            move |bounds, window, cx| {
+                                let _ = panel.update(cx, |panel, _| {
+                                    if (panel.trailing[index] - bounds.size.width).abs() > px(0.5) {
+                                        panel.trailing[index] = bounds.size.width;
+                                        window.request_animation_frame();
+                                    }
+                                });
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .size_full(),
+                    ),
+                )
+        };
+        let inline_options = inline_options.map(|options| trailing(0, options.into_any_element()));
+        let replace_controls = trailing(
+            1,
+            h_flex()
+                .gap_2()
+                .child(
+                    Button::new("replace-one")
+                        .when(compact, |button| button.xsmall())
+                        .when(!compact, |button| button.small())
+                        .flex_shrink_0()
+                        .label(t!("Input.Replace"))
+                        .disabled(!has_matches)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.replace_next(window, cx);
+                        })),
+                )
+                .child(
+                    Button::new("replace-all")
+                        .when(compact, |button| button.xsmall())
+                        .when(!compact, |button| button.small())
+                        .flex_shrink_0()
+                        .label(t!("Input.Replace All"))
+                        .disabled(!has_matches)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.replace_all(window, cx);
+                        })),
+                )
+                .into_any_element(),
+        );
+        let panel = cx.entity().downgrade();
         v_flex()
             .id("search-panel")
+            .relative()
+            .tab_group()
             .occlude()
             .track_focus(&self.focus_handle(cx))
             .key_context(CONTEXT)
@@ -712,132 +1113,48 @@ impl Render for SearchPanel {
             .on_action(cx.listener(Self::on_action_tab_prev))
             .font_family(cx.theme().font_family.clone())
             .items_center()
-            .py_2()
-            .px_3()
+            .when(compact, |panel| panel.py(px(2.)).px_2())
+            .when(!compact, |panel| panel.py_2().px_3())
             .w_full()
             .gap_1()
-            .bg(cx.theme().popover)
+            .when(!compact, |panel| panel.gap_2())
+            .bg(cx.theme().title_bar)
             .border_b_1()
-            .rounded(cx.theme().radius.half())
-            .border_color(cx.theme().border)
+            .border_color(cx.theme().title_bar_border)
+            .child(
+                gpui::canvas(
+                    move |bounds, window, cx| {
+                        let _ = panel.update(cx, |panel, _| {
+                            if (panel.width - bounds.size.width).abs() > px(0.5) {
+                                panel.width = bounds.size.width;
+                                window.request_animation_frame();
+                            }
+                        });
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
             .child(
                 h_flex()
                     .w_full()
                     .gap_2()
+                    .when(compact, |query| query.gap_1())
                     .child(
-                        div()
+                        Input::new(&self.search_input)
+                            .small()
                             .flex_1()
-                            .gap_1()
-                            .child(
-                                Input::new(&self.search_input)
-                                    .focus_bordered(false)
-                                    .suffix(
-                                        Button::new("case-insensitive")
-                                            .selected(!self.case_insensitive)
-                                            .xsmall()
-                                            .compact()
-                                            .ghost()
-                                            .icon(IconName::CaseSensitive)
-                                            .tooltip("Match case")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.case_insensitive = !this.case_insensitive;
-                                                this.update_search_query(cx);
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .small()
-                                    .w_full()
-                                    .shadow_none(),
-                            )
-                            .child(
-                                canvas(
-                                    {
-                                        let view = cx.entity();
-                                        move |bounds, _, cx| {
-                                            view.update(cx, |r, _| {
-                                                r.input_width = bounds.size.width
-                                            })
-                                        }
-                                    },
-                                    |_, _, _, _| {},
-                                )
-                                .absolute()
-                                .size_full(),
-                            ),
+                            .min_w_0()
+                            .shadow_none(),
                     )
-                    .child(
-                        Button::new("whole-word")
-                            .xsmall()
-                            .ghost()
-                            .label("Word")
-                            .tooltip("Match whole words")
-                            .selected(self.whole_word)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.whole_word = !this.whole_word;
-                                this.update_search_query(cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("replace-mode")
-                            .xsmall()
-                            .ghost()
-                            .icon(IconName::Replace)
-                            .tooltip("Show replacement")
-                            .selected(self.replace_mode)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.replace_mode = !this.replace_mode;
-                                if this.replace_mode {
-                                    this.replace_input.read(cx).focus_handle.focus(window);
-                                } else {
-                                    this.search_input.read(cx).focus_handle.focus(window);
-                                }
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("prev")
-                            .xsmall()
-                            .ghost()
-                            .icon(IconName::ChevronLeft)
-                            .tooltip("Previous match")
-                            .disabled(!has_matches)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.prev(window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("next")
-                            .xsmall()
-                            .ghost()
-                            .icon(IconName::ChevronRight)
-                            .tooltip("Next match")
-                            .disabled(!has_matches)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.next(window, cx);
-                            })),
-                    )
-                    .child(crate::semantic_text::text(
-                        "match-count",
-                        match_label.clone().into(),
-                        Label::new(match_label)
-                            .when(!has_matches, |this| {
-                                this.text_color(cx.theme().muted_foreground)
-                            })
-                            .text_left()
-                            .min_w_16(),
-                    ))
-                    .child(div().w_7())
-                    .child(
-                        Button::new("close")
-                            .xsmall()
-                            .ghost()
-                            .icon(IconName::Close)
-                            .tooltip("Close Find")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.on_action_escape(&Escape, window, cx);
-                            })),
-                    ),
+                    .when(compact, |row| {
+                        row.child(count(true)).child(self.compact_options(cx))
+                    })
+                    .children(close_query)
+                    .children(inline_options),
             )
+            .children(row_options)
             .when(self.replace_mode, |this| {
                 this.child(
                     h_flex()
@@ -845,29 +1162,12 @@ impl Render for SearchPanel {
                         .gap_2()
                         .child(
                             Input::new(&self.replace_input)
-                                .focus_bordered(false)
                                 .small()
-                                .w(self.input_width)
+                                .flex_1()
+                                .min_w_0()
                                 .shadow_none(),
                         )
-                        .child(
-                            Button::new("replace-one")
-                                .small()
-                                .label(t!("Input.Replace"))
-                                .disabled(!has_matches)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.replace_next(window, cx);
-                                })),
-                        )
-                        .child(
-                            Button::new("replace-all")
-                                .small()
-                                .label(t!("Input.Replace All"))
-                                .disabled(!has_matches)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.replace_all(window, cx);
-                                })),
-                        ),
+                        .child(replace_controls),
                 )
             })
             .into_any_element()
@@ -876,6 +1176,33 @@ impl Render for SearchPanel {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn streamed_replacement_keeps_precise_unicode_and_line_endings() {
+        use super::{AtomicBool, MatchRanges, Regex, Rope, replace_matches};
+
+        let text = format!(
+            "{}\r\n{}",
+            "🐋a".repeat(209),
+            "K café\r\nk CAFÉ\nplain\r".repeat(1200)
+        );
+        let source = Rope::from(text.as_str());
+        let pattern = Regex::new("(?i)k café").unwrap();
+        let mut ranges = MatchRanges::new(text.len());
+        for found in pattern.find_iter(&text) {
+            ranges.push(found.range());
+        }
+        for replacement in ["", "🦀$5\r\n"] {
+            let expected = pattern.replace_all(&text, regex::NoExpand(replacement));
+            assert_eq!(
+                replace_matches(&source, &ranges, replacement, &AtomicBool::new(false))
+                    .unwrap()
+                    .to_string(),
+                expected
+            );
+        }
+        assert!(replace_matches(&source, &ranges, "ignored", &AtomicBool::new(true)).is_none());
+    }
+
     struct SearchFixture {
         editor: gpui::Entity<super::InputState>,
     }
@@ -920,6 +1247,18 @@ mod tests {
         let word = cx.update(|window, cx| window.focused(cx));
         assert!(word.is_some());
         assert_ne!(word, case);
+        cx.simulate_keystrokes("tab");
+        let replace = cx.update(|window, cx| window.focused(cx));
+        assert!(replace.is_some());
+        assert_ne!(replace, word);
+        cx.simulate_keystrokes("tab");
+        let close = cx.update(|window, cx| window.focused(cx));
+        assert!(close.is_some());
+        assert_ne!(close, replace);
+        cx.simulate_keystrokes("shift-tab");
+        assert_eq!(cx.update(|window, cx| window.focused(cx)), replace);
+        cx.simulate_keystrokes("shift-tab");
+        assert_eq!(cx.update(|window, cx| window.focused(cx)), word);
         cx.simulate_keystrokes("shift-tab");
         assert_eq!(cx.update(|window, cx| window.focused(cx)), case);
         cx.simulate_keystrokes("shift-tab");
@@ -936,7 +1275,9 @@ mod tests {
                 1
             );
         });
-        cx.simulate_keystrokes("tab tab tab space");
+        cx.simulate_keystrokes("tab tab tab");
+        assert_eq!(cx.update(|window, cx| window.focused(cx)), replace);
+        cx.simulate_keystrokes("space");
         cx.simulate_event(gpui::KeyUpEvent {
             keystroke: gpui::Keystroke::parse("space").unwrap(),
         });
@@ -1054,6 +1395,36 @@ mod tests {
         assert_eq!(matcher.label(), "1/1");
         matcher.update_query("[", true, false);
         assert_eq!(matcher.len(), 0);
+    }
+
+    #[test]
+    fn bounded_scans_preserve_contiguous_regex_results() {
+        let short = "🙂 K K CAFÉ café_ é\r\na\nb aaabaa\n[ \r café\u{2028}one\n";
+        let long = "🌱café K\r".repeat(8500);
+        let text = format!("{}\n{long}\n{short}\n{long}", short.repeat(1800));
+        let mut matcher = SearchMatcher::new();
+        matcher.text = Rope::from(text.as_str());
+        for literal in [
+            "café", "K", "\r", "a\nb", "\n", "é\r\n", "\u{2028}", "[", "aa",
+        ] {
+            for case_insensitive in [false, true] {
+                for whole_word in [false, true] {
+                    matcher.update_query(literal, case_insensitive, whole_word);
+                    let expected: Vec<_> = matcher
+                        .query
+                        .as_ref()
+                        .unwrap()
+                        .find_iter(&text)
+                        .map(|found| found.range())
+                        .collect();
+                    assert_eq!(
+                        matcher.matched_ranges.iter().collect::<Vec<_>>(),
+                        expected,
+                        "{literal:?}, {case_insensitive}, {whole_word}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

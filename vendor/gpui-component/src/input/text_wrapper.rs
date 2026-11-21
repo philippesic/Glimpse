@@ -1,9 +1,11 @@
+use std::collections::{HashMap, HashSet};
+use std::hash::BuildHasher;
 use std::ops::Range;
 use std::sync::Arc;
 
 use gpui::{
-    App, BackgroundExecutor, Font, LineFragment, Pixels, Point, ShapedLine, Size, TextSystem,
-    Window, point, px, size,
+    App, BackgroundExecutor, Font, LineFragment, Pixels, Point, PreparedTextLines, ShapedLine,
+    Size, TextRun, TextSystem, Window, WindowTextSystem, point, px, size,
 };
 use ropey::{LineType, Rope, RopeSlice};
 use smallvec::SmallVec;
@@ -14,7 +16,7 @@ use crate::input::RopeExt;
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct LineItem {
     length: usize,
-    wraps: Option<Box<LineWraps>>,
+    wraps: Option<Arc<LineWraps>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -28,7 +30,7 @@ struct LineWraps {
 impl LineItem {
     fn new(length: usize, indent: Option<u32>, ranges: SmallVec<[Range<usize>; 1]>) -> Self {
         let wraps = (ranges.len() > 1).then(|| {
-            Box::new(LineWraps {
+            Arc::new(LineWraps {
                 indent,
                 word_columns: 0,
                 word_width: px(0.),
@@ -281,7 +283,9 @@ impl TextWrapper {
             || text.len() < 2 * 1024 * 1024
             || rows > 8 * 1024 * 1024 / std::mem::size_of::<LineItem>()
         {
-            return Self::prepare_full(config, &text, &text_system);
+            let mut layout = Self::prepare_full(config, &text, &text_system);
+            layout.share_line_wraps();
+            return layout;
         }
 
         let mut boundaries = vec![0];
@@ -292,7 +296,9 @@ impl TextWrapper {
             }
         }
         if boundaries.len() == 1 {
-            return Self::prepare_full(config, &text, &text_system);
+            let mut layout = Self::prepare_full(config, &text, &text_system);
+            layout.share_line_wraps();
+            return layout;
         }
         boundaries.push(rows);
 
@@ -335,7 +341,34 @@ impl TextWrapper {
             );
         }
         layout.rebuild_index_from(0);
+        layout.share_line_wraps();
         layout
+    }
+
+    pub(super) fn share_line_wraps(&mut self) {
+        const MAX_SHARED_WRAPS: usize = 256;
+        if self.lines.len() < 4096 || self.wrap_width.is_none() {
+            return;
+        }
+        let mut shared = HashMap::<u64, Arc<LineWraps>>::new();
+        for wraps in self.lines.iter_mut().filter_map(|line| line.wraps.as_mut()) {
+            if wraps.ranges.len() > 8 {
+                continue;
+            }
+            let key = shared.hasher().hash_one((
+                wraps.indent,
+                wraps.word_columns,
+                f32::from(wraps.word_width).to_bits(),
+                wraps.ranges.as_slice(),
+            ));
+            if let Some(existing) = shared.get(&key) {
+                if existing.as_ref() == wraps.as_ref() {
+                    wraps.clone_from(existing);
+                }
+            } else if shared.len() < MAX_SHARED_WRAPS {
+                shared.insert(key, wraps.clone());
+            }
+        }
     }
 
     /// Update the text wrapper and recalculate the wrapped lines.
@@ -370,23 +403,33 @@ impl TextWrapper {
             && self._initialized == prepared._initialized
     }
 
-    pub(super) fn matches_revision(&self, text: &Rope, layout: &Self) -> bool {
-        self.uses_same_layout(layout) && self.text == *text
+    pub(super) fn references_revision(&self, text: &Rope) -> bool {
+        ropey::extra::esoterica::ropes_are_instances(&self.text, text)
+    }
+
+    pub(super) fn matches_revision(&self, text: &Rope) -> bool {
+        self.references_revision(text) || self.text == *text
     }
 
     pub(super) fn retain_for_history(self) -> Option<Self> {
         const MAX_LAYOUT_BYTES: usize = 4 * 1024 * 1024;
-        let lines = self.lines.capacity() * std::mem::size_of::<LineItem>()
+        let mut bytes = self.lines.capacity() * std::mem::size_of::<LineItem>()
             + self.block_starts.capacity() * std::mem::size_of::<usize>();
-        let wraps: usize = self
-            .lines
-            .iter()
-            .filter_map(|line| line.wraps.as_ref())
-            .map(|wraps| {
-                std::mem::size_of::<LineWraps>()
-                    + wraps.ranges.capacity() * std::mem::size_of::<Range<usize>>()
-            })
-            .sum();
+        if !self._initialized || bytes > MAX_LAYOUT_BYTES {
+            return None;
+        }
+        let mut shared = HashSet::new();
+        for wraps in self.lines.iter().filter_map(|line| line.wraps.as_ref()) {
+            if Arc::strong_count(wraps) > 1 && !shared.insert(Arc::as_ptr(wraps)) {
+                continue;
+            }
+            bytes += std::mem::size_of::<LineWraps>()
+                + std::mem::size_of::<[usize; 2]>()
+                + wraps.ranges.capacity() * std::mem::size_of::<Range<usize>>();
+            if bytes > MAX_LAYOUT_BYTES {
+                return None;
+            }
+        }
         let checkpoints: usize = self
             .checkpoints
             .values()
@@ -395,12 +438,98 @@ impl TextWrapper {
                     + 4 * std::mem::size_of::<(usize, Vec<WrapCheckpoint>)>()
             })
             .sum();
-        (self._initialized && lines + wraps + checkpoints <= MAX_LAYOUT_BYTES).then_some(self)
+        (bytes + checkpoints <= MAX_LAYOUT_BYTES).then_some(self)
+    }
+
+    pub(super) fn prepare_opening_lines(
+        &self,
+        cache: WindowTextSystem,
+        rows: usize,
+    ) -> PreparedTextLines {
+        self.prepare_first_rows(&self.text, cache, rows, 16 * 1024)
+    }
+
+    pub(super) fn prepare_opening_prefix(
+        config: LayoutConfig,
+        text: &Rope,
+        system: &Arc<TextSystem>,
+        cache: WindowTextSystem,
+        rows: usize,
+    ) -> PreparedTextLines {
+        let end = text.line_start_offset(rows.min(64)).min(64 * 1024);
+        let end = text.clip_offset(end, sum_tree::Bias::Left);
+        let prefix = Rope::from(text.slice(..end));
+        let layout = Self::prepare_full(config, &prefix, system);
+        layout.prepare_opening_lines(cache, rows)
+    }
+
+    pub(super) fn prepare_glyphs(
+        &self,
+        text: &Rope,
+        cache: WindowTextSystem,
+        rows: usize,
+    ) -> Option<PreparedTextLines> {
+        if text.len() < 512 * 1024 || self.wrap_width.is_none() {
+            return None;
+        }
+        let _work = gpui::work_trace::Span::new("editor_replacement_shape_worker");
+        Some(self.prepare_first_rows(text, cache, rows, 8 * 1024))
+    }
+
+    fn prepare_first_rows(
+        &self,
+        text: &Rope,
+        cache: WindowTextSystem,
+        rows: usize,
+        mut remaining_bytes: usize,
+    ) -> PreparedTextLines {
+        let mut remaining_rows = rows.min(64);
+        'lines: for (row, layout) in self.lines.iter().enumerate() {
+            let line = text.slice_line(row);
+            for index in 0..layout.lines_len().min(remaining_rows) {
+                let Some(range) = layout.range(index) else {
+                    break 'lines;
+                };
+                if range.len() > remaining_bytes {
+                    break 'lines;
+                }
+                remaining_bytes -= range.len();
+                remaining_rows -= 1;
+                let value = line.slice(range).to_string();
+                cache.layout_line(
+                    &value,
+                    self.font_size,
+                    &[TextRun {
+                        len: value.len(),
+                        font: self.font.clone(),
+                        color: gpui::black(),
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    }],
+                    None,
+                );
+            }
+            if remaining_rows == 0 {
+                break;
+            }
+        }
+        cache.into_prepared_lines()
     }
 
     pub(super) fn prepare_replacement(&mut self, text: &Rope, text_system: &Arc<TextSystem>) {
         self.set_default_text(text);
         self.update_with_text_system(text, &(0..text.len()), text, text_system);
+        for line in &mut self.lines {
+            if let Some(wraps) = &mut line.wraps
+                && wraps.ranges.capacity() >= 256
+            {
+                Arc::make_mut(wraps).ranges.shrink_to_fit();
+            }
+        }
+        for checkpoints in self.checkpoints.values_mut() {
+            checkpoints.shrink_to_fit();
+        }
     }
 
     fn update_with_text_system(
@@ -451,6 +580,7 @@ impl TextWrapper {
                     && let Some(width) = line_wrapper
                         .uniform_word_width_for_bytes(changed_text.slice_line(row).bytes())
                 {
+                    let wraps = Arc::make_mut(wraps);
                     wraps.word_width = width;
                     wraps.word_columns = wraps.ranges[0].len() as u32;
                 }
@@ -567,6 +697,7 @@ impl TextWrapper {
         if rows + wrapped.len() <= 1 {
             line.wraps = None;
         } else if let Some(wraps) = line.wraps.as_mut() {
+            let wraps = Arc::make_mut(wraps);
             wraps.ranges.truncate(rows);
             wraps.ranges.extend(wrapped);
             wraps.word_columns = 0;
@@ -647,6 +778,7 @@ impl TextWrapper {
         if rows == 1 {
             line.wraps = None;
         } else {
+            let wraps = Arc::make_mut(wraps);
             wraps.ranges.resize(rows, 0..0);
             for (row, range) in wraps.ranges.iter_mut().enumerate() {
                 *range = row * columns..((row + 1) * columns).min(length);
@@ -711,6 +843,7 @@ impl TextWrapper {
             .to_string();
         let fragments = [LineFragment::text(&tail)];
         let indent = (prefix > 0).then_some(continuation_indent);
+        let wraps = Arc::make_mut(wraps);
         wraps.ranges.truncate(prefix);
         let mut previous = start;
         for boundary in wrapper.wrap_line_with_indent(&fragments, width, indent) {
@@ -778,9 +911,12 @@ impl TextWrapper {
         let new_end_offset = changed_text.line_end_offset(new_end_row);
         let new_range = new_start_offset..new_end_offset;
 
-        let mut new_lines = Vec::with_capacity(new_end_row - new_start_row + 1);
+        let row_count = new_end_row - new_start_row + 1;
+        let mut new_lines = Vec::with_capacity(row_count);
         let mut new_checkpoints = std::collections::BTreeMap::new();
         let wrap_width = self.wrap_width;
+        let mut recent: Option<[Option<(RopeSlice<'_>, LineItem)>; 64]> =
+            (wrap_width.is_some() && row_count >= 64).then(|| [const { None }; 64]);
 
         // line not contains `\n`.
         for (ix, line) in changed_text
@@ -800,6 +936,20 @@ impl TextWrapper {
             if line.len() > longest_row_len {
                 longest_row_ix = new_start_row + ix;
                 longest_row_len = line.len();
+            }
+
+            let cached = recent
+                .as_mut()
+                .filter(|_| (1..1024).contains(&line.len()))
+                .map(|rows| {
+                    let slot = line.len() % rows.len();
+                    &mut rows[slot]
+                });
+            if let Some(Some((previous, item))) = cached.as_deref()
+                && *previous == line
+            {
+                new_lines.push(item.clone());
+                continue;
             }
 
             // If wrap_width is Pixels::MAX, skip wrapping to disable word wrap
@@ -828,7 +978,11 @@ impl TextWrapper {
             } else {
                 None
             };
-            new_lines.push(LineItem::new(line.len(), indent, wrapped_lines));
+            let item = LineItem::new(line.len(), indent, wrapped_lines);
+            if let Some(slot) = cached {
+                *slot = Some((line, item.clone()));
+            }
+            new_lines.push(item);
         }
 
         if self.lines.is_empty() {
@@ -1193,6 +1347,41 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(checkpoint_states(&actual), checkpoint_states(&exact));
+    }
+
+    #[gpui::test]
+    fn repeated_wraps_share_geometry_and_keep_independent_edits(cx: &mut gpui::TestAppContext) {
+        let system = cx.update(|cx| cx.text_system().clone());
+        let config = LayoutConfig {
+            font: gpui::font(".ZedMono"),
+            font_size: px(16.),
+            wrap_width: Some(px(110.)),
+        };
+        let row = "    repeat café 日本語 and more words";
+        let mut text = Rope::from(format!("{row}\r\n\nother text\n").repeat(96).as_str());
+        let mut layout = TextWrapper::prepare_full(config.clone(), &text, &system);
+        let shared = layout.lines[3].wraps.as_ref().unwrap().clone();
+        assert!(Arc::ptr_eq(
+            layout.lines[0].wraps.as_ref().unwrap(),
+            &shared
+        ));
+
+        let offset = text.line_end_offset(0);
+        let range = offset..offset;
+        text.replace(range.clone(), " longer");
+        layout.update_with_text_system(&text, &range, &Rope::from(" longer"), &system);
+
+        let exact = TextWrapper::prepare_full(config, &text, &system);
+        assert_eq!(layout.lines, exact.lines);
+        assert_eq!(layout.len(), exact.len());
+        assert!(Arc::ptr_eq(
+            layout.lines[3].wraps.as_ref().unwrap(),
+            &shared
+        ));
+        assert!(!Arc::ptr_eq(
+            layout.lines[0].wraps.as_ref().unwrap(),
+            &shared
+        ));
     }
 
     #[gpui::test]

@@ -9,8 +9,9 @@ use gpui::{
     Action, App, AppContext, Bounds, ClipboardItem, Context, Entity, EntityInputHandler,
     EventEmitter, FocusHandle, Focusable, InteractiveElement as _, IntoElement, KeyBinding,
     KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _,
-    Pixels, Point, Render, ScrollHandle, ScrollWheelEvent, SharedString, Styled as _, Subscription,
-    Task, UTF16Selection, Window, actions, div, point, prelude::FluentBuilder as _, px,
+    Pixels, Point, PreparedTextLines, Render, ScrollHandle, ScrollWheelEvent, SharedString,
+    Styled as _, Subscription, Task, UTF16Selection, Window, WindowTextSystem, actions, div, point,
+    prelude::FluentBuilder as _, px,
 };
 use ropey::{Rope, RopeSlice};
 use serde::Deserialize;
@@ -41,6 +42,8 @@ use crate::input::{
 use crate::input::{InlineCompletion, RopeExt as _, Selection};
 use crate::{Root, history::History};
 use crate::{highlighter::DiagnosticSet, input::text_wrapper::LineItem};
+
+const UNDO_TEXT_BUDGET: usize = 32 * 1024 * 1024;
 
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
 #[action(namespace = input, no_json)]
@@ -216,6 +219,8 @@ pub(crate) fn init(cx: &mut App) {
         KeyBinding::new("ctrl-z", Undo, Some(CONTEXT)),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-y", Redo, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-shift-z", Redo, Some(CONTEXT)),
         #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-.", ToggleCodeActions, Some(CONTEXT)),
         #[cfg(not(target_os = "macos"))]
@@ -236,6 +241,7 @@ pub(super) struct LastLayout {
     pub(super) visible_range: Range<usize>,
     /// The first visible line top position in scroll viewport.
     pub(super) visible_top: Pixels,
+    pub(super) viewport_height: Pixels,
     /// The range of byte offset of the visible lines.
     pub(super) visible_range_offset: Range<usize>,
     /// The last layout lines (Only have visible lines).
@@ -282,11 +288,14 @@ pub struct InputState {
     value_cache: std::cell::RefCell<Option<SharedString>>,
     line_endings: super::text_metadata::LineEndings,
     accessibility_label: Option<SharedString>,
+    accessibility_description: Option<SharedString>,
+    pub(super) reveal_cursor_after_layout: bool,
     accessibility_mapping: Rc<std::cell::RefCell<accessibility::Mapping>>,
     pub(super) text_wrapper: TextWrapper,
     defer_large_layout: bool,
     requested_layout: Option<LayoutConfig>,
     layout_task: Option<Task<()>>,
+    pub(super) opening_lines: Option<PreparedTextLines>,
     history_layout: Option<TextWrapper>,
     pub(super) history: History<Change>,
     pub(super) blink_cursor: Entity<BlinkCursor>,
@@ -371,8 +380,13 @@ pub struct PreparedInput {
 impl PreparedInput {
     pub fn new(value: impl Into<SharedString>) -> Self {
         let value = value.into();
+        let text = if value.len() >= 1024 * 1024 {
+            Rope::from_shared_str(value.clone().into())
+        } else {
+            Rope::from(value.as_str())
+        };
         let revision = Revision {
-            text: Rope::from(value.as_str()),
+            text,
             endings: LineEndings::new(&value),
         };
         Self { value, revision }
@@ -381,27 +395,45 @@ impl PreparedInput {
     pub fn value(&self) -> &str {
         &self.value
     }
+
+    pub fn text_revision(&self) -> &Rope {
+        &self.revision.text
+    }
 }
 
 pub(super) struct PreparedReplacement {
-    value: SharedString,
     revision: Revision,
     layout: TextWrapper,
+    glyphs: Option<gpui::PreparedTextLines>,
 }
 
 impl PreparedReplacement {
     pub(super) fn new(
-        value: SharedString,
+        text: Rope,
         mut layout: TextWrapper,
         text_system: &Arc<gpui::TextSystem>,
     ) -> Self {
-        let PreparedInput { value, revision } = PreparedInput::new(value);
+        let revision = Revision {
+            endings: LineEndings::from_rope(&text),
+            text,
+        };
         layout.prepare_replacement(&revision.text, text_system);
+        layout.share_line_wraps();
         Self {
-            value,
             revision,
             layout,
+            glyphs: None,
         }
+    }
+
+    pub(super) fn with_viewport(
+        mut self,
+        viewport: Option<(gpui::WindowTextSystem, usize)>,
+    ) -> Self {
+        if let Some((cache, rows)) = viewport {
+            self.glyphs = self.layout.prepare_glyphs(&self.revision.text, cache, rows);
+        }
+        self
     }
 }
 
@@ -416,13 +448,31 @@ impl InputState {
     }
 
     fn prepares_large_wrapped_layout(&self) -> bool {
+        self.defers_wrap_for(self.text.len())
+    }
+
+    pub(super) fn wrap_layout_width(&self, available: Pixels) -> Pixels {
+        if self.prepares_large_wrapped_layout() {
+            let step = 4.;
+            px((f32::from(available) / step).floor() * step)
+        } else {
+            available
+        }
+    }
+
+    fn defers_wrap_for(&self, bytes: usize) -> bool {
         self.defer_large_layout
             && self.mode.is_multi_line()
             && self.soft_wrap
-            && self.text.len() >= 512 * 1024
+            && bytes >= 512 * 1024
     }
 
-    pub(super) fn prepare_layout(&mut self, config: LayoutConfig, cx: &mut Context<Self>) -> bool {
+    pub(super) fn prepare_layout(
+        &mut self,
+        config: LayoutConfig,
+        opening: Option<(&WindowTextSystem, usize)>,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if !self.prepares_large_wrapped_layout() || self.text_wrapper.matches_config(&config) {
             self.requested_layout = None;
             self.text_wrapper.prepare(
@@ -438,6 +488,13 @@ impl InputState {
         self.requested_layout = Some(config.clone());
         if self.layout_task.is_none() {
             let reflow = self.last_layout.is_some();
+            let opening = opening
+                .filter(|_| {
+                    !reflow
+                        && !self.masked
+                        && self.external_highlights.as_ref().is_some_and(Vec::is_empty)
+                })
+                .map(|(layouts, rows)| (layouts.prepare_in_separate_cache(), rows));
             let old_offset = self.layout_scroll_offset();
             let old_caret_visible = self.caret_visible(old_offset);
             let text = self.text.clone();
@@ -447,16 +504,48 @@ impl InputState {
                 let text = text.clone();
                 let config = config.clone();
                 async move {
-                    let _wrap = gpui::work_trace::Span::new(if reflow {
+                    let (opening, shaped) = if executor.num_cpus() > 4 {
+                        let shaped = opening.map(|(layouts, rows)| {
+                            let text = text.clone();
+                            let config = config.clone();
+                            let text_system = text_system.clone();
+                            executor.spawn(async move {
+                                let _shape =
+                                    gpui::work_trace::Span::new("editor_opening_shape_worker");
+                                TextWrapper::prepare_opening_prefix(
+                                    config,
+                                    &text,
+                                    &text_system,
+                                    layouts,
+                                    rows,
+                                )
+                            })
+                        });
+                        (None, shaped)
+                    } else {
+                        (opening, None)
+                    };
+                    let wrap = gpui::work_trace::Span::new(if reflow {
                         "editor_reflow_worker"
                     } else {
                         "editor_wrap_worker"
                     });
-                    TextWrapper::prepare_full_on_worker(config, text, text_system, executor).await
+                    let layout =
+                        TextWrapper::prepare_full_on_worker(config, text, text_system, executor)
+                            .await;
+                    drop(wrap);
+                    let opening_lines = match shaped {
+                        Some(shaped) => Some(shaped.await),
+                        None => opening.map(|(layouts, rows)| {
+                            let _shape = gpui::work_trace::Span::new("editor_opening_shape_worker");
+                            layout.prepare_opening_lines(layouts, rows)
+                        }),
+                    };
+                    (layout, opening_lines)
                 }
             });
             self.layout_task = Some(cx.spawn(async move |this, cx| {
-                let layout = task.await;
+                let (layout, opening_lines) = task.await;
                 _ = this.update(cx, |state, cx| {
                     state.layout_task.take();
                     if state.requested_layout.as_ref() == Some(&config)
@@ -469,6 +558,7 @@ impl InputState {
                         let offset = state.reflow_scroll_offset(&layout, current, keep_caret);
                         let retired = std::mem::replace(&mut state.text_wrapper, layout);
                         cx.background_spawn(async move { drop(retired) }).detach();
+                        state.opening_lines = opening_lines;
                         state.deferred_scroll_offset = offset;
                         state.mode.update_auto_grow(&state.text_wrapper);
                     }
@@ -525,18 +615,20 @@ impl InputState {
             .then(|| self.text_wrapper.replacement_layout())
     }
 
-    pub(super) fn cached_value(&self) -> Option<SharedString> {
-        self.value_cache.borrow().clone()
-    }
-
     pub(super) fn apply_prepared_replacement(
         &mut self,
         prepared: PreparedReplacement,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if !self.can_install_revision() || !self.text_wrapper.uses_same_layout(&prepared.layout) {
+        if !self.can_install_revision()
+            || !(self.text_wrapper.uses_same_layout(&prepared.layout)
+                || self.defers_wrap_for(prepared.revision.text.len()))
+        {
             return false;
+        }
+        if let Some(glyphs) = &prepared.glyphs {
+            window.text_system().adopt_prepared_lines(glyphs);
         }
         if !self.history.ignore {
             self.history.clear_redo();
@@ -549,20 +641,13 @@ impl InputState {
             ));
         }
         self.history.end_grouping();
-        self.install_revision(
-            prepared.revision,
-            Some(prepared.value),
-            prepared.layout,
-            window,
-            cx,
-        );
+        self.install_revision(prepared.revision, prepared.layout, window, cx);
         true
     }
 
     fn install_revision(
         &mut self,
         revision: Revision,
-        value: Option<SharedString>,
         layout: TextWrapper,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -570,7 +655,7 @@ impl InputState {
         self.pause_blink_cursor(cx);
         self.text = revision.text;
         self.line_endings = revision.endings;
-        *self.value_cache.get_mut() = value;
+        self.value_cache.get_mut().take();
         self.history_layout =
             std::mem::replace(&mut self.text_wrapper, layout).retain_for_history();
         if let Some(diagnostics) = self.mode.diagnostics_mut() {
@@ -612,7 +697,9 @@ impl InputState {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle().tab_stop(true);
         let blink_cursor = cx.new(|_| BlinkCursor::new());
-        let history = History::new().group_interval(std::time::Duration::from_secs(1));
+        let history = History::new()
+            .group_interval(std::time::Duration::from_secs(1))
+            .max_bytes(UNDO_TEXT_BUDGET);
 
         let _subscriptions = vec![
             // Observe the blink cursor to repaint the view when it changes.
@@ -637,6 +724,8 @@ impl InputState {
 
         Self {
             accessibility_label: None,
+            accessibility_description: None,
+            reveal_cursor_after_layout: false,
             accessibility_mapping: Rc::new(std::cell::RefCell::new(
                 accessibility::Mapping::default(),
             )),
@@ -649,6 +738,7 @@ impl InputState {
             defer_large_layout: false,
             requested_layout: None,
             layout_task: None,
+            opening_lines: None,
             history_layout: None,
             blink_cursor,
             history,
@@ -905,6 +995,8 @@ impl InputState {
 
         // Move scroll to top
         self.scroll_handle.set_offset(point(px(0.), px(0.)));
+        // A single-line field keeps the end of its new value, where the cursor is, in view.
+        self.reveal_cursor_after_layout = self.mode.is_single_line();
 
         cx.notify();
     }
@@ -1078,8 +1170,21 @@ impl InputState {
     pub fn value(&self) -> SharedString {
         self.value_cache
             .borrow_mut()
-            .get_or_insert_with(|| SharedString::new(self.text.to_string()))
+            .get_or_insert_with(|| {
+                self.text.shared_str().map_or_else(
+                    || SharedString::new(String::from(&self.text)),
+                    |text| SharedString::from(text.clone()),
+                )
+            })
             .clone()
+    }
+
+    pub fn release_value_cache(&mut self, cx: &mut Context<Self>) {
+        if let Some(value) = self.value_cache.get_mut().take()
+            && value.len() >= 512 * 1024
+        {
+            cx.background_spawn(async move { drop(value) }).detach();
+        }
     }
 
     pub fn line_endings(&self) -> &'static str {
@@ -1094,6 +1199,10 @@ impl InputState {
     /// Return the text [`Rope`] of the input field.
     pub fn text(&self) -> &Rope {
         &self.text
+    }
+
+    pub fn has_text_revision(&self, text: &Rope) -> bool {
+        ropey::extra::esoterica::ropes_are_instances(&self.text, text)
     }
 
     /// Return the (0-based) [`Position`] of the cursor.
@@ -1121,8 +1230,12 @@ impl InputState {
         cx: &mut Context<Self>,
     ) {
         let offset = self.text.position_to_offset(&position.into());
+        self.set_cursor_offset_unfocused(offset, cx);
+    }
+
+    pub fn set_cursor_offset_unfocused(&mut self, offset: usize, cx: &mut Context<Self>) -> usize {
         self.move_to(offset, None, cx);
-        self.update_preferred_column();
+        self.selected_range.start
     }
 
     /// Focus the input field.
@@ -1777,6 +1890,18 @@ impl InputState {
             .push(Change::new(range.clone(), &old_text, new_range, new_text));
     }
 
+    fn release_retired_history_layout(&mut self) {
+        if let Some(layout) = &self.history_layout
+            && !self.history.undos().iter().chain(self.history.redos()).any(|change| {
+                [&change.old_text, &change.new_text].into_iter().any(|text| {
+                    matches!(text, HistoryText::Revision(revision) if layout.references_revision(&revision.text))
+                })
+            })
+        {
+            self.history_layout = None;
+        }
+    }
+
     pub(super) fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
         self.history.ignore = true;
         if let Some(changes) = self.history.undo() {
@@ -1814,9 +1939,11 @@ impl InputState {
                     && range.start == 0
                     && range.end == self.text.len()
                     && let Some(layout) = self.history_layout.take()
-                    && layout.matches_revision(&revision.text, &self.text_wrapper)
+                    && (layout.uses_same_layout(&self.text_wrapper)
+                        || self.defers_wrap_for(revision.text.len()))
+                    && layout.matches_revision(&revision.text)
                 {
-                    self.install_revision(revision, None, layout, window, cx);
+                    self.install_revision(revision, layout, window, cx);
                 } else {
                     let range_utf16 = self.range_to_utf16(&range.into());
                     self.replace_text_in_range_silent(
@@ -1948,7 +2075,7 @@ impl InputState {
     /// The offset is the UTF-8 offset.
     ///
     /// Ensure the offset use self.next_boundary or self.previous_boundary to get the correct offset.
-    pub(crate) fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+    pub fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         self.clear_inline_completion(cx);
 
         let offset = super::grapheme::floor(&self.text, offset);
@@ -2204,6 +2331,31 @@ impl InputState {
         cx.notify();
     }
 
+    pub fn set_accessibility_description(
+        &mut self,
+        description: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        self.accessibility_description = Some(description.into());
+        cx.notify();
+    }
+
+    pub fn begin_undo_group(&mut self) {
+        self.history.new_group();
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.history.undos().is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.history.redos().is_empty()
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.selected_range.start != self.selected_range.end
+    }
+
     pub fn interaction_active(&self) -> bool {
         self.selecting || self.ime_marked_range.is_some()
     }
@@ -2330,7 +2482,6 @@ impl InputState {
         }
 
         self.value_cache.get_mut().take();
-        self.history_layout = None;
         if self.mode.is_single_line() {
             self.line_endings = super::text_metadata::LineEndings::new(&self.text.to_string());
         } else {
@@ -2351,6 +2502,7 @@ impl InputState {
         } else {
             self.push_history(&old_text, &range, &new_text);
         }
+        self.release_retired_history_layout();
         self.history.end_grouping();
         if let Some(diagnostics) = self.mode.diagnostics_mut() {
             diagnostics.reset(&self.text)
@@ -2420,6 +2572,7 @@ impl EntityInputHandler for InputState {
                     self.history
                         .push(Change::new(original.range, &original.text, marked, &text));
                     self.history.new_group();
+                    self.release_retired_history_layout();
                 }
                 self.update_search(cx);
                 cx.emit(InputEvent::Change);
@@ -2494,7 +2647,6 @@ impl EntityInputHandler for InputState {
         }
 
         self.value_cache.get_mut().take();
-        self.history_layout = None;
         if self.mode.is_single_line() {
             self.line_endings = super::text_metadata::LineEndings::new(&self.text.to_string());
         } else {
@@ -2713,31 +2865,31 @@ mod revision_tests {
         cx.update(|window, cx| {
             editor.update(cx, |state, cx| {
                 assert!(state.initial_layout_pending());
-                assert!(!state.prepare_layout(config.clone(), cx));
+                assert!(!state.prepare_layout(config.clone(), None, cx));
                 state.set_external_highlights(Vec::new(), cx);
                 state.set_value(after.clone(), window, cx);
-                assert!(!state.prepare_layout(config.clone(), cx));
+                assert!(!state.prepare_layout(config.clone(), None, cx));
             });
         });
         cx.run_until_parked();
         cx.update(|_, cx| {
             editor.update(cx, |state, cx| {
                 assert!(!state.text_wrapper.matches_config(&config));
-                assert!(!state.prepare_layout(config.clone(), cx));
-                assert!(!state.prepare_layout(final_config.clone(), cx));
+                assert!(!state.prepare_layout(config.clone(), None, cx));
+                assert!(!state.prepare_layout(final_config.clone(), None, cx));
             });
         });
         cx.run_until_parked();
         cx.update(|_, cx| {
             editor.update(cx, |state, cx| {
                 assert!(!state.text_wrapper.matches_config(&config));
-                assert!(!state.prepare_layout(final_config.clone(), cx));
+                assert!(!state.prepare_layout(final_config.clone(), None, cx));
             });
         });
         cx.run_until_parked();
         cx.update(|_, cx| {
             editor.update(cx, |state, cx| {
-                assert!(state.prepare_layout(final_config.clone(), cx));
+                assert!(state.prepare_layout(final_config.clone(), None, cx));
                 assert_eq!(state.value().as_str(), after);
                 assert_eq!(state.line_endings, LineEndings::new(&after));
                 let exact = TextWrapper::prepare_full(final_config, &state.text, cx.text_system());
@@ -2778,6 +2930,7 @@ mod revision_tests {
                 state.last_layout = Some(LastLayout {
                     visible_range: row..row + 1,
                     visible_top: state.text_wrapper.soft_row_start(row) * line_height,
+                    viewport_height: px(200.),
                     visible_range_offset: state.text.line_start_offset(row)
                         ..state.text.line_end_offset(row),
                     lines: Rc::new(Vec::new()),
@@ -2786,7 +2939,7 @@ mod revision_tests {
                     line_number_width: px(0.),
                     cursor_bounds: None,
                 });
-                assert!(state.prepare_layout(newer.clone(), cx));
+                assert!(state.prepare_layout(newer.clone(), None, cx));
                 assert!(state.text_wrapper.matches_config(&config));
                 assert!(state.replace_text_checked(None, "✓", window, cx));
                 state.deferred_scroll_offset = Some(point(
@@ -2799,7 +2952,7 @@ mod revision_tests {
         cx.update(|_, cx| {
             editor.update(cx, |state, cx| {
                 assert!(state.text_wrapper.matches_config(&config));
-                assert!(state.prepare_layout(newer.clone(), cx));
+                assert!(state.prepare_layout(newer.clone(), None, cx));
             })
         });
         cx.run_until_parked();
@@ -2844,7 +2997,7 @@ mod revision_tests {
                     let mut expected = TextWrapper::new(font.clone(), size, width);
                     expected.prepare(&Rope::from(after), font.clone(), size, width, cx);
                     let prepared = PreparedReplacement::new(
-                        after.to_owned().into(),
+                        Rope::from(after),
                         state.replacement_layout().unwrap(),
                         cx.text_system(),
                     );
@@ -2853,6 +3006,13 @@ mod revision_tests {
                     assert_eq!(state.line_endings, LineEndings::new(after));
                     assert_eq!(state.text_wrapper.lines, expected.lines);
                     assert_eq!(state.cursor(), 0);
+                    assert!(state.history_layout.is_some());
+
+                    state.history.new_group();
+                    assert!(state.replace_text_checked(None, "x", window, cx));
+                    assert_eq!(state.value().as_str(), format!("x{after}"));
+                    state.undo(&Undo, window, cx);
+                    assert_eq!(state.value().as_str(), after);
                     assert!(state.history_layout.is_some());
 
                     state.undo(&Undo, window, cx);
@@ -2868,7 +3028,7 @@ mod revision_tests {
 
                     let resized = Some(px(81.));
                     let prepared = PreparedReplacement::new(
-                        before.to_owned().into(),
+                        Rope::from(before),
                         state.replacement_layout().unwrap(),
                         cx.text_system(),
                     );

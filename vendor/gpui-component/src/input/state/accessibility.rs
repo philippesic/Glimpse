@@ -1,12 +1,22 @@
 use super::*;
-use crate::semantic_text::{text_run, visit_segments};
+use crate::semantic_text::{
+    MAX_RUN_CHARACTERS, Segment, text_run, text_run_with_boundaries, visit_line_segments,
+};
 use gpui::accesskit::{
     Action, ActionData, ActionRequest, Node, NodeId, Role, TextPosition, TextSelection,
 };
 use gpui::accessibility::TextRunIds;
 use gpui::WeakEntity;
+use ropey::{LineType, extra::esoterica::ropes_are_instances};
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::hash::BuildHasher;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+const PACKED_LINE_THRESHOLD: usize = 4096;
+const SHARE_RUNS_FROM_BYTES: usize = 64 * 1024;
+const MAX_SHARED_RUNS: usize = 256;
 
 #[derive(Default)]
 pub(super) struct Mapping {
@@ -18,17 +28,18 @@ pub(super) struct Mapping {
 #[derive(Clone, Default)]
 struct TextRuns {
     revision: usize,
-    text: SharedString,
+    text: Rope,
     runs: Arc<[Run]>,
     nodes: Arc<[(NodeId, Node)]>,
     next_key: usize,
+    packed: bool,
 }
 
 pub(super) struct PrepareTextRuns {
     owner: TextRunIds,
     previous: TextRuns,
-    text: SharedString,
-    changed: (Range<usize>, Range<usize>),
+    text: Rope,
+    changed: Option<(Range<usize>, Range<usize>)>,
 }
 
 #[derive(Clone)]
@@ -36,23 +47,236 @@ struct Run {
     id: NodeId,
     range: Range<usize>,
 }
+
+#[derive(Default)]
+struct PackedLines {
+    backing: Option<Arc<str>>,
+    start: usize,
+    text: String,
+    lengths: Vec<u8>,
+    words: Vec<u16>,
+    line_starts: Vec<u16>,
+    shared: Option<HashMap<u64, Node>>,
+    layouts: HashMap<u64, Node>,
+}
+
+impl PackedLines {
+    fn push(&mut self, start: usize, line: &str, part: Segment) {
+        let characters = self.lengths.len() as u16;
+        if self.text.is_empty() {
+            self.start = start;
+        } else {
+            self.line_starts.push(characters);
+            if part.words.first() != Some(&0) {
+                self.words.push(characters);
+            }
+        }
+        self.text.push_str(line);
+        self.lengths.extend(part.lengths);
+        self.words
+            .extend(part.words.into_iter().map(|word| characters + word));
+    }
+
+    fn flush(&mut self, emit: &mut impl FnMut(Range<usize>, Option<usize>, Node)) {
+        if self.text.is_empty() {
+            return;
+        }
+        let fingerprint = self
+            .shared
+            .as_ref()
+            .map(|shared| shared.hasher().hash_one(self.text.as_str()));
+        let cached = fingerprint
+            .and_then(|hash| self.shared.as_ref()?.get(&hash))
+            .filter(|run| {
+                run.value() == Some(self.text.as_str())
+                    && run.hard_line_starts() == self.line_starts
+                    && has_text_boundaries(run, &self.lengths, &self.words)
+            });
+        let node = if let Some(run) = cached {
+            self.lengths.clear();
+            self.words.clear();
+            self.line_starts.clear();
+            run.clone()
+        } else {
+            let run = self.build_run();
+            if let (Some(shared), Some(hash)) = (&mut self.shared, fingerprint)
+                && shared.len() < MAX_SHARED_RUNS
+            {
+                shared.entry(hash).or_insert_with(|| run.clone());
+            }
+            run
+        };
+        emit(self.start..self.start + self.text.len(), None, node);
+        self.text.clear();
+    }
+
+    fn build_run(&mut self) -> Node {
+        let layout = self.shared.as_ref().map(|shared| {
+            shared
+                .hasher()
+                .hash_one((&self.lengths, &self.words, &self.line_starts))
+        });
+        let template = layout
+            .and_then(|key| self.layouts.get(&key))
+            .filter(|node| {
+                node.hard_line_starts() == self.line_starts
+                    && has_text_boundaries(node, &self.lengths, &self.words)
+            });
+        if let Some(template) = template {
+            let mut run = template.clone();
+            self.set_value(&mut run);
+            self.lengths.clear();
+            self.words.clear();
+            self.line_starts.clear();
+            return run;
+        }
+
+        self.lengths.shrink_to_fit();
+        self.words.shrink_to_fit();
+        let lengths = std::mem::take(&mut self.lengths);
+        let words = std::mem::take(&mut self.words);
+        let mut run = if self.backing.is_some() {
+            let mut run = text_run_with_boundaries(lengths, words);
+            self.set_value(&mut run);
+            run
+        } else {
+            text_run(&self.text, lengths, words)
+        };
+        if !self.line_starts.is_empty() {
+            self.line_starts.shrink_to_fit();
+            run.set_hard_line_starts(std::mem::take(&mut self.line_starts));
+        }
+        if let Some(key) = layout
+            && self.layouts.len() < MAX_SHARED_RUNS
+        {
+            self.layouts.entry(key).or_insert_with(|| {
+                let mut template = run.clone();
+                template.clear_value();
+                template
+            });
+        }
+        run
+    }
+
+    fn set_value(&self, run: &mut Node) {
+        let range = self.start..self.start + self.text.len();
+        if let Some(backing) = &self.backing
+            && backing.get(range.clone()) == Some(self.text.as_str())
+        {
+            run.set_shared_value(backing.clone(), range);
+        } else {
+            run.set_value(self.text.as_str());
+        }
+    }
+}
+
+fn has_text_boundaries(run: &Node, lengths: &[u8], words: &[u16]) -> bool {
+    run.character_lengths() == lengths
+        && if run.wide_word_starts().is_empty() {
+            run.word_starts()
+                .iter()
+                .copied()
+                .map(u16::from)
+                .eq(words.iter().copied())
+        } else {
+            run.wide_word_starts() == words
+        }
+}
+
+fn shared_text_run<'a>(
+    value: &'a str,
+    lengths: Vec<u8>,
+    words: Vec<u16>,
+    shared: &mut HashMap<&'a str, Node>,
+) -> Node {
+    if let Some(run) = shared.get(value)
+        && has_text_boundaries(run, &lengths, &words)
+    {
+        return run.clone();
+    }
+    let run = text_run(value, lengths, words);
+    if shared.len() < MAX_SHARED_RUNS {
+        shared.entry(value).or_insert_with(|| run.clone());
+    }
+    run
+}
+
+fn visit_source_runs(
+    text: &Rope,
+    range: Range<usize>,
+    packed: bool,
+    mut emit: impl FnMut(Range<usize>, Option<usize>, Node),
+) {
+    let backing = packed.then(|| text.shared_str()).flatten();
+    let mut block = PackedLines {
+        backing: backing.cloned(),
+        shared: (packed && range.len() >= SHARE_RUNS_FROM_BYTES).then(HashMap::new),
+        ..Default::default()
+    };
+    let mut offset = range.start;
+    for (line_index, line) in text.slice(range.clone()).lines(LineType::LF).enumerate() {
+        if line.len() == 0 && range.end < text.len() {
+            break;
+        }
+        let line = backing
+            .map(|source| &source[offset..offset + line.len()])
+            .or_else(|| line.as_str())
+            .map_or_else(|| Cow::Owned(String::from(line)), Cow::Borrowed);
+        let mut shared = (line.len() >= SHARE_RUNS_FROM_BYTES).then(HashMap::new);
+        visit_line_segments(&line, line_index, |part| {
+            if packed && !line.is_empty() && part.range.len() == line.len() {
+                if block.lengths.len() + part.lengths.len() > MAX_RUN_CHARACTERS {
+                    block.flush(&mut emit);
+                }
+                block.push(offset, &line, part);
+            } else {
+                block.flush(&mut emit);
+                let range = offset + part.range.start..offset + part.range.end;
+                if let Some(shared) = &mut shared {
+                    let continues_before = part.range.start != 0;
+                    let continues_after = part.range.end != line.len();
+                    let mut node =
+                        shared_text_run(&line[part.range], part.lengths, part.words, shared);
+                    if continues_before {
+                        node.set_text_run_continues_before();
+                    }
+                    if continues_after {
+                        node.set_text_run_continues_after();
+                    }
+                    emit(range, None, node);
+                } else {
+                    let node = text_run(&line[part.range], part.lengths, part.words);
+                    emit(range, Some(part.line), node);
+                }
+            }
+        });
+        offset += line.len();
+    }
+    block.flush(&mut emit);
+}
+
 impl TextRuns {
     #[cfg(test)]
-    fn update(&mut self, text: SharedString, mut node_id: impl FnMut(usize) -> NodeId) {
+    fn update(&mut self, text: Rope, mut node_id: impl FnMut(usize) -> NodeId) {
         let changed = changed_lines(&self.text, &text);
         self.update_changed(text, changed, &mut node_id);
     }
 
-    fn matches(&self, text: &str) -> bool {
-        !self.nodes.is_empty() && std::ptr::eq(self.text.as_str(), text)
+    fn matches(&self, text: &Rope) -> bool {
+        !self.nodes.is_empty() && ropes_are_instances(&self.text, text)
     }
 
     fn update_changed(
         &mut self,
-        text: SharedString,
-        (old, new): (Range<usize>, Range<usize>),
+        text: Rope,
+        (mut old, mut new): (Range<usize>, Range<usize>),
         mut node_id: impl FnMut(usize) -> NodeId,
     ) {
+        if !self.packed && text.len_lines(LineType::LF) > PACKED_LINE_THRESHOLD {
+            self.packed = true;
+            old = 0..self.text.len();
+            new = 0..text.len();
+        }
         let prefix = self
             .runs
             .partition_point(|run| run.range.end <= old.start && run.range.start < old.start);
@@ -61,15 +285,19 @@ impl TextRuns {
         } else {
             self.runs.partition_point(|run| run.range.start < old.end)
         };
+        if self.packed && prefix < suffix {
+            let start = self.runs[prefix].range.start;
+            let end = self.runs[suffix - 1].range.end;
+            new.start -= old.start - start;
+            new.end += end - old.end;
+            old.end = end;
+        }
         let mut nodes = Vec::with_capacity(self.nodes.len());
         let mut runs = Vec::with_capacity(self.runs.len());
         nodes.extend(self.nodes[..prefix].iter().cloned());
         runs.extend(self.runs[..prefix].iter().cloned());
-        let mut previous: Option<(usize, NodeId, Node)> = None;
-        visit_segments(&text[new.clone()], |part| {
-            if part.range.is_empty() && new.end < text.len() {
-                return;
-            }
+        let mut previous = None::<(Option<usize>, NodeId, Node)>;
+        visit_source_runs(&text, new.clone(), self.packed, |range, line, mut run| {
             let id = if runs.len() < suffix {
                 self.runs[runs.len()].id
             } else {
@@ -77,16 +305,14 @@ impl TextRuns {
                 self.next_key += 1;
                 node_id(key)
             };
-            let range = new.start + part.range.start..new.start + part.range.end;
-            let mut run = text_run(&text[range.clone()], part.lengths, part.words);
-            if let Some((line, previous_id, mut previous)) = previous.take() {
-                if line == part.line {
+            if let Some((previous_line, previous_id, mut previous)) = previous.take() {
+                if line.is_some() && previous_line == line {
                     previous.set_next_on_line(id);
                     run.set_previous_on_line(previous_id);
                 }
                 nodes.push((previous_id, previous));
             }
-            previous = Some((part.line, id, run));
+            previous = Some((line, id, run));
             runs.push(Run { id, range });
         });
         if let Some((_, id, node)) = previous {
@@ -139,38 +365,36 @@ impl TextRuns {
 }
 
 impl Mapping {
-    fn prepare(&mut self, owner: TextRunIds, text: SharedString) -> Option<PrepareTextRuns> {
+    fn prepare(&mut self, owner: TextRunIds, text: &Rope) -> Option<PrepareTextRuns> {
         if self.owner != Some(owner) {
             self.owner = Some(owner);
             self.current = TextRuns::default();
         }
-        if self.current.matches(&text) || self.running {
+        if self.current.matches(text) || self.running {
             return None;
         }
-        let changed = changed_lines(&self.current.text, &text);
-        if changed.0.len().max(changed.1.len()) <= 64 * 1024
+        let changed = (self.current.text.len().max(text.len()) <= 512 * 1024)
+            .then(|| changed_lines(&self.current.text, text));
+        if let Some(changed) = changed.as_ref()
+            && changed.0.len().max(changed.1.len()) <= 64 * 1024
             && self.current.nodes.len() <= 4096
-            && text.as_bytes()[changed.1.clone()]
-                .iter()
-                .filter(|&&byte| byte == b'\n')
-                .take(4096)
-                .count()
-                < 4096
+            && (self.current.packed || text.len_lines(LineType::LF) <= PACKED_LINE_THRESHOLD)
+            && text.slice(changed.1.clone()).len_lines(LineType::LF) <= 4096
         {
             self.current
-                .update_changed(text, changed, |key| owner.get(key));
+                .update_changed(text.clone(), changed.clone(), |key| owner.get(key));
             return None;
         }
         self.running = true;
         Some(PrepareTextRuns {
             owner,
             previous: self.current.clone(),
-            text,
+            text: text.clone(),
             changed,
         })
     }
 
-    fn finish(&mut self, owner: TextRunIds, current: TextRuns, text: &str) {
+    fn finish(&mut self, owner: TextRunIds, current: TextRuns, text: &Rope) {
         self.running = false;
         if self.owner == Some(owner) && current.matches(text) {
             self.current = current;
@@ -180,8 +404,11 @@ impl Mapping {
 
 impl PrepareTextRuns {
     fn build(mut self) -> TextRuns {
+        let changed = self
+            .changed
+            .unwrap_or_else(|| changed_lines(&self.previous.text, &self.text));
         self.previous
-            .update_changed(self.text, self.changed, |key| self.owner.get(key));
+            .update_changed(self.text, changed, |key| self.owner.get(key));
         self.previous
     }
 
@@ -192,65 +419,72 @@ impl PrepareTextRuns {
             state
                 .accessibility_mapping
                 .borrow_mut()
-                .finish(owner, current, &state.value());
+                .finish(owner, current, &state.text);
             cx.notify();
         });
     }
 }
-fn common_bytes(first: &[u8], second: &[u8], reverse: bool) -> usize {
-    let length = first.len().min(second.len());
-    let first = if reverse {
-        &first[first.len() - length..]
-    } else {
-        &first[..length]
-    };
-    let second = if reverse {
-        &second[second.len() - length..]
-    } else {
-        &second[..length]
-    };
+fn common_bytes(first: &Rope, second: &Rope, limit: usize, reverse: bool) -> usize {
     let mut matched = 0;
-    if reverse {
-        for (first, second) in first.rchunks(1024).zip(second.rchunks(1024)) {
-            if first != second {
-                return matched
-                    + first
+    while matched < limit {
+        let first_index = if reverse {
+            first.len() - matched - 1
+        } else {
+            matched
+        };
+        let second_index = if reverse {
+            second.len() - matched - 1
+        } else {
+            matched
+        };
+        let (first_chunk, first_start) = first.chunk(first_index);
+        let (second_chunk, second_start) = second.chunk(second_index);
+        let first_local = first_index - first_start;
+        let second_local = second_index - second_start;
+        let remaining = limit - matched;
+        let (first, second) = if reverse {
+            let length = remaining.min(first_local + 1).min(second_local + 1);
+            (
+                &first_chunk.as_bytes()[first_local + 1 - length..=first_local],
+                &second_chunk.as_bytes()[second_local + 1 - length..=second_local],
+            )
+        } else {
+            let length = remaining
+                .min(first_chunk.len() - first_local)
+                .min(second_chunk.len() - second_local);
+            (
+                &first_chunk.as_bytes()[first_local..first_local + length],
+                &second_chunk.as_bytes()[second_local..second_local + length],
+            )
+        };
+        if first != second {
+            return matched
+                + if reverse {
+                    first
                         .iter()
                         .rev()
                         .zip(second.iter().rev())
                         .take_while(|(a, b)| a == b)
-                        .count();
-            }
-            matched += first.len();
+                        .count()
+                } else {
+                    first.iter().zip(second).take_while(|(a, b)| a == b).count()
+                };
         }
-    } else {
-        for (first, second) in first.chunks(1024).zip(second.chunks(1024)) {
-            if first != second {
-                return matched + first.iter().zip(second).take_while(|(a, b)| a == b).count();
-            }
-            matched += first.len();
-        }
+        matched += first.len();
     }
     matched
 }
-fn changed_lines(old: &str, new: &str) -> (Range<usize>, Range<usize>) {
-    let prefix = common_bytes(old.as_bytes(), new.as_bytes(), false);
-    let suffix = common_bytes(&old.as_bytes()[prefix..], &new.as_bytes()[prefix..], true);
-    let start = old.as_bytes()[..prefix]
-        .iter()
-        .rposition(|&byte| byte == b'\n')
-        .map_or(0, |byte| byte + 1);
-    let old_suffix = old.len() - suffix;
-    let new_suffix = new.len() - suffix;
-    let old_end = old.as_bytes()[old_suffix..]
-        .iter()
-        .position(|&byte| byte == b'\n')
-        .map_or(old.len(), |byte| old_suffix + byte + 1);
-    let new_end = new.as_bytes()[new_suffix..]
-        .iter()
-        .position(|&byte| byte == b'\n')
-        .map_or(new.len(), |byte| new_suffix + byte + 1);
-    (start..old_end, start..new_end)
+
+fn changed_lines(old: &Rope, new: &Rope) -> (Range<usize>, Range<usize>) {
+    let limit = old.len().min(new.len());
+    let prefix = common_bytes(old, new, limit, false);
+    let suffix = common_bytes(old, new, limit - prefix, true);
+    let start = old.line_to_byte_idx(old.byte_to_line_idx(prefix, LineType::LF), LineType::LF);
+    let end = |text: &Rope| {
+        let line = text.byte_to_line_idx(text.len() - suffix, LineType::LF);
+        text.line_to_byte_idx(line + 1, LineType::LF)
+    };
+    (start..end(old), start..end(new))
 }
 
 impl InputState {
@@ -267,7 +501,6 @@ impl InputState {
         window: &mut Window,
         mapping: &mut Mapping,
     ) -> (gpui::AccessibilityInfo, Option<PrepareTextRuns>) {
-        let text = self.value();
         if self.masked {
             let mut node = Node::new(Role::PasswordInput);
             node.set_label(
@@ -276,7 +509,7 @@ impl InputState {
                     .unwrap_or(&self.placeholder)
                     .to_string(),
             );
-            node.set_value("•".repeat(text.chars().count()));
+            node.set_value("•".repeat(self.text.len_chars()));
             node.add_action(Action::Focus);
             if self.disabled {
                 node.set_read_only();
@@ -288,9 +521,9 @@ impl InputState {
             return (info, None);
         }
         let owner = window.accessibility_text_run_ids(id);
-        let work = mapping.prepare(owner, text.clone());
+        let work = mapping.prepare(owner, &self.text);
         let current = &mapping.current;
-        let ready = current.matches(&text) && !self.initial_layout_pending();
+        let ready = current.matches(&self.text) && !self.initial_layout_pending();
         let mut node = Node::new(if self.mode.is_multi_line() {
             Role::MultilineTextInput
         } else {
@@ -302,6 +535,9 @@ impl InputState {
                 .unwrap_or(&self.placeholder)
                 .to_string(),
         );
+        if let Some(description) = &self.accessibility_description {
+            node.set_description(description.to_string());
+        }
         if self.disabled || !ready {
             node.set_read_only();
         } else {
@@ -340,9 +576,7 @@ impl InputState {
             self.focus(window, cx);
             return true;
         }
-        if self.initial_layout_pending()
-            || (!self.masked && !mapping.current.matches(&self.value()))
-        {
+        if self.initial_layout_pending() || (!self.masked && !mapping.current.matches(&self.text)) {
             return false;
         }
         match (request.action, request.data) {
@@ -355,7 +589,6 @@ impl InputState {
                 };
                 self.selected_range = (anchor.min(focus)..anchor.max(focus)).into();
                 self.selection_reversed = focus < anchor;
-                self.focus(window, cx);
                 self.update_preferred_column();
                 cx.notify();
                 true
@@ -378,6 +611,130 @@ mod tests {
     use super::*;
     use crate::semantic_text::segments;
 
+    #[test]
+    fn packed_source_shares_exact_utf8_bytes_until_edited() {
+        let backing: Arc<str> = "🙂 café é\r\n日本語 word\n".repeat(2000).into();
+        let mut text = Rope::from_shared_str(backing.clone());
+        let mut restored = String::new();
+        visit_source_runs(&text, 0..text.len(), true, |range, _, node| {
+            let value = node.value().unwrap();
+            assert_eq!(value, &backing[range.clone()]);
+            if range.start == 0 {
+                assert_eq!(value.as_ptr(), backing.as_ptr());
+            }
+            restored.push_str(value);
+        });
+        assert_eq!(restored, backing.as_ref());
+
+        text.insert(4, " changed");
+        restored.clear();
+        visit_source_runs(&text, 0..text.len(), true, |_, _, node| {
+            restored.push_str(node.value().unwrap());
+        });
+        assert_eq!(restored, String::from(&text));
+        assert!(backing.starts_with("🙂 café é\r\n"));
+    }
+
+    #[test]
+    fn distinct_text_reuses_only_equal_grapheme_word_and_line_boundaries() {
+        let mut packed = PackedLines {
+            shared: Some(HashMap::new()),
+            ..Default::default()
+        };
+        let mut build = |value: &str, lengths: Vec<u8>, words: Vec<u16>, starts: Vec<u16>| {
+            packed.text = value.into();
+            packed.lengths = lengths;
+            packed.words = words;
+            packed.line_starts = starts;
+            packed.build_run()
+        };
+        let first = build("a\nb\n", vec![1, 1, 1, 1], vec![0, 2], vec![2]);
+        let second = build("c\nd\n", vec![1, 1, 1, 1], vec![0, 2], vec![2]);
+        let different = build("efg\n", vec![1, 1, 1, 1], vec![0], vec![]);
+        assert_eq!(first.value(), Some("a\nb\n"));
+        assert_eq!(second.value(), Some("c\nd\n"));
+        assert_eq!(different.value(), Some("efg\n"));
+        assert!(std::ptr::eq(
+            first.character_lengths(),
+            second.character_lengths()
+        ));
+        assert!(std::ptr::eq(first.word_starts(), second.word_starts()));
+        assert!(std::ptr::eq(
+            first.hard_line_starts(),
+            second.hard_line_starts()
+        ));
+        assert_eq!(different.word_starts(), [0]);
+        assert!(different.hard_line_starts().is_empty());
+    }
+
+    #[test]
+    fn equal_packed_runs_share_properties_and_keep_distinct_positions() {
+        let stanza = "café 🙂 é é\r\n\n日本語 word\n";
+        let text = stanza.repeat(8_000);
+        let mut mapping = TextRuns::default();
+        mapping.update(Rope::from(text.as_str()), |index| NodeId(index as u64 + 1));
+        let mut by_text = HashMap::new();
+        let mut shared = 0;
+        for (index, (id, run)) in mapping.nodes.iter().enumerate() {
+            if let Some(previous) = by_text.insert(run.value().unwrap(), index) {
+                let (previous_id, previous_run) = &mapping.nodes[previous];
+                assert_ne!(previous_id, id);
+                assert!(!run.hard_line_starts().is_empty());
+                assert!(run.shares_data_with(previous_run));
+                let start = mapping.runs[index].range.start;
+                assert_eq!(mapping.offset(&mapping.position(start)), Some(start));
+                shared += 1;
+            }
+        }
+        assert!(shared > 10);
+        assert_eq!(
+            mapping
+                .nodes
+                .iter()
+                .map(|(_, node)| node.value().unwrap())
+                .collect::<String>(),
+            text
+        );
+    }
+
+    #[test]
+    fn repeated_long_runs_share_exact_metadata_without_sharing_positions() {
+        let text = "x ".repeat(64 * 1024);
+        let mut mapping = TextRuns::default();
+        mapping.update(Rope::from(text.as_str()), |index| NodeId(index as u64 + 1));
+        let first = &mapping.nodes[0];
+        let second = &mapping.nodes[1];
+        let third = &mapping.nodes[2];
+        let last = mapping.nodes.last().unwrap();
+        assert!(second.1.shares_data_with(&third.1));
+        assert_ne!(second.0, third.0);
+        assert!(!first.1.text_run_continues_before());
+        assert!(first.1.text_run_continues_after());
+        assert!(last.1.text_run_continues_before());
+        assert!(!last.1.text_run_continues_after());
+        assert_eq!(mapping.offset(&mapping.position(4097)), Some(4097));
+        assert_eq!(
+            mapping
+                .nodes
+                .iter()
+                .map(|(_, node)| node.value().unwrap())
+                .collect::<String>(),
+            text
+        );
+
+        let mut cache = HashMap::new();
+        let value = "a\u{301}b";
+        let original = shared_text_run(value, vec![3, 1], vec![0], &mut cache);
+        let same = shared_text_run(value, vec![3, 1], vec![0], &mut cache);
+        let words = shared_text_run(value, vec![3, 1], vec![1], &mut cache);
+        let scalars = shared_text_run(value, vec![1, 2, 1], vec![0], &mut cache);
+        assert!(original.shares_data_with(&same));
+        assert!(!original.shares_data_with(&words));
+        assert!(!original.shares_data_with(&scalars));
+        assert_eq!(words.word_starts(), [1]);
+        assert_eq!(scalars.character_lengths(), [1, 2, 1]);
+    }
+
     #[gpui::test]
     fn large_accessible_updates_reject_stale_text_and_owners(cx: &mut gpui::TestAppContext) {
         let cx = cx.add_empty_window();
@@ -386,23 +743,24 @@ mod tests {
             let mut new_id = gpui::GlobalElementId::default();
             new_id.push("another input".into());
             let new_owner = window.accessibility_text_run_ids(&new_id);
-            let initial: SharedString = "original café\r\n".repeat(5_000).into();
-            let latest: SharedString = "new é🙂\r\n".repeat(6_000).into();
+            let initial = Rope::from("original café\r\n".repeat(5_000));
+            let latest = "new é🙂\r\n".repeat(6_000);
+            let latest_rope = Rope::from(latest.as_str());
             let mut mapping = Mapping::default();
-            let pending = mapping.prepare(owner, initial.clone()).unwrap();
-            assert!(mapping.prepare(owner, latest.clone()).is_none());
-            mapping.finish(owner, pending.build(), &latest);
+            let pending = mapping.prepare(owner, &initial).unwrap();
+            assert!(mapping.prepare(owner, &latest_rope).is_none());
+            mapping.finish(owner, pending.build(), &latest_rope);
             assert!(mapping.current.nodes.is_empty());
 
-            let pending = mapping.prepare(owner, latest.clone()).unwrap();
-            assert!(mapping.prepare(new_owner, latest.clone()).is_none());
-            mapping.finish(owner, pending.build(), &latest);
+            let pending = mapping.prepare(owner, &latest_rope).unwrap();
+            assert!(mapping.prepare(new_owner, &latest_rope).is_none());
+            mapping.finish(owner, pending.build(), &latest_rope);
             assert!(mapping.current.nodes.is_empty());
 
-            let pending = mapping.prepare(new_owner, latest.clone()).unwrap();
-            mapping.finish(new_owner, pending.build(), &latest);
-            assert_complete_mapping(&mapping.current, &latest);
-            assert!(mapping.prepare(new_owner, latest.clone()).is_none());
+            let pending = mapping.prepare(new_owner, &latest_rope).unwrap();
+            mapping.finish(new_owner, pending.build(), &latest_rope);
+            assert_packed_mapping(&mapping.current, &latest);
+            assert!(mapping.prepare(new_owner, &latest_rope).is_none());
         });
     }
 
@@ -443,6 +801,120 @@ mod tests {
             }
         }
     }
+
+    fn assert_packed_mapping(mapping: &TextRuns, text: &str) {
+        assert!(mapping.packed);
+        let parts = segments(text);
+        let mut lengths = Vec::new();
+        let mut end = 0;
+        let mut ids = std::collections::HashSet::new();
+        assert_eq!(mapping.runs.len(), mapping.nodes.len());
+        for (run, (id, node)) in mapping.runs.iter().zip(mapping.nodes.iter()) {
+            assert_eq!(run.range.start, end);
+            assert_eq!(run.id, *id);
+            assert!(ids.insert(*id));
+            end = run.range.end;
+            let content = &text[run.range.clone()];
+            assert_eq!(node.value(), Some(content));
+            assert!(node.character_lengths().len() <= MAX_RUN_CHARACTERS);
+            let mut byte = 0;
+            let mut line_starts = Vec::new();
+            for (index, &length) in node.character_lengths().iter().enumerate() {
+                byte += usize::from(length);
+                if byte < content.len() && content.as_bytes()[byte - 1] == b'\n' {
+                    line_starts.push((index + 1) as u16);
+                    let boundary = run.range.start + byte;
+                    assert_eq!(mapping.offset(&mapping.position(boundary)), Some(boundary));
+                }
+            }
+            assert_eq!(byte, content.len());
+            assert_eq!(node.hard_line_starts(), line_starts);
+            lengths.extend_from_slice(node.character_lengths());
+        }
+        assert_eq!(end, text.len());
+        assert_eq!(
+            lengths,
+            parts
+                .into_iter()
+                .flat_map(|part| part.lengths)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn packed_updates_preserve_boundaries_and_sparse_run_ids() {
+        let long = "é🙂 phrase ".repeat(420);
+        let initial = format!(
+            "{}{}\r\n{}\n",
+            "two β\r\n\r\n".repeat(1700),
+            long,
+            "last 🌿\n".repeat(1000)
+        );
+        let mut text = Rope::from(initial.as_str());
+        let mut mapping = TextRuns::default();
+        let node_id = |key| NodeId(key as u64 + 100);
+        mapping.update(text.clone(), node_id);
+        assert!(mapping.nodes.len() < 40);
+        assert_packed_mapping(&mapping, &initial);
+
+        let suffix = mapping.nodes.last().unwrap().0;
+        let mid = initial.find("two β").unwrap() + 4;
+        text.remove(mid..mid + "β\r\n\r\n".len());
+        text.insert(mid, "é 🙂\n");
+        mapping.update(text.clone(), node_id);
+        assert_packed_mapping(&mapping, &String::from(&text));
+        assert_eq!(mapping.nodes.last().unwrap().0, suffix);
+        assert!(mapping
+            .nodes
+            .iter()
+            .any(|(_, node)| node.next_on_line().is_some()));
+
+        text = Rope::from("new\r\n\nend");
+        mapping.update(text.clone(), node_id);
+        assert_packed_mapping(&mapping, &String::from(&text));
+        assert_eq!(mapping.nodes.len(), 1);
+    }
+    #[test]
+    fn accessible_diff_preserves_lf_boundaries_across_rope_chunks() {
+        let base = "é🙂 first\r\n中 second\rlast\n".repeat(800);
+        let previous = Rope::from(base.as_str());
+        for (start, end, insert) in [
+            (0, 1, "q"),
+            (0, 0, "new\r\n"),
+            (1599, 1602, "x"),
+            (1600, 1600, "中文"),
+            (base.len() - 1, base.len(), ""),
+            (base.len(), base.len(), "新"),
+            (0, base.len(), ""),
+        ] {
+            let mut start = start;
+            let mut end = end;
+            while !base.is_char_boundary(start) {
+                start -= 1;
+            }
+            while !base.is_char_boundary(end) {
+                end += 1;
+            }
+            let mut next = previous.clone();
+            next.remove(start..end);
+            next.insert(start, insert);
+            let next_text = next.to_string();
+            let (old, new) = changed_lines(&previous, &next);
+            assert_eq!(old.start, new.start);
+            assert_eq!(&base[..old.start], &next_text[..new.start]);
+            assert_eq!(&base[old.end..], &next_text[new.end..]);
+            if old.start > 0 {
+                assert_eq!(base.as_bytes()[old.start - 1], b'\n');
+            }
+            if old.end < base.len() {
+                assert_eq!(base.as_bytes()[old.end - 1], b'\n');
+            }
+            if new.end < next_text.len() {
+                assert_eq!(next_text.as_bytes()[new.end - 1], b'\n');
+            }
+        }
+    }
+
     #[test]
     fn incremental_accessible_edits_preserve_complete_text_and_positions() {
         for initial in [
@@ -454,7 +926,7 @@ mod tests {
         ] {
             let mut text = initial;
             let mut mapping = TextRuns::default();
-            mapping.update(text.clone().into(), |key| NodeId(key as u64 + 10));
+            mapping.update(Rope::from(text.as_str()), |key| NodeId(key as u64 + 10));
             assert_complete_mapping(&mapping, &text);
             let mut random = 23u64;
             for step in 0..100 {
@@ -468,7 +940,7 @@ mod tests {
                 let end = (start + (random >> 32) as usize % 9).min(boundaries.len() - 1);
                 let inserted = ["x", "", "\nnew\r\n", "é🙂", "👩‍👩‍👧‍👦", "\r", "中文"][step % 7];
                 text.replace_range(boundaries[start]..boundaries[end], inserted);
-                mapping.update(text.clone().into(), |key| NodeId(key as u64 + 10));
+                mapping.update(Rope::from(text.as_str()), |key| NodeId(key as u64 + 10));
                 assert_complete_mapping(&mapping, &text);
             }
         }
@@ -477,13 +949,12 @@ mod tests {
     fn unchanged_accessible_lines_keep_their_identity_across_edits() {
         let mut mapping = TextRuns::default();
         let initial = "first\nsecond\nthird\nlast é🙂";
-        mapping.update(initial.into(), |key| NodeId(key as u64 + 10));
+        mapping.update(Rope::from(initial), |key| NodeId(key as u64 + 10));
         let last = mapping.nodes.last().unwrap().clone();
-        mapping.update("changed first\nsecond\nthird\nlast é🙂".into(), |key| {
-            NodeId(key as u64 + 10)
-        });
+        let changed = "changed first\nsecond\nthird\nlast é🙂";
+        mapping.update(Rope::from(changed), |key| NodeId(key as u64 + 10));
         assert_eq!(mapping.nodes.last(), Some(&last));
-        assert_complete_mapping(&mapping, &mapping.text);
+        assert_complete_mapping(&mapping, changed);
     }
 
     #[test]

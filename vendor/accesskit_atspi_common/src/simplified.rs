@@ -793,7 +793,7 @@ impl Event {
                         source,
                         detail1: start_index,
                         detail2: length,
-                        data: Some(EventData::String(content)),
+                        data: Some(EventData::String(content.to_string())),
                     },
                     ObjectEvent::TextRemoved {
                         start_index,
@@ -804,7 +804,7 @@ impl Event {
                         source,
                         detail1: start_index,
                         detail2: length,
-                        data: Some(EventData::String(content)),
+                        data: Some(EventData::String(content.to_string())),
                     },
                     ObjectEvent::TextSelectionChanged => Self {
                         kind: "object:text-selection-changed".into(),

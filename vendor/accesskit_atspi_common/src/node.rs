@@ -428,6 +428,9 @@ impl NodeWrapper<'_> {
         if let Some(html_id) = self.html_id() {
             attributes.insert("id", html_id.to_string());
         }
+        if let Some(level) = self.0.level() {
+            attributes.insert("level", level.to_string());
+        }
         if let Some(label) = self.braille_label() {
             attributes.insert("braillelabel", label.to_string());
         }
@@ -535,6 +538,16 @@ impl NodeWrapper<'_> {
         } else {
             ""
         })
+    }
+
+    fn action_key_binding(&self, index: i32) -> String {
+        if index != 0 || self.n_actions() == 0 {
+            return String::new();
+        }
+        self.0
+            .data()
+            .keyboard_shortcut()
+            .map_or_else(String::new, |shortcut| format!(";;{shortcut}"))
     }
 
     fn raw_bounds_and_transform(&self) -> (Option<Rect>, Affine) {
@@ -1104,6 +1117,10 @@ impl PlatformNode {
         })
     }
 
+    pub fn action_key_binding(&self, index: i32) -> Result<String> {
+        self.resolve(|node| Ok(NodeWrapper(&node).action_key_binding(index)))
+    }
+
     pub fn actions(&self) -> Result<Vec<AtspiAction>> {
         self.resolve(|node| {
             let wrapper = NodeWrapper(&node);
@@ -1113,7 +1130,7 @@ impl PlatformNode {
                 actions.push(AtspiAction {
                     localized_name: wrapper.get_action_name(i as i32),
                     description: "".into(),
-                    key_binding: "".into(),
+                    key_binding: wrapper.action_key_binding(i as i32),
                 });
             }
             Ok(actions)
@@ -1444,6 +1461,9 @@ impl PlatformNode {
         offset: i32,
         granularity: Granularity,
     ) -> Result<(String, i32, i32)> {
+        if granularity == Granularity::Sentence {
+            return self.sentence_at_offset(offset);
+        }
         self.resolve_for_text(|node| {
             let range = text_range_from_offset(&node, offset, granularity)?;
             let text = range.text();
@@ -1462,11 +1482,34 @@ impl PlatformNode {
         })
     }
 
+    fn sentence_at_offset(&self, offset: i32) -> Result<(String, i32, i32)> {
+        use crate::sentence_index::{Lookup, lookup};
+        let context = self.upgrade_context()?;
+        let mut index = context.sentence_index.lock().unwrap();
+        let request = self.resolve_for_text(|node| lookup(&node, offset, index.as_ref()))?;
+        match request {
+            Lookup::Sentence(result) => Ok(result),
+            Lookup::Index(request) => {
+                let (built, result) = request.build(offset)?;
+                *index = Some(built);
+                Ok(result)
+            }
+        }
+    }
+
     pub fn text(&self, start_offset: i32, end_offset: i32) -> Result<String> {
         self.resolve_for_text(|node| {
             let range = text_range_from_offsets(&node, start_offset, end_offset)
                 .ok_or(Error::IndexOutOfRange)?;
             Ok(range.text())
+        })
+    }
+
+    pub fn text_snapshot(&self, start_offset: i32, end_offset: i32) -> Result<crate::TextSnapshot> {
+        self.resolve_for_text(|node| {
+            let range = text_range_from_offsets(&node, start_offset, end_offset)
+                .ok_or(Error::IndexOutOfRange)?;
+            Ok(range.snapshot_text())
         })
     }
 

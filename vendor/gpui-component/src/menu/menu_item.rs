@@ -2,7 +2,7 @@ use crate::{h_flex, ActiveTheme, Disableable, StyledExt};
 use gpui::{
     prelude::FluentBuilder as _, AnyElement, App, ClickEvent, ElementId, InteractiveElement,
     IntoElement, MouseButton, ParentElement, RenderOnce, SharedString,
-    StatefulInteractiveElement as _, StyleRefinement, Styled, Window,
+    StatefulInteractiveElement as _, StyleRefinement, Styled, Window, px,
 };
 use smallvec::SmallVec;
 use std::rc::Rc;
@@ -11,6 +11,7 @@ use std::rc::Rc;
 pub(crate) struct MenuItemElement {
     id: ElementId,
     label: SharedString,
+    shortcut: Option<SharedString>,
     focus: Option<gpui::FocusHandle>,
     on_focus: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
     role: gpui::accesskit::Role,
@@ -18,6 +19,7 @@ pub(crate) struct MenuItemElement {
     style: StyleRefinement,
     disabled: bool,
     selected: bool,
+    expanded: Option<bool>,
     on_click: Option<Rc<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
     on_hover: Option<Box<dyn Fn(&bool, &mut Window, &mut App) + 'static>>,
     children: SmallVec<[AnyElement; 2]>,
@@ -30,6 +32,7 @@ impl MenuItemElement {
         Self {
             id: id.clone(),
             label: "Menu item".into(),
+            shortcut: None,
             focus: None,
             on_focus: None,
             role: gpui::accesskit::Role::MenuItem,
@@ -37,6 +40,7 @@ impl MenuItemElement {
             style: StyleRefinement::default(),
             disabled: false,
             selected: false,
+            expanded: None,
             on_click: None,
             on_hover: None,
             children: SmallVec::new(),
@@ -57,9 +61,19 @@ impl MenuItemElement {
         self
     }
 
+    pub(crate) fn shortcut(mut self, shortcut: SharedString) -> Self {
+        self.shortcut = Some(shortcut);
+        self
+    }
+
     /// Set ListItem as the selected item style.
     pub(crate) fn selected(mut self, selected: bool) -> Self {
         self.selected = selected;
+        self
+    }
+
+    pub(crate) fn expanded(mut self, expanded: bool) -> Self {
+        self.expanded = Some(expanded);
         self
     }
 
@@ -110,8 +124,10 @@ impl RenderOnce for MenuItemElement {
         let semantic_id = self.id.clone();
         let label = self.label;
         let role = self.role;
+        let shortcut = self.shortcut;
         let disabled = self.disabled;
         let selected = self.selected;
+        let expanded = self.expanded;
         let focus = self.focus;
         let on_focus = self.on_focus;
         let on_click = self.on_click.clone();
@@ -130,21 +146,19 @@ impl RenderOnce for MenuItemElement {
             .when_some(self.on_hover, |this, on_hover| {
                 this.on_hover(move |hovered, window, cx| (on_hover)(hovered, window, cx))
             })
+            .border_l(px(3.))
+            .border_color(cx.theme().transparent)
             .when(!self.disabled, |this| {
-                this.group_hover(self.group_name, |this| {
-                    this.bg(cx.theme().primary)
-                        .text_color(cx.theme().primary_foreground)
-                })
-                .when(self.selected, |this| {
-                    this.bg(cx.theme().primary)
-                        .text_color(cx.theme().primary_foreground)
-                })
-                .when_some(self.on_click, |this, on_click| {
-                    this.on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                        cx.stop_propagation();
+                this.group_hover(self.group_name, |this| this.bg(cx.theme().list_hover))
+                    .when(self.selected, |this| {
+                        this.bg(cx.theme().selection).border_color(cx.theme().ring)
                     })
-                    .on_click(move |event, window, cx| on_click(event, window, cx))
-                })
+                    .when_some(self.on_click, |this, on_click| {
+                        this.on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                            cx.stop_propagation();
+                        })
+                        .on_click(move |event, window, cx| on_click(event, window, cx))
+                    })
             })
             .when(self.disabled, |this| {
                 this.text_color(cx.theme().muted_foreground)
@@ -154,7 +168,16 @@ impl RenderOnce for MenuItemElement {
             use gpui::accesskit::{Action, Node};
             let mut node = Node::new(role);
             node.set_label(label.to_string());
+            if role == gpui::accesskit::Role::Label {
+                node.set_value(label.to_string());
+            }
+            if let Some(shortcut) = &shortcut {
+                node.set_keyboard_shortcut(shortcut.to_string());
+            }
             node.set_selected(selected);
+            if let Some(expanded) = expanded {
+                node.set_expanded(expanded);
+            }
             if disabled {
                 node.set_disabled()
             } else {

@@ -8,4 +8,15 @@ pub struct Confirm {
     pub secondary: bool,
 }
 
-actions!(ui, [Cancel, SelectUp, SelectDown, SelectLeft, SelectRight]);
+actions!(
+    ui,
+    [
+        Cancel,
+        SelectUp,
+        SelectDown,
+        SelectLeft,
+        SelectRight,
+        SelectFirst,
+        SelectLast
+    ]
+);

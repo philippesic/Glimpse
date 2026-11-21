@@ -3,7 +3,7 @@ use std::rc::Rc;
 use gpui::{
     Context, Corner, DismissEvent, ElementId, Entity, FocusHandle, Focusable, InteractiveElement,
     IntoElement, KeyDownEvent, KeyUpEvent, MouseButton, RenderOnce, SharedString, StyleRefinement,
-    Styled, Window,
+    Styled, Window, Pixels, px,
 };
 
 use crate::{button::Button, menu::PopupMenu, popover::Popover, Selectable};
@@ -39,6 +39,8 @@ pub struct DropdownMenuPopover<T: Selectable + InteractiveElement + IntoElement 
     style: StyleRefinement,
     anchor: Corner,
     trigger: T,
+    open_requested: bool,
+    bottom_inset: Option<Pixels>,
     builder: Rc<dyn Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu>,
 }
 
@@ -57,8 +59,20 @@ where
             style: StyleRefinement::default(),
             anchor: anchor.into(),
             trigger,
+            open_requested: false,
+            bottom_inset: None,
             builder: Rc::new(builder),
         }
+    }
+
+    pub fn request_open(mut self, requested: bool) -> Self {
+        self.open_requested = requested;
+        self
+    }
+
+    pub fn keep_clear_of_bottom(mut self, inset: Pixels) -> Self {
+        self.bottom_inset = Some(inset);
+        self
     }
 
     /// Set the anchor corner for the dropdown menu popover.
@@ -80,6 +94,7 @@ struct DropdownMenuState {
     open: bool,
     return_focus: Option<FocusHandle>,
     keyboard_armed: bool,
+    keyboard_opened: bool,
 }
 
 impl<T> RenderOnce for DropdownMenuPopover<T>
@@ -91,13 +106,24 @@ where
         let menu_state =
             window.use_keyed_state(self.id.clone(), cx, |_, _| DropdownMenuState::default());
 
+        if self.open_requested && !menu_state.read(cx).open {
+            let return_focus = window.focused(cx);
+            menu_state.update(cx, |state, _| {
+                state.return_focus = return_focus;
+                state.open = true;
+                state.keyboard_opened = true;
+            });
+        }
         let open = menu_state.read(cx).open;
         let trigger = self
             .trigger
             .on_mouse_down(MouseButton::Left, {
                 let state = menu_state.clone();
                 move |_, window, cx| {
-                    state.update(cx, |state, cx| state.return_focus = window.focused(cx));
+                    state.update(cx, |state, cx| {
+                        state.return_focus = window.focused(cx);
+                        state.keyboard_opened = false;
+                    });
                 }
             })
             .on_key_down({
@@ -120,6 +146,7 @@ where
                             if std::mem::take(&mut state.keyboard_armed) {
                                 state.return_focus = window.focused(cx);
                                 state.open = true;
+                                state.keyboard_opened = true;
                             }
                         });
                         window.refresh();
@@ -152,7 +179,8 @@ where
             .trigger(trigger)
             .trigger_style(self.style)
             .anchor(self.anchor)
-            .content(move |_, window, cx| {
+            .wait_for_anchor(self.bottom_inset.is_some())
+            .content(move |popover, window, cx| {
                 // Here is special logic to only create the PopupMenu once and reuse it.
                 // Because this `content` will called in every time render, so we need to store the menu
                 // in state to avoid recreating at every render.
@@ -166,9 +194,13 @@ where
                         let menu = PopupMenu::build(window, cx, move |menu, window, cx| {
                             builder(menu, window, cx)
                         });
-                        menu_state.update(cx, |state, _| {
+                        let keyboard = menu_state.update(cx, |state, _| {
                             state.menu = Some(menu.clone());
+                            std::mem::take(&mut state.keyboard_opened)
                         });
+                        if keyboard {
+                            menu.update(cx, |menu, cx| menu.highlight_first_item(cx));
+                        }
                         menu.focus_handle(cx).focus(window);
 
                         // Listen for dismiss events from the PopupMenu to close the popover.
@@ -191,7 +223,14 @@ where
                     }
                 };
 
-                menu.clone()
+                if let Some(inset) = self.bottom_inset
+                    && let Some(bounds) = popover.trigger_bounds
+                {
+                    let origin = Popover::resolved_corner(self.anchor, bounds);
+                    let height = window.viewport_size().height - origin.y - inset - px(16.);
+                    menu.update(cx, |menu, cx| menu.limit_available_height(height, cx));
+                }
+                menu
             })
     }
 }

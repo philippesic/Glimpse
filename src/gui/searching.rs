@@ -5,14 +5,21 @@ pub(super) struct State {
     pub temporary: Option<PathBuf>,
     pub suspended: Option<(Panel, String)>,
     pub status: String,
+    announce_status: bool,
+    announcement: Option<Task<()>>,
     pub started: bool,
     pub running: bool,
+    pub file_opens: HashMap<u64, u64>,
+    pub filename_hints: std::sync::Arc<HashMap<String, paths::LabelCue>>,
+    pub duplicate_parents: std::sync::Arc<HashMap<PathBuf, paths::ParentHint>>,
     pub building: bool,
     pub query: String,
     pub selection: Option<usize>,
     pub focus: FocusHandle,
     pub scroll: UniformListScrollHandle,
     pub picker_selection: Option<PathBuf>,
+    pub takeover: bool,
+    pub collapsed: bool,
 }
 impl State {
     pub fn new(cx: &mut Context<Shell>) -> Self {
@@ -20,14 +27,21 @@ impl State {
             temporary: None,
             suspended: None,
             status: "Enter a query, then press Enter to search".into(),
+            announce_status: true,
+            announcement: None,
             started: false,
             running: false,
+            file_opens: HashMap::new(),
+            duplicate_parents: Default::default(),
+            filename_hints: Default::default(),
             building: false,
             query: String::new(),
             selection: None,
             focus: cx.focus_handle().tab_stop(true),
             scroll: Default::default(),
             picker_selection: None,
+            takeover: false,
+            collapsed: false,
         }
     }
 }
@@ -58,9 +72,20 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.command_enabled(command) {
+            // Commands stays open with its query so another command can be chosen.
+            if let Some(found) = glimpse::commands::COMMANDS.iter().find(|c| c.id == command) {
+                self.status = format!("{} is not available now", found.label);
+            }
+            cx.notify();
+            return;
+        }
         if !self.resume_search(window, cx) {
             self.panel = None;
-            self.focus(window, cx);
+            match self.panel_return.take() {
+                Some(invoker) if self.shown(&invoker, cx) => window.focus(&invoker),
+                _ => self.focus(window, cx),
+            }
         }
         self.command(command, window, cx);
     }
@@ -75,24 +100,33 @@ impl Shell {
         search::Filters {
             ignored: self.settings.search_ignored,
             metadata: self.settings.search_metadata,
+            cross_mounts: self.settings.search_mounts,
+            directory_links: self.settings.search_directory_links,
             exclude: self.settings.search_exclude.clone(),
             file_bytes: self.settings.search_file_mib * 1024 * 1024,
         }
     }
     pub(super) fn reset_search(&mut self, status: &str) {
+        self.search_ui.collapsed = false;
         self.search_id = self.search.cancel();
         self.hits = Default::default();
+        self.search_ui.duplicate_parents = Default::default();
+        self.search_ui.filename_hints = Default::default();
         self.search_ui.selection = None;
         self.search_ui.started = false;
         self.search_ui.running = false;
         self.search_ui.building = false;
         self.search_ui.status = status.into();
+        self.search_ui.announcement.take();
+        self.search_ui.announce_status = true;
     }
     pub(super) fn start_search(&mut self, cx: &App) {
         let query = self.query.read(cx).value().to_string();
         self.start_search_value(query, self.panel == Some(Panel::Text));
     }
     pub(super) fn start_search_value(&mut self, query: String, content: bool) {
+        self.status.clear();
+        self.clear_open_failure();
         self.reset_search("Searching saved files…");
         self.search_ui.query = query.clone();
         if query.is_empty() {
@@ -131,7 +165,18 @@ impl Shell {
         if update {
             self.start_search(cx);
         }
+        self.announce_search_when_quiet(cx);
         cx.notify();
+    }
+    pub(super) fn announce_search_when_quiet(&mut self, cx: &mut Context<Self>) {
+        self.search_ui.announce_status = false;
+        self.search_ui.announcement = Some(cx.spawn(async move |this, cx| {
+            Timer::after(std::time::Duration::from_millis(400)).await;
+            let _ = this.update(cx, |this, cx| {
+                this.search_ui.announce_status = true;
+                cx.notify();
+            });
+        }));
     }
     pub(super) fn build_index(&mut self) {
         self.reset_search("Building filename snapshot…");
@@ -162,6 +207,7 @@ impl Shell {
             .min(self.hits.len() - 1);
         self.search_ui.selection = Some(index);
         self.search_ui.picker_selection = Some(self.hits[index].path.clone());
+        self.search_ui.collapsed = false;
         self.search_ui
             .scroll
             .scroll_to_item(index, ScrollStrategy::Top);
@@ -174,12 +220,16 @@ impl Shell {
         };
         let (path, line, fingerprint) = (hit.path.clone(), hit.line, hit.fingerprint);
         self.search_ui.selection = Some(index);
+        let filename_result = self.panel == Some(Panel::Files);
         self.search_ui.picker_selection = Some(path.clone());
-        if let Some(token) = self.open(path, false, fingerprint.map(|_| (line, 1)))
-            && let Some(fingerprint) = fingerprint
-        {
-            self.hit_versions
-                .insert(token, (fingerprint, self.search_id));
+        if let Some(token) = self.open(path, false, fingerprint.map(|_| (line, 1))) {
+            if let Some(fingerprint) = fingerprint {
+                self.hit_versions
+                    .insert(token, (fingerprint, self.search_id));
+            }
+            if filename_result {
+                self.search_ui.file_opens.insert(token, self.search_id);
+            }
         }
         cx.notify();
     }
@@ -198,12 +248,11 @@ impl Shell {
         }
         let index = self.search_ui.selection.unwrap_or(0).min(count - 1);
         let next = match key.key.as_str() {
-            "up" => index.saturating_sub(1),
-            "down" => (index + 1).min(count - 1),
-            "home" => 0,
-            "end" => count - 1,
-            "pageup" => index.saturating_sub(5),
-            "pagedown" => (index + 5).min(count - 1),
+            "up" if index == 0 => {
+                self.query.update(cx, |input, cx| input.focus(window, cx));
+                cx.notify();
+                return true;
+            }
             "enter" => {
                 self.open_hit(index, cx);
                 return true;
@@ -212,8 +261,14 @@ impl Shell {
                 self.command("dismiss", window, cx);
                 return true;
             }
-            _ => return false,
+            other => match keyboard::list_step(other, Some(index), count, 5) {
+                Some(next) => next,
+                None => return false,
+            },
         };
+        if next != index {
+            self.clear_open_failure();
+        }
         self.search_ui.selection = Some(next);
         self.search_ui.picker_selection = Some(self.hits[next].path.clone());
         self.search_ui
@@ -224,13 +279,20 @@ impl Shell {
     }
     pub(super) fn search_details(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let scope = paths::display(self.effective_scope());
+        let selected = self
+            .search_ui
+            .selection
+            .and_then(|index| self.hits.get(index));
+        let result_path = selected.map_or_else(String::new, |hit| {
+            format!("Selected result: {}\n", paths::display(&hit.path))
+        });
         let exclusions = if self.settings.search_exclude.is_empty() {
             "None"
         } else {
             &self.settings.search_exclude
         };
         let detail = format!(
-            "Search folder: {scope}\nScope: {}\nIgnore files: {}\nRepository metadata: {}\nAdditional exclusions: {exclusions}\nSaved-file content limit: {} MiB per file. Unsaved buffers are excluded from recursive text search; use Find in Document for the active buffer.\nRecursive traversal does not follow directory symlinks or cross nested mounts.\nCoverage is bounded to 100,000 entries and 1,000 displayed matches. Unreadable paths and reached limits produce Partial. A filename index is a session snapshot with a 16 MiB path budget; filesystem notifications can mark it stale. Rebuild refreshes it, and Remove releases it. Content searches always read saved files.\nCurrent result state: {}",
+            "Search folder: {scope}\n{result_path}Scope: {}\nIgnore files: {}\nRepository metadata: {}\nAdditional exclusions: {exclusions}\nSaved-file content limit: {} MiB per file. Unsaved buffers are excluded from recursive text search; use Find in Document for the active buffer.\n{} {}\nCoverage is bounded to 100,000 entries and 1,000 displayed matches. Unreadable paths and reached limits produce Partial. A filename index is a session snapshot with a 16 MiB path budget; filesystem notifications can mark it stale. Rebuild refreshes it, and Remove releases it. Content searches always read saved files.\nCurrent result state: {}",
             if self.search_ui.temporary.is_some() {
                 "temporary; existing pin retained"
             } else if self.scope.is_some() {
@@ -249,6 +311,16 @@ impl Shell {
                 "excluded"
             },
             self.settings.search_file_mib,
+            if self.settings.search_directory_links {
+                "Follows directory symlinks, which can lead outside the search folder."
+            } else {
+                "Skips directory symlinks."
+            },
+            if self.settings.search_mounts {
+                "Includes nested mounted volumes."
+            } else {
+                "Skips nested mounted volumes."
+            },
             self.search_ui.status
         );
         self.ask_decision(
@@ -260,210 +332,533 @@ impl Shell {
             cx,
         );
     }
-    pub(super) fn search_view(&self, window: &mut Window, cx: &Context<Self>) -> AnyElement {
+    /// "Text · folder · Location": the search type and whether the scope follows
+    /// Location stay readable; only a long folder name is shortened, in the middle.
+    pub(super) fn search_scope_button(
+        &self,
+        stacked: bool,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let scope = self.effective_scope();
+        let kind = if self.panel == Some(Panel::Text) {
+            "Saved text"
+        } else {
+            "Files"
+        };
+        let mode = if self.search_ui.temporary.is_some() {
+            "temporary"
+        } else if self.scope.is_some() {
+            "pinned"
+        } else {
+            "Location"
+        };
+        let rem = window.rem_size();
+        let measure = |text: &SharedString| {
+            let run = window.text_style().to_run(text.len());
+            window
+                .text_system()
+                .shape_line(text.clone(), rem * 0.875, &[run], None)
+                .width
+        };
+        let chrome = rem * 4.5 + if stacked { rem * 2.5 } else { px(0.) };
+        let fixed = measure(&format!("{kind} ·  · {mode}").into());
+        let room = (window.viewport_size().width - chrome - fixed).max(rem * 3.);
+        let folder = decision::abbreviate_folder(&paths::name(scope), room, &measure);
+        let label = format!("{kind} · {folder} · {mode}");
+        self.search_scope_menu(label, self.search.index_status(scope).is_some(), cx)
+    }
+    pub(super) fn search_view(
+        &self,
+        stacked: bool,
+        window: &mut Window,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         let scope = self.effective_scope();
         let index = self.search.index_status(scope);
         let compatible = self.search.index_compatible(scope, &self.search_filters());
         let hits = self.hits.clone();
+        let duplicate_parents = self.search_ui.duplicate_parents.clone();
+        let filename_hints = self.search_ui.filename_hints.clone();
         let count = hits.len().min(1000);
-        let row_height = px(32. * self.settings.ui_scale);
+        let scale = self.settings.ui_scale;
+        let row_height = px(32. * scale);
+        let mut status = match (count, self.search_ui.status.as_str()) {
+            (0, "Complete") => "No matches".into(),
+            (0, state) if state.starts_with("Indexed snapshot") => {
+                format!("No matches in snapshot · {state}")
+            }
+            (0, state) if state.starts_with("Partial") => {
+                format!("No matches in scanned files · {state}")
+            }
+            (0, state) => state.to_owned(),
+            (1, "Complete") => "1 match".into(),
+            (_, state) if state.starts_with("Failed to open result.") => state.to_owned(),
+            (_, "Complete") => format!("{count} matches"),
+            (_, state) => format!("{state} · {count} displayed"),
+        };
+        if self.panel == Some(Panel::Files)
+            && self.search_ui.selection.is_some()
+            && !self.search_ui.running
+            && !self.search_ui.status.starts_with("Failed")
+        {
+            status.push_str(" · Enter opens selected file");
+        }
+        let coverage = format!(
+            "{} · metadata {} · content ≤ {} MiB/file · exclusions: {}",
+            if self.settings.search_ignored {
+                "Ignore rules bypassed"
+            } else {
+                "Ignore rules respected"
+            },
+            if self.settings.search_metadata {
+                "included"
+            } else {
+                "excluded"
+            },
+            self.settings.search_file_mib,
+            if self.settings.search_exclude.is_empty() {
+                "none".into()
+            } else {
+                format!("{:?}", self.settings.search_exclude)
+            }
+        );
+        let muted = cx.theme().muted_foreground;
+        let small = px(12. * scale);
         div()
             .flex()
             .flex_col()
+            .flex_1()
             .min_h_0()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .flex_wrap()
-                    .gap_2()
-                    .px_2()
-                    .child(
-                        self.command_button(
-                            "search-scope-heading",
-                            format!(
-                                "{} in {} ({})",
-                                if self.panel == Some(Panel::Text) {
-                                    "Saved text"
-                                } else {
-                                    "Files"
-                                },
-                                paths::name(scope),
-                                if self.search_ui.temporary.is_some() {
-                                    "temporary"
-                                } else if self.scope.is_some() {
-                                    "pinned"
-                                } else {
-                                    "Location"
-                                }
-                            ),
-                            "search-details",
-                            cx,
-                        )
-                        .tooltip(paths::display(scope)),
-                    )
-                    .child(self.button("This Folder", "search-here", cx))
-                    .child(self.button(
-                        if self.scope.is_some() {
-                            "Unpin"
-                        } else {
-                            "Pin Here"
-                        },
-                        "scope",
-                        cx,
-                    ))
-                    .child(self.button("Go to Scope", "go-scope", cx))
-                    .child(self.button(
-                        if index.is_some() {
-                            "Rebuild Index"
-                        } else {
-                            "Index This Folder"
-                        },
-                        "index-folder",
-                        cx,
-                    ))
-                    .when(index.is_some(), |row| {
-                        row.child(self.button("Remove Index", "remove-index", cx))
-                    })
-                    .when(self.search_ui.running, |row| {
-                        row.child(self.button("Stop Search", "stop-search", cx))
-                    }),
-            )
-            .child(div().px_2().text_sm().truncate().child(format!(
-                "{} · metadata {} · symlinks excluded · content ≤ {} MiB/file · exclusions: {}",
-                if self.settings.search_ignored {
-                    "Ignore rules bypassed"
-                } else {
-                    "Ignore rules respected"
-                },
-                if self.settings.search_metadata {
-                    "included"
-                } else {
-                    "excluded"
-                },
-                self.settings.search_file_mib,
-                if self.settings.search_exclude.is_empty() {
-                    "none".into()
-                } else {
-                    format!("{:?}", self.settings.search_exclude)
-                }
-            )))
-            .when_some(index, |panel, index| {
-                panel.child(div().px_2().text_sm().child(format!(
-                    "{index}{}",
-                    if compatible {
-                        ""
-                    } else {
-                        " · settings changed; rebuild to use"
-                    }
-                )))
+            .when(!stacked || self.search_ui.running, |panel| {
+                panel.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .flex_wrap()
+                        .gap(px(8. * scale))
+                        .px(px(12. * scale))
+                        .flex_shrink_0()
+                        .when(!stacked, |row| {
+                            row.child(self.search_scope_button(false, window, cx))
+                        })
+                        .when(self.search_ui.running, |row| {
+                            row.child(self.button("Stop Search", "stop-search", cx))
+                        }),
+                )
             })
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_2()
-                    .py_1()
-                    .child(div().flex_1().min_w_0().text_sm().child(format!(
-                        "{} · {} displayed (limit 1,000)",
-                        self.search_ui.status, count
-                    )))
-                    .when(count > 0, |row| {
-                        row.child(self.button("Focus Results", "focus-results", cx))
+                    .px(px(12. * scale))
+                    .pt(px(4. * scale))
+                    .flex_shrink_0()
+                    .text_size(small)
+                    .text_color(muted)
+                    .when(stacked, |panel| {
+                        panel.child(accessibility::status(
+                            if self.search_ui.announce_status {
+                                "search-result-announcement"
+                            } else {
+                                "search-result-status"
+                            },
+                            status.clone(),
+                            div()
+                                .text_color(cx.theme().foreground)
+                                .truncate()
+                                .child(status.clone()),
+                            self.search_ui.announce_status,
+                        ))
                     })
-                    .child(self.button("Coverage…", "search-details", cx)),
+                    .child(accessibility::label(
+                        "search-coverage-label",
+                        coverage.clone(),
+                        div()
+                            .id("search-coverage")
+                            .truncate()
+                            .child(coverage.clone())
+                            .tooltip(move |window, cx| {
+                                gpui_component::tooltip::Tooltip::new(coverage.clone())
+                                    .build(window, cx)
+                            }),
+                    ))
+                    .when(
+                        self.settings.search_directory_links || self.settings.search_mounts,
+                        |panel| {
+                            let expansion = match (
+                                self.settings.search_directory_links,
+                                self.settings.search_mounts,
+                            ) {
+                                (true, true) => "Includes directory symlinks and mounted volumes",
+                                (true, false) => "Includes directory symlinks",
+                                (false, _) => "Includes mounted volumes",
+                            };
+                            panel.child(accessibility::message(
+                                "search-traversal",
+                                expansion.into(),
+                                div().child(expansion),
+                            ))
+                        },
+                    )
+                    .when_some(index, |panel, index| {
+                        let status = format!(
+                            "{index}{}",
+                            if compatible {
+                                ""
+                            } else {
+                                " · settings changed; rebuild to use"
+                            }
+                        );
+                        panel.child(accessibility::message(
+                            "filename-index-status",
+                            status.clone(),
+                            div().child(status),
+                        ))
+                    }),
             )
-            .when(count > 0, |panel| {
+            .when(!stacked, |panel| {
                 panel.child(
+                    div()
+                        .px(px(12. * scale))
+                        .py(px(4. * scale))
+                        .flex_shrink_0()
+                        .child(accessibility::status(
+                            if self.search_ui.announce_status {
+                                "search-result-announcement"
+                            } else {
+                                "search-result-status"
+                            },
+                            status.clone(),
+                            div()
+                                .id("search-status-text")
+                                .text_size(small)
+                                .text_color(muted)
+                                .truncate()
+                                .child(status.clone()),
+                            self.search_ui.announce_status,
+                        )),
+                )
+            })
+            .when(stacked, |panel| {
+                panel.child(div().h(px(4. * scale)).flex_shrink_0())
+            })
+            .when(count > 0, |panel| {
+                panel.child(accessibility::collection(
+                    "search-results",
+                    "Search results".into(),
                     div()
                         .id("results")
                         .track_focus(&self.search_ui.focus)
-                        .h((row_height * count.min(5)).min(window.viewport_size().height * 0.22))
-                        .min_h(row_height)
-                        .border_1()
-                        .border_color(if self.search_ui.focus.is_focused(window) {
-                            cx.theme().primary
-                        } else {
-                            cx.theme().border
-                        })
+                        .mx(px(10. * scale))
+                        .mb(px(8. * scale))
+                        .p(px(2. * scale))
+                        .rounded(px(7. * scale))
+                        .overflow_hidden()
+                        .flex_1()
+                        .min_h(row_height + px(4. * scale))
                         .child(
                             uniform_list(
                                 "search-hits",
                                 count,
-                                cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
-                                    range
-                                        .map(|i| {
-                                            let hit = &hits[i];
-                                            let name = paths::display(
-                                                hit.path
+                                cx.processor(
+                                    move |this, range: std::ops::Range<usize>, window, cx| {
+                                        let rem = window.rem_size();
+                                        let style = window.text_style();
+                                        let bold = style.clone().highlight(HighlightStyle {
+                                            font_weight: Some(FontWeight::BOLD),
+                                            ..Default::default()
+                                        });
+                                        let measure_with =
+                                            |text: &SharedString, style: &TextStyle| {
+                                                let run = style.to_run(text.len());
+                                                window
+                                                    .text_system()
+                                                    .shape_line(
+                                                        text.clone(),
+                                                        rem * 0.875,
+                                                        &[run],
+                                                        None,
+                                                    )
+                                                    .width
+                                            };
+                                        let measure =
+                                            |text: &SharedString| measure_with(text, &style);
+                                        let measure_bold =
+                                            |text: &SharedString| measure_with(text, &bold);
+                                        let room = window.viewport_size().width
+                                            - rem * 1.5
+                                            - px(27. * scale + 4.);
+                                        range
+                                            .map(|i| {
+                                                let hit = &hits[i];
+                                                let relative = hit
+                                                    .path
                                                     .strip_prefix(this.effective_scope())
-                                                    .unwrap_or(&hit.path),
-                                            );
-                                            let prefix = if hit.fingerprint.is_some() {
-                                                format!("{name}:{}  ", hit.line)
-                                            } else {
-                                                format!("{name}  ")
-                                            };
-                                            let label = format!("{prefix}{}", hit.excerpt);
-                                            let ranges = if hit.fingerprint.is_some() {
-                                                hit.excerpt
-                                                    .match_indices(&hit.query)
-                                                    .map(|(start, text)| {
-                                                        (prefix.len() + start)
-                                                            ..(prefix.len() + start + text.len())
-                                                    })
-                                                    .collect()
-                                            } else {
-                                                search::highlight_ranges(&name, &hit.query)
-                                            };
-                                            let tooltip = if hit.fingerprint.is_some() {
-                                                format!(
-                                                    "{}:{}\n{}",
-                                                    paths::display(&hit.path),
-                                                    hit.line,
+                                                    .unwrap_or(&hit.path);
+                                                let content = hit.fingerprint.is_some();
+                                                let file = paths::name(&hit.path);
+                                                let parent = relative
+                                                    .parent()
+                                                    .map_or_else(String::new, paths::display);
+                                                let distinguishing =
+                                                    duplicate_parents.get(&hit.path);
+                                                let filename_hint = filename_hints.get(&file);
+                                                let name = if content {
+                                                    let suffix = format!(":{}", hit.line);
+                                                    let room = room * 0.6;
+                                                    if let Some(folder) = distinguishing {
+                                                        labels::document(
+                                                            &file, &suffix, folder, " · ", room,
+                                                            &measure,
+                                                        )
+                                                    } else if filename_hint.is_some() {
+                                                        labels::filename(
+                                                            &file,
+                                                            &suffix,
+                                                            filename_hint,
+                                                            room,
+                                                            &measure,
+                                                        )
+                                                    } else {
+                                                        format!(
+                                                            "{}{suffix}",
+                                                            fit_path(
+                                                                &paths::display(relative),
+                                                                room,
+                                                                &measure
+                                                            ),
+                                                        )
+                                                    }
+                                                } else {
+                                                    match distinguishing {
+                                                        Some(folder) => labels::document(
+                                                            &file,
+                                                            "",
+                                                            folder,
+                                                            " · ",
+                                                            room,
+                                                            &measure_bold,
+                                                        ),
+                                                        None => filename_caption(
+                                                            &file,
+                                                            &parent,
+                                                            filename_hint,
+                                                            room,
+                                                            &measure_bold,
+                                                        ),
+                                                    }
+                                                };
+                                                let prefix = if content {
+                                                    format!("{name}  ")
+                                                } else {
+                                                    name.clone()
+                                                };
+                                                let label = format!("{prefix}{}", hit.excerpt);
+                                                let ranges = if content {
                                                     hit.excerpt
-                                                )
-                                            } else {
-                                                paths::display(&hit.path)
-                                            };
-                                            let text = StyledText::new(label).with_highlights(
-                                                ranges.into_iter().map(|range| {
-                                                    (
-                                                        range,
+                                                        .match_indices(&hit.query)
+                                                        .map(|(start, text)| {
+                                                            (prefix.len() + start)
+                                                                ..(prefix.len()
+                                                                    + start
+                                                                    + text.len())
+                                                        })
+                                                        .collect()
+                                                } else {
+                                                    search::highlight_ranges(&name, &hit.query)
+                                                };
+                                                let spoken = match (content, parent.is_empty()) {
+                                                    (true, true) => {
+                                                        format!(
+                                                            "{file}, line {}: {}",
+                                                            hit.line, hit.excerpt
+                                                        )
+                                                    }
+                                                    (true, false) => format!(
+                                                        "{file}, line {}: {}, in {parent}",
+                                                        hit.line, hit.excerpt
+                                                    ),
+                                                    (false, true) => file.to_string(),
+                                                    (false, false) => {
+                                                        format!("{file}, in {parent}")
+                                                    }
+                                                };
+                                                let tooltip = if content {
+                                                    format!(
+                                                        "{}:{}\n{}",
+                                                        paths::display(&hit.path),
+                                                        hit.line,
+                                                        hit.excerpt
+                                                    )
+                                                } else {
+                                                    paths::display(&hit.path)
+                                                };
+                                                let selected = this.search_ui.selection == Some(i);
+                                                let (marker, fill) = theme::list_row(
+                                                    selected,
+                                                    this.search_ui.focus.is_focused(window),
+                                                    cx,
+                                                );
+                                                let bold = HighlightStyle {
+                                                    font_weight: Some(FontWeight::BOLD),
+                                                    ..Default::default()
+                                                };
+                                                // A Find Text row reads as location first, then a quieter excerpt
+                                                // in which the match keeps full weight and colour.
+                                                let highlights: Vec<_> = if content {
+                                                    let quiet = HighlightStyle {
+                                                        color: Some(cx.theme().muted_foreground),
+                                                        ..Default::default()
+                                                    };
+                                                    let mut spans = vec![(
+                                                        0..name.len(),
                                                         HighlightStyle {
-                                                            font_weight: Some(FontWeight::BOLD),
+                                                            font_weight: Some(FontWeight::MEDIUM),
                                                             ..Default::default()
                                                         },
+                                                    )];
+                                                    let mut at = prefix.len();
+                                                    for range in ranges {
+                                                        if range.start > at {
+                                                            spans.push((at..range.start, quiet));
+                                                        }
+                                                        at = range.end;
+                                                        spans.push((range, bold));
+                                                    }
+                                                    if at < label.len() {
+                                                        spans.push((at..label.len(), quiet));
+                                                    }
+                                                    spans
+                                                } else {
+                                                    ranges
+                                                        .into_iter()
+                                                        .map(|range| (range, bold))
+                                                        .collect()
+                                                };
+                                                let text = StyledText::new(label)
+                                                    .with_highlights(highlights);
+                                                Button::new(("search-hit", i))
+                                                    .accessibility_role(
+                                                        gpui::accesskit::Role::ListBoxOption,
                                                     )
-                                                }),
-                                            );
-                                            Button::new(("search-hit", i))
-                                                .accessibility_role(
-                                                    gpui::accesskit::Role::ListBoxOption,
-                                                )
-                                                .accessibility_focus(this.search_ui.focus.clone())
-                                                .tooltip(tooltip)
-                                                .child(
-                                                    div().flex_1().min_w_0().truncate().child(text),
-                                                )
-                                                .small()
-                                                .w_full()
-                                                .h(row_height)
-                                                .justify_start()
-                                                .selected(this.search_ui.selection == Some(i))
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.open_hit(i, cx)
-                                                }))
-                                        })
-                                        .collect::<Vec<_>>()
-                                }),
+                                                    .accessibility_focus(
+                                                        this.search_ui.focus.clone(),
+                                                    )
+                                                    .accessibility_label(spoken)
+                                                    .tab_stop(false)
+                                                    .tooltip(tooltip)
+                                                    .child(
+                                                        div()
+                                                            .flex_1()
+                                                            .min_w_0()
+                                                            .truncate()
+                                                            .child(text),
+                                                    )
+                                                    .ghost()
+                                                    .small()
+                                                    .w_full()
+                                                    .h(row_height)
+                                                    .justify_start()
+                                                    .selected(selected)
+                                                    .border_l(px(3. * scale))
+                                                    .border_y_0()
+                                                    .border_r_0()
+                                                    .border_color(marker)
+                                                    .when_some(fill, |row, fill| row.bg(fill))
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.open_hit(i, cx)
+                                                    }))
+                                            })
+                                            .collect::<Vec<_>>()
+                                    },
+                                ),
                             )
                             .h_full()
                             .track_scroll(self.search_ui.scroll.clone()),
                         ),
-                )
+                    self.search_ui.focus.clone(),
+                ))
             })
             .into_any_element()
+    }
+}
+
+fn filename_caption(
+    file: &str,
+    folder: &str,
+    cue: Option<&paths::LabelCue>,
+    room: Pixels,
+    measure: &impl Fn(&SharedString) -> Pixels,
+) -> String {
+    let separator = " · ";
+    if folder.is_empty() {
+        return labels::filename(file, "", cue, room, measure);
+    }
+    let full = SharedString::from(format!("{file}{separator}{folder}"));
+    if measure(&full) <= room {
+        return full.to_string();
+    }
+    let name = labels::filename(file, "", cue, room, measure);
+    let folder_room =
+        room - measure(&SharedString::from(name.clone())) - measure(&separator.into());
+    if folder_room <= measure(&"…".into()) * 2. {
+        return name;
+    }
+    let folder = decision::abbreviate_folder(folder, folder_room, measure);
+    format!("{name}{separator}{folder}")
+}
+
+/// Shortens the folder part of a relative path first, so the file name and its extension stay
+/// readable; a name too long on its own loses its middle.
+pub(super) fn fit_path(
+    relative: &str,
+    room: Pixels,
+    measure: &impl Fn(&SharedString) -> Pixels,
+) -> String {
+    if measure(&SharedString::from(relative.to_owned())) <= room {
+        return relative.to_owned();
+    }
+    let Some(split) = relative.rfind('/') else {
+        return decision::abbreviate_folder(relative, room, measure).to_string();
+    };
+    let (folder, name) = relative.split_at(split);
+    let folder_room = room - measure(&SharedString::from(name.to_owned()));
+    if folder_room >= measure(&"…/…".into()) * 2. {
+        format!(
+            "{}{name}",
+            decision::abbreviate_folder(folder, folder_room, measure)
+        )
+    } else {
+        decision::abbreviate_folder(&name[1..], room, measure).to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fit_path;
+    use gpui::{SharedString, px};
+
+    fn measure(text: &SharedString) -> gpui::Pixels {
+        px(text.chars().count() as f32 * 8.)
+    }
+
+    #[test]
+    fn shortened_paths_keep_the_file_name_and_extension() {
+        let path = "project-a/src/config/settings.toml";
+        assert_eq!(fit_path(path, px(400.), &measure), path);
+        let fitted = fit_path(path, px(200.), &measure);
+        assert!(fitted.ends_with("/settings.toml"), "{fitted}");
+        assert!(
+            fitted.starts_with("pro") && fitted.contains('…'),
+            "{fitted}"
+        );
+        assert!(measure(&fitted.clone().into()) <= px(200.), "{fitted}");
+        let tight = fit_path(path, px(112.), &measure);
+        assert!(tight.ends_with(".toml") && !tight.contains('/'), "{tight}");
+        let long = fit_path(
+            "a-very-long-generated-file-name-for-testing.toml",
+            px(160.),
+            &measure,
+        );
+        assert!(long.ends_with(".toml") && long.contains('…'), "{long}");
     }
 }

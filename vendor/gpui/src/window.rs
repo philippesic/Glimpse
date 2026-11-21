@@ -222,6 +222,66 @@ slotmap::new_key_type! {
     pub struct FocusId;
 }
 
+/// With `GLIMPSE_CLIP_PROBE` set, report glyphs cut off vertically by a box under two font sizes
+/// tall: a label box shorter than its glyphs, not content scrolled past a viewport edge.
+/// The edge that cuts the glyph is attributed to the outermost clipping box that introduced it.
+fn report_tight_glyph_clip(
+    glyph: &Bounds<ScaledPixels>,
+    masks: &[ContentMask<Pixels>],
+    scale_factor: f32,
+    font_size: ScaledPixels,
+) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    thread_local! {
+        static REPORTED: RefCell<FxHashSet<(i32, i32, i32, i32)>> = RefCell::default();
+    }
+    if !*ENABLED.get_or_init(|| std::env::var_os("GLIMPSE_CLIP_PROBE").is_some()) {
+        return;
+    }
+    let Some(inner) = masks.last().map(|mask| mask.scale(scale_factor)) else {
+        return;
+    };
+    let (top, bottom) = (glyph.origin.y.0, (glyph.origin.y + glyph.size.height).0);
+    let (left, right) = (glyph.origin.x.0, (glyph.origin.x + glyph.size.width).0);
+    let mask_top = inner.bounds.origin.y.0;
+    let mask_bottom = mask_top + inner.bounds.size.height.0;
+    let mask_left = inner.bounds.origin.x.0;
+    let mask_right = mask_left + inner.bounds.size.width.0;
+    let visible = bottom > mask_top && top < mask_bottom && right > mask_left && left < mask_right;
+    if !visible {
+        return;
+    }
+    let edge_box_height = |cut_top: bool| {
+        masks
+            .iter()
+            .map(|mask| mask.scale(scale_factor))
+            .find(|mask| {
+                let edge = if cut_top {
+                    mask.bounds.origin.y.0
+                } else {
+                    mask.bounds.origin.y.0 + mask.bounds.size.height.0
+                };
+                (edge - if cut_top { mask_top } else { mask_bottom }).abs() < 0.5
+            })
+            .map_or(f32::MAX, |mask| mask.bounds.size.height.0)
+    };
+    let tight = font_size.0 * 2.;
+    let cut = (top < mask_top - 1. && edge_box_height(true) < tight)
+        || (bottom > mask_bottom + 1. && edge_box_height(false) < tight);
+    if !cut {
+        return;
+    }
+    let key = (left as i32, top as i32, right as i32, bottom as i32);
+    REPORTED.with_borrow_mut(|reported| {
+        if reported.len() < 512 && reported.insert(key) {
+            eprintln!(
+                "GLIMPSE_CLIPPED_GLYPH glyph={},{},{},{} mask={},{},{},{}",
+                key.0, key.1, key.2, key.3, mask_left, mask_top, mask_right, mask_bottom
+            );
+        }
+    });
+}
+
 thread_local! {
     pub(crate) static ELEMENT_ARENA: RefCell<Arena> = RefCell::new(Arena::new(1024 * 1024));
 }
@@ -691,6 +751,7 @@ pub(crate) struct Frame {
     pub(crate) deferred_draws: Vec<DeferredDraw>,
     pub(crate) input_handlers: Vec<Option<PlatformInputHandler>>,
     pub(crate) tooltip_requests: Vec<Option<TooltipRequest>>,
+    tooltip_start: usize,
     pub(crate) cursor_styles: Vec<CursorStyleRequest>,
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) debug_bounds: FxHashMap<String, Bounds<Pixels>>,
@@ -739,6 +800,7 @@ impl Frame {
             deferred_draws: Vec::new(),
             input_handlers: Vec::new(),
             tooltip_requests: Vec::new(),
+            tooltip_start: 0,
             cursor_styles: Vec::new(),
 
             #[cfg(any(test, feature = "test-support"))]
@@ -762,6 +824,7 @@ impl Frame {
         self.scene.clear();
         self.input_handlers.clear();
         self.tooltip_requests.clear();
+        self.tooltip_start = 0;
         self.cursor_styles.clear();
         self.hitboxes.clear();
         self.window_control_hitboxes.clear();
@@ -972,6 +1035,7 @@ impl Window {
         let bounds = window_bounds
             .map(|bounds| bounds.get_bounds())
             .unwrap_or_else(|| default_bounds(display_id, cx));
+        let window_decorations = window_decorations.unwrap_or(WindowDecorations::Server);
         let platform_open = crate::work_trace::Span::new("platform_window");
         let mut platform_window = cx.platform.open_window(
             handle,
@@ -986,6 +1050,10 @@ impl Window {
                 show,
                 display_id,
                 window_min_size,
+                #[cfg(all(any(target_os = "linux", target_os = "freebsd"), feature = "wayland"))]
+                window_background,
+                #[cfg(all(any(target_os = "linux", target_os = "freebsd"), feature = "wayland"))]
+                window_decorations,
                 #[cfg(target_os = "macos")]
                 tabbing_identifier,
             },
@@ -1014,8 +1082,7 @@ impl Window {
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
         let last_input_timestamp = Rc::new(Cell::new(Instant::now()));
 
-        platform_window
-            .request_decorations(window_decorations.unwrap_or(WindowDecorations::Server));
+        platform_window.request_decorations(window_decorations);
         platform_window.set_background_appearance(window_background);
 
         if let Some(ref window_open_state) = window_bounds {
@@ -1798,6 +1865,11 @@ impl Window {
         self.platform_window.window_controls()
     }
 
+    /// Change the window's minimum size where the platform supports it.
+    pub fn set_window_min_size(&mut self, size: Size<Pixels>) {
+        self.platform_window.set_min_size(size);
+    }
+
     /// Updates the window's title at the platform level.
     pub fn set_window_title(&mut self, title: &str) {
         self.accessibility.title = title.to_owned();
@@ -2116,7 +2188,9 @@ impl Window {
 
     fn prepaint_tooltip(&mut self, cx: &mut App) -> Option<AnyElement> {
         // Use indexing instead of iteration to avoid borrowing self for the duration of the loop.
-        for tooltip_request_index in (0..self.next_frame.tooltip_requests.len()).rev() {
+        for tooltip_request_index in
+            (self.next_frame.tooltip_start..self.next_frame.tooltip_requests.len()).rev()
+        {
             let Some(Some(tooltip_request)) = self
                 .next_frame
                 .tooltip_requests
@@ -2413,6 +2487,12 @@ impl Window {
             .tooltip_requests
             .push(Some(TooltipRequest { id, tooltip }));
         id
+    }
+
+    /// Keep tooltips from earlier layers below a transient surface.
+    pub fn hide_underlying_tooltips(&mut self) {
+        self.invalidator.debug_assert_prepaint();
+        self.next_frame.tooltip_start = self.next_frame.tooltip_requests.len();
     }
 
     /// Invoke the given function with the given content mask after intersecting it
@@ -3022,6 +3102,12 @@ impl Window {
                 size: tile.bounds.size.map(Into::into),
             };
             let content_mask = self.content_mask().scale(scale_factor);
+            report_tight_glyph_clip(
+                &bounds,
+                &self.content_mask_stack,
+                scale_factor,
+                font_size.scale(scale_factor),
+            );
             self.next_frame.scene.insert_primitive(MonochromeSprite {
                 order: 0,
                 pad: 0,

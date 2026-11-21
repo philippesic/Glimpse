@@ -534,6 +534,7 @@ mod tests {
             generation: 4,
             entries: vec![file("/home/me/Alpine")],
             done: true,
+            filename_hints: Default::default(),
             error: None,
         });
         assert_eq!(nav.cached_rows(&root)[0].path, root.join("Alpine"));
@@ -565,6 +566,7 @@ mod tests {
             generation: 9,
             entries: vec![file("/home/me/a/new")],
             done: true,
+            filename_hints: Default::default(),
             error: None,
         });
         assert!(Arc::ptr_eq(&parent_rows, &nav.cached_rows(&root)));
@@ -607,6 +609,7 @@ mod tests {
             generation: 7,
             entries: vec![file("/home/me/b")],
             done: true,
+            filename_hints: Default::default(),
             error: None,
         });
         assert_eq!(nav.rows(&root).len(), 1);
@@ -634,6 +637,7 @@ mod tests {
             generation: 4,
             entries: vec![file("/home/me/stale")],
             done: true,
+            filename_hints: Default::default(),
             error: None,
         });
         nav.batch(crate::directory::Batch {
@@ -641,6 +645,7 @@ mod tests {
             generation: 5,
             entries: vec![file("/home/me/kept")],
             done: false,
+            filename_hints: Default::default(),
             error: None,
         });
         nav.selections
@@ -650,6 +655,7 @@ mod tests {
             generation: 5,
             entries: vec![folder("/home/me/a")],
             done: true,
+            filename_hints: Default::default(),
             error: None,
         });
         assert_eq!(nav.selection(), Some("/home/me/kept".into()));

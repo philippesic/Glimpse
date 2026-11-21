@@ -36,6 +36,7 @@ pub struct Popover {
     mouse_button: MouseButton,
     appearance: bool,
     overlay_closable: bool,
+    wait_for_anchor: bool,
     on_open_change: Option<Rc<dyn Fn(&bool, &mut Window, &mut App)>>,
 }
 
@@ -54,6 +55,7 @@ impl Popover {
             mouse_button: MouseButton::Left,
             appearance: true,
             overlay_closable: true,
+            wait_for_anchor: false,
             default_open: false,
             open: None,
             on_open_change: None,
@@ -63,6 +65,11 @@ impl Popover {
     /// Set the anchor corner of the popover, default is `Corner::TopLeft`.
     pub fn anchor(mut self, anchor: Corner) -> Self {
         self.anchor = anchor;
+        self
+    }
+
+    pub(crate) fn wait_for_anchor(mut self, wait: bool) -> Self {
+        self.wait_for_anchor = wait;
         self
     }
 
@@ -164,7 +171,7 @@ impl Popover {
         self
     }
 
-    fn resolved_corner(anchor: Corner, bounds: Bounds<Pixels>) -> Point<Pixels> {
+    pub(crate) fn resolved_corner(anchor: Corner, bounds: Bounds<Pixels>) -> Point<Pixels> {
         bounds.corner(match anchor {
             Corner::TopLeft => Corner::BottomLeft,
             Corner::TopRight => Corner::BottomRight,
@@ -192,7 +199,7 @@ impl Styled for Popover {
 pub struct PopoverState {
     focus_handle: FocusHandle,
     pub(crate) tracked_focus_handle: Option<FocusHandle>,
-    trigger_bounds: Option<Bounds<Pixels>>,
+    pub(crate) trigger_bounds: Option<Bounds<Pixels>>,
     open: bool,
     on_open_change: Option<Rc<dyn Fn(&bool, &mut Window, &mut App)>>,
 
@@ -308,9 +315,23 @@ impl RenderOnce for Popover {
         };
 
         let parent_view_id = window.current_view();
+        let wait_for_anchor = self.wait_for_anchor;
 
-        let el = div()
-            .id(self.id)
+        let shrinkable = self
+            .trigger_style
+            .as_ref()
+            .is_some_and(|style| style.min_size.width.is_some() || style.max_size.width.is_some());
+        let mut el = div().id(self.id);
+        if shrinkable {
+            let trigger = self.trigger_style.as_ref().unwrap();
+            let style = el.style();
+            style.display = Some(gpui::Display::Flex);
+            style.min_size.width = trigger.min_size.width;
+            style.max_size.width = trigger.max_size.width;
+            style.flex_shrink = trigger.flex_shrink;
+            style.flex_grow = trigger.flex_grow;
+        }
+        let el = el
             .child((trigger)(open, window, cx))
             .on_mouse_down(self.mouse_button, {
                 let state = state.clone();
@@ -328,10 +349,15 @@ impl RenderOnce for Popover {
                 canvas(
                     {
                         let state = state.clone();
-                        move |bounds, _, cx| {
-                            state.update(cx, |state, _| {
+                        move |bounds, window, cx| {
+                            let moved_while_open = state.update(cx, |state, _| {
+                                let moved = state.open && state.trigger_bounds != Some(bounds);
                                 state.trigger_bounds = Some(bounds);
-                            })
+                                moved
+                            });
+                            if wait_for_anchor && moved_while_open {
+                                window.request_animation_frame();
+                            }
                         }
                     },
                     |_, _, _, _| {},
@@ -340,7 +366,7 @@ impl RenderOnce for Popover {
                 .size_full(),
             );
 
-        if !open {
+        if !open || wait_for_anchor && trigger_bounds.is_none() {
             return el;
         }
 

@@ -9,6 +9,7 @@ use core::fmt;
 use hashbrown::{HashMap, HashSet};
 
 use crate::node::{FullNodeId, NodeRef, NodeState, ParentAndIndex};
+use crate::node_pages::NodePages;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
@@ -65,7 +66,7 @@ pub(crate) struct SubtreeState {
 
 #[derive(Clone, Debug)]
 pub struct TreeState {
-    pub(crate) nodes: HashMap<FullNodeId, NodeState>,
+    nodes: NodePages,
     pub(crate) info: TreeInfo,
     pub(crate) root: FullNodeId,
     pub(crate) focus: FullNodeId,
@@ -140,9 +141,8 @@ impl TreeState {
         {
             for (id, data) in update.nodes {
                 let id = map_id(id);
-                let old = self.nodes.get_mut(&id).unwrap();
-                if old.data != data {
-                    old.data = data;
+                if self.nodes.get(&id).unwrap().data != data {
+                    self.nodes.get_mut(&id).unwrap().data = data;
                     if let Some(changes) = &mut changes {
                         changes.updated_node_ids.insert(id);
                     }
@@ -228,7 +228,7 @@ impl TreeState {
         }
 
         fn add_node(
-            nodes: &mut HashMap<FullNodeId, NodeState>,
+            nodes: &mut NodePages,
             pending_grafts: &mut HashMap<TreeId, FullNodeId>,
             changes: &mut Option<&mut InternalChanges>,
             parent_and_index: Option<ParentAndIndex>,
@@ -266,9 +266,12 @@ impl TreeState {
                 }
                 unreachable.remove(&mapped_child_id);
                 let parent_and_index = ParentAndIndex(node_id, child_index);
-                if let Some(child_state) = self.nodes.get_mut(&mapped_child_id) {
+                if let Some(child_state) = self.nodes.get(&mapped_child_id) {
                     if child_state.parent_and_index != Some(parent_and_index) {
-                        child_state.parent_and_index = Some(parent_and_index);
+                        self.nodes
+                            .get_mut(&mapped_child_id)
+                            .unwrap()
+                            .parent_and_index = Some(parent_and_index);
                         if let Some(changes) = &mut changes {
                             changes.updated_node_ids.insert(mapped_child_id);
                         }
@@ -381,7 +384,7 @@ impl TreeState {
 
         if !unreachable.is_empty() {
             fn traverse_unreachable(
-                nodes: &mut HashMap<FullNodeId, NodeState>,
+                nodes: &mut NodePages,
                 grafts_to_remove: &mut HashSet<TreeId>,
                 changes: &mut Option<&mut InternalChanges>,
                 seen_child_ids: &HashSet<FullNodeId>,
@@ -422,7 +425,7 @@ impl TreeState {
         }
 
         fn traverse_subtree(
-            nodes: &mut HashMap<FullNodeId, NodeState>,
+            nodes: &mut NodePages,
             subtrees_to_remove: &mut Vec<TreeId>,
             subtrees_queued: &mut HashSet<TreeId>,
             changes: &mut Option<&mut InternalChanges>,
@@ -630,7 +633,7 @@ impl Tree {
         let mut tree_index_map = TreeIndexMap::default();
         let tree_index = tree_index_map.get_or_create_index(initial_state.tree_id);
         let mut state = TreeState {
-            nodes: HashMap::new(),
+            nodes: NodePages::default(),
             root: FullNodeId::new(tree.root, tree_index),
             info: tree,
             focus: FullNodeId::new(initial_state.focus, tree_index),
@@ -640,6 +643,7 @@ impl Tree {
             tree_index_map,
         };
         state.update(initial_state, None);
+        state.nodes.clear_changes();
         Self {
             next_state: state.clone(),
             state,
@@ -704,21 +708,9 @@ impl Tree {
             let node = self.state.node_by_id(*id).unwrap();
             handler.node_removed(&node);
         }
-        for id in changes.added_node_ids {
-            self.state
-                .nodes
-                .insert(id, self.next_state.nodes.get(&id).unwrap().clone());
-        }
-        for id in changes.updated_node_ids {
-            self.state
-                .nodes
-                .get_mut(&id)
-                .unwrap()
-                .clone_from(self.next_state.nodes.get(&id).unwrap());
-        }
-        for id in changes.removed_node_ids {
-            self.state.nodes.remove(&id);
-        }
+        self.state
+            .nodes
+            .share_changes_from(&mut self.next_state.nodes);
         if self.state.info != self.next_state.info {
             self.state.info.clone_from(&self.next_state.info);
         }
@@ -3295,8 +3287,10 @@ mod tests {
             assert_eq!(sparse.state.nodes.len(), full.state.nodes.len());
             assert_eq!(sparse.state.focus, full.state.focus);
             assert_eq!(sparse.state.root, full.state.root);
-            for (id, node) in &sparse.state.nodes {
-                let expected = &full.state.nodes[id];
+            for id in core::iter::once(NodeId(0)).chain(children.iter().copied()) {
+                let id = node_id(id.0);
+                let node = sparse.state.nodes.get(&id).unwrap();
+                let expected = full.state.nodes.get(&id).unwrap();
                 assert_eq!(node.parent_and_index, expected.parent_and_index);
                 assert_eq!(node.data, expected.data);
             }

@@ -1,9 +1,13 @@
+use super::accessibility::message;
 use glimpse::storage::Settings;
 use gpui::{prelude::*, *};
 use gpui_component::{
     ActiveTheme, Disableable, Selectable, Sizable,
     button::{Button, ButtonVariants},
-    input::{Input, InputState},
+    checkbox::Checkbox,
+    input::{Input, InputEvent, InputState},
+    menu::{DropdownMenu, PopupMenuItem},
+    scroll::{Scrollbar, ScrollbarShow},
 };
 
 pub enum Event {
@@ -40,7 +44,7 @@ impl Page {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum Field {
     Font,
     Size,
@@ -69,16 +73,40 @@ impl Field {
     fn label(self) -> &'static str {
         match self {
             Self::Font => "Source font family",
-            Self::Size => "Source font size",
-            Self::Height => "Line height",
-            Self::Scale => "Interface scale",
-            Self::Markdown => "Reading font size",
-            Self::Indent => "Indent width",
-            Self::FileLimit => "Search file limit",
-            Self::Exclusions => "Search exclusions",
-            Self::Keymaps => "Shortcut overrides",
+            Self::Size => "Source font size (10–32 px)",
+            Self::Height => "Line height (1.2–2.0)",
+            Self::Scale => "Interface scale (0.8–2.0)",
+            Self::Markdown => "Reading font size (12–28 px)",
+            Self::Indent => "Indent width (1–8 columns)",
+            Self::FileLimit => "Saved text limit (1–10 MiB)",
+            Self::Exclusions => "Exclude patterns",
+            Self::Keymaps => "Shortcut overrides (JSON)",
         }
     }
+    fn page(self) -> Page {
+        match self {
+            Self::Scale => Page::Appearance,
+            Self::Font | Self::Size | Self::Height | Self::Markdown => Page::Text,
+            Self::Indent => Page::Editing,
+            Self::FileLimit | Self::Exclusions => Page::Search,
+            Self::Keymaps => Page::Shortcuts,
+        }
+    }
+
+    fn hint(self) -> &'static str {
+        match self {
+            Self::Font => "Leave blank to use system monospace.",
+            Self::Size => "10–32 px",
+            Self::Height => "1.2–2.0 times the font size",
+            Self::Scale => "0.8–2.0 times the default interface size",
+            Self::Markdown => "12–28 px",
+            Self::Indent => "1–8 columns",
+            Self::FileLimit => "1–10 MiB per saved file",
+            Self::Exclusions => "One glob per line.",
+            Self::Keymaps => "Use command names from the list below.",
+        }
+    }
+
     fn value(self, settings: &Settings) -> String {
         match self {
             Self::Font => settings.font_family.clone(),
@@ -89,7 +117,14 @@ impl Field {
             Self::Indent => settings.indent.to_string(),
             Self::FileLimit => settings.search_file_mib.to_string(),
             Self::Exclusions => settings.search_exclude.clone(),
-            Self::Keymaps => serde_json::to_string_pretty(&settings.keymaps).unwrap(),
+            Self::Keymaps => serde_json::to_string_pretty(
+                &settings
+                    .keymaps
+                    .iter()
+                    .map(|(command, key)| (command, super::platform::shortcut_label(key)))
+                    .collect::<std::collections::BTreeMap<_, _>>(),
+            )
+            .unwrap(),
         }
     }
 }
@@ -99,10 +134,14 @@ pub struct Preferences {
     fields: Vec<Entity<InputState>>,
     page: Page,
     focus: FocusHandle,
+    shortcuts_focus: FocusHandle,
     row_focus: Vec<FocusHandle>,
+    theme_focus: [FocusHandle; 3],
+    page_focus: [FocusHandle; 5],
     scroll: ScrollHandle,
     _subscriptions: Vec<Subscription>,
     error: String,
+    field_error: Option<(Field, String)>,
     pending: bool,
 }
 
@@ -110,7 +149,7 @@ impl EventEmitter<Event> for Preferences {}
 
 impl Preferences {
     pub fn new(settings: Settings, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let fields = Field::ALL
+        let fields: Vec<_> = Field::ALL
             .into_iter()
             .map(|field| {
                 cx.new(|cx| {
@@ -130,6 +169,7 @@ impl Preferences {
             })
             .collect();
         let focus = cx.focus_handle();
+        let shortcuts_focus = cx.focus_handle().tab_stop(true);
         window.focus(&focus);
         let scroll = ScrollHandle::new();
         let row_focus: Vec<_> = (0..10).map(|_| cx.focus_handle()).collect();
@@ -137,12 +177,31 @@ impl Preferences {
             .iter()
             .enumerate()
             .map(|(index, focus)| {
-                cx.on_focus_in(focus, window, move |this, _, cx| {
+                cx.on_focus_in(focus, window, move |this, window, cx| {
                     this.scroll.scroll_to_item(index);
-                    cx.notify();
+                    cx.defer_in(window, |_, _, cx| cx.notify());
                 })
             })
             .collect();
+        subscriptions.extend(Field::ALL.into_iter().zip(&fields).map(|(field, input)| {
+            cx.subscribe(input, move |this, _, event, cx| {
+                if matches!(event, InputEvent::Change)
+                    && this
+                        .field_error
+                        .as_ref()
+                        .is_some_and(|(failed, _)| *failed == field)
+                {
+                    this.field_error = None;
+                    cx.notify();
+                }
+            })
+        }));
+        subscriptions.push(
+            cx.on_focus_in(&shortcuts_focus, window, |this, window, cx| {
+                this.scroll.scroll_to_top_of_item(2);
+                cx.defer_in(window, |_, _, cx| cx.notify());
+            }),
+        );
         let view = cx.weak_entity();
         let owner = window.window_handle();
         subscriptions.push(cx.intercept_keystrokes(move |event, window, cx| {
@@ -150,6 +209,81 @@ impl Preferences {
                 return;
             }
             let _ = view.update(cx, |this: &mut Self, cx| {
+                let key = &event.keystroke;
+                let modifiers = &key.modifiers;
+                if modifiers.alt
+                    && !modifiers.control
+                    && !modifiers.platform
+                    && !modifiers.shift
+                    && let Ok(number) = key.key.parse::<usize>()
+                    && let Some(page) = number.checked_sub(1).and_then(|i| Page::ALL.get(i))
+                    && !this.pending
+                {
+                    this.select_page(*page, cx);
+                    this.focus.focus(window);
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    return;
+                }
+                if event
+                    .context_stack
+                    .iter()
+                    .any(|context| context.contains("PopupMenu"))
+                {
+                    return;
+                }
+                // Categories are one Tab stop; arrow keys, Home and End choose among them.
+                if let Some(index) = this
+                    .page_focus
+                    .iter()
+                    .position(|focus| focus.is_focused(window))
+                    && !modifiers.control
+                    && !modifiers.platform
+                    && !modifiers.alt
+                    && !this.pending
+                {
+                    let last = Page::ALL.len() - 1;
+                    let next = match key.key.as_str() {
+                        "left" | "up" => Some(index.checked_sub(1).unwrap_or(last)),
+                        "right" | "down" => Some(if index == last { 0 } else { index + 1 }),
+                        "home" => Some(0),
+                        "end" => Some(last),
+                        _ => None,
+                    };
+                    if let Some(next) = next {
+                        this.select_page(Page::ALL[next], cx);
+                        this.page_focus[next].focus(window);
+                        window.prevent_default();
+                        cx.stop_propagation();
+                        return;
+                    }
+                }
+                if let Some(index) = this
+                    .theme_focus
+                    .iter()
+                    .position(|focus| focus.is_focused(window))
+                    && !modifiers.control
+                    && !modifiers.platform
+                    && !modifiers.alt
+                    && !this.pending
+                {
+                    let next = match key.key.as_str() {
+                        "left" | "up" => Some((index + 2) % 3),
+                        "right" | "down" => Some((index + 1) % 3),
+                        _ => None,
+                    };
+                    if let Some(next) = next {
+                        this.draft.system_theme = next == 0;
+                        if next > 0 {
+                            this.draft.dark = next == 2;
+                        }
+                        this.theme_focus[next].focus(window);
+                        window.prevent_default();
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
+                }
                 if super::modal::tab(&event.keystroke, &this.focus, window, cx) {
                     return;
                 }
@@ -163,11 +297,15 @@ impl Preferences {
         }));
         Self {
             error: settings.warning.clone().unwrap_or_default(),
+            field_error: None,
             draft: settings,
             fields,
             page: Page::Appearance,
             focus,
+            shortcuts_focus,
             row_focus,
+            theme_focus: [cx.focus_handle(), cx.focus_handle(), cx.focus_handle()],
+            page_focus: std::array::from_fn(|_| cx.focus_handle()),
             scroll,
             _subscriptions: subscriptions,
             pending: false,
@@ -178,38 +316,51 @@ impl Preferences {
         self.pending
     }
 
+    fn select_page(&mut self, page: Page, cx: &mut Context<Self>) {
+        if self.page != page {
+            self.page = page;
+            self.scroll.set_offset(Point::default());
+            cx.notify();
+        }
+    }
+
     pub fn failed(&mut self, error: String, cx: &mut Context<Self>) {
         self.pending = false;
         self.error = error;
         cx.notify();
     }
 
-    fn apply(&mut self, cx: &mut Context<Self>) {
-        let result = self.candidate(cx);
-        match result {
+    fn apply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.error.clear();
+        self.field_error = None;
+        match self.candidate(cx) {
             Ok(settings) => {
                 self.pending = true;
-                self.error.clear();
                 cx.emit(Event::Apply(Box::new(settings)));
             }
-            Err(error) => self.error = error,
+            Err((Some(field), error)) => {
+                self.field_error = Some((field, error));
+                self.select_page(field.page(), cx);
+                self.fields[field as usize].focus_handle(cx).focus(window);
+            }
+            Err((None, error)) => self.error = error,
         }
         cx.notify();
     }
 
-    fn candidate(&self, cx: &App) -> Result<Settings, String> {
+    fn candidate(&self, cx: &App) -> Result<Settings, (Option<Field>, String)> {
         let value = |field: Field| self.fields[field as usize].read(cx).value().to_string();
-        let number = |field, label| {
+        let number = |field: Field| {
             value(field)
                 .trim()
                 .parse::<f32>()
-                .map_err(|_| format!("{label} must be a number."))
+                .map_err(|_| (Some(field), "Enter a number.".into()))
         };
-        let integer = |field, label| {
+        let integer = |field: Field| {
             value(field)
                 .trim()
                 .parse::<usize>()
-                .map_err(|_| format!("{label} must be a whole number."))
+                .map_err(|_| (Some(field), "Enter a whole number.".into()))
         };
         let mut settings = self.draft.clone();
         settings.font_family = value(Field::Font).trim().to_owned();
@@ -220,54 +371,157 @@ impl Preferences {
                 .iter()
                 .any(|name| name.eq_ignore_ascii_case(&settings.font_family))
         {
-            return Err("Source font family is unavailable. Enter an installed family or clear the field for system monospace.".into());
+            return Err((
+                Some(Field::Font),
+                "Choose an installed font or leave blank.".into(),
+            ));
         }
-        settings.font_size = number(Field::Size, "Source font size")?;
-        settings.line_height = number(Field::Height, "Line height")?;
-        settings.ui_scale = number(Field::Scale, "Interface scale")?;
-        settings.markdown_font_size = number(Field::Markdown, "Reading font size")?;
-        settings.indent = integer(Field::Indent, "Indent width")?;
-        settings.search_file_mib = integer(Field::FileLimit, "Search file limit")?;
+        settings.font_size = number(Field::Size)?;
+        settings.line_height = number(Field::Height)?;
+        settings.ui_scale = number(Field::Scale)?;
+        settings.markdown_font_size = number(Field::Markdown)?;
+        settings.indent = integer(Field::Indent)?;
+        settings.search_file_mib = integer(Field::FileLimit)?;
         settings.search_exclude = value(Field::Exclusions);
-        settings.keymaps = serde_json::from_str(&value(Field::Keymaps))
-            .map_err(|error| format!("Shortcut overrides: {error}"))?;
-        for (value, lower, upper, label) in [
-            (settings.font_size, 10., 32., "Source font size"),
-            (settings.line_height, 1.2, 2., "Line height"),
-            (settings.ui_scale, 0.8, 2., "Interface scale"),
-            (settings.markdown_font_size, 12., 28., "Reading font size"),
+        settings.keymaps = serde_json::from_str(&value(Field::Keymaps)).map_err(|error| {
+            (
+                Some(Field::Keymaps),
+                format!(
+                    "Expected a JSON object. Check line {}.",
+                    error.line().max(1)
+                ),
+            )
+        })?;
+        for key in settings.keymaps.values_mut() {
+            *key = super::platform::portable_shortcut(key);
+        }
+        for (value, lower, upper, field) in [
+            (settings.font_size, 10., 32., Field::Size),
+            (settings.line_height, 1.2, 2., Field::Height),
+            (settings.ui_scale, 0.8, 2., Field::Scale),
+            (settings.markdown_font_size, 12., 28., Field::Markdown),
         ] {
             if !(lower..=upper).contains(&value) {
-                return Err(format!("{label} must be between {lower} and {upper}."));
+                return Err((
+                    Some(field),
+                    format!("Enter a value from {lower} to {upper}."),
+                ));
             }
         }
         if !(1..=8).contains(&settings.indent) {
-            return Err("Indent width must be between 1 and 8 columns.".into());
+            return Err((Some(Field::Indent), "Enter a value from 1 to 8.".into()));
         }
         if !(1..=10).contains(&settings.search_file_mib) {
-            return Err("Search file limit must be between 1 and 10 MiB.".into());
+            return Err((Some(Field::FileLimit), "Enter a value from 1 to 10.".into()));
         }
         settings.warning = None;
-        settings.validate()?;
+        settings.validate().map_err(|error| {
+            if let Err(binding_error) = glimpse::commands::bindings(&settings.keymaps) {
+                let message = match binding_error {
+                    glimpse::commands::BindingError::Conflict { shortcut, command } => {
+                        let key = super::platform::shortcut_label(&shortcut);
+                        format!("{key} is already used by {command}.")
+                    }
+                    glimpse::commands::BindingError::Invalid(message) => {
+                        super::platform::shortcut_label(&message)
+                    }
+                };
+                (Some(Field::Keymaps), message)
+            } else if let Err((line, pattern_error)) = settings.validate_exclusion_patterns() {
+                let reason = match pattern_error {
+                    ignore::Error::Glob { err, .. } => err,
+                    error => error.to_string(),
+                };
+                (Some(Field::Exclusions), format!("Line {line} · {reason}"))
+            } else {
+                (None, error)
+            }
+        })?;
         Ok(settings)
     }
 
-    fn field(&self, label: &'static str, field: Field) -> AnyElement {
+    fn field(&self, field: Field, cx: &App) -> AnyElement {
+        let error = self
+            .field_error
+            .as_ref()
+            .filter(|(failed, _)| *failed == field);
+        let hint = error.map_or_else(|| field.hint().to_owned(), |(_, error)| error.clone());
+        let tooltip = hint.clone();
+        let label = field
+            .label()
+            .split_once(" (")
+            .map_or(field.label(), |(label, _)| label);
         div()
+            .id(field.label())
             .flex()
             .flex_col()
-            .gap(px(4.))
+            .gap(px(2.))
             .child(label)
             .child(
                 Input::new(&self.fields[field as usize])
+                    .small()
                     .disabled(self.pending)
                     .h(px(if matches!(field, Field::Exclusions | Field::Keymaps) {
                         96.
                     } else {
-                        32. * self.draft.ui_scale
+                        26. * self.draft.ui_scale
                     })),
             )
+            .child(super::accessibility::status(
+                "preferences-field-hint",
+                hint.clone(),
+                div()
+                    .id("field-hint")
+                    .text_sm()
+                    .truncate()
+                    .text_color(if error.is_some() {
+                        cx.theme().danger
+                    } else {
+                        cx.theme().muted_foreground
+                    })
+                    .child(hint)
+                    .tooltip(move |window, cx| {
+                        gpui_component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx)
+                    }),
+                error.is_some(),
+            ))
             .into_any_element()
+    }
+
+    fn scroll_shortcuts(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = &event.keystroke;
+        if key.modifiers.control || key.modifiers.alt || key.modifiers.platform {
+            return;
+        }
+        let scroll = &self.scroll;
+        let position = scroll.offset();
+        let step = px(24. * self.draft.ui_scale);
+        let page = (scroll.bounds().size.height - step).max(step);
+        match key.key.as_str() {
+            "home" => scroll.scroll_to_top_of_item(2),
+            "end" => scroll.scroll_to_bottom(),
+            key => {
+                let delta = match key {
+                    "up" => step,
+                    "down" => -step,
+                    "pageup" => page,
+                    "pagedown" => -page,
+                    _ => return,
+                };
+                scroll.set_offset(point(
+                    position.x,
+                    (position.y + delta).clamp(-scroll.max_offset().height, px(0.)),
+                ));
+            }
+        }
+        window.prevent_default();
+        cx.stop_propagation();
+        cx.notify();
     }
 
     fn toggle(
@@ -278,12 +532,13 @@ impl Preferences {
     ) -> AnyElement {
         let mut draft = self.draft.clone();
         let checked = *field(&mut draft);
-        Button::new(label)
+        Checkbox::new(label)
             .small()
-            .compact()
-            .label(format!("{}  {label}", if checked { "✓" } else { "○" }))
-            .selected(checked)
-            .outline()
+            .min_h(px(24. * self.draft.ui_scale))
+            .items_center()
+            .label(label)
+            .checked(checked)
+            .animate(!self.draft.reduce_motion)
             .disabled(self.pending)
             .on_click(cx.listener(move |this, _, _, cx| {
                 let value = field(&mut this.draft);
@@ -300,62 +555,70 @@ impl Render for Preferences {
         match self.page {
             Page::Appearance => {
                 rows.push(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .gap_2()
-                        .children(
-                            [
-                                ("System", None),
-                                ("Light", Some(false)),
-                                ("Dark", Some(true)),
-                            ]
-                            .into_iter()
-                            .map(|(label, dark)| {
-                                Button::new(label)
-                                    .small()
-                                    .compact()
-                                    .label(label)
-                                    .primary()
-                                    .when(
-                                        if let Some(dark) = dark {
-                                            self.draft.system_theme || self.draft.dark != dark
-                                        } else {
-                                            !self.draft.system_theme
-                                        },
-                                        |button| button.outline(),
-                                    )
-                                    .selected(if let Some(dark) = dark {
+                    super::accessibility::group(
+                        "theme-group",
+                        "Theme".into(),
+                        div().flex().flex_col().gap_1().child("Theme").child(
+                            div().flex().flex_wrap().gap_2().children(
+                                [
+                                    ("System", None),
+                                    ("Light", Some(false)),
+                                    ("Dark", Some(true)),
+                                ]
+                                .into_iter()
+                                .enumerate()
+                                .map(|(index, (label, dark))| {
+                                    let chosen = if let Some(dark) = dark {
                                         !self.draft.system_theme && self.draft.dark == dark
                                     } else {
                                         self.draft.system_theme
-                                    })
-                                    .disabled(self.pending)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.draft.system_theme = dark.is_none();
-                                        if let Some(dark) = dark {
-                                            this.draft.dark = dark;
-                                        }
-                                        cx.notify();
-                                    }))
-                            }),
-                        )
-                        .into_any_element(),
+                                    };
+                                    Button::new(label)
+                                        .with_focus_handle(self.theme_focus[index].clone())
+                                        .tab_stop(chosen)
+                                        .small()
+                                        .compact()
+                                        .label(label)
+                                        .accessibility_role(gpui::accesskit::Role::RadioButton)
+                                        .accessibility_toggled(chosen)
+                                        .map(|button| {
+                                            if chosen {
+                                                button
+                                                    .ghost()
+                                                    .bg(cx.theme().selection)
+                                                    .text_color(cx.theme().ring)
+                                            } else {
+                                                button.ghost()
+                                            }
+                                        })
+                                        .disabled(self.pending)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.draft.system_theme = dark.is_none();
+                                            if let Some(dark) = dark {
+                                                this.draft.dark = dark;
+                                            }
+                                            cx.notify();
+                                        }))
+                                }),
+                            ),
+                        ),
+                    )
+                    .into_any_element(),
                 );
-                rows.push(self.field("Interface scale (0.8–2.0)", Field::Scale));
+                rows.push(self.field(Field::Scale, cx));
                 rows.push(self.toggle("Compact file rows", |s| &mut s.compact, cx));
                 rows.push(self.toggle("Reduce motion", |s| &mut s.reduce_motion, cx));
                 rows.push(self.toggle("Remember locations", |s| &mut s.remember_locations, cx));
             }
             Page::Text => {
-                rows.push(self.field("Source font family", Field::Font));
-                rows.push(self.field("Source font size (10–32 px)", Field::Size));
-                rows.push(self.field("Line height (1.2–2.0)", Field::Height));
-                rows.push(self.field("Reading font size (12–28 px)", Field::Markdown));
+                rows.push(self.field(Field::Font, cx));
+                rows.push(self.field(Field::Size, cx));
+                rows.push(self.field(Field::Height, cx));
+                rows.push(self.field(Field::Markdown, cx));
                 rows.push(self.toggle("Proportional plain text", |s| &mut s.proportional, cx));
             }
             Page::Editing => {
-                rows.push(self.field("Indent width (1–8 columns)", Field::Indent));
+                rows.push(self.field(Field::Indent, cx));
                 rows.push(self.toggle("Use tabs for indentation", |s| &mut s.tabs, cx));
                 rows.push(self.toggle("Wrap long lines", |s| &mut s.wrap, cx));
                 rows.push(self.toggle("Line numbers", |s| &mut s.line_numbers, cx));
@@ -367,99 +630,238 @@ impl Render for Preferences {
                 rows.push(self.toggle("Show hidden files", |s| &mut s.show_hidden, cx));
                 rows.push(self.toggle("Search ignored files", |s| &mut s.search_ignored, cx));
                 rows.push(self.toggle("Search metadata folders", |s| &mut s.search_metadata, cx));
-                rows.push(self.field("Saved text limit (1–10 MiB)", Field::FileLimit));
-                rows.push(self.field("Exclude patterns", Field::Exclusions));
+                rows.push(self.toggle("Cross mounted volumes", |s| &mut s.search_mounts, cx));
+                rows.push(self.toggle(
+                    "Follow directory symlinks",
+                    |s| &mut s.search_directory_links,
+                    cx,
+                ));
+                rows.push(self.field(Field::FileLimit, cx));
+                rows.push(self.field(Field::Exclusions, cx));
             }
             Page::Shortcuts => {
-                rows.push(div().child("Override commands with a JSON object. Cmd means Control on Linux and Command on macOS. An empty value disables a shortcut. Text editing keys remain reserved.").into_any_element());
-                rows.push(self.field("Shortcut overrides (JSON)", Field::Keymaps));
+                let key = super::platform::shortcut_label("Cmd+Shift+O");
+                let example = format!("{{\"folder\": \"{key}\"}}");
+                let prompt = "Enter a JSON object that maps command names to keys.";
+                let rules =
+                    "Use an empty value to disable a shortcut. Text editing keys are reserved.";
                 rows.push(
-                    div()
-                        .text_size(px(12.))
-                        .children(
-                            glimpse::commands::COMMANDS
-                                .iter()
-                                .filter(|command| !command.shortcut.is_empty())
-                                .map(|command| {
-                                    div().child(format!(
-                                        "{}: {} ({})",
-                                        command.id, command.shortcut, command.label
-                                    ))
-                                }),
-                        )
-                        .into_any_element(),
+                    super::accessibility::label(
+                        "keymap-help",
+                        format!("{prompt} {example}. {rules}"),
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(div().child(prompt))
+                            .child(
+                                div()
+                                    .whitespace_nowrap()
+                                    .font_family(cx.theme().mono_font_family.clone())
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(example),
+                            )
+                            .child(div().child(rules)),
+                    )
+                    .into_any_element(),
+                );
+                rows.push(self.field(Field::Keymaps, cx));
+                let muted = cx.theme().muted_foreground;
+                let focus = self.shortcuts_focus.clone();
+                let action_focus = focus.clone();
+                rows.push(
+                    accessible(
+                        "current-shortcuts-region",
+                        div()
+                            .id("current-shortcuts")
+                            .track_focus(&focus)
+                            .border_1()
+                            .rounded_md()
+                            .border_color(gpui::transparent_black())
+                            .focus(|style| style.border_color(cx.theme().ring))
+                            // The focus border sits in the margin so the rows share the inset;
+                            // whole-pixel rows keep an even pitch.
+                            .mx(px(-1.))
+                            .flex()
+                            .flex_col()
+                            .line_height(px(24.))
+                            .on_key_down(cx.listener(Self::scroll_shortcuts))
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Current shortcuts"),
+                            )
+                            .children(glimpse::commands::COMMANDS.iter().filter_map(|command| {
+                                let key = self
+                                    .draft
+                                    .keymaps
+                                    .get(command.id)
+                                    .map(String::as_str)
+                                    .unwrap_or(command.shortcut);
+                                (!key.is_empty()).then(|| {
+                                    let shortcut = super::platform::shortcut_label(key);
+                                    let label =
+                                        format!("{} ({}) · {shortcut}", command.label, command.id);
+                                    super::accessibility::label(
+                                        command.id,
+                                        label,
+                                        div()
+                                            .flex()
+                                            .items_baseline()
+                                            .gap(px(8.))
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .truncate()
+                                                    .child(command.label),
+                                            )
+                                            .child(
+                                                div().text_color(muted).text_sm().child(command.id),
+                                            )
+                                            .child(
+                                                div()
+                                                    .w(px(150.))
+                                                    .flex_shrink_0()
+                                                    .text_right()
+                                                    .child(shortcut),
+                                            ),
+                                    )
+                                })
+                            })),
+                        move |_, window, _| {
+                            let mut node = gpui::accesskit::Node::new(gpui::accesskit::Role::Group);
+                            node.set_label("Current shortcuts");
+                            node.add_action(gpui::accesskit::Action::Focus);
+                            let mut info = AccessibilityInfo::new(node);
+                            info.focused = focus.is_focused(window);
+                            info
+                        },
+                    )
+                    .on_action(move |request, _, window, _| {
+                        if request.action == gpui::accesskit::Action::Focus {
+                            action_focus.focus(window);
+                        }
+                    })
+                    .into_any_element(),
                 );
             }
         }
-        let categories = if self.draft.ui_scale > 1.25 || window.viewport_size().width < px(600.) {
+        let compact_categories =
+            self.draft.ui_scale > 1.25 || window.viewport_size().width < px(600.);
+        let short = window.viewport_size().height < px(480.);
+        let compact_header = short && compact_categories;
+        let categories = if compact_categories {
+            let selected = self.page;
+            let view = cx.weak_entity();
             div()
                 .flex()
                 .items_center()
-                .justify_between()
-                .gap(px(8.))
                 .child(
-                    Button::new("previous-category")
-                        .label("‹")
+                    Button::new("preferences-category-menu")
+                        .label(if compact_header {
+                            selected.label().to_owned()
+                        } else {
+                            format!("Category · {}", selected.label())
+                        })
+                        .tooltip("Preferences category")
                         .small()
-                        .tooltip("Previous category")
+                        .dropdown_caret(true)
                         .disabled(self.pending)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            let index = Page::ALL
-                                .iter()
-                                .position(|page| *page == this.page)
-                                .unwrap();
-                            this.page = Page::ALL[(index + 4) % 5];
-                            this.scroll.set_offset(Point::default());
-                            cx.notify();
-                        })),
+                        .dropdown_menu(move |mut menu, window, _| {
+                            menu = menu
+                                .accessible_name("Preferences category")
+                                .scrollable(true)
+                                .max_w(window.viewport_size().width - px(16.))
+                                .max_h((window.viewport_size().height - px(40.)).max(px(100.)));
+                            for (index, page) in Page::ALL.into_iter().enumerate() {
+                                let view = view.clone();
+                                menu = menu.item(
+                                    PopupMenuItem::new(page.label())
+                                        .checked(page == selected)
+                                        .shortcut_hint(super::platform::shortcut_label(&format!(
+                                            "Alt+{}",
+                                            index + 1
+                                        )))
+                                        .on_click(move |_, window, cx| {
+                                            let view = view.clone();
+                                            window.defer(cx, move |_, cx| {
+                                                let _ = view.update(cx, |this, cx| {
+                                                    this.select_page(page, cx)
+                                                });
+                                            });
+                                        }),
+                                );
+                            }
+                            menu
+                        }),
                 )
-                .child(format!(
-                    "{} ({}/5)",
-                    self.page.label(),
-                    Page::ALL
-                        .iter()
-                        .position(|page| *page == self.page)
-                        .unwrap()
-                        + 1
+                .child(message(
+                    "preferences-category",
+                    selected.label().into(),
+                    div().size_0(),
                 ))
-                .child(
-                    Button::new("next-category")
-                        .label("›")
-                        .small()
-                        .tooltip("Next category")
-                        .disabled(self.pending)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            let index = Page::ALL
-                                .iter()
-                                .position(|page| *page == this.page)
-                                .unwrap();
-                            this.page = Page::ALL[(index + 1) % 5];
-                            this.scroll.set_offset(Point::default());
-                            cx.notify();
-                        })),
-                )
                 .into_any_element()
         } else {
             div()
                 .flex()
                 .flex_wrap()
                 .gap_1()
-                .children(Page::ALL.into_iter().map(|page| {
+                .children(Page::ALL.into_iter().enumerate().map(|(index, page)| {
                     Button::new(page.label())
                         .label(page.label())
                         .small()
-                        .primary()
-                        .when(page != self.page, |button| button.outline())
+                        .with_focus_handle(self.page_focus[index].clone())
+                        .tab_stop(page == self.page)
+                        .accessibility_role(gpui::accesskit::Role::Tab)
                         .selected(page == self.page)
+                        .map(|button| {
+                            if page == self.page {
+                                button
+                                    .ghost()
+                                    .bg(cx.theme().selection)
+                                    .text_color(cx.theme().ring)
+                            } else {
+                                button.ghost()
+                            }
+                        })
                         .disabled(self.pending)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.page = page;
-                            this.scroll.set_offset(Point::default());
-                            cx.notify();
-                        }))
+                        .on_click(cx.listener(move |this, _, _, cx| this.select_page(page, cx)))
                 }))
+                .map(|tabs| {
+                    gpui::accessible("preferences-categories", tabs, |_, _, _| {
+                        let mut node = gpui::accesskit::Node::new(gpui::accesskit::Role::TabList);
+                        node.set_label("Preferences categories");
+                        AccessibilityInfo::new(node)
+                    })
+                })
                 .into_any_element()
         };
+        let title = div()
+            .flex_shrink_0()
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .text_size(px(20. * self.draft.ui_scale))
+            .when(compact_header, |title| {
+                title.text_size(px(16. * self.draft.ui_scale))
+            })
+            .child("Preferences");
+        let header = div()
+            .flex()
+            .flex_shrink_0()
+            .gap(px(if short { 8. } else { 12. }))
+            .map(|header| {
+                if compact_header {
+                    header
+                        .flex_wrap()
+                        .items_center()
+                        .justify_between()
+                        .gap_y(px(4.))
+                } else {
+                    header.flex_col()
+                }
+            })
+            .child(title)
+            .child(categories);
         let semantic_title = "Preferences".to_owned();
         let semantic_detail = "Appearance, text, editing, search and keyboard settings".to_owned();
         let rendered = div()
@@ -468,6 +870,7 @@ impl Render for Preferences {
             .inset_0()
             .occlude()
             .bg(cx.theme().overlay)
+            .when(short, |overlay| overlay.bg(cx.theme().background))
             .flex()
             .items_center()
             .justify_center()
@@ -477,48 +880,80 @@ impl Render for Preferences {
                     .track_focus(&self.focus)
                     .occlude()
                     .w(px(620.).min(window.viewport_size().width - px(32.)))
-                    .max_h(window.viewport_size().height - px(32.))
+                    .h((px(560.) * self.draft.ui_scale.max(1.))
+                        .min(window.viewport_size().height - px(32.)))
                     .flex()
                     .flex_col()
                     .gap(px(12.))
                     .p(px(16.))
-                    .rounded_lg()
+                    .when(short, |panel| panel.gap(px(8.)).py(px(10.)))
+                    .rounded(cx.theme().radius_lg)
                     .border_1()
                     .border_color(cx.theme().border)
-                    .bg(cx.theme().background)
+                    .shadow_xl()
+                    .bg(cx.theme().popover)
                     .text_color(cx.theme().foreground)
+                    .child(header)
                     .child(
                         div()
-                            .text_size(px(20. * self.draft.ui_scale))
-                            .child("Preferences"),
-                    )
-                    .child(categories)
-                    .child(
-                        div()
-                            .id("preference-fields")
+                            .relative()
                             .min_h_0()
                             .flex_1()
-                            .overflow_y_scroll()
-                            .track_scroll(&self.scroll)
-                            .children(rows.into_iter().enumerate().map(|(i, row)| {
-                                div().track_focus(&self.row_focus[i]).pb(px(12.)).child(row)
-                            })),
+                            .flex()
+                            .flex_col()
+                            .overflow_hidden()
+                            .when(compact_categories, |fields| {
+                                fields.border_t_1().border_color(cx.theme().border).pt_1()
+                            })
+                            .child(super::accessibility::group(
+                                "preference-fields-group",
+                                "Settings".into(),
+                                div()
+                                    .id("preference-fields")
+                                    .min_h_0()
+                                    .flex_1()
+                                    .overflow_y_scroll()
+                                    .track_scroll(&self.scroll)
+                                    .pt(px(4.))
+                                    .mr(px(-12.))
+                                    .pr(px(12.))
+                                    .children(rows.into_iter().enumerate().map(|(i, row)| {
+                                        div().track_focus(&self.row_focus[i]).pb(px(12.)).child(row)
+                                    })),
+                            ))
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .bottom_0()
+                                    .left_0()
+                                    .right(px(-12.))
+                                    .child(
+                                        Scrollbar::vertical(&self.scroll)
+                                            .scrollbar_show(ScrollbarShow::Always),
+                                    ),
+                            ),
                     )
                     .when(!self.error.is_empty(), |this| {
-                        this.child(
+                        this.child(super::accessibility::message(
+                            "preferences-error",
+                            self.error.clone(),
                             div()
-                                .id("preferences-error")
+                                .id("preferences-validation")
                                 .max_h(px(80.))
                                 .overflow_y_scroll()
                                 .text_color(cx.theme().danger)
                                 .child(self.error.clone()),
-                        )
+                        ))
                     })
                     .child(
                         div()
                             .flex()
                             .flex_wrap()
                             .gap_2()
+                            .pt(px(12.))
+                            .border_t_1()
+                            .border_color(cx.theme().title_bar_border)
                             .child(
                                 Button::new("reload-preferences")
                                     .small()
@@ -547,7 +982,9 @@ impl Render for Preferences {
                                     .label(if self.pending { "Saving…" } else { "Apply" })
                                     .primary()
                                     .disabled(self.pending)
-                                    .on_click(cx.listener(|this, _, _, cx| this.apply(cx))),
+                                    .on_click(
+                                        cx.listener(|this, _, window, cx| this.apply(window, cx)),
+                                    ),
                             ),
                     ),
             );

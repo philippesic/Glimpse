@@ -1,6 +1,9 @@
 use gpui::{prelude::*, *};
 use gpui_component::{ActiveTheme, PixelsExt};
 
+const MIN_WIDTH: Pixels = px(180.);
+const STEP: Pixels = px(20.);
+
 pub struct Divider {
     width: Pixels,
     dragging: Option<(Pixels, Pixels)>,
@@ -17,30 +20,35 @@ impl Divider {
     }
 
     pub fn width(&self, window: &Window) -> Pixels {
-        self.width.clamp(px(180.), Self::maximum(window))
+        self.width.clamp(MIN_WIDTH, Self::maximum(window))
     }
 
     fn maximum(window: &Window) -> Pixels {
-        px(600.).min((window.viewport_size().width - px(208.)).max(px(180.)))
+        px(600.).min((window.viewport_size().width - px(208.)).max(MIN_WIDTH))
     }
 }
 
 impl Render for Divider {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let weak = cx.entity().downgrade();
-        div()
+        let focused = self.focus.is_focused(window);
+        let divider = div()
             .id("navigator-divider")
             .w(px(8.))
             .h_full()
             .flex_shrink_0()
             .cursor_col_resize()
             .track_focus(&self.focus)
-            .when(self.focus.is_focused(window), |style| {
-                style.bg(cx.theme().ring)
+            .bg(cx.theme().sidebar)
+            .map(|style| {
+                if focused {
+                    style.bg(cx.theme().ring)
+                } else {
+                    style.hover(|style| style.bg(cx.theme().title_bar_border))
+                }
             })
-            .hover(|style| style.bg(cx.theme().border))
-            .border_x_1()
-            .border_color(cx.theme().border)
+            .border_r_1()
+            .border_color(cx.theme().title_bar_border)
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
@@ -51,15 +59,15 @@ impl Render for Divider {
                 }),
             )
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                let delta = match event.keystroke.key.as_str() {
-                    "left" => -20.,
-                    "right" => 20.,
-                    "home" => 180. - this.width.as_f32(),
-                    "end" => Self::maximum(window).as_f32() - this.width.as_f32(),
+                let width = this.width(window);
+                let maximum = Self::maximum(window);
+                this.width = match event.keystroke.key.as_str() {
+                    "left" => (width - STEP).max(MIN_WIDTH),
+                    "right" => (width + STEP).min(maximum),
+                    "home" => MIN_WIDTH,
+                    "end" => maximum,
                     _ => return,
                 };
-                this.width =
-                    (this.width(window) + px(delta)).clamp(px(180.), Self::maximum(window));
                 cx.stop_propagation();
                 cx.notify();
             }))
@@ -80,7 +88,7 @@ impl Render for Divider {
                                     this.dragging = None;
                                 } else {
                                     this.width = (width + event.position.x - start)
-                                        .clamp(px(180.), Self::maximum(window));
+                                        .clamp(MIN_WIDTH, Self::maximum(window));
                                 }
                                 cx.notify();
                             });
@@ -95,6 +103,36 @@ impl Render for Divider {
                 )
                 .absolute()
                 .size_full(),
-            )
+            );
+        let focus = self.focus.clone();
+        let width = self.width(window);
+        let view = cx.weak_entity();
+        accessible("navigator-width", divider, move |_, window, _| {
+            use gpui::accesskit::{Action, Node, Orientation, Role};
+            let mut node = Node::new(Role::Splitter);
+            node.set_label("Navigator divider");
+            node.set_description("Use the Left and Right arrow keys to adjust the width.");
+            node.set_orientation(Orientation::Vertical);
+            node.set_numeric_value(width.as_f32() as f64);
+            node.set_min_numeric_value(MIN_WIDTH.as_f32() as f64);
+            node.set_max_numeric_value(Self::maximum(window).as_f32() as f64);
+            node.set_numeric_value_step(STEP.as_f32() as f64);
+            node.add_action(Action::Focus);
+            node.add_action(Action::SetValue);
+            let mut info = AccessibilityInfo::new(node);
+            info.focused = focus.is_focused(window);
+            info
+        })
+        .on_action(move |request, _, window, cx| {
+            use gpui::accesskit::{Action, ActionData};
+            let _ = view.update(cx, |this, cx| match (request.action, request.data) {
+                (Action::Focus, _) => this.focus.focus(window),
+                (Action::SetValue, Some(ActionData::NumericValue(value))) if value.is_finite() => {
+                    this.width = px(value as f32).clamp(MIN_WIDTH, Self::maximum(window));
+                    cx.notify();
+                }
+                _ => {}
+            });
+        })
     }
 }

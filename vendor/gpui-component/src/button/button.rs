@@ -1,8 +1,8 @@
 use std::rc::Rc;
 
 use crate::{
-    ActiveTheme, Colorize as _, Disableable, FocusableExt as _, Icon, IconName, Selectable,
-    Sizable, Size, StyleSized, StyledExt, h_flex, spinner::Spinner, tooltip::Tooltip,
+    ActiveTheme, Disableable, FocusableExt as _, Icon, IconName, Selectable, Sizable, Size,
+    StyleSized, StyledExt, h_flex, spinner::Spinner, tooltip::Tooltip,
 };
 use gpui::{
     Action, AnyElement, App, ClickEvent, Corners, Div, Edges, ElementId, Hsla, InteractiveElement,
@@ -178,11 +178,19 @@ impl ButtonVariant {
 pub struct Button {
     id: ElementId,
     semantic_role: gpui::accesskit::Role,
+    semantic_description: Option<SharedString>,
+    semantic_label: Option<SharedString>,
+    semantic_toggled: Option<bool>,
+    semantic_expanded: Option<bool>,
     semantic_focus: Option<gpui::FocusHandle>,
+    focus_handle: Option<gpui::FocusHandle>,
     base: Stateful<Div>,
     style: StyleRefinement,
     icon: Option<Icon>,
     label: Option<SharedString>,
+    display_label: Option<SharedString>,
+    italic_label: bool,
+    parent_decorates: bool,
     children: Vec<AnyElement>,
     disabled: bool,
     pub(crate) selected: bool,
@@ -220,13 +228,21 @@ impl Button {
         Self {
             id: id.clone(),
             semantic_role: gpui::accesskit::Role::Button,
+            semantic_description: None,
+            semantic_label: None,
+            semantic_toggled: None,
+            semantic_expanded: None,
             semantic_focus: None,
+            focus_handle: None,
             // ID must be set after div is created;
             // `dropdown_menu` uses this id to create the popup menu.
             base: div().flex_shrink_0().id(id),
             style: StyleRefinement::default(),
             icon: None,
             label: None,
+            display_label: None,
+            italic_label: false,
+            parent_decorates: false,
             disabled: false,
             selected: false,
             variant: ButtonVariant::default(),
@@ -253,8 +269,37 @@ impl Button {
         self
     }
 
+    pub fn with_focus_handle(mut self, focus: gpui::FocusHandle) -> Self {
+        self.focus_handle = Some(focus);
+        self
+    }
+
     pub fn accessibility_role(mut self, role: gpui::accesskit::Role) -> Self {
         self.semantic_role = role;
+        self
+    }
+
+    /// Supplementary accessible text, such as a document's unsaved state.
+    /// Name the button for assistive technology when its visible content is shortened.
+    pub fn accessibility_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.semantic_label = Some(label.into());
+        self
+    }
+
+    pub fn accessibility_description(mut self, description: impl Into<SharedString>) -> Self {
+        self.semantic_description = Some(description.into());
+        self
+    }
+
+    /// Expose an on/off toggle state to assistive technology.
+    pub fn accessibility_toggled(mut self, toggled: bool) -> Self {
+        self.semantic_toggled = Some(toggled);
+        self
+    }
+
+    /// Expose whether the content this button controls is expanded.
+    pub fn accessibility_expanded(mut self, expanded: bool) -> Self {
+        self.semantic_expanded = Some(expanded);
         self
     }
 
@@ -285,6 +330,23 @@ impl Button {
     /// Set label to the Button, if no label is set, the button will be in Icon Button mode.
     pub fn label(mut self, label: impl Into<SharedString>) -> Self {
         self.label = Some(label.into());
+        self
+    }
+
+    pub fn display_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.display_label = Some(label.into());
+        self
+    }
+
+    pub fn italic_label(mut self) -> Self {
+        self.italic_label = true;
+        self
+    }
+
+    /// Leave hover fill and the focus ring to an enclosing element that groups this button
+    /// with others, such as a tab and its close button.
+    pub fn parent_decorates(mut self) -> Self {
+        self.parent_decorates = true;
         self
     }
 
@@ -441,16 +503,32 @@ impl RenderOnce for Button {
         let clickable = self.clickable();
         let is_disabled = self.disabled;
         let hoverable = self.hoverable();
+        let parent_decorates = self.parent_decorates;
+        let focus_gap = if !self.outline
+            && matches!(
+                style,
+                ButtonVariant::Primary
+                    | ButtonVariant::Danger
+                    | ButtonVariant::Info
+                    | ButtonVariant::Success
+                    | ButtonVariant::Warning
+            ) {
+            px(2.)
+        } else {
+            px(0.)
+        };
         let normal_style = style.normal(self.outline, cx);
         let icon_size = match self.size {
             Size::Size(v) => Size::Size(v * 0.75),
             _ => self.size,
         };
 
-        let focus_handle = window
-            .use_keyed_state(self.id.clone(), cx, |_, cx| cx.focus_handle())
-            .read(cx)
-            .clone();
+        let focus_handle = self.focus_handle.unwrap_or_else(|| {
+            window
+                .use_keyed_state(self.id.clone(), cx, |_, cx| cx.focus_handle())
+                .read(cx)
+                .clone()
+        });
         let is_focused = focus_handle.is_focused(window);
 
         let rounding = match self.rounded {
@@ -461,15 +539,24 @@ impl RenderOnce for Button {
             ButtonRounded::None => Pixels::ZERO,
         };
 
+        let label_start = matches!(
+            self.style.justify_content,
+            Some(gpui::JustifyContent::Start | gpui::JustifyContent::FlexStart)
+        );
         let semantic_id = self.id.clone();
         let semantic_role = self.semantic_role;
         let semantic_label = self
-            .label
+            .semantic_label
             .clone()
+            .or_else(|| self.label.clone())
             .or_else(|| self.tooltip.as_ref().map(|(label, _)| label.clone()))
             .unwrap_or_else(|| "Button".into());
+        let italic_label = self.italic_label;
         let semantic_disabled = self.disabled || self.loading;
         let semantic_selected = self.selected;
+        let semantic_description = self.semantic_description.clone();
+        let semantic_toggled = self.semantic_toggled;
+        let semantic_expanded = self.semantic_expanded;
         let semantic_handler = self.on_click.clone();
         let semantic_focus = focus_handle.clone();
         let composite_focus = self.semantic_focus.clone();
@@ -537,11 +624,13 @@ impl RenderOnce for Button {
                 this.border_color(normal_style.border)
                     .bg(normal_style.bg)
                     .when(normal_style.underline, |this| this.text_decoration_1())
-                    .hover(|this| {
-                        let hover_style = style.hovered(self.outline, cx);
-                        this.bg(hover_style.bg)
-                            .border_color(hover_style.border)
-                            .text_color(hover_style.fg)
+                    .when(!parent_decorates, |this| {
+                        this.hover(|this| {
+                            let hover_style = style.hovered(self.outline, cx);
+                            this.bg(hover_style.bg)
+                                .border_color(hover_style.border)
+                                .text_color(hover_style.fg)
+                        })
                     })
                     .active(|this| {
                         let active_style = style.active(self.outline, cx);
@@ -589,11 +678,19 @@ impl RenderOnce for Button {
             .child({
                 h_flex()
                     .id("label")
+                    .flex_1()
                     .min_w_0()
                     .max_w_full()
                     .overflow_hidden()
                     .items_center()
-                    .justify_center()
+                    .map(|this| {
+                        // The label area fills the button, so it carries the button's alignment.
+                        if label_start {
+                            this.justify_start()
+                        } else {
+                            this.justify_center()
+                        }
+                    })
                     .button_text_size(self.size)
                     .map(|this| match self.size {
                         Size::XSmall => this.gap_1(),
@@ -612,12 +709,15 @@ impl RenderOnce for Button {
                                 .when_some(self.loading_icon, |this, icon| this.icon(icon)),
                         )
                     })
-                    .when_some(self.label, |this, label| {
+                    .when_some(self.display_label.or(self.label), |this, label| {
                         this.child(
+                            // Truncation clips to the label box, so the line box must hold the font's
+                            // ascenders and descenders or they are cut off.
                             div()
                                 .min_w_0()
                                 .truncate()
-                                .line_height(relative(1.))
+                                .line_height(relative(1.5))
+                                .when(italic_label, |label| label.italic())
                                 .child(label),
                         )
                     })
@@ -643,12 +743,32 @@ impl RenderOnce for Button {
                         .build(window, cx)
                 })
             })
-            .focus_ring(is_focused, px(0.), window, cx);
+            .map(|this| {
+                // Filled buttons keep a separate ring outside their fill, where it stays visible.
+                if focus_gap > px(0.) {
+                    this.focus_ring_outside(is_focused && !parent_decorates, focus_gap, window, cx)
+                } else {
+                    this.focus_ring(is_focused && !parent_decorates, focus_gap, window, cx)
+                }
+            });
         gpui::accessible(semantic_id, rendered, move |_, window, _| {
             use gpui::accesskit::{Action, Node};
             let mut node = Node::new(semantic_role);
             node.set_label(semantic_label.to_string());
             node.set_selected(semantic_selected);
+            if let Some(description) = &semantic_description {
+                node.set_description(description.to_string());
+            }
+            if let Some(toggled) = semantic_toggled {
+                node.set_toggled(if toggled {
+                    gpui::accesskit::Toggled::True
+                } else {
+                    gpui::accesskit::Toggled::False
+                });
+            }
+            if let Some(expanded) = semantic_expanded {
+                node.set_expanded(expanded);
+            }
             if semantic_disabled {
                 node.set_disabled();
             } else {
@@ -881,13 +1001,7 @@ impl ButtonVariant {
                     cx.theme().info_hover
                 }
             }
-            ButtonVariant::Ghost => {
-                if cx.theme().mode.is_dark() {
-                    cx.theme().secondary.lighten(0.1).opacity(0.8)
-                } else {
-                    cx.theme().secondary.darken(0.1).opacity(0.8)
-                }
-            }
+            ButtonVariant::Ghost => cx.theme().secondary_hover,
             ButtonVariant::Link => cx.theme().transparent,
             ButtonVariant::Text => cx.theme().transparent,
             ButtonVariant::Custom(colors) => {
@@ -927,13 +1041,7 @@ impl ButtonVariant {
                 }
             }
             ButtonVariant::Secondary => cx.theme().secondary_active,
-            ButtonVariant::Ghost => {
-                if cx.theme().mode.is_dark() {
-                    cx.theme().secondary.lighten(0.2).opacity(0.8)
-                } else {
-                    cx.theme().secondary.darken(0.2).opacity(0.8)
-                }
-            }
+            ButtonVariant::Ghost => cx.theme().secondary_active,
             ButtonVariant::Danger => {
                 if outline {
                     cx.theme().danger_active.opacity(0.1)

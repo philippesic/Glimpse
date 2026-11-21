@@ -31,6 +31,8 @@ def main():
             / "packaging/linux/glimpse.desktop",
             "share/icons/hicolor/scalable/apps/glimpse.svg": root
             / "packaging/linux/glimpse.svg",
+            "share/doc/glimpse/LICENSE": root / "LICENSE",
+            "share/doc/glimpse/LICENSE-lucide": root / "assets/icons/LICENSE-lucide",
             "install.py": root / "packaging/linux/install.py",
         }
         for relative, source in files.items():
@@ -40,6 +42,26 @@ def main():
             destination.chmod(
                 0o755 if relative in ("bin/glimpse", "install.py") else 0o644
             )
+        notices = stage / "share/doc/glimpse/THIRD-PARTY.txt"
+        subprocess.run(
+            [
+                "cargo",
+                "about",
+                "generate",
+                "--locked",
+                "--fail",
+                "--target",
+                f"{platform.machine()}-unknown-linux-gnu",
+                "--config",
+                "packaging/licenses/about.toml",
+                "--output-file",
+                str(notices),
+                "packaging/licenses/third-party.hbs",
+            ],
+            cwd=root,
+            check=True,
+        )
+        notices.chmod(0o644)
         (stage / "README.txt").write_text(
             "Glimpse for Linux\n\n"
             'Install: python3 install.py --prefix "$HOME/.local"\n'
@@ -48,6 +70,7 @@ def main():
             "It does not change your default file associations.\n\n"
             "Requires a compatible Linux desktop, graphics driver, and system libraries.\n"
             "Python 3 is needed only for installation. The application works offline.\n"
+            "Licenses and third-party source links are in share/doc/glimpse/.\n"
         )
         manifest = {
             "version": version,

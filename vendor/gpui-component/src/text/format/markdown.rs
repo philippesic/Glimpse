@@ -2,22 +2,74 @@ use crate::{
     highlighter::HighlightTheme,
     text::{
         TextViewStyle,
+        document_text::DocumentSourceBuilder,
         node::{
-            self, CodeBlock, ImageNode, InlineNode, LinkMark, NodeContext, Paragraph, Span, Table,
-            TableCell, TableRow, TextMark,
+            self, CodeBlock, ImageNode, InlineMarks, InlineNode, InlineText, LinkMark, NodeContext,
+            Paragraph, Span, Table, TableCell, TableRow, TextMark,
         },
     },
 };
 use gpui::SharedString;
 use linkify::{LinkFinder, LinkKind};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use std::collections::HashSet;
+
+const MAX_SHARED_INLINE_VALUES: usize = 256;
+const READING_TEXT_BATCH_BLOCKS: usize = 64;
+
+#[derive(Default)]
+struct InlineContentCache {
+    enabled: bool,
+    pack_reading: bool,
+    texts: HashSet<SharedString>,
+    marks: HashSet<InlineMarks>,
+}
+
+impl InlineContentCache {
+    fn text(&mut self, text: String) -> InlineText {
+        if !self.enabled || text.len() > 8 * 1024 {
+            return InlineText::Owned(text.into());
+        }
+        if let Some(text) = self.texts.get(text.as_str()) {
+            return InlineText::Owned(text.clone());
+        }
+        if self.pack_reading
+            && text.len() < 8 * 1024
+            && self.texts.len() >= MAX_SHARED_INLINE_VALUES
+        {
+            return InlineText::Pending(text.into_boxed_str());
+        }
+        let text = SharedString::from(text);
+        if self.texts.len() < MAX_SHARED_INLINE_VALUES {
+            self.texts.insert(text.clone());
+        }
+        InlineText::Owned(text)
+    }
+
+    fn marks(&mut self, marks: Vec<(std::ops::Range<usize>, TextMark)>) -> InlineMarks {
+        if marks.is_empty() {
+            return InlineMarks::default();
+        }
+        if !self.enabled || marks.len() > 32 {
+            return marks.into();
+        }
+        if let Some(marks) = self.marks.get(marks.as_slice()) {
+            return marks.clone();
+        }
+        let marks = InlineMarks::from(marks);
+        if self.marks.len() < MAX_SHARED_INLINE_VALUES {
+            self.marks.insert(marks.clone());
+        }
+        marks
+    }
+}
 
 enum Block {
     Root,
     Paragraph,
     Heading(u8),
     Quote,
-    List(bool),
+    List(Option<u64>),
     Item,
     Code(Option<SharedString>),
     Html,
@@ -63,12 +115,12 @@ impl Frame {
                 .map(|mark| (start..self.text.len(), mark.clone())),
         );
     }
-    fn finish_text(&mut self) {
+    fn finish_text(&mut self, cache: &mut InlineContentCache) {
         if !self.text.is_empty() {
-            self.paragraph.push(
-                InlineNode::new(std::mem::take(&mut self.text))
-                    .marks(std::mem::take(&mut self.text_marks)),
-            );
+            let mut inline =
+                InlineNode::new("").marks(cache.marks(std::mem::take(&mut self.text_marks)));
+            inline.text = cache.text(std::mem::take(&mut self.text));
+            self.paragraph.push(inline);
         }
     }
     fn flush(&mut self, marks: &[TextMark], finder: &LinkFinder) {
@@ -79,7 +131,13 @@ impl Frame {
         if marks.iter().any(|mark| mark.code || mark.link.is_some())
             || !text.contains([':', '@']) && !text.contains("www.")
         {
-            self.append(&text, marks);
+            if self.text.is_empty() {
+                self.text_marks
+                    .extend(marks.iter().map(|mark| (0..text.len(), mark.clone())));
+                self.text = text;
+            } else {
+                self.append(&text, marks);
+            }
             return;
         }
         let mut offset = 0;
@@ -112,9 +170,14 @@ impl Frame {
             self.append(&text[offset..], marks);
         }
     }
-    fn finish_pending(&mut self, marks: &[TextMark], finder: &LinkFinder) {
+    fn finish_pending(
+        &mut self,
+        marks: &[TextMark],
+        finder: &LinkFinder,
+        cache: &mut InlineContentCache,
+    ) {
         self.flush(marks, finder);
-        self.finish_text();
+        self.finish_text(cache);
         if !self.paragraph.is_empty() {
             self.children
                 .push(node::Node::Paragraph(self.paragraph.take()));
@@ -127,9 +190,10 @@ impl Frame {
         finder: &LinkFinder,
         style: &TextViewStyle,
         theme: &HighlightTheme,
+        cache: &mut InlineContentCache,
     ) -> node::Node {
         self.flush(marks, finder);
-        self.finish_text();
+        self.finish_text(cache);
         self.paragraph.set_span(Span {
             start: self.start,
             end,
@@ -151,7 +215,7 @@ impl Frame {
                 column_aligns: alignments.into_iter().map(Into::into).collect(),
             }),
             _ => {
-                self.finish_pending(marks, finder);
+                self.finish_pending(marks, finder, cache);
                 match self.kind {
                     Block::Root => {
                         self.children.shrink_to_fit();
@@ -162,8 +226,8 @@ impl Frame {
                     Block::Quote => node::Node::Blockquote {
                         children: self.children,
                     },
-                    Block::List(ordered) => node::Node::List {
-                        ordered,
+                    Block::List(start) => node::Node::List {
+                        start,
                         children: self.children,
                     },
                     Block::Item => node::Node::ListItem {
@@ -186,12 +250,20 @@ pub(crate) fn parse(
     style: &TextViewStyle,
     cx: &mut NodeContext,
     theme: &HighlightTheme,
+    mut on_image: impl FnMut(&str),
+    mut reading_text: Option<&mut DocumentSourceBuilder>,
 ) -> Result<node::Node, SharedString> {
     let mut finder = LinkFinder::new();
     finder.url_must_have_scheme(false);
+    let mut cache = InlineContentCache {
+        enabled: raw.len() >= 64 * 1024,
+        pack_reading: reading_text.is_some(),
+        ..Default::default()
+    };
     let mut frames = vec![Frame::new(Block::Root, 0)];
     let mut marks = Vec::new();
     let mut images: Vec<Image> = Vec::new();
+    let mut packed_blocks = 0;
     let options =
         Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS | Options::ENABLE_STRIKETHROUGH;
     for (event, range) in Parser::new_ext(raw, options).into_offset_iter() {
@@ -199,6 +271,7 @@ pub(crate) fn parse(
             Event::Start(Tag::Image {
                 dest_url, title, ..
             }) => {
+                on_image(&dest_url);
                 frames.last_mut().unwrap().flush(&marks, &finder);
                 images.push(Image {
                     image: ImageNode {
@@ -220,7 +293,7 @@ pub(crate) fn parse(
                     } else {
                         image.image.alt = Some(image.alt.into());
                         let frame = frames.last_mut().unwrap();
-                        frame.finish_text();
+                        frame.finish_text(&mut cache);
                         frame.paragraph.push_image(image.image);
                     }
                 }
@@ -260,7 +333,10 @@ pub(crate) fn parse(
                 marks.pop();
             }
             Event::Start(tag) => {
-                frames.last_mut().unwrap().finish_pending(&marks, &finder);
+                frames
+                    .last_mut()
+                    .unwrap()
+                    .finish_pending(&marks, &finder, &mut cache);
                 let kind = match tag {
                     Tag::Paragraph => {
                         if matches!(frames.last().unwrap().kind, Block::Item) {
@@ -270,7 +346,7 @@ pub(crate) fn parse(
                     }
                     Tag::Heading { level, .. } => Block::Heading(level as u8),
                     Tag::BlockQuote(_) => Block::Quote,
-                    Tag::List(start) => Block::List(start.is_some()),
+                    Tag::List(start) => Block::List(start),
                     Tag::Item => Block::Item,
                     Tag::CodeBlock(code) => Block::Code(match code {
                         CodeBlockKind::Indented => None,
@@ -295,7 +371,7 @@ pub(crate) fn parse(
                     });
                 } else if tag == TagEnd::TableCell {
                     frame.flush(&marks, &finder);
-                    frame.finish_text();
+                    frame.finish_text(&mut cache);
                     frame.paragraph.set_span(Span {
                         start: frame.start,
                         end: range.end,
@@ -309,7 +385,7 @@ pub(crate) fn parse(
                         .last_mut()
                         .unwrap()
                         .children
-                        .push(frame.finish(range.end, &marks, &finder, style, theme));
+                        .push(frame.finish(range.end, &marks, &finder, style, theme, &mut cache));
                 }
             }
             Event::Text(text) => {
@@ -363,7 +439,7 @@ pub(crate) fn parse(
             }
             Event::Rule => {
                 let frame = frames.last_mut().unwrap();
-                frame.finish_pending(&marks, &finder);
+                frame.finish_pending(&marks, &finder, &mut cache);
                 frame.children.push(node::Node::Divider);
             }
             Event::FootnoteReference(label) => frames
@@ -373,16 +449,43 @@ pub(crate) fn parse(
                 .push_str(&format!("[^{label}]")),
             Event::DisplayMath(text) => frames.last_mut().unwrap().buffer.push_str(&text),
         }
+        if frames.len() == 1
+            && let Some(reading_text) = reading_text.as_deref_mut()
+        {
+            let children = &mut frames[0].children;
+            if children.len() - packed_blocks >= READING_TEXT_BATCH_BLOCKS {
+                reading_text.append_blocks(&mut children[packed_blocks..]);
+                packed_blocks = children.len();
+            }
+        }
     }
-    Ok(frames
-        .pop()
-        .unwrap()
-        .finish(raw.len(), &marks, &finder, style, theme))
+    let mut root =
+        frames
+            .pop()
+            .unwrap()
+            .finish(raw.len(), &marks, &finder, style, theme, &mut cache);
+    if packed_blocks != 0
+        && let Some(reading_text) = reading_text
+        && let node::Node::Root { children } = &mut root
+    {
+        reading_text.append_blocks(&mut std::sync::Arc::make_mut(children)[packed_blocks..]);
+    }
+    Ok(root)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse(
+        raw: &str,
+        style: &TextViewStyle,
+        cx: &mut NodeContext,
+        theme: &HighlightTheme,
+    ) -> Result<node::Node, SharedString> {
+        super::parse(raw, style, cx, theme, |_| {}, None)
+    }
+
     fn paragraph(source: &str) -> Paragraph {
         let style = TextViewStyle::default();
         let mut context = NodeContext::default();
@@ -455,6 +558,47 @@ mod tests {
     }
 
     #[test]
+    fn large_document_retains_forward_links_and_source_spans() {
+        let start = "# First heading\r\n\r\n";
+        let paragraph = "café é **bold [link][target]**\r\n\r\n";
+        let count = 20_000;
+        let source = format!(
+            "{start}{}# Final heading\r\n\r\n[target]: sibling.md\r\n",
+            paragraph.repeat(count),
+        );
+        let mut context = NodeContext::default();
+        let style = TextViewStyle::default();
+        let node::Node::Root { children } =
+            parse(&source, &style, &mut context, &style.highlight_theme).unwrap()
+        else {
+            panic!("expected a document");
+        };
+        assert_eq!(children.len(), count + 2);
+        let mut first_inline: Option<&InlineNode> = None;
+        for index in [0, count / 2, count - 1] {
+            let node::Node::Paragraph(block) = &children[index + 1] else {
+                panic!("expected a paragraph at {index}");
+            };
+            let span = block.span.unwrap();
+            assert_eq!(span.start, start.len() + index * paragraph.len());
+            let inline = &block.children[0];
+            let first = *first_inline.get_or_insert(inline);
+            assert_eq!(inline.text.as_ptr(), first.text.as_ptr());
+            assert_eq!(inline.marks.as_ptr(), first.marks.as_ptr());
+            let marks = marks_for(block, "link");
+            assert!(marks.iter().any(|mark| mark.bold));
+            assert!(marks.iter().any(|mark| mark
+                .link
+                .as_ref()
+                .is_some_and(|link| link.url.as_str() == "sibling.md")));
+        }
+        let node::Node::Heading { children, .. } = children.last().unwrap() else {
+            panic!("expected the final heading");
+        };
+        assert_eq!(children.children[0].text.as_str(), "Final heading");
+    }
+
+    #[test]
     fn declared_dialect_keeps_html_literal() {
         let style = TextViewStyle::default();
         let mut context = NodeContext::default();
@@ -480,8 +624,7 @@ mod tests {
         let style = TextViewStyle::default();
         let mut context = NodeContext::default();
         let root = parse(source, &style, &mut context, &style.highlight_theme).unwrap();
-        let mut links = vec![];
-        root.links(&context, &mut links);
+        let links = root.links(&context);
         assert_eq!(
             links
                 .iter()
@@ -515,7 +658,7 @@ mod tests {
         };
         assert!(quote
             .iter()
-            .any(|node| matches!(node, node::Node::List { ordered: true, .. })));
+            .any(|node| matches!(node, node::Node::List { start: Some(3), .. })));
         let node::Node::List {
             children: tasks, ..
         } = &children[2]
@@ -574,14 +717,19 @@ mod tests {
     #[test]
     #[ignore = "release parser CPU and memory probe; excludes native rendering and presentation"]
     fn benchmark_supported_markdown() {
-        fn paragraph_storage(paragraph: &Paragraph) -> (usize, usize, usize) {
+        fn paragraph_storage(
+            paragraph: &Paragraph,
+            texts: &mut HashSet<usize>,
+            marks: &mut HashSet<usize>,
+        ) -> (usize, usize, usize) {
             let bytes = paragraph.children.capacity() * std::mem::size_of::<InlineNode>()
                 + paragraph
                     .children
                     .iter()
                     .map(|inline| {
-                        inline.text.len()
-                            + inline.marks.capacity()
+                        usize::from(texts.insert(inline.text.as_ptr() as usize)) * inline.text.len()
+                            + usize::from(marks.insert(inline.marks.as_ptr() as usize))
+                                * inline.marks.len()
                                 * std::mem::size_of::<(std::ops::Range<usize>, TextMark)>()
                             + usize::from(inline.has_render_state())
                                 * (std::mem::size_of::<
@@ -631,6 +779,8 @@ mod tests {
                 "FINAL SUPPORTED SIZE MARKER"
             );
             if samples.len() == 1 {
+                let mut texts = HashSet::new();
+                let mut marks = HashSet::new();
                 let storage: Vec<_> = children
                     .iter()
                     .filter_map(|node| match node {
@@ -638,7 +788,7 @@ mod tests {
                         | node::Node::Heading {
                             children: paragraph,
                             ..
-                        } => Some(paragraph_storage(paragraph)),
+                        } => Some(paragraph_storage(paragraph, &mut texts, &mut marks)),
                         _ => None,
                     })
                     .collect();
@@ -709,6 +859,10 @@ mod streaming_tests {
         for seed in 0..100usize {
             let mut expected = Paragraph::default();
             let mut frame = Frame::new(Block::Paragraph, 0);
+            let mut cache = InlineContentCache {
+                enabled: true,
+                ..Default::default()
+            };
             for index in 0..seed + 10 {
                 let text = ["café 🙂", "é中文", "\r\n", "", "plain"][index % 5];
                 let mut marks = Vec::new();
@@ -742,11 +896,11 @@ mod streaming_tests {
                         ..Default::default()
                     };
                     expected.push_image(image.clone());
-                    frame.finish_text();
+                    frame.finish_text(&mut cache);
                     frame.paragraph.push_image(image);
                 }
             }
-            frame.finish_text();
+            frame.finish_text(&mut cache);
             assert_eq!(atoms(&frame.paragraph), atoms(&expected));
             assert!(frame
                 .paragraph

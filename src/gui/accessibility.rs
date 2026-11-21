@@ -6,10 +6,63 @@ pub(super) fn message(
     label: String,
     child: impl IntoElement,
 ) -> impl IntoElement {
+    status(id, label, child, true)
+}
+
+pub(super) fn status(
+    id: &'static str,
+    label: String,
+    child: impl IntoElement,
+    announce: bool,
+) -> impl IntoElement {
     accessible(id, child, move |_, _, _| {
         let mut node = Node::new(Role::Status);
         node.set_label(label.clone());
-        node.set_live(gpui::accesskit::Live::Polite);
+        if announce {
+            node.set_live(gpui::accesskit::Live::Polite);
+        }
+        AccessibilityInfo::new(node)
+    })
+}
+
+/// Static text that assistive technology should read, such as an empty-state line.
+pub(super) fn label(id: &'static str, text: String, child: impl IntoElement) -> impl IntoElement {
+    accessible(id, child, move |_, _, _| {
+        let mut node = Node::new(Role::Label);
+        node.set_label(text.clone());
+        node.set_value(text.clone());
+        node.set_read_only();
+        AccessibilityInfo::new(node)
+    })
+}
+
+/// A list of options without its own focus stop, such as path completions.
+pub(super) fn listbox(
+    id: &'static str,
+    label: String,
+    child: impl IntoElement,
+) -> impl IntoElement {
+    accessible(id, child, move |_, _, _| {
+        let mut node = Node::new(Role::ListBox);
+        node.set_label(label.clone());
+        AccessibilityInfo::new(node)
+    })
+}
+
+/// A labelled region; also gives assistive technology the clipping bounds of a scrolled area.
+pub(super) fn group(id: &'static str, label: String, child: impl IntoElement) -> impl IntoElement {
+    accessible(id, child, move |_, _, _| {
+        let mut node = Node::new(Role::Group);
+        node.set_label(label.clone());
+        AccessibilityInfo::new(node)
+    })
+}
+
+/// A non-modal popup above the panes, such as Commands or path completions.
+pub(super) fn popup(id: &'static str, label: String, child: impl IntoElement) -> impl IntoElement {
+    accessible(id, child, move |_, _, _| {
+        let mut node = Node::new(Role::Dialog);
+        node.set_label(label.clone());
         AccessibilityInfo::new(node)
     })
 }
@@ -40,7 +93,7 @@ impl Shell {
         &self,
         entry: &Entry,
         position: (usize, usize),
-        selected: bool,
+        cursor: bool,
         child: impl IntoElement,
         cx: &Context<Self>,
     ) -> AnyElement {
@@ -49,6 +102,7 @@ impl Shell {
         let symlink = entry.symlink;
         let (index, total) = position;
         let focus = self.nav_focus.clone();
+        let selected = cursor && !self.trash_needs_selection;
         let view = cx.entity().downgrade();
         let label = format!(
             "{}{}",
@@ -73,22 +127,27 @@ impl Shell {
                 node.add_action(Action::Focus);
                 node.add_action(Action::Click);
                 let mut info = AccessibilityInfo::new(node);
-                info.focused = selected && focus.is_focused(window);
+                info.focused = cursor && focus.is_focused(window);
                 info
             },
         )
         .on_action(move |request, _, window, cx| {
             let _ = view.update(cx, |this, cx| {
-                this.selection = Some(path.clone());
-                this.search_ui.picker_selection = Some(path.clone());
                 match request.action {
                     Action::Focus => {
+                        if this.trash_needs_selection {
+                            this.selection = Some(path.clone());
+                        } else {
+                            this.select_navigation(path.clone());
+                        }
                         this.nav_focus.focus(window);
                         if let Some(scroll) = this.scrolls.get(&this.current) {
                             scroll.scroll_to_item(index, ScrollStrategy::Top);
                         }
                     }
                     Action::Click => {
+                        this.select_navigation(path.clone());
+                        this.nav_focus.focus(window);
                         this.open(path.clone(), true, None);
                     }
                     _ => return,

@@ -1,18 +1,34 @@
-use std::{fs, io::Write, path::Path};
+use std::{
+    fs,
+    io::{self, Write},
+    path::Path,
+};
+
+fn destination_error(error: io::Error) -> String {
+    match error.kind() {
+        io::ErrorKind::AlreadyExists => "An item with this name already exists.".into(),
+        io::ErrorKind::PermissionDenied => "You don’t have permission to make this change.".into(),
+        io::ErrorKind::ReadOnlyFilesystem => "This folder is on a read-only volume.".into(),
+        _ => error.to_string(),
+    }
+}
+
 pub fn create(path: &Path, folder: bool, text: &str) -> Result<(), String> {
     if folder {
-        return fs::create_dir(path).map_err(|e| e.to_string());
+        return fs::create_dir(path).map_err(destination_error);
     }
     if text.len() as u64 > crate::document::MAX_BYTES {
         return Err("New file exceeds the 10 MiB editing limit".into());
     }
     let parent = path.parent().ok_or("Missing parent folder")?;
-    let mut staged = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
+    let mut staged = tempfile::NamedTempFile::new_in(parent).map_err(destination_error)?;
     staged
         .write_all(text.as_bytes())
         .and_then(|_| staged.as_file().sync_all())
-        .map_err(|e| e.to_string())?;
-    staged.persist_noclobber(path).map_err(|e| e.to_string())?;
+        .map_err(destination_error)?;
+    staged
+        .persist_noclobber(path)
+        .map_err(|error| destination_error(error.error))?;
     Ok(())
 }
 pub fn rename(source: &Path, destination: &Path) -> Result<(), String> {
@@ -35,7 +51,7 @@ pub fn rename(source: &Path, destination: &Path) -> Result<(), String> {
         )
     };
     if result != 0 {
-        return Err(std::io::Error::last_os_error().to_string());
+        return Err(destination_error(io::Error::last_os_error()));
     }
     Ok(())
 }
@@ -73,8 +89,54 @@ fn trash_location(path: &Path) -> Result<Option<std::path::PathBuf>, String> {
 
 #[cfg(target_os = "linux")]
 fn trash_location(path: &Path) -> Result<Option<std::path::PathBuf>, String> {
-    trash::delete(path).map_err(|error| error.to_string())?;
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+    if let Some(parent) = path.parent() {
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        let parent = CString::new(parent.as_os_str().as_bytes())
+            .map_err(|_| "The parent folder is unavailable.")?;
+        let access = unsafe {
+            libc::faccessat(
+                libc::AT_FDCWD,
+                parent.as_ptr(),
+                libc::W_OK | libc::X_OK,
+                libc::AT_EACCESS,
+            )
+        };
+        if access != 0 {
+            return Err(trash_io_reason(&io::Error::last_os_error()).into());
+        }
+    }
+    trash::delete(path).map_err(|error| {
+        if std::env::var_os("GLIMPSE_TRACE").is_some() {
+            eprintln!("GLIMPSE_TRASH {error}");
+        }
+        match &error {
+            trash::Error::FileSystem { source, .. } => trash_io_reason(source),
+            trash::Error::CouldNotAccess { .. } | trash::Error::CanonicalizePath { .. } => {
+                "The file or folder is unavailable."
+            }
+            _ => "Trash is unavailable for this item.",
+        }
+        .to_owned()
+    })?;
     Ok(None)
+}
+
+#[cfg(target_os = "linux")]
+fn trash_io_reason(error: &io::Error) -> &'static str {
+    match error.kind() {
+        io::ErrorKind::PermissionDenied => "Permission denied.",
+        io::ErrorKind::ReadOnlyFilesystem => "The volume is read-only.",
+        io::ErrorKind::NotFound => "The file or folder is unavailable.",
+        io::ErrorKind::StorageFull => "The volume is full.",
+        io::ErrorKind::QuotaExceeded => "The storage quota has been reached.",
+        _ => "Check the file and Trash and try again.",
+    }
 }
 
 #[cfg(test)]

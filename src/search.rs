@@ -1,5 +1,6 @@
 use std::{
-    collections::hash_map::DefaultHasher,
+    cmp::Reverse,
+    collections::{BinaryHeap, HashMap, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
     io::Read,
     os::unix::fs::OpenOptionsExt,
@@ -12,6 +13,9 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+const MAX_RESULTS: usize = 1000;
+
 #[derive(Clone)]
 pub struct Hit {
     pub path: PathBuf,
@@ -24,6 +28,8 @@ pub struct Hit {
 pub struct ResultSet {
     pub generation: u64,
     pub hits: Vec<Hit>,
+    pub duplicate_parents: HashMap<PathBuf, crate::paths::ParentHint>,
+    pub filename_hints: HashMap<String, crate::paths::LabelCue>,
     pub state: String,
     pub completed: bool,
 }
@@ -31,6 +37,8 @@ pub struct ResultSet {
 pub struct Filters {
     pub ignored: bool,
     pub metadata: bool,
+    pub cross_mounts: bool,
+    pub directory_links: bool,
     pub exclude: String,
     pub file_bytes: usize,
 }
@@ -39,6 +47,8 @@ impl Default for Filters {
         Self {
             ignored: false,
             metadata: false,
+            cross_mounts: false,
+            directory_links: false,
             exclude: String::new(),
             file_bytes: 1024 * 1024,
         }
@@ -72,6 +82,9 @@ pub fn fingerprint_body(body: &[u8], bom: bool) -> u64 {
     body.hash(&mut hash);
     hash.finish()
 }
+/// Byte ranges of `value` to emphasise for a filename query: the last contiguous occurrence
+/// when there is one (so a match in the file name wins over its folders), otherwise the query's
+/// characters in order, starting in the file name when they all fit there.
 pub fn highlight_ranges(value: &str, query: &str) -> Vec<std::ops::Range<usize>> {
     let chars: Vec<_> = value
         .char_indices()
@@ -80,25 +93,47 @@ pub fn highlight_ranges(value: &str, query: &str) -> Vec<std::ops::Range<usize>>
                 .map(move |lower| (start, start + c.len_utf8(), lower))
         })
         .collect();
-    let mut position = 0;
-    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
-    for expected in query.chars().flat_map(char::to_lowercase) {
-        let Some(offset) = chars[position..]
-            .iter()
-            .position(|(_, _, c)| *c == expected)
-        else {
-            return Vec::new();
-        };
-        position += offset;
-        let (start, end, _) = chars[position];
-        if let Some(last) = ranges.last_mut().filter(|range| range.end >= start) {
-            last.end = end;
-        } else {
-            ranges.push(start..end);
-        }
-        position += 1;
+    let wanted: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
+    if wanted.is_empty() {
+        return Vec::new();
     }
-    ranges
+    if let Some(at) = (0..=chars.len().saturating_sub(wanted.len()))
+        .rev()
+        .filter(|_| chars.len() >= wanted.len())
+        .find(|&at| {
+            chars[at..at + wanted.len()]
+                .iter()
+                .zip(&wanted)
+                .all(|((_, _, c), w)| c == w)
+        })
+    {
+        return std::iter::once(chars[at].0..chars[at + wanted.len() - 1].1).collect();
+    }
+    let name_start = chars
+        .iter()
+        .rposition(|(_, _, c)| *c == '/')
+        .map_or(0, |slash| slash + 1);
+    let subsequence = |from: usize| {
+        let mut position = from;
+        let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+        for expected in &wanted {
+            let offset = chars[position..]
+                .iter()
+                .position(|(_, _, c)| c == expected)?;
+            position += offset;
+            let (start, end, _) = chars[position];
+            if let Some(last) = ranges.last_mut().filter(|range| range.end >= start) {
+                last.end = end;
+            } else {
+                ranges.push(start..end);
+            }
+            position += 1;
+        }
+        Some(ranges)
+    };
+    subsequence(name_start)
+        .or_else(|| subsequence(0))
+        .unwrap_or_default()
 }
 fn excerpt(value: &str, query: &str) -> String {
     let found = value.find(query).unwrap_or(0);
@@ -120,12 +155,6 @@ fn excerpt(value: &str, query: &str) -> String {
     )
 }
 fn rank(path: &Path, scope: &Path, query: &str) -> Option<i64> {
-    let value = path
-        .strip_prefix(scope)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .to_lowercase();
-    let query = query.to_lowercase();
     let basename = path
         .file_name()
         .unwrap_or_default()
@@ -134,13 +163,18 @@ fn rank(path: &Path, scope: &Path, query: &str) -> Option<i64> {
     if basename == query {
         return Some(10000);
     }
-    if basename.starts_with(&query) {
+    if basename.starts_with(query) {
         return Some(8000 - basename.len() as i64);
     }
-    if let Some(index) = basename.find(&query) {
+    if let Some(index) = basename.find(query) {
         return Some(6000 - index as i64);
     }
-    if let Some(index) = value.find(&query) {
+    let value = path
+        .strip_prefix(scope)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .to_lowercase();
+    if let Some(index) = value.find(query) {
         return Some(4000 - index as i64);
     }
     let mut chars = query.chars();
@@ -168,6 +202,57 @@ fn ordered(hits: &[Hit]) -> Vec<Hit> {
     });
     hits
 }
+fn indexed_hits(
+    paths: &[PathBuf],
+    scope: &Path,
+    query: &str,
+    folded_query: &str,
+    cancelled: impl Fn() -> bool,
+) -> Result<(Vec<Hit>, bool), usize> {
+    #[derive(Eq, Ord, PartialEq, PartialOrd)]
+    struct RankedPath<'a> {
+        score: Reverse<i64>,
+        path: &'a Path,
+    }
+
+    let mut best = BinaryHeap::with_capacity(MAX_RESULTS);
+    let mut truncated = false;
+    for (processed, path) in paths.iter().enumerate() {
+        if cancelled() {
+            return Err(processed);
+        }
+        let Some(score) = rank(path, scope, folded_query) else {
+            continue;
+        };
+        let ranked = RankedPath {
+            score: Reverse(score),
+            path,
+        };
+        if best.len() < MAX_RESULTS {
+            best.push(ranked);
+        } else if let Some(mut worst) = best.peek_mut() {
+            truncated = true;
+            if ranked < *worst {
+                *worst = ranked;
+            }
+        }
+    }
+    if cancelled() {
+        return Err(paths.len());
+    }
+    let hits = best
+        .into_iter()
+        .map(|ranked| Hit {
+            path: ranked.path.to_path_buf(),
+            line: 1,
+            excerpt: String::new(),
+            query: query.to_owned(),
+            fingerprint: None,
+            score: ranked.score.0,
+        })
+        .collect();
+    Ok((hits, truncated))
+}
 impl Search {
     pub fn new(ctx: crate::wake::Context) -> Self {
         let index = Arc::new(Mutex::new(None::<FilenameIndex>));
@@ -191,6 +276,12 @@ impl Search {
                     let mut result = ResultSet {
                         generation: id,
                         hits: ordered(hits),
+                        duplicate_parents: crate::paths::parent_hints(
+                            hits.iter().map(|hit| hit.path.as_path()),
+                        ),
+                        filename_hints: crate::paths::filename_hints(
+                            hits.iter().filter_map(|hit| hit.path.file_name()),
+                        ),
                         state: state.into(),
                         completed,
                     };
@@ -212,6 +303,7 @@ impl Search {
                     }
                 };
                 let building = query.is_empty() && !content;
+                let folded_query = query.to_lowercase();
                 if !content && !building {
                     let cached = worker_index
                         .lock()
@@ -220,47 +312,42 @@ impl Search {
                         .filter(|index| index.scope == scope && index.filters == filters)
                         .map(|index| (index.paths.clone(), index.partial, index.stale.clone()));
                     if let Some((paths, partial, stale)) = cached {
-                        let mut hits = Vec::new();
-                        for path in paths.iter() {
-                            if cancelled() {
-                                break;
+                        crate::metrics::event("search-indexed-start", id, paths.len() as u64);
+                        let report_abandoned = |processed| {
+                            crate::metrics::event("search-indexed-abandoned", id, processed as u64);
+                        };
+                        let (hits, truncated) =
+                            match indexed_hits(&paths, &scope, &query, &folded_query, cancelled) {
+                                Ok(hits) => hits,
+                                Err(processed) => {
+                                    report_abandoned(processed);
+                                    continue;
+                                }
+                            };
+                        let state = match (stale.load(Ordering::Relaxed), partial || truncated) {
+                            (true, true) => {
+                                "Indexed snapshot stale · partial results · rebuild for current results"
                             }
-                            if let Some(score) = rank(path, &scope, &query) {
-                                hits.push(Hit {
-                                    path: path.clone(),
-                                    line: 1,
-                                    excerpt: String::new(),
-                                    query: query.clone(),
-                                    fingerprint: None,
-                                    score,
-                                });
-                            }
-                        }
-                        hits = ordered(&hits);
-                        let truncated = hits.len() > 1000;
-                        hits.truncate(1000);
-                        send(
-                            &hits,
-                            if stale.load(Ordering::Relaxed) {
-                                "Indexed snapshot stale · rebuild for current results"
-                            } else if partial || truncated {
+                            (true, false) => "Indexed snapshot stale · rebuild for current results",
+                            (false, true) => {
                                 "Indexed snapshot · partial results · rebuild for changes"
-                            } else {
-                                "Indexed snapshot · rebuild for changes"
-                            },
-                            true,
-                        );
+                            }
+                            (false, false) => "Indexed snapshot · rebuild for changes",
+                        };
+                        if !send(&hits, state, true) && cancelled() {
+                            report_abandoned(paths.len());
+                        }
                         continue;
                     }
                 }
                 let stale = Arc::new(AtomicBool::new(false));
                 let mut index_watcher = None;
+                use notify::Watcher;
                 if building {
-                    use notify::Watcher;
                     let dirty = stale.clone();
                     let repaint = ctx.clone();
-                    if let Ok(mut watcher) =
-                        notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                    if let Ok(watcher) = notify::RecommendedWatcher::new(
+                        move |event: notify::Result<notify::Event>| {
                             if event.as_ref().is_ok_and(|event| {
                                 matches!(
                                     event.kind,
@@ -272,11 +359,9 @@ impl Search {
                             if !dirty.swap(true, Ordering::Relaxed) {
                                 repaint.request_repaint();
                             }
-                        })
-                        && watcher
-                            .watch(&scope, notify::RecursiveMode::Recursive)
-                            .is_ok()
-                    {
+                        },
+                        notify::Config::default().with_follow_symlinks(filters.directory_links),
+                    ) {
                         index_watcher = Some(watcher);
                     }
                     if index_watcher.is_none() {
@@ -310,27 +395,36 @@ impl Search {
                         continue;
                     }
                 };
-                let (resolved_scope, mount_points) = match std::fs::canonicalize(&scope)
-                    .map_err(|error| error.to_string())
-                    .and_then(|scope| {
-                        crate::locations::mount_points().map(|points| (scope, points))
-                    }) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        send(
-                            &[],
-                            &format!("Failed — cannot validate mount boundaries: {error}"),
-                            true,
-                        );
-                        continue;
+                let boundaries = if filters.cross_mounts {
+                    None
+                } else {
+                    match std::fs::canonicalize(&scope)
+                        .map_err(|error| error.to_string())
+                        .and_then(|scope| {
+                            crate::locations::mount_points().map(|points| (scope, points))
+                        }) {
+                        Ok((resolved, mounts)) => {
+                            let outside = mounts
+                                .into_iter()
+                                .filter(|path| !resolved.starts_with(path))
+                                .collect::<std::collections::HashSet<_>>();
+                            Some((resolved, outside))
+                        }
+                        Err(error) => {
+                            send(
+                                &[],
+                                &format!("Failed — cannot validate mount boundaries: {error}"),
+                                true,
+                            );
+                            continue;
+                        }
                     }
                 };
-                let boundaries: std::collections::HashSet<_> = mount_points
-                    .into_iter()
-                    .filter(|path| path != &resolved_scope && path.starts_with(&resolved_scope))
-                    .collect();
                 let walked_scope = scope.clone();
                 let metadata = filters.metadata;
+                let directory_links = filters.directory_links;
+                let incomplete = Arc::new(AtomicBool::new(false));
+                let skipped_entry = incomplete.clone();
                 let file_bytes = filters.file_bytes.clamp(1, 10 * 1024 * 1024);
                 let walker = ignore::WalkBuilder::new(&scope)
                     .hidden(false)
@@ -338,22 +432,37 @@ impl Search {
                     .ignore(!filters.ignored)
                     .git_exclude(!filters.ignored)
                     .require_git(false)
-                    .follow_links(false)
-                    .same_file_system(true)
+                    .follow_links(directory_links)
+                    .same_file_system(!filters.cross_mounts)
                     .overrides(exclusions)
                     .filter_entry(move |entry| {
-                        let allowed_metadata = metadata
-                            || ![".git", ".hg", ".svn"]
+                        if entry.depth() == 0 {
+                            return true;
+                        }
+                        if !metadata
+                            && [".git", ".hg", ".svn"]
                                 .iter()
-                                .any(|name| entry.file_name() == *name);
-                        let boundary =
-                            entry
-                                .path()
-                                .strip_prefix(&walked_scope)
-                                .is_ok_and(|relative| {
-                                    boundaries.contains(&resolved_scope.join(relative))
-                                });
-                        allowed_metadata && !boundary
+                                .any(|name| entry.file_name() == *name)
+                        {
+                            return false;
+                        }
+                        if !entry.file_type().is_some_and(|kind| kind.is_dir()) {
+                            return !entry.path_is_symlink();
+                        }
+                        let Some((scope, mounts)) = &boundaries else {
+                            return true;
+                        };
+                        if directory_links {
+                            let Ok(target) = std::fs::canonicalize(entry.path()) else {
+                                skipped_entry.store(true, Ordering::Relaxed);
+                                return false;
+                            };
+                            return !target.ancestors().any(|path| mounts.contains(path));
+                        }
+                        entry
+                            .path()
+                            .strip_prefix(&walked_scope)
+                            .is_ok_and(|relative| !mounts.contains(&scope.join(relative)))
                     })
                     .build();
                 for entry in walker {
@@ -361,7 +470,7 @@ impl Search {
                         break;
                     }
                     count += 1;
-                    if count > 100_000 || hits.len() >= 1000 {
+                    if count > 100_000 || hits.len() >= MAX_RESULTS {
                         partial = true;
                         break;
                     }
@@ -372,6 +481,14 @@ impl Search {
                             continue;
                         }
                     };
+                    if entry.file_type().is_some_and(|kind| kind.is_dir())
+                        && let Some(watcher) = &mut index_watcher
+                        && watcher
+                            .watch(entry.path(), notify::RecursiveMode::NonRecursive)
+                            .is_err()
+                    {
+                        stale.store(true, Ordering::Relaxed);
+                    }
                     if !entry.file_type().is_some_and(|t| t.is_file()) {
                         continue;
                     }
@@ -448,13 +565,13 @@ impl Search {
                                     fingerprint: Some(version),
                                     score: 0,
                                 });
-                                if hits.len() >= 1000 {
+                                if hits.len() >= MAX_RESULTS {
                                     partial = true;
                                     break;
                                 }
                             }
                         }
-                    } else if let Some(score) = rank(entry.path(), &scope, &query) {
+                    } else if let Some(score) = rank(entry.path(), &scope, &folded_query) {
                         hits.push(Hit {
                             path: entry.path().to_owned(),
                             line: 1,
@@ -471,6 +588,7 @@ impl Search {
                         last = Instant::now();
                     }
                 }
+                partial |= incomplete.load(Ordering::Relaxed);
                 if !cancelled() {
                     if building {
                         let mut index = worker_index.lock().unwrap();
@@ -528,12 +646,11 @@ impl Search {
                     format!(
                         "{} filenames · {}snapshot",
                         index.paths.len(),
-                        if index.stale.load(Ordering::Relaxed) {
-                            "stale · rebuild "
-                        } else if index.partial {
-                            "partial "
-                        } else {
-                            ""
+                        match (index.stale.load(Ordering::Relaxed), index.partial) {
+                            (true, true) => "partial · stale · rebuild ",
+                            (true, false) => "stale · rebuild ",
+                            (false, true) => "partial ",
+                            (false, false) => "",
                         }
                     )
                 })
@@ -587,6 +704,32 @@ impl Drop for Search {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn indexed_hits_keep_the_best_paths_and_abandon_work() {
+        let scope = Path::new("/fixtures");
+        let paths: Vec<_> = (0..1024)
+            .rev()
+            .map(|index| scope.join(format!("Item{index:04}.rs")))
+            .collect();
+        let (hits, truncated) = indexed_hits(&paths, scope, "ITEM", "item", || false).unwrap();
+        assert!(truncated);
+        let hits = ordered(&hits);
+        assert_eq!(hits.len(), MAX_RESULTS);
+        assert_eq!(hits[0].path, scope.join("Item0000.rs"));
+        assert_eq!(hits[MAX_RESULTS - 1].path, scope.join("Item0999.rs"));
+        assert_eq!(hits[0].query, "ITEM");
+
+        let checks = std::cell::Cell::new(0);
+        assert!(matches!(
+            indexed_hits(&paths, scope, "ITEM", "item", || {
+                checks.set(checks.get() + 1);
+                checks.get() == 10
+            }),
+            Err(9)
+        ));
+        assert_eq!(checks.get(), 10);
+    }
+
     #[test]
     #[ignore = "release search CPU benchmark; excludes UI presentation"]
     fn benchmark_indexed_hundred_thousand_paths() {
@@ -908,13 +1051,22 @@ mod presentation_tests {
         assert!(shown.chars().count() <= 162);
         assert!(shown.starts_with('…') && shown.ends_with('…'));
     }
+    #[test]
+    fn filename_highlights_prefer_a_whole_match_in_the_file_name() {
+        let value = "project-a/src/config/settings.toml";
+        let whole = highlight_ranges(value, "Settings");
+        assert_eq!((whole.len(), whole.first()), (1, Some(&(21..29))));
+        assert_eq!(highlight_ranges(value, "stt"), vec![21..22, 23..25]);
+        assert_eq!(highlight_ranges(value, "pac"), vec![0..1, 8..9, 12..13]);
+        assert!(highlight_ranges(value, "zz").is_empty());
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
 mod mount_tests {
     use super::*;
     #[test]
-    fn same_device_bind_mounts_and_directory_aliases_remain_outside_search() {
+    fn same_device_mounts_and_symlinks_require_independent_search_opt_ins() {
         use std::os::unix::fs::{MetadataExt, symlink};
         if let Some(root) = std::env::var_os("GLIMPSE_MOUNT_FIXTURE") {
             let root = PathBuf::from(root);
@@ -939,31 +1091,57 @@ mod mount_tests {
             assert!(root.join("scope/mounted/needle-outside.txt").is_file());
             let search = Search::new(crate::wake::Context::default());
             let scope = root.join("scope");
-            for indexed in [false, true] {
-                if indexed {
-                    search
-                        .start_filtered(scope.clone(), String::new(), false, Filters::default())
-                        .unwrap();
-                    loop {
-                        if search
-                            .replies
-                            .recv_timeout(Duration::from_secs(5))
-                            .unwrap()
-                            .completed
-                        {
-                            break;
-                        }
-                    }
+            let terminal = |generation| loop {
+                let result = search.replies.recv_timeout(Duration::from_secs(5)).unwrap();
+                if result.generation == generation && result.completed {
+                    break result;
                 }
-                search
-                    .start_filtered(scope.clone(), "needle".into(), false, Filters::default())
-                    .unwrap();
-                loop {
-                    let result = search.replies.recv_timeout(Duration::from_secs(5)).unwrap();
-                    if result.completed {
-                        assert_eq!(result.hits.len(), 1, "{}", result.state);
-                        assert_eq!(result.hits[0].path, scope.join("needle-visible.txt"));
-                        break;
+            };
+            for (cross_mounts, directory_links) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let filters = Filters {
+                    cross_mounts,
+                    directory_links,
+                    ..Default::default()
+                };
+                let mut expected = vec![scope.join("needle-visible.txt")];
+                if cross_mounts {
+                    expected.push(scope.join("mounted/needle-outside.txt"));
+                }
+                if directory_links {
+                    expected.push(scope.join("alias/needle-outside.txt"));
+                }
+                if cross_mounts && directory_links {
+                    expected.push(scope.join("through-mount/needle-outside.txt"));
+                }
+                expected.sort();
+                for indexed in [false, true] {
+                    search.clear_index();
+                    if indexed {
+                        let id = search
+                            .start_filtered(scope.clone(), String::new(), false, filters.clone())
+                            .unwrap();
+                        terminal(id);
+                        assert!(search.index_compatible(&scope, &filters));
+                    }
+                    let id = search
+                        .start_filtered(scope.clone(), "needle".into(), false, filters.clone())
+                        .unwrap();
+                    let result = terminal(id);
+                    let mut paths = result
+                        .hits
+                        .into_iter()
+                        .map(|hit| hit.path)
+                        .collect::<Vec<_>>();
+                    paths.sort();
+                    assert_eq!(paths, expected, "{}", result.state);
+                    if directory_links {
+                        assert!(
+                            result.state.to_lowercase().contains("partial"),
+                            "{}",
+                            result.state
+                        );
                     }
                 }
             }
@@ -975,10 +1153,21 @@ mod mount_tests {
         std::fs::write(root.path().join("scope/needle-visible.txt"), b"inside").unwrap();
         std::fs::write(root.path().join("outside/needle-outside.txt"), b"outside").unwrap();
         symlink(root.path().join("outside"), root.path().join("scope/alias")).unwrap();
+        symlink(
+            root.path().join("scope/mounted"),
+            root.path().join("scope/through-mount"),
+        )
+        .unwrap();
+        symlink(root.path().join("scope"), root.path().join("scope/cycle")).unwrap();
+        symlink(
+            root.path().join("outside/needle-outside.txt"),
+            root.path().join("scope/needle-file-link.txt"),
+        )
+        .unwrap();
         let result = std::process::Command::new("unshare")
             .args(["--user","--map-root-user","--mount","--propagation","private","--"])
             .arg(std::env::current_exe().unwrap())
-            .args(["--exact","search::mount_tests::same_device_bind_mounts_and_directory_aliases_remain_outside_search","--nocapture"])
+            .args(["--exact","search::mount_tests::same_device_mounts_and_symlinks_require_independent_search_opt_ins","--nocapture"])
             .env("GLIMPSE_MOUNT_FIXTURE",root.path())
             .env("GLIMPSE_PARENT_MOUNT_NAMESPACE",std::fs::read_link("/proc/self/ns/mnt").unwrap())
             .output().unwrap();

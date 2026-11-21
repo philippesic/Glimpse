@@ -335,7 +335,7 @@ impl TextElement {
         last_layout: &LastLayout,
         bounds: &Bounds<Pixels>,
         cx: &mut App,
-    ) -> Vec<(Path<Pixels>, bool)> {
+    ) -> Vec<(Bounds<Pixels>, bool)> {
         let search_panel = self.state.read(cx).search_panel.clone();
         let Some((ranges, current_match_ix)) = search_panel.and_then(|panel| {
             if let Some(matcher) = panel.read(cx).matcher() {
@@ -344,7 +344,7 @@ impl TextElement {
                 None
             }
         }) else {
-            return vec![];
+            return Vec::new();
         };
 
         let mut offset = last_layout.visible_range_offset.start;
@@ -357,27 +357,26 @@ impl TextElement {
             );
             offset += line.len() + 1;
         }
-        let mut paths = Vec::new();
+        let mut matches = Vec::new();
         for index in matching_indices(&ranges, &visible) {
-            if let Some(path) =
-                Self::layout_search_range(&ranges.get(index).unwrap(), last_layout, bounds)
-            {
-                paths.push((path, current_match_ix == index));
-            }
+            let range = ranges.get(index).unwrap();
+            let current = current_match_ix == index;
+            Self::layout_search_range(&range, last_layout, bounds, |rect| {
+                matches.push((rect, current));
+            });
         }
 
-        paths
+        matches
     }
 
     fn layout_search_range(
         range: &Range<usize>,
         layout: &LastLayout,
         bounds: &Bounds<Pixels>,
-    ) -> Option<Path<Pixels>> {
-        let mut builder = gpui::PathBuilder::fill();
+        mut push: impl FnMut(Bounds<Pixels>),
+    ) {
         let mut offset = layout.visible_range_offset.start;
         let mut top = layout.visible_top;
-        let mut painted = false;
         for line in layout.lines.iter() {
             for row in &line.wrapped_lines {
                 let start = offset + row.range.start;
@@ -392,17 +391,14 @@ impl TextElement {
                 let right = row.shaped.x_for_index(to.max(from) - start).max(x + px(6.));
                 let origin = bounds.origin
                     + point(layout.line_number_width, top + row.row * layout.line_height);
-                builder.move_to(origin + point(x, px(0.)));
-                builder.line_to(origin + point(right, px(0.)));
-                builder.line_to(origin + point(right, layout.line_height));
-                builder.line_to(origin + point(x, layout.line_height));
-                builder.close();
-                painted = true;
+                push(Bounds::new(
+                    origin + point(x, px(0.)),
+                    size(right - x, layout.line_height),
+                ));
             }
             offset += line.len() + 1;
             top += line.size(layout.line_height).height;
         }
-        painted.then(|| builder.build().ok()).flatten()
     }
 
     fn layout_hover_highlight(
@@ -678,10 +674,7 @@ impl TextElement {
             .deferred_scroll_offset
             .unwrap_or_else(|| state.scroll_handle.offset())
             .y;
-        let viewport_rows = (f32::from(window.viewport_size().height)
-            / f32::from(last_layout.line_height))
-        .ceil() as usize
-            + 2;
+        let scroll_bottom = scroll_top + last_layout.viewport_height;
         for row in visible_range.clone() {
             let Some(line_item) = text_wrapper.lines.get(row) else {
                 break;
@@ -691,11 +684,12 @@ impl TextElement {
                 / f32::from(last_layout.line_height))
             .floor()
             .max(0.)) as usize;
-            let mut needed: std::collections::BTreeSet<usize> = (first_row
-                ..first_row
-                    .saturating_add(viewport_rows)
-                    .min(line_item.lines_len()))
-                .collect();
+            let last_row = (f32::from(scroll_bottom - line_top)
+                / f32::from(last_layout.line_height))
+            .ceil()
+            .max(0.) as usize;
+            let end = last_row.saturating_add(2).min(line_item.lines_len());
+            let mut needed: std::collections::BTreeSet<usize> = (first_row..end).collect();
             for endpoint in [
                 state.cursor(),
                 state.selected_range.start,
@@ -832,7 +826,7 @@ pub(super) struct PrepaintState {
     current_row: Option<usize>,
     selection_path: Option<Path<Pixels>>,
     hover_highlight_path: Option<Path<Pixels>>,
-    search_match_paths: Vec<(Path<Pixels>, bool)>,
+    search_match_bounds: Vec<(Bounds<Pixels>, bool)>,
     document_color_paths: Vec<(Path<Pixels>, Hsla)>,
     hover_definition_hitbox: Option<Hitbox>,
     indent_guides_path: Option<Path<Pixels>>,
@@ -949,25 +943,34 @@ impl Element for TextElement {
         let style = window.text_style();
         let font = style.font();
         let text_size = style.font_size.to_pixels(window.rem_size());
+        let line_height = window.line_height();
+        let opening_rows = ((f32::from(bounds.size.height) / f32::from(line_height)).ceil()
+            as usize)
+            .saturating_add(2);
 
         let state = self.state.read(cx);
         let (line_number_width, line_number_len) =
             Self::layout_line_numbers(state, &state.text, text_size, &style, window);
         let wrap_width = if state.mode.is_multi_line() && state.soft_wrap {
-            Some(bounds.size.width - line_number_width - RIGHT_MARGIN)
+            Some(state.wrap_layout_width(bounds.size.width - line_number_width - RIGHT_MARGIN))
         } else {
             None
         };
         let prepared = self.state.update(cx, |state, cx| {
             let _wrap = gpui::work_trace::Span::new("editor_wrap");
-            state.prepare_layout(
+            let prepared = state.prepare_layout(
                 LayoutConfig {
                     font,
                     font_size: text_size,
                     wrap_width,
                 },
+                Some((window.text_system(), opening_rows)),
                 cx,
-            )
+            );
+            if prepared && let Some(lines) = state.opening_lines.take() {
+                window.text_system().adopt_prepared_lines(&lines);
+            }
+            prepared
         });
         if !prepared {
             return None;
@@ -975,7 +978,6 @@ impl Element for TextElement {
 
         let state = self.state.read(cx);
         let wrap_width = state.text_wrapper.wrap_width();
-        let line_height = window.line_height();
 
         let (visible_range, visible_top) =
             self.calculate_visible_range(&state, line_height, bounds.size.height);
@@ -1017,6 +1019,7 @@ impl Element for TextElement {
         let mut last_layout = LastLayout {
             visible_range,
             visible_top,
+            viewport_height: bounds.size.height,
             visible_range_offset: visible_start_offset..visible_end_offset,
             line_height,
             wrap_width,
@@ -1199,7 +1202,7 @@ impl Element for TextElement {
             self.layout_cursor(&last_layout, &mut bounds, window, cx);
         last_layout.cursor_bounds = cursor_bounds;
 
-        let search_match_paths = self.layout_search_matches(&last_layout, &mut bounds, cx);
+        let search_match_bounds = self.layout_search_matches(&last_layout, &mut bounds, cx);
         let selection_path = self.layout_selections(&last_layout, &mut bounds, cx);
         let hover_highlight_path = self.layout_hover_highlight(&last_layout, &mut bounds, cx);
         let document_color_paths =
@@ -1259,7 +1262,7 @@ impl Element for TextElement {
             cursor_scroll_offset,
             current_row,
             selection_path,
-            search_match_paths,
+            search_match_bounds,
             hover_highlight_path,
             hover_definition_hitbox,
             document_color_paths,
@@ -1353,7 +1356,19 @@ impl Element for TextElement {
             }
         }
 
-        let active_line_color = cx.theme().highlight_theme.style.editor_active_line;
+        // Read-only views have no editing position worth marking.
+        let read_only = state.disabled;
+        let active_line_color = cx
+            .theme()
+            .highlight_theme
+            .style
+            .editor_active_line
+            .filter(|_| !read_only);
+        let gutter_color = if read_only {
+            cx.theme().muted
+        } else {
+            cx.theme().editor_background()
+        };
 
         // Paint active line
         let mut offset_y = px(0.);
@@ -1387,11 +1402,11 @@ impl Element for TextElement {
         // Paint selections
         if window.is_window_active() {
             let secondary_selection = cx.theme().selection.saturation(0.1);
-            for (path, is_active) in prepaint.search_match_paths.iter() {
-                window.paint_path(path.clone(), secondary_selection);
+            for &(rect, is_active) in &prepaint.search_match_bounds {
+                window.paint_quad(fill(rect, secondary_selection));
 
-                if *is_active {
-                    window.paint_path(path.clone(), cx.theme().selection);
+                if is_active {
+                    window.paint_quad(fill(rect, cx.theme().selection));
                 }
             }
 
@@ -1402,6 +1417,18 @@ impl Element for TextElement {
             // Paint hover highlight
             if let Some(path) = prepaint.hover_highlight_path.take() {
                 window.paint_path(path, secondary_selection);
+            }
+
+            for &(rect, current) in &prepaint.search_match_bounds {
+                let height = rect.size.height.min(px(if current { 2. } else { 1. }));
+                let origin = rect.origin + point(px(0.), rect.size.height - height);
+                let underline = Bounds::new(origin, size(rect.size.width, height));
+                let ink = if current {
+                    cx.theme().foreground
+                } else {
+                    cx.theme().muted_foreground
+                };
+                window.paint_quad(fill(underline, ink));
             }
         }
 
@@ -1470,7 +1497,7 @@ impl Element for TextElement {
                         input_bounds.size.height + prepaint.ghost_lines_height,
                     ),
                 },
-                cx.theme().editor_background(),
+                gutter_color,
             ));
 
             // Each item is the normal lines.
@@ -1485,7 +1512,14 @@ impl Element for TextElement {
                 if is_active {
                     if let Some(bg_color) = active_line_color {
                         window.paint_quad(fill(
-                            Bounds::new(p, size(prepaint.last_layout.line_number_width, height)),
+                            Bounds::new(
+                                p,
+                                size(
+                                    prepaint.last_layout.line_number_width
+                                        - LINE_NUMBER_RIGHT_MARGIN,
+                                    height,
+                                ),
+                            ),
                             bg_color,
                         ));
                     }
@@ -1508,6 +1542,11 @@ impl Element for TextElement {
         }
         self.state.update(cx, |state, cx| {
             let initial_layout_completed = state.initial_layout_pending();
+            // A panel opening above the text (Find) shortens the viewport after the
+            // cursor was scrolled into view; keep the cursor visible in the new height.
+            let shrunk = state
+                .last_bounds
+                .is_some_and(|last| bounds.size.height < last.size.height);
             state.last_layout = Some(prepaint.last_layout.clone());
             state.last_bounds = Some(bounds);
             state.last_cursor = Some(state.cursor());
@@ -1516,6 +1555,10 @@ impl Element for TextElement {
             state.scroll_size = prepaint.scroll_size;
             state.update_scroll_offset(Some(prepaint.cursor_scroll_offset), cx);
             state.deferred_scroll_offset = None;
+            if shrunk || std::mem::take(&mut state.reveal_cursor_after_layout) {
+                let cursor = state.cursor();
+                state.scroll_to(cursor, None, cx);
+            }
 
             if initial_layout_completed {
                 cx.emit(InputEvent::InitialLayoutReady);
@@ -1710,7 +1753,7 @@ mod tests {
     }
 
     #[test]
-    fn search_paths_clip_matches_to_sparse_shaped_rows() {
+    fn search_bounds_cover_only_matching_shaped_rows() {
         let mut line = LineLayout::new();
         line.set_visible_lines(
             1000,
@@ -1731,6 +1774,7 @@ mod tests {
         let layout = LastLayout {
             visible_range: 0..1,
             visible_top: px(0.),
+            viewport_height: px(200.),
             visible_range_offset: 0..1000,
             lines: Rc::new(vec![line]),
             line_height: px(10.),
@@ -1739,11 +1783,21 @@ mod tests {
             cursor_bounds: None,
         };
         let bounds = Bounds::new(point(px(10.), px(30.)), size(px(300.), px(200.)));
-        for range in [300..500, 405..900, 0..1000] {
-            assert!(TextElement::layout_search_range(&range, &layout, &bounds).is_some());
-        }
-        for range in [0..100, 500..600, 900..1000] {
-            assert!(TextElement::layout_search_range(&range, &layout, &bounds).is_none());
+        for (range, tops) in [
+            (300..500, &[430.][..]),
+            (405..900, &[430., 830.][..]),
+            (0..1000, &[430., 830.][..]),
+            (0..100, &[][..]),
+            (500..600, &[][..]),
+            (900..1000, &[][..]),
+        ] {
+            let mut actual = Vec::new();
+            TextElement::layout_search_range(&range, &layout, &bounds, |rect| actual.push(rect));
+            let expected = tops
+                .iter()
+                .map(|&top| Bounds::new(point(px(30.), px(top)), size(px(6.), px(10.))))
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "{range:?}");
         }
     }
 

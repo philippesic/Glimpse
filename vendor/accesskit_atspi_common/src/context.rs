@@ -46,6 +46,7 @@ pub(crate) struct Context {
     pub(crate) tree: RwLock<Tree>,
     pub(crate) action_handler: Arc<dyn ActionHandlerNoMut + Send + Sync>,
     pub(crate) root_window_bounds: RwLock<WindowBounds>,
+    pub(crate) sentence_index: Mutex<Option<crate::sentence_index::SentenceIndex>>,
 }
 
 impl Debug for Context {
@@ -71,6 +72,7 @@ impl Context {
             tree: RwLock::new(tree),
             action_handler,
             root_window_bounds: RwLock::new(root_window_bounds),
+            sentence_index: Mutex::new(None),
         })
     }
 
