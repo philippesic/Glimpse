@@ -26,6 +26,9 @@ class InstallSafety(unittest.TestCase):
                 ROOT / "packaging/linux/glimpse.desktop"
             ).read_bytes(),
             "share/icons/hicolor/scalable/apps/glimpse.svg": b"new icon",
+            "share/doc/glimpse/LICENSE": b"license fixture",
+            "share/doc/glimpse/LICENSE-lucide": b"icon license fixture",
+            "share/doc/glimpse/THIRD-PARTY.txt": b"third-party notices fixture",
             "install.py": b"installer fixture",
             "README.txt": b"readme fixture",
         }
@@ -90,7 +93,11 @@ class InstallSafety(unittest.TestCase):
     def test_installed_desktop_launcher_preserves_restore_and_file_arguments(self):
         prefix = self.root / "installed with spaces"
         executable, desktop = INSTALLER.install(self.source, prefix)
-        self.assertIn(f'Exec="{executable}" --desktop -- %F', desktop.read_text().splitlines())
+        self.assertIn(
+            f'Exec="{executable}" --desktop -- %F', desktop.read_text().splitlines()
+        )
+        notices = prefix / "share/doc/glimpse/THIRD-PARTY.txt"
+        self.assertEqual(notices.read_bytes(), b"third-party notices fixture")
 
 
 if __name__ == "__main__":

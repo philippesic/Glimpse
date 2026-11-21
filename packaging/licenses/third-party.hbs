@@ -1,0 +1,13 @@
+Glimpse third-party notices
+===========================
+
+{{#each licenses}}
+{{name}} ({{id}})
+Used by:
+{{#each used_by}}
+- {{crate.name}} {{crate.version}}{{#if crate.source}} (https://crates.io/crates/{{crate.name}}/{{crate.version}}){{/if}}
+{{/each}}
+
+{{{text}}}
+
+{{/each}}

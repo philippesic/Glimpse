@@ -29,12 +29,18 @@ def desktop_program(path):
 
 def install(source, prefix):
     manifest = json.loads((source / "manifest.json").read_text())
+    licenses = (
+        "share/doc/glimpse/LICENSE",
+        "share/doc/glimpse/LICENSE-lucide",
+        "share/doc/glimpse/THIRD-PARTY.txt",
+    )
     required = {
         "bin/glimpse",
         "share/applications/glimpse.desktop",
         "share/icons/hicolor/scalable/apps/glimpse.svg",
         "install.py",
         "README.txt",
+        *licenses,
     }
     if not required.issubset(manifest["files"]):
         raise ValueError("Package manifest is incomplete")
@@ -64,6 +70,7 @@ def install(source, prefix):
             0o644,
         ),
         (desktop, entry.encode(), 0o644),
+        *((prefix / name, (source / name).read_bytes(), 0o644) for name in licenses),
     ]
     changed = []
     try:
