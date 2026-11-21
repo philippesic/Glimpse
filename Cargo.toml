@@ -9,6 +9,9 @@ name = "glimpse"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
+license = "MIT"
+description = "A native file navigator and UTF-8 text editor"
+repository = "https://github.com/philippesic/Glimpse"
 
 [features]
 test-support = ["gpui/accessibility-test-hooks"]

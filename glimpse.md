@@ -325,7 +325,7 @@ Measure optimized release builds on a named reference machine, OS, display refre
 | Idle, ten small files open, no search | Aspirational base RSS at most 50 MB excluding document text; report total RSS and define any subtraction. Average idle CPU at most 0.1% of one core over 60 seconds |
 | Base desktop distribution | Compressed release package target at most 30 MiB per platform; symbols and optional assets measured separately |
 
-Also measure a genuinely cold launch, content-search throughput, first result versus complete results, save/recovery latency, GPU memory where available, and repeated open/close/search cycles. Search cache, undo, decoded images, and recovery history require explicit bounds. Report missed budgets and their cause; changing a target requires an explicit design decision. Initial development measurements and their limits are documented in README; they do not qualify release budgets.
+Also measure a genuinely cold launch, content-search throughput, first result versus complete results, save/recovery latency, GPU memory where available, and repeated open/close/search cycles. Search cache, undo, decoded images, and recovery history require explicit bounds. Report missed budgets and their cause; changing a target requires an explicit design decision. [Platform qualification](docs/qualification.md) records the available evidence and its limits.
 
 ### Correctness and release gates
 
