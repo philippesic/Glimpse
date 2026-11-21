@@ -213,7 +213,7 @@ pub struct DiskFile {
     pub target: PathBuf,
     pub bytes: FileBytes,
     pub bom: bool,
-    identity: (u64, u64),
+    identity: (u64, u64, u128),
 }
 
 pub enum Observation {
@@ -221,8 +221,13 @@ pub enum Observation {
     Changed(DiskFile, Arc<str>),
 }
 
-fn identity(meta: &Metadata) -> (u64, u64) {
-    (meta.dev(), meta.ino())
+fn identity(meta: &Metadata) -> (u64, u64, u128) {
+    let created = meta
+        .created()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |since| since.as_nanos());
+    (meta.dev(), meta.ino(), created)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -405,7 +410,7 @@ impl DiskFile {
             target: PathBuf::new(),
             bytes: Default::default(),
             bom: false,
-            identity: (0, 0),
+            identity: (0, 0, 0),
         }
     }
 
@@ -429,7 +434,7 @@ impl DiskFile {
     }
     pub fn same_file(&self, other: &Self) -> bool {
         (!self.target.as_os_str().is_empty() && self.target == other.target)
-            || (self.identity != (0, 0) && self.identity == other.identity)
+            || (self.identity != (0, 0, 0) && self.identity == other.identity)
     }
 
     pub fn open(path: PathBuf) -> Result<(Self, Arc<str>)> {

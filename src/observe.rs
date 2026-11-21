@@ -176,8 +176,9 @@ mod tests {
     #[test]
     fn directory_aliases_share_one_watch_and_keep_logical_path_events() {
         let root = tempfile::tempdir().unwrap();
-        let real = root.path().join("real");
-        let alias = root.path().join("alias");
+        let base = std::fs::canonicalize(root.path()).unwrap();
+        let real = base.join("real");
+        let alias = base.join("alias");
         std::fs::create_dir(&real).unwrap();
         std::os::unix::fs::symlink(&real, &alias).unwrap();
         let resolved = Watches {
